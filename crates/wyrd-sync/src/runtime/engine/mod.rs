@@ -51,13 +51,13 @@
 //! [`MembershipLog`]: crate::membership::MembershipLog
 //! [`DurableStore`]: crate::durable::DurableStore
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use wyrd_format::{
-    ContentId, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, ObjectStore,
-    SnapshotId, StorageId, TransitionId,
+    ContentId, DeviceEncryptionKey, DeviceId, DriveId, FetchStatus, MembershipTransition,
+    ObjectStore, SnapshotId, StorageId, TransitionId,
 };
 use zeroize::Zeroizing;
 
@@ -582,6 +582,28 @@ pub(super) enum FetchKey {
     Body(SnapshotId),
 }
 
+/// One completed terminal generation for one content identity: the
+/// attempt generation that established it, and whether the evidence
+/// was verification rejection on every representation (`corrupt`) or
+/// anything else (`unavailable`). Memory-only by decision (OD-11-3):
+/// a reopened engine starts with no terminal state, and nothing here
+/// ever commits. Copy so projections snapshot it freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalState {
+    /// The completed attempt generation. Reported as
+    /// `FetchStatus::Unavailable(generation)`; monotonic per
+    /// identity while the identity stays demanded. An identity that
+    /// goes undemanded (fulfilled, unpinned) drops its tracking, so
+    /// a later demand restarts at 1 — the number scopes one demand
+    /// episode, not the engine's life.
+    pub generation: u64,
+    /// True only when every exhausted representation cooled on
+    /// verification rejection (`Invalid`). Any transport, budget, or
+    /// mixed evidence projects `Unavailable`, never `Corrupt`
+    /// (protocol invariant 7).
+    pub corrupt: bool,
+}
+
 /// One observed DAG head with its authorization classification
 /// and bound epoch. The presentation layer numbers the eligible
 /// heads of this listing to address merge sources as `@N`.
@@ -669,6 +691,23 @@ pub struct Engine {
     /// clears both ledgers.
     pub(super) fetch_budget_burns: BTreeMap<FetchKey, (u32, u64)>,
     pub(super) fetch_cool_until: BTreeMap<FetchKey, u64>,
+    /// Identity-level terminal fetch state (OD-11-1 option A): the
+    /// current attempt generation per demanded identity, completed
+    /// terminal generations, identities attempted under the current
+    /// generation, and the cooldown-kind sets that separate
+    /// verification rejection (`invalid`) from budget backoff
+    /// (`budget`). All transient: reset on restart, never durable
+    /// (OD-11-3 option A).
+    pub(super) fetch_generations: BTreeMap<ContentId, u64>,
+    pub(super) fetch_terminal: BTreeMap<ContentId, TerminalState>,
+    pub(super) fetch_attempted: BTreeSet<ContentId>,
+    pub(super) fetch_invalid_cooled: BTreeSet<FetchKey>,
+    pub(super) fetch_budget_cooled: BTreeSet<FetchKey>,
+    /// Representations that banked at least one transport strike
+    /// since the last clear. Transport evidence taints verification
+    /// purity for the corrupt verdict, so the set is consulted when an
+    /// invalid strike trips a cooldown.
+    pub(super) fetch_transport_seen: BTreeSet<FetchKey>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
     /// `DurableStore::commit_until`). Production always runs to
@@ -728,6 +767,12 @@ impl Engine {
             fetch_strikes: BTreeMap::new(),
             fetch_budget_burns: BTreeMap::new(),
             fetch_cool_until: BTreeMap::new(),
+            fetch_generations: BTreeMap::new(),
+            fetch_terminal: BTreeMap::new(),
+            fetch_attempted: BTreeSet::new(),
+            fetch_invalid_cooled: BTreeSet::new(),
+            fetch_budget_cooled: BTreeSet::new(),
+            fetch_transport_seen: BTreeSet::new(),
             #[cfg(test)]
             crash_stage: None,
         };
@@ -1675,6 +1720,9 @@ impl Engine {
                 self.fetch_cool_until.remove(key);
                 self.fetch_strikes.remove(key);
                 self.fetch_budget_burns.remove(key);
+                self.fetch_invalid_cooled.remove(key);
+                self.fetch_budget_cooled.remove(key);
+                self.fetch_transport_seen.remove(key);
                 true
             }
             Some(_) => false,
@@ -1695,6 +1743,13 @@ impl Engine {
         if *strikes >= FETCH_MAX_STRIKES {
             self.fetch_cool_until
                 .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
+            // Identity-level corruption evidence is pure by
+            // construction: a cooled representation that also banked
+            // transport strikes is mixed evidence and never counts as
+            // verification rejection for the corrupt verdict.
+            if !self.fetch_transport_seen.contains(key) {
+                self.fetch_invalid_cooled.insert(*key);
+            }
         }
     }
 
@@ -1715,9 +1770,14 @@ impl Engine {
         }
         *last_run = self.fetch_run;
         *strikes = strikes.saturating_add(1);
+        self.fetch_transport_seen.insert(*key);
         if *strikes >= FETCH_MAX_STRIKES {
             self.fetch_cool_until
                 .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
+            // Transport evidence taints verification purity: a
+            // representation that banked unreachable-routes is mixed
+            // evidence even if an invalid strike trips the threshold.
+            self.fetch_invalid_cooled.remove(key);
         }
     }
 
@@ -1741,6 +1801,11 @@ impl Engine {
         if *burns >= FETCH_MAX_STRIKES {
             self.fetch_cool_until
                 .insert(*key, self.fetch_run + FETCH_COOLDOWN_PASSES);
+            // A budget cooldown is never fault evidence: it blocks
+            // terminality (via `fetch_budget_cooled`) and it cannot
+            // count as verification rejection.
+            self.fetch_budget_cooled.insert(*key);
+            self.fetch_invalid_cooled.remove(key);
         }
     }
 
@@ -1750,6 +1815,191 @@ impl Engine {
         self.fetch_strikes.remove(key);
         self.fetch_budget_burns.remove(key);
         self.fetch_cool_until.remove(key);
+        self.fetch_invalid_cooled.remove(key);
+        self.fetch_budget_cooled.remove(key);
+        self.fetch_transport_seen.remove(key);
+    }
+
+    /// Record that the plan attempted a fetch for one content
+    /// identity under its current generation. Terminal evaluation
+    /// only completes generations that attempted: a generation that
+    /// never got to try (still cooling, no waiter-driven work yet)
+    /// waits for evidence instead of spinning terminal verdicts.
+    pub(super) fn note_fetch_attempted(&mut self, content: &ContentId) {
+        self.fetch_attempted.insert(*content);
+    }
+
+    /// Re-evaluate identity-level terminal fetch state after a fetch
+    /// run. Call after every `execute_plan` / `execute_plan_sliced`
+    /// before reading terminal status: the evaluation is a function
+    /// of the run's ledger state plus a fresh reconcile, so it lags
+    /// the run by nothing and commits nothing. Returns the rebuilt
+    /// runtime the evaluation reconciled, so callers building a
+    /// projection off the same state skip a second replay.
+    ///
+    /// Not pure: reconciling expires lapsed cooldowns (via
+    /// `fetch_eligible`), which clears their ledgers as a side
+    /// effect. Expiry only ever moves representations from cooled to
+    /// eligible, never the reverse, so repeated evaluation without
+    /// an intervening run is still idempotent.
+    ///
+    /// The model is OD-11-1 option A: per-identity generations fed by
+    /// representation-level ledgers. An identity is terminal when it
+    /// has at least one representation, every representation is
+    /// cooled on failure evidence (strikes, never budget burns), and
+    /// the current generation attempted. Missing, keyless, and
+    /// locally-refused representations stay eligible and block
+    /// terminality — they are not evidence about the representation.
+    /// Snapshot bodies and roots are a different identity space and
+    /// never participate: only object and child-manifest storage keys
+    /// feed an identity's generation. Root-manifest and snapshot-body
+    /// waiters therefore still block to the deadline (see the
+    /// tracking issue's follow-up line); their strikes and cooldowns
+    /// keep working exactly as before.
+    pub fn evaluate_terminal(&mut self) -> Result<RuntimeState, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let runtime = rebuilt.runtime;
+        let plan = runtime.reconcile();
+        let mut representations: BTreeMap<ContentId, Vec<FetchKey>> = BTreeMap::new();
+        let mut push = |id: ContentId, key: FetchKey| {
+            let keys = representations.entry(id).or_default();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        };
+        for (id, candidates) in &plan.pending_objects {
+            for candidate in candidates {
+                push(*id, FetchKey::Storage(candidate.storage_id));
+            }
+        }
+        for (id, link) in &plan.pending_manifests {
+            push(*id, FetchKey::Storage(link.storage));
+        }
+        for (id, keys) in &representations {
+            let demanded = matches!(
+                runtime.materialization(id),
+                super::MaterializationState::Cached | super::MaterializationState::Pinned
+            ) && !runtime.is_local(id);
+            if !demanded {
+                // Fulfilled, unpinned, or never wanted: drop all
+                // tracking. The next demand starts at generation 1.
+                self.fetch_generations.remove(id);
+                self.fetch_terminal.remove(id);
+                self.fetch_attempted.remove(id);
+                continue;
+            }
+            if keys.is_empty() {
+                // No representations to judge: clear any verdict, keep
+                // the generation. Terminality is a verdict over
+                // representations; with none there is nothing to be
+                // terminal about, and nothing completed either.
+                self.fetch_terminal.remove(id);
+                self.fetch_attempted.remove(id);
+                continue;
+            }
+            // Expire stale cooldowns first: `fetch_eligible` clears
+            // lapsed entries (and their ledgers) as a side effect, so
+            // what remains in `fetch_cool_until` is live.
+            for key in keys {
+                self.fetch_eligible(key);
+            }
+            let exhausted = keys.iter().all(|key| {
+                self.fetch_cool_until.contains_key(key) && !self.fetch_budget_cooled.contains(key)
+            });
+            // A completed generation never reopens on its own:
+            // cooldown expiry and newly arrived candidates make
+            // representations eligible again (the background plan
+            // keeps attempting under the durable policy, so recovery
+            // needs no waiter), but the verdict stands until a new
+            // waiter reopens the attempt as a new generation or
+            // fulfillment dissolves it. Rotating generations without
+            // demand would republish a verdict nobody is reading every
+            // cooldown cycle, against the OD-11-2 resource invariant
+            // (no waiter, no fetch work). Candidates that fulfill
+            // clear through the demanded/local arms instead.
+            if !self.fetch_terminal.contains_key(id)
+                && exhausted
+                && self.fetch_attempted.contains(id)
+            {
+                let generation = self.fetch_generations.entry(*id).or_insert(1);
+                let corrupt = keys
+                    .iter()
+                    .all(|key| self.fetch_invalid_cooled.contains(key));
+                self.fetch_terminal.insert(
+                    *id,
+                    TerminalState {
+                        generation: *generation,
+                        corrupt,
+                    },
+                );
+            } else {
+                self.fetch_generations.entry(*id).or_insert(1);
+            }
+        }
+        // Identities that left the plan entirely (fulfilled while the
+        // evaluation was not looking, or unpinned) stop being tracked.
+        // `fetch_generations` only names demanded identities, so the
+        // map stays bounded by live demand, not drive history.
+        let live: std::collections::BTreeSet<ContentId> = representations.keys().copied().collect();
+        self.fetch_generations.retain(|id, _| live.contains(id));
+        self.fetch_terminal.retain(|id, _| live.contains(id));
+        self.fetch_attempted.retain(|id| live.contains(id));
+        Ok(runtime)
+    }
+
+    /// The settled terminal verdict for one identity: `Unavailable`
+    /// with the completed generation, or `Corrupt` when every
+    /// exhausted representation cooled on verification rejection.
+    /// `None` means the identity is not terminal — still fetching,
+    /// already available, or never demanded.
+    pub fn terminal_status(&self, id: &ContentId) -> Option<FetchStatus> {
+        self.terminal_state(id).map(|terminal| {
+            if terminal.corrupt {
+                FetchStatus::Corrupt
+            } else {
+                FetchStatus::Unavailable(terminal.generation)
+            }
+        })
+    }
+
+    /// The completed terminal record for one identity, if the
+    /// engine tracks one. The verdict form of [`Engine::terminal_status`].
+    pub fn terminal_state(&self, id: &ContentId) -> Option<TerminalState> {
+        self.fetch_terminal.get(id).copied()
+    }
+
+    /// Snapshot the whole terminal map for projections built after
+    /// engine work (the view's materialization overlay).
+    pub fn terminal_snapshot(&self) -> BTreeMap<ContentId, TerminalState> {
+        self.fetch_terminal.clone()
+    }
+
+    /// The current attempt generation for one demanded identity, if
+    /// the engine tracks one. Generations open at 1 on first demand
+    /// and advance monotonically while the identity stays demanded:
+    /// a completed terminal never reopens under the same number.
+    pub fn generation(&self, id: &ContentId) -> Option<u64> {
+        self.fetch_generations.get(id).copied()
+    }
+
+    /// Open a new generation for a terminal identity: the completed
+    /// verdict clears and the attempt counter advances, so the next
+    /// demand fetches instead of observing the old terminal. No-op
+    /// unless the identity is terminal — a non-terminal generation
+    /// continues, never restarts.
+    ///
+    /// The reopen inherits the standing cooldown: representations
+    /// cooled under the completed generation stay cooled, so the new
+    /// generation projects `Fetching` (eligible again only as
+    /// cooldowns lapse) rather than fast-failing. A retry therefore
+    /// blocks boundedly instead of observing a verdict — the verdict
+    /// reforms only on fresh post-cooldown evidence.
+    pub fn reopen_generation(&mut self, id: &ContentId) {
+        if self.fetch_terminal.remove(id).is_some() {
+            let next = self.fetch_generations.get(id).copied().unwrap_or(0) + 1;
+            self.fetch_generations.insert(*id, next);
+            self.fetch_attempted.remove(id);
+        }
     }
 }
 
@@ -1775,3 +2025,5 @@ mod tests_materialization;
 mod tests_properties;
 #[cfg(test)]
 mod tests_serving;
+#[cfg(test)]
+mod tests_terminal;

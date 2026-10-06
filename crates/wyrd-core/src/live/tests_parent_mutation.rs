@@ -187,6 +187,7 @@ fn live_over_tree(
     let revision = engine.current();
     let materialization = RuntimeMaterialization {
         runtime: engine.runtime_state().unwrap(),
+        terminal: engine.terminal_snapshot(),
     };
     let store = Arc::new(RwLock::new(store));
     let baseline = TreeView::open_shared(

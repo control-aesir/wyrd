@@ -291,7 +291,7 @@ fn unavailable_content_fails_cleanly() {
     let view = DriveView::new(
         store,
         FakeMaterialization::with(vec![
-            (missing_chunk, FetchStatus::Unavailable),
+            (missing_chunk, FetchStatus::Unavailable(2)),
             (corrupt_chunk, FetchStatus::Corrupt),
         ]),
         heads(vec![snapshot(root)]),
@@ -299,7 +299,12 @@ fn unavailable_content_fails_cleanly() {
 
     // Lookup succeeds (trees are local); reads fail by status.
     let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
-    assert_eq!(view.read(&gone, 0, 8), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.read(&gone, 0, 8),
+        Err(ViewError::Unavailable {
+            content: missing_chunk
+        })
+    );
     let bad = view.open(&view.lookup("bad.txt").unwrap()).unwrap();
     assert_eq!(view.read(&bad, 0, 7), Err(ViewError::Corrupt));
     // No status entry means remote-only: the daemon would fetch.
@@ -316,10 +321,13 @@ fn missing_tree_maps_through_fetch_status() {
     let absent = ContentId::derive(ObjectKind::Tree, b"absent tree");
     let view = DriveView::new(
         store,
-        FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable)]),
+        FakeMaterialization::with(vec![(absent, FetchStatus::Unavailable(1))]),
         heads(vec![snapshot(absent)]),
     );
-    assert_eq!(view.lookup("anything"), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.lookup("anything"),
+        Err(ViewError::Unavailable { content: absent })
+    );
 
     let store = MemoryObjectStore::default();
     let view = DriveView::new(
@@ -855,12 +863,15 @@ fn zero_length_reads_serve_nothing() {
     );
     let view = DriveView::new(
         store,
-        FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable)]),
+        FakeMaterialization::with(vec![(missing, FetchStatus::Unavailable(3))]),
         heads(vec![snapshot(root)]),
     );
     let gone = view.open(&view.lookup("gone.txt").unwrap()).unwrap();
     assert_eq!(view.read(&gone, 0, 0).unwrap(), b"");
-    assert_eq!(view.read(&gone, 0, 8), Err(ViewError::Unavailable));
+    assert_eq!(
+        view.read(&gone, 0, 8),
+        Err(ViewError::Unavailable { content: missing })
+    );
 }
 
 #[test]

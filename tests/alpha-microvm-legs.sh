@@ -258,13 +258,32 @@ leg_fetch_member() {
   pass "unknown-path open fails fast, never hangs for an announcement"
   # The recovery identity must FAIL first: bounded EIO against the
   # dead route, so the later success proves revival rather than a
-  # first attempt that never saw trouble.
+  # first attempt that never saw trouble. The failure must be FAST
+  # (well under the 30s open deadline): a terminal generation
+  # completes its waiters with the verdict instead of blocking, so
+  # a fast EIO proves the identity went terminal — a deadline EIO
+  # would mean the fetch never concluded. The loop allows the
+  # verdict to still be forming (three strike runs); once formed,
+  # every subsequent read fails fast deterministically.
   rc=0
-  timeout 60 cat "$MNTS/xmember-f/stale-2.txt" >/dev/null 2>"$E2E_ROOT/stale-2.err" || rc=$?
-  [[ "$rc" == 1 ]] || die "stale-2 read returned rc $rc, want EIO (1)"
-  grep -q "Input/output error" "$E2E_ROOT/stale-2.err" \
-    || die "stale-2 read was not EIO: $(cat "$E2E_ROOT/stale-2.err")"
-  pass "second stale identity fails closed and bounded"
+  fast=0
+  attempt=0
+  while (( attempt < 3 )); do
+    start=$(date +%s)
+    timeout 60 cat "$MNTS/xmember-f/stale-2.txt" >/dev/null 2>"$E2E_ROOT/stale-2.err" || rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    [[ "$rc" == 1 ]] || die "stale-2 read returned rc $rc, want EIO (1)"
+    grep -q "Input/output error" "$E2E_ROOT/stale-2.err" \
+      || die "stale-2 read was not EIO: $(cat "$E2E_ROOT/stale-2.err")"
+    if (( elapsed < 15 )); then
+      fast=1
+      break
+    fi
+    attempt=$((attempt + 1))
+  done
+  [[ "$fast" == 1 ]] \
+    || die "stale-2 read never failed fast: the identity never went terminal (all attempts ran to the deadline)"
+  pass "second stale identity fails closed, bounded, and fast (terminal verdict, not deadline)"
   touch "$E2E_ROOT/member-probed-done"
   # The owner is back on a fresh endpoint with a new route (see
   # owner leg). Converge its head BEFORE authoring: the scratch and
@@ -298,7 +317,10 @@ leg_fetch_member() {
   # Recovery without remount: the owner is back on a fresh endpoint
   # with a new route (see owner leg), and this mount never went
   # down. The stale-2 identity failed terminally against the dead
-  # route; the live route must produce a new fetch attempt and the
+  # route (fast EIO pinned above); each bounded open below re-demands
+  # it, so the reviving fetch runs as a new generation — the same
+  # read succeeding here proves the verdict was never permanent.
+  # The live route must produce a new fetch attempt and the
   # open must eventually succeed. Each attempt is a fresh
   # bounded open (30s): the loop below is the retry, while the
   # fetch continues across attempts. Ten attempts bound the worst

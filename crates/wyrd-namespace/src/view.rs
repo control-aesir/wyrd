@@ -245,7 +245,11 @@ pub enum ViewError {
     /// can register exactly that want and retry.
     NotMaterialized { content: ContentId },
     #[error("content unavailable: no peer reachable and nothing cached")]
-    Unavailable,
+    /// A settled terminal verdict (or a stale available claim) for
+    /// content the store does not hold. Like `NotMaterialized`, the
+    /// identity rides the error so a demand-driven backend can note
+    /// reopen demand for exactly that identity.
+    Unavailable { content: ContentId },
     #[error("content failed verification; scrub and repair before surfacing")]
     Corrupt,
     #[error("local store failure: {1}")]

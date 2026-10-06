@@ -5,7 +5,7 @@ use crate::bulk::MemoryBulkSource;
 #[test]
 fn attempts_settle_into_fetch_status() {
     assert_eq!(
-        FetchOutcome::Fulfilled(()).settled(),
+        FetchOutcome::Fulfilled(()).settled(1),
         FetchStatus::Available
     );
     for outcome in [
@@ -13,10 +13,15 @@ fn attempts_settle_into_fetch_status() {
         FetchOutcome::UnavailableKey,
         FetchOutcome::Transport,
     ] {
-        assert_eq!(outcome.settled(), FetchStatus::Unavailable);
+        // The per-attempt projection borrows the caller's generation:
+        // one attempt is never terminal on its own.
+        assert_eq!(outcome.settled(1), FetchStatus::Unavailable(1));
+        assert_eq!(outcome.settled(3), FetchStatus::Unavailable(3));
     }
     for outcome in [FetchOutcome::<()>::Invalid, FetchOutcome::Local] {
-        assert_eq!(outcome.settled(), FetchStatus::Corrupt);
+        // Verification rejection carries no generation: corrupt stays
+        // attached to the representation that produced it.
+        assert_eq!(outcome.settled(1), FetchStatus::Corrupt);
     }
 }
 

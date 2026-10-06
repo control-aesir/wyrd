@@ -243,7 +243,14 @@ fn export_against_policy_proves_pin_needs_bytes() {
         .into_iter()
         .map(|authorized| ViewHead::new(Head::new(authorized)))
         .collect();
-    let bare = DriveView::new(partial, RuntimeMaterialization { runtime }, heads);
+    let bare = DriveView::new(
+        partial,
+        RuntimeMaterialization {
+            runtime,
+            terminal: Default::default(),
+        },
+        heads,
+    );
     let out = dir.join("export-unfetched");
     let error = export_tree(&bare, &out).unwrap_err();
     let ExportError::View { path, .. } = error else {

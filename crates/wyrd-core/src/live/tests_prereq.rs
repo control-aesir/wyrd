@@ -792,6 +792,7 @@ fn live_over_configured(
     let revision = engine.current();
     let materialization = RuntimeMaterialization {
         runtime: engine.runtime_state().unwrap(),
+        terminal: engine.terminal_snapshot(),
     };
     let store = Arc::new(RwLock::new(store));
     let baseline = FileView::open_shared(
@@ -1080,6 +1081,7 @@ fn a_quota_without_an_accountant_refuses_to_compose() {
     let revision = engine.current();
     let materialization = RuntimeMaterialization {
         runtime: engine.runtime_state().unwrap(),
+        terminal: engine.terminal_snapshot(),
     };
     let store = Arc::new(RwLock::new(store));
     let baseline =

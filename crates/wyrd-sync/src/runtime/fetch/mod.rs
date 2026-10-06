@@ -522,18 +522,24 @@ impl<T> FetchOutcome<T> {
     /// verified, so retrying the network cannot help — the data path
     /// itself needs repair.
     ///
+    /// Per-attempt projection only: the generation is threaded in by
+    /// the caller because one attempt has no generation scope of its
+    /// own. Identity-level terminality — whether every
+    /// representation is exhausted — is decided by the engine's
+    /// terminal evaluation (`Engine::evaluate_terminal`), not here.
+    ///
     /// No production caller yet: the daemon composing sync with the
     /// FUSE view settles attempts through here once in-flight fetch
     /// tracking lands. Unit tests pin the contract until then.
     #[allow(dead_code)]
-    pub(super) fn settled(&self) -> FetchStatus {
+    pub(super) fn settled(&self, generation: u64) -> FetchStatus {
         match self {
             FetchOutcome::Fulfilled(_) => FetchStatus::Available,
             FetchOutcome::Missing
             | FetchOutcome::UnavailableKey
             | FetchOutcome::Transport
             | FetchOutcome::Deadline { .. }
-            | FetchOutcome::Store(_) => FetchStatus::Unavailable,
+            | FetchOutcome::Store(_) => FetchStatus::Unavailable(generation),
             FetchOutcome::Invalid | FetchOutcome::Local => FetchStatus::Corrupt,
         }
     }

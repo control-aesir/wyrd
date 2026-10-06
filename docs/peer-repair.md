@@ -1,6 +1,9 @@
 # Peer Repair: design note
 
 Status: v0.2 defers dedicated repair (this issue's sanctioned path).
+Part 1 shipped in v0.3: generation-scoped terminal fetch state with
+waiter completion (`Unavailable(generation)` plus reopen-on-new-waiter;
+quarantine, scrub, and diagnostics are the following children).
 The v0.2 ship is fetch-walk fallback across recorded representations
 with post-fetch verification, fail-closed, bounded `EIO` on exhaustion.
 This note records the design the deferral points at, and the protocol
@@ -32,8 +35,11 @@ Backoff: 3 strikes → 8-pass cooldown for `Invalid`/`Transport`,
 separate burn ledger for budget deaths, `Missing` never strikes
 (`runtime/engine/mod.rs:533-534,1602-1648`). Strike ledgers are
 in-memory by decision ("cheaper to reason about than persisting
-grudges"). `FetchStatus::Corrupt`/`Unavailable` are vocabulary only:
-`status()` never returns them (`runtime/state.rs:178-189`).
+grudges"). `FetchStatus::Corrupt` is still vocabulary only;
+`Unavailable(generation)` projects live once the engine's terminal
+evaluation completes a generation with every representation
+exhausted (`runtime/engine/mod.rs`: `evaluate_terminal`), overlaid
+onto the durable status by the node's materialization projection.
 
 ## Part 1 — device-local repair loop (v0.3 core, no protocol change)
 
@@ -51,8 +57,12 @@ is defined over a **retry generation / failure epoch**:
   generation X*, never new evidence;
 - terminal when the current generation has accumulated enough failure
   evidence that every currently eligible candidate is exhausted;
-- the generation changes when new candidates arrive or the retry
-  policy reopens cooled ones.
+- the generation changes when a new waiter reopens a completed
+  terminal. Cooldown expiry and newly arrived candidates restore
+  eligibility — attempts resume under the background plan — but
+  they do not rotate the generation on their own: rotating without
+  demand would republish a verdict nobody is reading every cooldown
+  cycle (OD-11-2). A completed generation never reopens by itself.
 
 This keeps two states distinct that must not be conflated:
 
@@ -80,7 +90,12 @@ establishes every representation bad.
 
 State-driven retry replaces deadline-driven retry: the EIO is a
 bounded result of one failed generation, not durable poison. A new
-waiter reopens the attempt as a new generation. Flaky networks cause
+waiter reopens the attempt as a new generation. The demand reaches
+the loop as a sticky note, not as a blocked waiter: an unavailable
+read records reopen demand and fails fast, and the next pass rotates
+the generation for the retry. (Corrupt verdicts complete waiters
+but record no note: their repair is quarantine's, not rewant's —
+see child 12.) Flaky networks cause
 EIOs, but each is bounded and recoverable — no EIO-storm-to-permanent
 path exists by construction.
 

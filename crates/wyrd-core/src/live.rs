@@ -17,9 +17,12 @@ use wyrd_sync::serving::VaultError;
 use wyrd_sync::{
     runtime::{
         DrainReport, Engine, EngineError, ExecuteReport, MaterializationState, RoutePublishing,
+        TerminalState,
     },
     transport::mailbox::Mailbox,
 };
+
+use std::collections::BTreeMap;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -519,6 +522,13 @@ pub struct LiveNode<V: NamespaceView> {
     /// report-counter predicate to keep in sync with future commit
     /// paths.
     pub(super) published_revision: u64,
+    /// The terminal snapshot the served generation was built with.
+    /// Terminal verdicts commit nothing, so the revision gate cannot
+    /// see them: a changed terminal map publishes a generation on its
+    /// own, or waiters would observe a stale fetching state past the
+    /// verdict. Compared by value; the map names only terminal
+    /// identities, so it stays tiny.
+    pub(super) published_terminal: BTreeMap<ContentId, TerminalState>,
     /// Eligible heads installed with the serving generation: the
     /// mounted-write contract needs exactly one, so the count rides
     /// every sync-pass line (0 reads stale/bootstrap, 2+ reads
@@ -872,6 +882,7 @@ where
                 mutations,
                 retained_bytes: config.retained_bytes.clone(),
                 published_revision: revision,
+                published_terminal: BTreeMap::new(),
                 published_heads,
                 observed_heads,
                 dirty: false,
@@ -1156,6 +1167,20 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
+        // Generation rotation on observed demand (OD-11-2): every
+        // identity noted since the last pass whose generation
+        // completed terminal reopens as a new one. Notes arrive from
+        // terminal reads — first touch and mid-wait observation —
+        // and outlive the waiter that carried them, which is what
+        // makes a retrying reader re-demandable: a waiter never
+        // blocks on a verdict that already exists, so pending alone
+        // could never carry its demand to the next pass. Reopen is a
+        // no-op for anything not terminal, so the sweep never
+        // disturbs live fetches. Admission below then carries the new
+        // generation's demand into the engine.
+        for id in self.wants.take_reopen_notes() {
+            self.engine.reopen_generation(&id);
+        }
         // Admit outstanding backend demand ahead of fetching, atomically
         // from the registry's perspective: only durably committed
         // identities are marked admitted, so a failing commit leaves
@@ -1267,13 +1292,27 @@ where
         {
             self.waker.wake();
         }
-        // Settle admitted wants: retire a landed fetch, and retire a fetch
-        // whose demand died — the engine's durable `Cached` policy keeps
-        // retrying independently of the registry, so a permanently
-        // unavailable identity never permanently consumes capacity.
-        let completed_runtime = self.engine.runtime_state()?;
+        // Settle admitted wants: retire a landed fetch, retire a
+        // terminal generation (its waiters observe the verdict through
+        // the view and release; the fetch it coalesced onto is over,
+        // so the admitted mark must not outlive it), and retire a
+        // fetch whose demand died — the engine's durable `Cached`
+        // policy keeps retrying independently of the registry, so a
+        // permanently unavailable identity never permanently consumes
+        // capacity. The evaluation runs after mutation application so
+        // the sweep settles against post-mutation state, and its
+        // rebuilt runtime feeds the sweep directly instead of paying
+        // a second replay. (The mutation path above therefore reads
+        // last pass's terminal verdicts: a mutation blocked on an
+        // identity that went terminal this pass defers as NeedContent
+        // and re-arms its want, then fails closed as Transient next
+        // pass — a one-pass delay in classification, never a skip.)
+        let completed_runtime = self.engine.evaluate_terminal()?;
+        let terminal = self.engine.terminal_snapshot();
         self.wants.retire_where(|content, waiters| {
-            completed_runtime.status(content) == FetchStatus::Available || waiters == 0
+            completed_runtime.status(content) == FetchStatus::Available
+                || terminal.contains_key(content)
+                || waiters == 0
         });
         // The publication gate is the durable commit sequence plus the
         // outbound outbox, not the pass reports: every fact commit this
@@ -1285,11 +1324,18 @@ where
         // their own. Skipping the pass would stall remote delivery
         // until unrelated local activity happens to run it. The dirty
         // backlog covers the one case neither sees — a failed pass
-        // that committed before failing.
+        // that committed before failing. Terminal verdicts join the
+        // gate for the same reason in miniature: they commit nothing,
+        // so without the comparison a verdict would never publish and
+        // waiters would read a stale fetching state past it.
         let revision = self.engine.current();
         let generation = self.generation();
         let outbound = self.engine.has_pending_outbound()?;
-        if !self.dirty && revision == self.published_revision && !outbound {
+        if !self.dirty
+            && revision == self.published_revision
+            && !outbound
+            && terminal == self.published_terminal
+        {
             batch.finish();
             // Idle passes report too: accepted-without-commit means a
             // memory-only suppression verdict, nonzero skipped means
@@ -1364,6 +1410,10 @@ where
                 sent,
                 "publication deferred: closure still fetching"
             );
+            // Terminal verdicts publish with the next installable
+            // generation: the deferred view keeps serving its heads,
+            // and `published_terminal` stays behind so the verdict
+            // still publishes once a head installs.
             return Ok(SyncReport {
                 drained,
                 fetched,
@@ -1384,6 +1434,7 @@ where
             Arc::clone(&self.store),
             RuntimeMaterialization {
                 runtime: completed_runtime,
+                terminal: terminal.clone(),
             },
             heads.into_iter().map(Head::new).collect(),
             generation + 1,
@@ -1394,6 +1445,7 @@ where
             *slot = Arc::new(next);
         }
         self.published_revision = revision;
+        self.published_terminal = terminal;
         self.published_heads = installed_heads;
         self.observed_heads = observed_head_ids;
         self.mutations.publish_parent_tokens();
@@ -2414,7 +2466,10 @@ where
             .map_err(|_| MutationError::Engine)?;
         Ok(V::open_shared(
             Arc::clone(&self.store),
-            RuntimeMaterialization { runtime },
+            RuntimeMaterialization {
+                runtime,
+                terminal: self.engine.terminal_snapshot(),
+            },
             heads.iter().cloned().map(Head::new).collect(),
         ))
     }
@@ -2445,17 +2500,21 @@ where
     /// corrupt — fails closed as the transient store error the view
     /// surfaces.
     fn mutation_absent(&self, chunk: &ContentId, heads: &[AuthorizedSnapshot]) -> MutationError {
-        let status = self
+        let base = self
             .engine
             .runtime_state()
             .map(|state| state.status(chunk))
             .unwrap_or(FetchStatus::RemoteOnly);
+        // Terminal verdicts overlay the durable status: a generation
+        // that exhausted its representations fails closed here, not
+        // as a prerequisite to wait out.
+        let status = crate::view::overlay_terminal(base, self.engine.terminal_state(chunk));
         match status {
             FetchStatus::RemoteOnly | FetchStatus::Fetching => MutationError::NeedContent {
                 chunk: *chunk,
                 base: Self::pin_head(heads),
             },
-            FetchStatus::Unavailable | FetchStatus::Available | FetchStatus::Corrupt => {
+            FetchStatus::Unavailable(_) | FetchStatus::Available | FetchStatus::Corrupt => {
                 MutationError::Store(StoreFailure::Transient)
             }
         }
@@ -2629,7 +2688,10 @@ where
             .map_err(|_| MutationError::Engine)?;
         let view = V::open_shared(
             Arc::clone(&self.store),
-            RuntimeMaterialization { runtime },
+            RuntimeMaterialization {
+                runtime,
+                terminal: self.engine.terminal_snapshot(),
+            },
             heads.iter().cloned().map(Head::new).collect(),
         );
         match view.lookup(path) {
@@ -3000,3 +3062,7 @@ mod parent_mutation_tests;
 #[cfg(test)]
 #[path = "live/tests_quota.rs"]
 mod quota_tests;
+
+#[cfg(test)]
+#[path = "live/tests_terminal.rs"]
+mod terminal_tests;

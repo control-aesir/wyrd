@@ -24,7 +24,9 @@ fn view_errors_map_to_posix_errors() {
         ViewError::NotMaterialized {
             content: ContentId::from_bytes([0; 32]),
         },
-        ViewError::Unavailable,
+        ViewError::Unavailable {
+            content: ContentId::from_bytes([0; 32]),
+        },
         ViewError::Corrupt,
     ] {
         assert_eq!(errno_of(&corruption), fuser::Errno::EIO);

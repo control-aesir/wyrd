@@ -122,7 +122,15 @@ pub enum FetchStatus {
     Available,
     /// No peer holds it, no key is held, or no peer is reachable;
     /// retryable once conditions change.
-    Unavailable,
+    ///
+    /// The payload is the terminal retry generation that established
+    /// this, when terminality was established at all: a bare
+    /// unreachable-without-verdict never occurs in production, because
+    /// only the generation-scoped terminal evaluation mints this
+    /// variant (`docs/peer-repair.md` Part 1). A new waiter reopens the
+    /// attempt as a new generation; the generation never survives a
+    /// restart.
+    Unavailable(u64),
     /// Remote bytes failed verification, or the local store refused
     /// verified bytes; scrub/repair before ever surfacing as data.
     Corrupt,

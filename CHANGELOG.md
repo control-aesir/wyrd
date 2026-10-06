@@ -88,6 +88,22 @@ version say exactly what changed.
   commits, no wire refusal signal, no quota-pressure reclamation).
   Decision only; no behavior change and no format impact. GC
   implementation stays post-v1.
+- Generation-scoped terminal fetch state with waiter completion
+  (`docs/peer-repair.md` Part 1, first child; OD-11-1/11-2/11-3 all
+  option A): `FetchStatus::Unavailable` carries the completed
+  generation; the engine tracks per-identity attempt generations fed
+  by the representation-level strike ledgers and completes a
+  generation when every representation is cooled on failure evidence
+  (attempted generations only — never on budget backoff, absence,
+  missing keys, or local refusals). The corrupt   verdict is reserved
+  for all-invalid evidence. Terminal generations complete their
+  waiters with bounded `EIO`, retire from want admission, reopen as a
+  new generation on observed demand (sticky reopen notes — a waiter
+  never blocks on an existing verdict), and publish through the
+  serving projection via the revision gate. Memory-only throughout: no
+  durable fact, nothing survives reopen. No format impact and no
+  protocol change; quarantine, scrub, and diagnostics are the
+  following children.
 - Retention accounting follow-through (OD-26, `feat(cli): predictable
   retention`): `RetainedBytes::subtract` (saturating, removal paths only —
   quarantine is a decrement only where it actually removes bytes);

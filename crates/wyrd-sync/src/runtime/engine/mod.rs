@@ -1693,6 +1693,33 @@ impl Engine {
         Ok(())
     }
 
+    /// Clear one identity's local-possession claim after its bytes
+    /// were discarded as verification-rejected (quarantine). The
+    /// residency policy is untouched: a `Cached` identity with no
+    /// claim reconciles back to pending, so the next waiter starts a
+    /// fresh fetch generation. Idempotent at commit time like
+    /// [`Engine::set_materialization`]: clearing an already-absent
+    /// claim commits nothing, so a repeated quarantine of one
+    /// identity does not grow the append-only log. Returns whether a
+    /// fact was committed.
+    ///
+    /// This is the only production writer of
+    /// [`Fact::ObjectRemoved`](crate::durable::Fact::ObjectRemoved):
+    /// eviction beyond rejected bytes belongs to `13-local-scrub`,
+    /// and nothing here touches the residency policy or the bytes
+    /// themselves. The quarantine drain clears the claim *before*
+    /// discarding the bytes, so no pass ever projects a stale
+    /// `Available` for bytes already gone; a reader interleaving
+    /// between the two observes the rejection again and waits on,
+    /// never served by, the doomed bytes.
+    pub fn record_object_removed(&mut self, content: ContentId) -> Result<bool, EngineError> {
+        if !self.store.rebuild(self.device)?.runtime.is_local(&content) {
+            return Ok(false);
+        }
+        self.store.commit(&[Fact::ObjectRemoved(content)])?;
+        Ok(true)
+    }
+
     /// Set the residency policy for many content objects in one
     /// durable commit. One rebuild filters no-ops, one
     /// [`DurableStore::commit`](crate::durable::DurableStore::commit)

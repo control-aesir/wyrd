@@ -24,7 +24,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use wyrd_format::{Component, ContentId, FetchStatus, ObjectStore, Snapshot, StoreFailure};
+use wyrd_format::{
+    Component, ContentId, FetchStatus, ObjectKind, ObjectStore, Snapshot, StoreFailure,
+};
 
 /// The residency policy for content the local store does not hold: a
 /// projection query the view consults per absent identity.
@@ -252,6 +254,20 @@ pub enum ViewError {
     Unavailable { content: ContentId },
     #[error("content failed verification; scrub and repair before surfacing")]
     Corrupt,
+    #[error("a stored representation failed verification; discard and re-demand before surfacing")]
+    /// Locally held bytes that no longer hash back to their address.
+    /// Unlike [`ViewError::Corrupt`] — authored or structural damage
+    /// no refetch can repair — the identity *and* the representation
+    /// kind ride the error so a demand-driven backend can discard
+    /// exactly those bytes and re-demand the identity. Only a store
+    /// verification failure (see
+    /// [`StoreError::is_verification_failure`](wyrd_format::StoreError::is_verification_failure))
+    /// may produce this variant; every other failure class keeps its
+    /// own shape, so deletions are never named by resource errors.
+    RejectedRepresentation {
+        content: ContentId,
+        kind: ObjectKind,
+    },
     #[error("local store failure: {1}")]
     Store(StoreFailure, String),
 }

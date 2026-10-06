@@ -238,6 +238,7 @@ pub(super) fn errno_of(error: &ViewError) -> fuser::Errno {
         | ViewError::NotMaterialized { .. }
         | ViewError::Unavailable { .. }
         | ViewError::Corrupt
+        | ViewError::RejectedRepresentation { .. }
         | ViewError::Store(_, _) => fuser::Errno::EIO,
     }
 }

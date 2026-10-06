@@ -2,6 +2,7 @@ use super::*;
 
 use wyrd_format::{ContentId, ObjectKind};
 
+use crate::durable::Fact;
 use crate::keys::DeviceIdentitySecret;
 use crate::runtime::test_util::TestDir;
 
@@ -194,4 +195,36 @@ fn unavailable_content_open_amplification_measurement() {
          fsyncs={} fact_log_bytes={bytes} rebuilds={rebuilds}",
         commits * 4,
     );
+}
+
+/// Claim-clearing commits exactly once: the first removal of a
+/// locally claimed identity appends one `ObjectRemoved` fact and the
+/// claim reads back absent; repeating it commits nothing, so a
+/// quarantine loop over one identity cannot grow the log. The
+/// residency policy is untouched throughout.
+#[test]
+fn record_object_removed_clears_the_claim_once() {
+    let dir = TestDir::new("materialization-remove");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let content = ContentId::derive(ObjectKind::Chunk, b"rejected bytes");
+
+    engine
+        .set_materialization(content, MaterializationState::Cached)
+        .unwrap();
+    engine.commit_facts(&[Fact::LocalObject(content)]).unwrap();
+    assert!(engine.runtime_state().unwrap().is_local(&content));
+    let committed = engine.current();
+
+    assert!(engine.record_object_removed(content).unwrap());
+    assert_eq!(engine.current(), committed + 1);
+    assert!(!engine.runtime_state().unwrap().is_local(&content));
+    // Policy untouched: still Cached, so the next waiter re-demands.
+    assert_eq!(
+        engine.runtime_state().unwrap().materialization(&content),
+        MaterializationState::Cached
+    );
+
+    assert!(!engine.record_object_removed(content).unwrap());
+    assert_eq!(engine.current(), committed + 1);
 }

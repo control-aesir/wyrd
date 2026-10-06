@@ -285,6 +285,37 @@ leg_fetch_member() {
     || die "stale-2 read never failed fast: the identity never went terminal (all attempts ran to the deadline)"
   pass "second stale identity fails closed, bounded, and fast (terminal verdict, not deadline)"
   touch "$E2E_ROOT/member-probed-done"
+  # Bitrot with a live claim (quarantine leg, peer-repair child
+  # 12): cold-2.txt is verified local on the member — the blocking
+  # open above served its bytes — so corrupting its chunk under the
+  # live name models disk bitrot against a held claim. The owner is
+  # still stopped, so no refetch can heal yet: the read must fail
+  # closed, serve nothing, and name the rejected representation in
+  # the mount log for the loop's drain.
+  cold_chunk=$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | head -n 1)
+  [[ -n "$cold_chunk" ]] || die "member store holds no cold-bytes chunk to corrupt"
+  [[ "$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | wc -l)" == 1 ]] \
+    || die "cold-bytes is not unique in the member store"
+  printf 'tampered!!\n' > "$cold_chunk" \
+    || die "host-side chunk surgery failed"
+  # The terminal verdict for the now-unfetchable identity may still
+  # be forming (same tolerance as the stale-2 probe above): every
+  # attempt must fail closed with EIO and serve nothing, whether it
+  # runs to the deadline or fails fast on the formed verdict.
+  attempt=0
+  while (( attempt < 3 )); do
+    rc=0
+    timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2-bitrot.got" 2>"$E2E_ROOT/cold-2-bitrot.err" || rc=$?
+    [[ "$rc" == 1 ]] || die "bitrotted read returned rc $rc, want EIO (1)"
+    grep -q "Input/output error" "$E2E_ROOT/cold-2-bitrot.err" \
+      || die "bitrotted read was not EIO"
+    [[ ! -s "$E2E_ROOT/cold-2-bitrot.got" ]] \
+      || die "bitrotted read served bytes: unverified content reached the mount"
+    attempt=$((attempt + 1))
+  done
+  grep -q "representation rejected" "$LOGDIR/mount-xmember-f.err" \
+    || die "mount log never named the rejected representation for quarantine"
+  pass "bitrotted read fails closed, serves nothing, names the rejection"
   # The owner is back on a fresh endpoint with a new route (see
   # owner leg). Converge its head BEFORE authoring: the scratch and
   # the delete below must extend the post-restart lineage, and the
@@ -294,6 +325,17 @@ leg_fetch_member() {
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
     || die "member never listed the post-restart write"
   pass "member converges on the post-restart head over the new route"
+  # Repair-on-demand without remount: the same mount that failed
+  # closed on the bitrotted chunk now serves verified bytes — the
+  # loop discarded the bad representation, unclaimed it, and
+  # refetched from the returned owner on this read's demand. No
+  # remount, no restart: the mountpoint never went down between
+  # the EIO above and this read.
+  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2-healed.got" \
+    || die "post-owner read failed: quarantine never healed"
+  [[ "$(cat "$E2E_ROOT/cold-2-healed.got")" == "cold-bytes" ]] \
+    || die "healed read returned wrong bytes"
+  pass "quarantined chunk heals from the returned owner without remount"
   # Scratch write against the live route: creating a file forces
   # the current head's tree object to materialize (reads never
   # fetch tree objects, only manifests and chunks), and the delete

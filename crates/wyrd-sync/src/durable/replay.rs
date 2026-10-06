@@ -50,6 +50,8 @@ pub enum RuntimeFact {
         Vec<u8>,
     ),
     CapabilityDelivered(u64, DeviceId),
+    TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
+    CapabilityReconciled(u64, DeviceId, [u8; 32]),
     CarryQueued(SnapshotId),
     CarryDone(SnapshotId),
 }
@@ -103,6 +105,16 @@ pub struct LoadedFacts {
     /// RuntimeFact either: receiving a request changes no runtime
     /// projection; the response path (21c) reads this bucket.
     pub reconciliation_requests: Vec<(DeviceId, ReconciliationEvidence)>,
+    /// Retired transition obligations, in commit order: (transition,
+    /// recipient, proving statement digest) triples. The digest rides
+    /// along for audit — which statement retired what — while the
+    /// runtime projection derives pending from the (transition,
+    /// recipient) pair alone.
+    pub transition_reconciled: Vec<(TransitionId, DeviceId, [u8; 32])>,
+    /// Retired capability obligations, in commit order: (epoch,
+    /// recipient, proving statement digest) triples, same shape as
+    /// above.
+    pub capability_reconciled: Vec<(u64, DeviceId, [u8; 32])>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -253,6 +265,18 @@ impl LoadedFacts {
                 // for the response path's audit trail.
                 self.reconciliation_requests.push((requester, evidence));
             }
+            DecodedFact::TransitionReconciled(id, recipient, statement) => {
+                self.transition_reconciled.push((id, recipient, statement));
+                self.runtime_facts
+                    .push(RuntimeFact::TransitionReconciled(id, recipient, statement));
+            }
+            DecodedFact::CapabilityReconciled(epoch, recipient, statement) => {
+                self.capability_reconciled
+                    .push((epoch, recipient, statement));
+                self.runtime_facts.push(RuntimeFact::CapabilityReconciled(
+                    epoch, recipient, statement,
+                ));
+            }
         }
     }
 }
@@ -265,6 +289,12 @@ pub struct Rebuilt {
     pub log: MembershipLog,
     pub keyring: DriveKeyring,
     pub runtime: RuntimeState,
+    /// Received reconciliation statements, in commit order. Carried
+    /// so the response path reads the statement list from the same
+    /// snapshot it starts answering from; each statement then
+    /// re-rebuilds before comparing, so a previous statement's
+    /// retire commits are visible to the next comparison.
+    pub reconciliation_requests: Vec<(DeviceId, ReconciliationEvidence)>,
 }
 
 /// The authorized key view over already-loaded facts: the single-device
@@ -388,6 +418,12 @@ pub(super) fn rebuild_facts(
             RuntimeFact::CapabilityDelivered(epoch, recipient) => {
                 runtime.record_capability_delivered(epoch, recipient);
             }
+            RuntimeFact::TransitionReconciled(id, recipient, statement) => {
+                runtime.record_transition_reconciled(id, recipient, statement);
+            }
+            RuntimeFact::CapabilityReconciled(epoch, recipient, statement) => {
+                runtime.record_capability_reconciled(epoch, recipient, statement);
+            }
             RuntimeFact::CarryQueued(head) => {
                 runtime.record_carry_queued(head);
             }
@@ -400,5 +436,6 @@ pub(super) fn rebuild_facts(
         log,
         keyring,
         runtime,
+        reconciliation_requests: facts.reconciliation_requests,
     })
 }

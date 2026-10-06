@@ -486,10 +486,26 @@ pub enum Fact {
     /// log — divergent histories are the case being reconciled —
     /// so intake validates structure and agreement only, and 21c's
     /// comparison decides what the evidence proves. The statement
-    /// epoch rides the wire envelope only: whether 21c needs it
-    /// durably (DG-3 names epoch/domain "where the class requires
-    /// it") is 21c's design decision — records are immutable, so a
-    /// yes means a new fact kind or a versioned layout, and this
-    /// comment is where that decision starts.
+    /// epoch rides the wire envelope only: 21c decided the retire
+    /// reference is the statement digest alone — the digest binds the
+    /// requester and the evidence bytes, the class-specific epoch
+    /// rides inside the obligation identity itself (the transition's
+    /// own epoch, the capability's epoch), and the envelope epoch
+    /// authenticated only transport. No versioned layout followed.
     ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
+    /// A retired transition obligation: the transition, the
+    /// recipient it is retired for, and the authenticated statement
+    /// digest that proved subsumption. Committed only by the 21c
+    /// response path, only for obligations the sender still holds
+    /// outstanding, and only against a statement from the durable
+    /// received-request bucket — never against a live projection.
+    /// Pending derives as queued minus (delivered ∪ reconciled), so
+    /// this is the fact that lets an obligation stop retrying. No
+    /// announcement retirement kind exists in 21c: announcement
+    /// obligations stay pending by scope boundary, pinned by test.
+    TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
+    /// A retired capability obligation: the epoch, the recipient,
+    /// and the proving statement digest. Same commit rule and same
+    /// pending derivation as above.
+    CapabilityReconciled(u64, DeviceId, [u8; 32]),
 }

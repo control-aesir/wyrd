@@ -285,6 +285,19 @@ it may omit what the full comparison would use (causing
 retransmission), never assert subsumption the durable facts do not
 support.
 
+Implemented as 21c (`runtime::respond`): the sender answers each
+received statement once per process lifetime (a volatile answered
+set; restarts re-answer idempotently), retiring what the evidence
+covers and retransmitting — at most 32 sends per statement —
+what it does not, through the existing deliver path with no new
+wire kind. Transitions sealed past the recipient's newest
+evidenced install are skipped, never retired, until the
+capability install arrives (rotation framing is never skipped, so
+the keys land first). Scope boundary, stated normatively: 21c
+retires transition and capability obligations; announcement
+obligations remain pending and are not eligible for
+reconciliation retirement in 21c.
+
 ### Acceptance scenarios (normative)
 
 A reader with this contract and the code must be able to state, for

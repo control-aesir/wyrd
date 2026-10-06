@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
 use wyrd_format::{
     ContentId, DeviceId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError,
-    ObjectKind, ObjectStore,
+    ObjectKind, ObjectStore, TransitionId,
 };
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact, ReconciliationView};
@@ -477,6 +477,49 @@ fn upgrade_reconciliation_request_replays_through_the_public_path() {
         ReconciliationView::derive(&loaded).evidence(),
         &evidence,
         "receiving changed nothing derivable"
+    );
+}
+
+/// The 21c half of the acceptance: commits carrying the two
+/// retirement tags replay through the public path. Each names its
+/// obligation class unambiguously — a transition triple and a
+/// capability triple land in their own buckets, never in each
+/// other's, never in derivation. Same older-replay half as `0x18`:
+/// an old node skips the unknown `0x1A`/`0x1B` records and still
+/// opens the store.
+#[test]
+fn upgrade_reconciliation_retirements_replay_through_the_public_path() {
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    rig.enqueue_capability(&admit, &[rig.epoch1.clone(), rig.epoch2.clone()]);
+    let report = rig.drain();
+    assert_eq!(report.accepted, 1, "the fixture capability must commit");
+    let dir = rig.dir.clone();
+    drop(rig.take_engine());
+
+    let transition = TransitionId::from_bytes([0x41; 32]);
+    let recipient = DeviceId::from_bytes([0x31; 32]);
+    let statement = [0x5A; 32];
+    {
+        let mut store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+        store
+            .commit(&[
+                Fact::TransitionReconciled(transition, recipient, statement),
+                Fact::CapabilityReconciled(2, recipient, statement),
+            ])
+            .unwrap();
+    }
+    let store = DurableStore::open(dir.clone(), drive(), "contracts").unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.transition_reconciled,
+        vec![(transition, recipient, statement)],
+        "the transition retirement replays verbatim"
+    );
+    assert_eq!(
+        loaded.capability_reconciled,
+        vec![(2, recipient, statement)],
+        "the capability retirement replays verbatim"
     );
 }
 

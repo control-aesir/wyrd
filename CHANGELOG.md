@@ -74,6 +74,22 @@ version say exactly what changed.
   it the mailbox reconnect edge. Nothing retires yet (21c). Recorded in
   `docs/upgrade-contract.md`, `docs/object-model.md`,
   `docs/resource-limits.md`.
+- Reconciliation response and retire condition
+  (`21c-reconciliation-response`): the sender answers each received
+  statement once per lifetime (volatile answered set, restarts
+  re-answer idempotently) — retiring what the evidence covers
+  (direct hold, validated-successor ancestry for transitions, exact
+  install match for capabilities) by committing `TransitionReconciled`
+  (`0x1A`) / `CapabilityReconciled` (`0x1B`) facts naming the
+  obligation, recipient, and proving statement digest, and
+  retransmitting what it does not through the existing deliver path
+  (at most 32 sends per statement, no new wire kind, transitions
+  past the recipient's newest evidenced install skipped). Pending
+  derives as queued-minus-(delivered ∪ reconciled). Scope boundary:
+  transitions and capabilities only — announcement obligations stay
+  pending, pinned by test. Recorded in `docs/upgrade-contract.md`,
+  `docs/object-model.md`, `docs/resource-limits.md`,
+  `docs/storage-growth.md`, `docs/sync-and-peers.md`.
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable
   evidence the recipient's state subsumes it (per-class predicates),

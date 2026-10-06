@@ -174,6 +174,19 @@ Releases are not required to write every format they read:
     against the full tag set like `0x16` (pinned by
     `reconciliation_tag_is_a_clean_upgrade_boundary`).
 
+    The two retirement facts (`0x1A` transition, `0x1B` capability)
+    are the `*Reconciled` kinds the paragraph above anticipates: one
+    tag per obligation class, each a fixed triple of obligation
+    identity, recipient, and proving statement digest. Fixed-length
+    records need no ceiling beyond their exact length; an old node
+    skips both tags and keeps the obligation pending (retries what a
+    new node retired — the safe direction). `0x1A`/`0x1B` follow
+    `0x19`, checked against the full tag set, with the one-tag-per-
+    class rule pinned alongside the boundary. No announcement
+    retirement tag exists in 21c: announcement obligations stay
+    pending by scope boundary, and a future announcement retirement
+    would allocate its own tag, never overload these two.
+
     The wire kind is not a format break: the reconciliation request
     rides a new control kind byte (`0x04`) under the unchanged
     envelope version. An old node fails the kind byte closed

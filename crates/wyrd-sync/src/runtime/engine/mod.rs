@@ -684,6 +684,25 @@ pub struct Engine {
     /// (the only writer of the fact, via `note_committed_facts`) —
     /// the projection follows the store, never leads it.
     pub(super) received_requests: BTreeSet<(DeviceId, [u8; 32])>,
+    /// Statements the response path has answered, as (requester,
+    /// statement-digest) pairs: [`Engine::answer_reconciliation`]
+    /// evaluates each durable statement once per process lifetime.
+    /// Volatile by design and never rebuilt at resync — a restart
+    /// re-answers every statement, which is safe because answering
+    /// is idempotent (covered obligations are no longer
+    /// outstanding, so no second retirement commits; retransmits
+    /// reuse byte-identical sealed bytes). The benign direction,
+    /// like the trigger's volatile marker: re-answer work, never
+    /// resumed silence.
+    pub(super) answered_statements: BTreeSet<(DeviceId, [u8; 32])>,
+    /// How many received-request bucket entries were answered: the
+    /// bucket is append-only in commit order, so each pass scans
+    /// only the suffix past this count. Reset on restart (never
+    /// rebuilt) alongside the set above — the rescan re-answers
+    /// idempotently. Guarded by `min` at use: the bucket only
+    /// grows within a lifetime, but a replaced store must not
+    /// underflow the scan.
+    pub(super) answered_upto: usize,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see
     /// [`PendingQueue`]). A flush batch emits the woken entries in
@@ -803,6 +822,8 @@ impl Engine {
             announcements: BTreeMap::new(),
             committed_capabilities: BTreeMap::new(),
             received_requests: BTreeSet::new(),
+            answered_statements: BTreeSet::new(),
+            answered_upto: 0,
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -2102,8 +2123,9 @@ mod tests_materialization;
 #[cfg(test)]
 mod tests_properties;
 #[cfg(test)]
-#[cfg(test)]
 mod tests_reconciliation;
+#[cfg(test)]
+mod tests_response;
 #[cfg(test)]
 mod tests_restart_equivalence;
 #[cfg(test)]

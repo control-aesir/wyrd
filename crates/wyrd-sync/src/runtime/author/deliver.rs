@@ -26,9 +26,57 @@ use zeroize::Zeroizing;
 /// orphaned transitions, epochs without a canonical transition or
 /// held secret, recipients no longer members — are skipped and stay
 /// pending; transport failures return immediately.
+/// Scope for a statement-triggered send: one recipient, at most
+/// `remaining` further send attempts, and the recipient's newest
+/// held epoch from the triggering statement. The epoch bound is the
+/// sender-side UnknownEpoch skip: a transition sealed under an epoch
+/// the recipient does not hold cannot be opened there, so sending it
+/// is waste — it stays pending (never retired) until the recipient's
+/// capability install for that epoch arrives in a later statement.
+/// Capabilities are never epoch-skipped (rotation framing is
+/// self-contained: the wrap carries its own secrets), so the keys
+/// always land first and the transition skip always converges. The
+/// blind retry path passes no scope and keeps its existing behavior.
+struct Scope<'a> {
+    recipient: &'a DeviceId,
+    remaining: usize,
+    newest_held: u64,
+}
+
 pub(crate) fn deliver_pending(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
+) -> Result<usize, EngineError> {
+    deliver_inner(engine, mailbox, &mut None)
+}
+
+/// Send pending obligations for one recipient only, stopping after
+/// `limit` send attempts and skipping transitions sealed under
+/// epochs past `newest_held` (the requester's newest evidenced
+/// install). The 21c answer's stage 4: the capped retransmit of one
+/// reconciliation statement's missing set. Shares the loop bodies
+/// below with the blind retry path — one seal/send implementation,
+/// two callers — so a scoped send and a pass send never disagree on
+/// bytes, markers, or skip conditions.
+pub(crate) fn deliver_scoped(
+    engine: &mut Engine,
+    mailbox: &mut impl Mailbox,
+    recipient: &DeviceId,
+    limit: usize,
+    newest_held: u64,
+) -> Result<usize, EngineError> {
+    let mut scope = Some(Scope {
+        recipient,
+        remaining: limit,
+        newest_held,
+    });
+    deliver_inner(engine, mailbox, &mut scope)
+}
+
+fn deliver_inner(
+    engine: &mut Engine,
+    mailbox: &mut impl Mailbox,
+    scope: &mut Option<Scope<'_>>,
 ) -> Result<usize, EngineError> {
     // One validated delivery snapshot per pass: every read below comes
     // from this rebuild. Mid-pass commits only append Sealed,
@@ -40,10 +88,15 @@ pub(crate) fn deliver_pending(
     // memory does not survive the outage the recovery exists for).
     // No re-read per pair: a newcomer catch-up or a large fan-out
     // costs one log decode, not one per obligation.
+    //
+    // A scoped call rebuilds too: the retire commits for its
+    // statement landed just before, so the snapshot sees them and
+    // covered obligations are already non-pending — the scoped send
+    // can only attempt the missing set.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let mut sent = 0usize;
-    sent += deliver_transitions(engine, mailbox, &rebuilt)?;
-    sent += deliver_capabilities(engine, mailbox, &rebuilt)?;
+    sent += deliver_transitions(engine, mailbox, &rebuilt, &mut *scope)?;
+    sent += deliver_capabilities(engine, mailbox, &rebuilt, &mut *scope)?;
     Ok(sent)
 }
 
@@ -196,14 +249,45 @@ fn deliver_transitions(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
     rebuilt: &Rebuilt,
+    scope: &mut Option<Scope<'_>>,
 ) -> Result<usize, EngineError> {
     let mut pending = rebuilt.runtime.pending_transitions();
     pending.sort();
+    if let Some(scope) = scope.as_ref() {
+        // Statement-triggered send: only the requester's pairs. The
+        // retire commits for the statement already landed, so these
+        // are exactly its missing set.
+        pending.retain(|(_, r)| r == scope.recipient);
+    }
     let mut sealed_overlay: BTreeMap<TransitionId, Vec<u8>> = BTreeMap::new();
     let mut sent = 0usize;
     let mut index = 0usize;
     while index < pending.len() {
+        if scope.as_ref().is_some_and(|s| s.remaining == 0) {
+            // Budget exhausted: the rest stays pending for the
+            // normal pass and the recipient's next statement.
+            // Checked before any seal work, so an unsent obligation
+            // costs no commit.
+            break;
+        }
         let id = pending[index].0;
+        if let Some(held) = scope.as_ref().map(|s| s.newest_held) {
+            // Sender-side UnknownEpoch skip: the transition's own
+            // epoch is past everything the statement shows the
+            // recipient holding, so the recipient could not open
+            // this envelope. It stays pending — never retired — for
+            // the statement that carries the capability install.
+            // An obligation whose transition the log never resolved
+            // takes the orphan path below instead: unknown epoch is
+            // not evidence of unholdability.
+            let epoch = engine.log.transition(&id).map(|t| t.epoch);
+            if epoch.is_some_and(|epoch| epoch > held) {
+                while index < pending.len() && pending[index].0 == id {
+                    index += 1;
+                }
+                continue;
+            }
+        }
         // Clone out of the log borrow before the mutable seal step.
         let Some((epoch, canonical)) = engine
             .log
@@ -304,6 +388,7 @@ fn deliver_transitions(
             recipients.push(pending[index].1);
             index += 1;
         }
+        let attempts = recipients.len();
         sent += send_sealed_to(
             engine,
             mailbox,
@@ -312,6 +397,11 @@ fn deliver_transitions(
             recipients,
             |recipient| Fact::TransitionDelivered(id, recipient),
         )?;
+        if let Some(scope) = scope.as_mut() {
+            // One attempt per recipient: in a scoped send there is at
+            // most one, so the budget counts obligations attempted.
+            scope.remaining = scope.remaining.saturating_sub(attempts);
+        }
     }
     Ok(sent)
 }
@@ -333,9 +423,13 @@ fn deliver_capabilities(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
     rebuilt: &Rebuilt,
+    scope: &mut Option<Scope<'_>>,
 ) -> Result<usize, EngineError> {
     let mut pending = rebuilt.runtime.pending_capabilities();
     pending.sort();
+    if let Some(scope) = scope.as_ref() {
+        pending.retain(|(_, r)| r == scope.recipient);
+    }
     if pending.is_empty() {
         // Nothing to mint: skip the chain walk and the session
         // clone below, so an idle pass copies no key material.
@@ -359,6 +453,11 @@ fn deliver_capabilities(
     // keep its `&mut Engine` while minting through the session.
     let signer = engine.identity_secret.clone();
     for (epoch, recipient) in pending {
+        if scope.as_ref().is_some_and(|s| s.remaining == 0) {
+            // Budget exhausted: same rule as the transition loop —
+            // checked before any mint work, skips consume nothing.
+            break;
+        }
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
         };
@@ -492,6 +591,9 @@ fn deliver_capabilities(
             [recipient],
             |delivered| Fact::CapabilityDelivered(epoch, delivered),
         )?;
+        if let Some(scope) = scope.as_mut() {
+            scope.remaining = scope.remaining.saturating_sub(1);
+        }
     }
     Ok(sent)
 }

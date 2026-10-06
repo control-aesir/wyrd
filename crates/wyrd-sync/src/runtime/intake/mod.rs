@@ -679,9 +679,11 @@ fn message_action(
 /// evidence) with the envelope's seen-id fact, inside the same
 /// per-pass budget every other arm charges — a received statement
 /// is one more small fact, never a bypass around the budget
-/// (`docs/resource-limits.md`). Nothing retires here (21c) and no
-/// response is composed here (21c): the commit only preserves the
-/// evidence the set difference will compare against.
+/// (`docs/resource-limits.md`). Nothing retires here and no response
+/// is composed here: the commit only preserves the evidence the set
+/// difference compares against, and the 21c answer path
+/// (`runtime::respond`) retires and sends from these durable facts
+/// on a later pass.
 fn request_action(
     engine: &Engine,
     id: &ControlMessageId,

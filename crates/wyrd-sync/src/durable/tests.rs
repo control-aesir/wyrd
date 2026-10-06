@@ -1,9 +1,9 @@
 use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
-    AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
-    LoadedFacts, ReconciliationError, ReconciliationEvidence, ReconciliationView,
-    SealedCapabilityFactId, ViewProvenance,
+    reconciliation_statement_digest, AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot,
+    CrashStage, DurableError, Fact, LoadedFacts, ReconciliationError, ReconciliationEvidence,
+    ReconciliationView, SealedCapabilityFactId, ViewProvenance,
 };
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
@@ -1658,6 +1658,89 @@ fn reconciliation_view_replays_to_the_same_view() {
     );
 }
 
+/// A received request replays verbatim into its own bucket: the
+/// (requester, evidence) pair survives the reopen, ordered by
+/// commit, without touching the stated-view bucket or the
+/// derivation — receiving changes nothing derivable.
+#[test]
+fn reconciliation_request_replays_to_the_same_statement() {
+    let dir = TestDir::new("reconciliation-request");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let evidence = ReconciliationView::derive(&store.load().unwrap())
+        .evidence()
+        .clone();
+    let requester = DeviceId::from_bytes([0x31; 32]);
+    store
+        .commit(&[Fact::ReconciliationRequestReceived(
+            requester,
+            evidence.clone(),
+        )])
+        .unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_requests,
+        vec![(requester, evidence.clone())],
+        "the received statement replays verbatim"
+    );
+    assert!(
+        loaded.reconciliation_views.is_empty(),
+        "receiving never states"
+    );
+    assert_eq!(
+        ReconciliationView::derive(&loaded).evidence(),
+        &evidence,
+        "receiving changes nothing derivable"
+    );
+}
+
+/// The wire-statement identity is stable content addressing: same
+/// requester plus same evidence digests identically across commits,
+/// while a different requester over identical evidence does not —
+/// so the dedupe key separates statements without confusing
+/// senders.
+#[test]
+fn reconciliation_statement_digest_is_requester_bound_and_stable() {
+    let dir = TestDir::new("reconciliation-statement-digest");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let evidence = ReconciliationView::derive(&store.load().unwrap())
+        .evidence()
+        .clone();
+    let a = DeviceId::from_bytes([0x31; 32]);
+    let b = DeviceId::from_bytes([0x32; 32]);
+    let first = reconciliation_statement_digest(&a, &evidence);
+    assert_eq!(
+        reconciliation_statement_digest(&a, &evidence),
+        first,
+        "same statement, same identity"
+    );
+    assert_ne!(
+        reconciliation_statement_digest(&b, &evidence),
+        first,
+        "same evidence, different requester, different statement"
+    );
+    let mut widened = evidence.clone();
+    widened
+        .transitions
+        .insert(TransitionId::from_bytes([0x99; 32]));
+    assert_ne!(
+        reconciliation_statement_digest(&a, &widened),
+        first,
+        "same requester, different evidence, different statement"
+    );
+    // And it differs from the local audit identity by construction:
+    // one names the statement for retirement, the other the
+    // evidence for audit.
+    assert_ne!(
+        first,
+        evidence.digest(),
+        "statement identity is not the evidence digest"
+    );
+}
+
 /// A torn view commit leaves the previous view, never a partial one:
 /// commit 3 carries a new announcement plus the view derived with it,
 /// so every pre-complete stage must reload to the commit-2 view and
@@ -2125,10 +2208,11 @@ fn populated_reconciliation_view_counts_bytes_toward_the_commit() {
 /// The view tag is a clean upgrade boundary: `0x18` sits outside the
 /// enumerated pre-view set, and the tag table holds no duplicates —
 /// a duplicate compiles and misdecodes, the exact hazard the `0x16`
-/// boundary test cites.
+/// boundary test cites. The received-request tag gets the same pin:
+/// `0x19` is a value, not just a member.
 #[test]
 fn reconciliation_tag_is_a_clean_upgrade_boundary() {
-    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_VIEW};
+    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_REQUEST, TAG_RECONCILIATION_VIEW};
     let pre_view_tags = [
         0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
@@ -2139,6 +2223,14 @@ fn reconciliation_tag_is_a_clean_upgrade_boundary() {
     );
     assert_eq!(
         TAG_RECONCILIATION_VIEW, 0x18,
+        "the tag is pinned: a different value is a different format"
+    );
+    assert!(
+        !pre_view_tags.contains(&TAG_RECONCILIATION_REQUEST),
+        "the request tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_RECONCILIATION_REQUEST, 0x19,
         "the tag is pinned: a different value is a different format"
     );
     let mut sorted = KNOWN_TAGS.to_vec();

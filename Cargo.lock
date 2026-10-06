@@ -5239,6 +5239,7 @@ dependencies = [
  "iroh",
  "nostr",
  "nostr-sdk",
+ "secp256k1",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -5248,6 +5249,7 @@ dependencies = [
  "wyrd-format",
  "wyrd-namespace",
  "wyrd-sync",
+ "zeroize",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ pub mod engine;
 mod fetch;
 mod intake;
 mod plan;
+pub(crate) mod reconcile;
 #[cfg(test)]
 pub(crate) mod test_util;
 

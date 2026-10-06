@@ -282,6 +282,20 @@ pub trait Mailbox {
     /// no-op — and dropping a [`Delivery`] without settling is an
     /// implicit `Retry`.
     fn settle(&mut self, id: DeliveryId, disposition: Disposition) -> Result<(), MailboxError>;
+
+    /// Monotonic count of transport reconnects this mailbox has
+    /// observed: relay re-attachments, stream re-drives, saturation
+    /// replays — any re-establishment the reconciliation trigger
+    /// treats as a fresh opportunity to discover gaps unobservable
+    /// while disconnected (OD-21-4). The live loop compares the
+    /// count across passes and reports the edge, never the level, so
+    /// over-counting coalesces downstream: only movement matters,
+    /// never the absolute value. Defaults to zero movement — fakes
+    /// and mailboxes that cannot observe reconnects report none, and
+    /// stay compiling without an opinion.
+    fn reconnects(&self) -> u64 {
+        0
+    }
 }
 
 /// Mailbox-scoped identity for one handover: stable across re-offers

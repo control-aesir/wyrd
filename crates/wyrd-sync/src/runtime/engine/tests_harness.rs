@@ -73,7 +73,7 @@ fn open_device(
 }
 
 /// Seal a control message for a device under a scenario epoch key.
-fn send_to(
+pub(super) fn send_to(
     pair: &mut Pair,
     from_sk: &DeviceIdentitySecret,
     to: DeviceId,

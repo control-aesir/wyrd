@@ -160,6 +160,28 @@ Releases are not required to write every format they read:
     canonical (ceiling-free) bytes, distinct from the authenticated
     wire-statement identity retirement references.
 
+    The received reconciliation request (`0x19`) is the sender side
+    of the same pattern: the (requester, evidence) pair intake
+    commits on first sight, so the set difference (21c) compares
+    against durable evidence. Same per-section ceiling and the same
+    evidence layout as `0x18`, requester bytes ahead; no subset
+    check at load (the sender cannot validate another device's
+    holdings against its own log — divergent histories are the case
+    being reconciled). An old node skips the unknown tag and keeps
+    whatever it had pending, which is the safe direction: it retries
+    what a new node would answer from evidence, rather than acting
+    on a statement it never read. `0x19` follows `0x18`, checked
+    against the full tag set like `0x16` (pinned by
+    `reconciliation_tag_is_a_clean_upgrade_boundary`).
+
+    The wire kind is not a format break: the reconciliation request
+    rides a new control kind byte (`0x04`) under the unchanged
+    envelope version. An old node fails the kind byte closed
+    (`UnknownKind`, discarded as terminal poison without a fact) —
+    it never misparses a request as another kind, and the sender's
+    relay-retained retry keeps the statement available for a new
+    node. Additive kinds need no negotiation by design.
+
     The tag boundary is pinned by
     `the_replacement_tag_is_a_clean_upgrade_boundary`: `0x16` sits
     outside the enumerated pre-replacement set, a commit carrying a

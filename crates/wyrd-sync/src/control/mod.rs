@@ -70,8 +70,8 @@ pub use bootstrap::{
     BootstrapInvitation, SealedBootstrap, BOOTSTRAP_HEADER_LEN, BOOTSTRAP_VERSION,
 };
 pub use message::{
-    AnnouncementUpdate, CapabilityPayload, ControlKind, KeyRotation, Message, SnapshotAnnouncement,
-    TransitionPayload,
+    AnnouncementUpdate, CapabilityPayload, ControlKind, KeyRotation, Message,
+    ReconciliationRequestPayload, SnapshotAnnouncement, TransitionPayload,
 };
 pub use nip46::{SignDomain, SignMessageRequest, SignMessageResponse};
 pub use rotation::{
@@ -252,6 +252,10 @@ pub fn open(
         Message::MembershipTransition(_) => None,
         Message::KeyRotation(_) => None,
         Message::SnapshotAnnouncement(m) => Some(m.epoch),
+        // A request names no epoch: the envelope epoch (the newest
+        // the requester holds) is the only epoch claim, and the
+        // evidence sets span epochs by construction.
+        Message::ReconciliationRequest(_) => None,
     };
     if let Some(epoch) = payload_epoch {
         if epoch != sealed.epoch {

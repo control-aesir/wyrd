@@ -1773,4 +1773,18 @@ where
             None => Err(MailboxError::Transport("unknown delivery".into())),
         }
     }
+
+    /// Transport reconnect observations for the reconciliation
+    /// trigger: relay recovery attempts plus stream re-drives. These
+    /// count attempts, not confirmed successes — a failed attempt
+    /// moves the count, the trigger probes, the send reports zero
+    /// acceptance, nothing is marked, and the next attempt re-arms
+    /// exactly once. Over-counting across the two supervisor
+    /// ledgers coalesces at the engine latch: only movement matters.
+    fn reconnects(&self) -> u64 {
+        self.health
+            .relay_recovery_attempts
+            .load(Ordering::Relaxed)
+            .saturating_add(self.health.stream_recovery_attempts.load(Ordering::Relaxed))
+    }
 }

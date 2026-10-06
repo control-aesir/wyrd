@@ -578,6 +578,12 @@ pub struct LiveNode<V: NamespaceView> {
     pub(super) serving_flush_budget: Duration,
     /// Stored copy of the config's per-pass fetch budget.
     pub(super) fetch_pass_budget: Duration,
+    /// Last observed mailbox reconnect count, for the
+    /// reconciliation trigger's edge detection (OD-21-4): `None`
+    /// before the first pass, which counts as a session start — the
+    /// loop's first pass is itself a fresh opportunity to discover
+    /// gaps. Compared by movement, never by value.
+    pub(super) last_mailbox_reconnects: Option<u64>,
 }
 
 /// The live half of a split node: everything a presentation
@@ -897,6 +903,7 @@ where
                 serving_barrier: None,
                 serving_flush_budget: config.serving_flush_budget,
                 fetch_pass_budget: config.fetch_pass_budget,
+                last_mailbox_reconnects: None,
             },
             parts,
         ))
@@ -1171,6 +1178,24 @@ where
         bulk: Option<&mut B>,
     ) -> Result<SyncReport, LiveError> {
         let drained = self.engine.drain(mailbox)?;
+        // Reconciliation trigger (OD-21-4, C+A): the reconnect edge
+        // plus the drain's gap signal, evaluated once per pass. The
+        // edge is counter movement, never level — the first pass
+        // counts as a session start — and the engine latch coalesces
+        // edges that arrive between evaluations. Mailbox failures
+        // absorb like every other send in this pass (see `publish`):
+        // a dead transport stalls the probe, never the loop. The
+        // outcome is dropped here (the loop stays free of reporting
+        // dependencies); 21d surfaces it.
+        let reconnects = mailbox.reconnects();
+        if self.last_mailbox_reconnects.replace(reconnects) != Some(reconnects) {
+            self.engine.note_reconnected();
+        }
+        match self.engine.maybe_request_reconciliation(mailbox) {
+            Ok(_) => {}
+            Err(EngineError::Mailbox(_)) => {}
+            Err(other) => return Err(LiveError::Engine(other)),
+        }
         // Generation rotation on observed demand (OD-11-2): every
         // identity noted since the last pass whose generation
         // completed terminal reopens as a new one. Notes arrive from
@@ -3070,3 +3095,7 @@ mod quota_tests;
 #[cfg(test)]
 #[path = "live/tests_terminal.rs"]
 mod terminal_tests;
+
+#[cfg(test)]
+#[path = "live/tests_trigger.rs"]
+mod trigger_tests;

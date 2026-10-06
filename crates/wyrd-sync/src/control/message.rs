@@ -1,14 +1,14 @@
 //! Control-plane message types: the evidence the Nostr mailbox delivers
 //! (see the control-plane issue; transport wiring is a later issue).
 //!
-//! Four kinds, each versioned by the envelope and duplicate-delivery
+//! Five kinds, each versioned by the envelope and duplicate-delivery
 //! idempotent within the retained inbox state: receivers dedupe by
 //! message id and the machines are set-based, so 0/1/5 receptions in any
 //! order converge. Semantic replay safety belongs to the receiving state
 //! machines. Messages are delivery hints, never authority: the receiver
 //! acts only after machine-side verification (transition signatures,
-//! capability unwrap, snapshot classification), which lives outside this
-//! module.
+//! capability unwrap, snapshot classification, reconciliation-statement
+//! decode), which lives outside this module.
 //!
 //! Canonical payload encodings (fixed-width little-endian, blobs counted
 //! with `u32`):
@@ -27,6 +27,9 @@
 //!                        ‖ root_manifest_transport BaoRoot (32)
 //!                        ‖ routing byte (+ counted node_addr blob if
 //!                        present) ‖ signature (64, last)
+//! ReconciliationRequest: requester DeviceId (32) ‖ evidence u32+bytes
+//!                        (the canonical reconciliation-evidence bytes;
+//!                        opaque here, decoded at intake)
 //! ```
 //!
 //! The announcement's signature covers the payload up to (not including)
@@ -43,15 +46,16 @@ use wyrd_format::{BaoRoot, ContentId, DeviceId, DriveId, SnapshotId, TransitionI
 use super::ControlError;
 
 /// The control-plane message kinds. Canonical tag bytes: Capability,
-/// MembershipTransition, KeyRotation, SnapshotAnnouncement. (Bootstrapping
-/// travels outside this envelope in `bootstrap.rs`, so no tag is reserved
-/// for invitations.)
+/// MembershipTransition, KeyRotation, SnapshotAnnouncement,
+/// ReconciliationRequest. (Bootstrapping travels outside this envelope
+/// in `bootstrap.rs`, so no tag is reserved for invitations.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlKind {
     Capability,
     MembershipTransition,
     KeyRotation,
     SnapshotAnnouncement,
+    ReconciliationRequest,
 }
 
 impl ControlKind {
@@ -62,6 +66,7 @@ impl ControlKind {
             ControlKind::MembershipTransition => 0x01,
             ControlKind::KeyRotation => 0x02,
             ControlKind::SnapshotAnnouncement => 0x03,
+            ControlKind::ReconciliationRequest => 0x04,
         }
     }
 
@@ -72,6 +77,7 @@ impl ControlKind {
             0x01 => Some(ControlKind::MembershipTransition),
             0x02 => Some(ControlKind::KeyRotation),
             0x03 => Some(ControlKind::SnapshotAnnouncement),
+            0x04 => Some(ControlKind::ReconciliationRequest),
             _ => None,
         }
     }
@@ -109,6 +115,26 @@ pub struct TransitionPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRotation {
     pub transition: TransitionId,
+}
+
+/// A reconciliation request: the recipient-originated pull statement
+/// (DG-3, `docs/sync-and-peers.md`). `requester` names the device
+/// asking — it must equal the mailbox envelope's sender, the same
+/// redundant-field agreement the capability arm enforces, so the
+/// responder knows whom the set difference is for. `evidence` is the
+/// canonical reconciliation-evidence bytes (the record body `0x18`
+/// commits, without the tag): counted transition ids, snapshot ids,
+/// and (device, epoch) pairs in sorted-set order. Control frames and
+/// seals these bytes but never interprets them — the opaque-`node_addr`
+/// precedent — so there is exactly one evidence layout across the
+/// wire statement, the stated-view record, and the received-request
+/// record; intake decodes them. No request nonce: the request is pure
+/// content, so redelivery, reseal, and re-request all converge to
+/// `Duplicate` by set membership instead of minting a fact per send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationRequestPayload {
+    pub requester: DeviceId,
+    pub evidence: Vec<u8>,
 }
 
 /// A snapshot announcement: enough to fetch and classify, plus the
@@ -247,6 +273,7 @@ pub enum Message {
     MembershipTransition(TransitionPayload),
     KeyRotation(KeyRotation),
     SnapshotAnnouncement(SnapshotAnnouncement),
+    ReconciliationRequest(ReconciliationRequestPayload),
 }
 
 impl Message {
@@ -257,6 +284,7 @@ impl Message {
             Message::MembershipTransition(_) => ControlKind::MembershipTransition,
             Message::KeyRotation(_) => ControlKind::KeyRotation,
             Message::SnapshotAnnouncement(_) => ControlKind::SnapshotAnnouncement,
+            Message::ReconciliationRequest(_) => ControlKind::ReconciliationRequest,
         }
     }
 
@@ -293,6 +321,12 @@ impl Message {
                     }
                 }
                 out.extend_from_slice(&m.signature);
+                out
+            }
+            Message::ReconciliationRequest(m) => {
+                let mut out = Vec::with_capacity(36 + m.evidence.len());
+                out.extend_from_slice(m.requester.as_bytes());
+                push_blob(&mut out, &m.evidence);
                 out
             }
         }
@@ -396,6 +430,16 @@ impl Message {
                     signature,
                 })
             }
+            ControlKind::ReconciliationRequest => {
+                need(pos, 32)?;
+                let requester = DeviceId::from_bytes(id32(pos));
+                pos += 32;
+                let evidence = blob(&mut pos)?;
+                Message::ReconciliationRequest(ReconciliationRequestPayload {
+                    requester,
+                    evidence,
+                })
+            }
         };
         if pos != len {
             return Err(ControlError::TrailingBytes);
@@ -461,6 +505,13 @@ mod tests {
         })
     }
 
+    fn request() -> Message {
+        Message::ReconciliationRequest(ReconciliationRequestPayload {
+            requester: DeviceId::from_bytes([0x31; 32]),
+            evidence: vec![0x5A; 64],
+        })
+    }
+
     #[test]
     fn kind_tags_match_the_table() {
         assert_eq!(capability().kind(), ControlKind::Capability);
@@ -468,22 +519,55 @@ mod tests {
         assert_eq!(transition().kind().byte(), 0x01);
         assert_eq!(rotation().kind().byte(), 0x02);
         assert_eq!(announcement().kind().byte(), 0x03);
+        assert_eq!(request().kind().byte(), 0x04);
         assert_eq!(
             ControlKind::from_byte(0x03),
             Some(ControlKind::SnapshotAnnouncement)
         );
-        assert_eq!(ControlKind::from_byte(0x04), None);
+        assert_eq!(
+            ControlKind::from_byte(0x04),
+            Some(ControlKind::ReconciliationRequest)
+        );
+        assert_eq!(ControlKind::from_byte(0x05), None);
     }
 
     #[test]
     fn every_kind_round_trips() {
-        for m in [capability(), transition(), rotation(), announcement()] {
+        for m in [
+            capability(),
+            transition(),
+            rotation(),
+            announcement(),
+            request(),
+        ] {
             let kind = m.kind();
             assert_eq!(
                 Message::decode_payload(kind, &m.encode_payload()).unwrap(),
                 m
             );
         }
+    }
+
+    #[test]
+    fn request_payload_layout_is_requester_then_blob() {
+        // requester (32) ‖ evidence u32+bytes: the evidence rides
+        // opaque — control frames it, intake decodes it.
+        let bytes = request().encode_payload();
+        assert_eq!(&bytes[..32], &[0x31; 32]);
+        assert_eq!(&bytes[32..36], &64u32.to_le_bytes(), "counted blob");
+        assert_eq!(&bytes[36..], &[0x5A; 64]);
+        // A cut inside the requester is truncation, not a request;
+        // trailing bytes after the blob are rejected, not ignored.
+        assert_eq!(
+            Message::decode_payload(ControlKind::ReconciliationRequest, &bytes[..10]),
+            Err(ControlError::Truncated)
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert_eq!(
+            Message::decode_payload(ControlKind::ReconciliationRequest, &trailing),
+            Err(ControlError::TrailingBytes)
+        );
     }
 
     #[test]

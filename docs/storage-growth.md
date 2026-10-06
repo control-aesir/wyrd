@@ -194,15 +194,24 @@ unbounded in count.
 | Vault | retained ciphertext per representation, and the count of them | no |
 
 The asymmetry is the finding, and the eager structural pull sharpens it.
-Intake commits transition / announcement / capability / control-message
-facts and never opens manifests, trees, or chunks, so one might expect a
-peer to hold only *history*. It holds more than that: reconciliation
+Intake commits transition / announcement / capability / control-message /
+reconciliation-request facts and never opens manifests, trees, or chunks,
+so one might expect a peer to hold only *history*. It holds more than that: reconciliation
 plans the root for every announcement, plans child manifests from every
 held manifest's children rather than from a want, and treats tree nodes
 as structural because the closure cannot be navigated without them. The
 plan runs every pass with no want gate. So a peer pays for the shape of
 what a member did whether or not it ever wants a byte of the content —
 only file content is genuinely pull-based.
+
+Received reconciliation requests widen that history in the peer-chosen
+direction: both the count and the size of `0x19` facts are chosen by
+the sender, up to the 64 KiB mailbox ceiling each — paced per pass by
+the intake budget (256 facts per sender, 1024 total) but unbounded in
+retention, with no aggregate ceiling and no GC in v0. Every stored
+statement also lengthens the `store.load()` replay each pass pays. The
+per-pass rate is bounded; the retention is not, and the bound for it
+waits for GC like everything else in this file.
 
 Authorization in v0 is membership, and membership carries **no retention
 obligation and no refusal right**: `trust.md` records that object

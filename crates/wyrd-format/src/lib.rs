@@ -40,7 +40,8 @@ pub use mutation::{
 };
 pub use snapshot::{Snapshot, SnapshotError};
 pub use store::{
-    FetchStatus, MemoryObjectStore, MemoryStoreError, ObjectStore, RetainedBytes, SharedStore,
-    SharedStoreError, StoreError, StoreFailure,
+    DiscardOutcome, DiscardRejectedRepresentation, FetchStatus, MemoryObjectStore,
+    MemoryStoreError, ObjectStore, RetainedBytes, SharedStore, SharedStoreError, StoreError,
+    StoreFailure,
 };
 pub use tree::{Component, Entry, EntryContent, Tree};

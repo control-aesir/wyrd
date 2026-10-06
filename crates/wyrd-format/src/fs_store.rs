@@ -35,7 +35,10 @@ use thiserror::Error;
 
 use crate::durable::{Durability, PublishError};
 use crate::identity::{ContentId, ObjectKind};
-use crate::store::{ObjectStore, RetainedBytes, StoreError, StoreFailure};
+use crate::store::{
+    DiscardOutcome, DiscardRejectedRepresentation, ObjectStore, RetainedBytes, StoreError,
+    StoreFailure,
+};
 
 /// Filesystem store failures: I/O plus the identity violations the
 /// [`ObjectStore`] contract makes the store's job to catch.
@@ -79,6 +82,15 @@ impl StoreError for FsStoreError {
                 StoreFailure::Transient
             }
         }
+    }
+
+    fn is_verification_failure(&self) -> bool {
+        // Only `Corrupt` is observed-invalid local bytes. `Io` is a
+        // resource condition, `IdentityMismatch` is a foreign
+        // preimage refused at import (never stored), and the
+        // resource variants fail the mount differently — none of
+        // them may name content for discard.
+        matches!(self, FsStoreError::Corrupt)
     }
 }
 
@@ -397,6 +409,46 @@ impl ObjectStore for FsObjectStore {
 
     fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
         Ok(self.find(id).is_some())
+    }
+}
+
+impl DiscardRejectedRepresentation for FsObjectStore {
+    type Error = FsStoreError;
+
+    fn discard_rejected_representation(
+        &mut self,
+        id: &ContentId,
+    ) -> Result<DiscardOutcome, Self::Error> {
+        // Verify-then-delete: the rejection was observed by an
+        // earlier read, and a refetch may have healed the live name
+        // since. Present-and-valid bytes are never unlinked, and a
+        // rename that lands between the re-read and the unlink
+        // installs verified bytes under this name — but the observed
+        // file is already gone from the namespace only if the unlink
+        // wins, in which case the claim-clear the caller performed
+        // first re-drives a fetch. Either interleaving fails closed.
+        let Some((kind, path)) = self.find(id) else {
+            return Ok(DiscardOutcome::Absent);
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            // Lost between `find` and `read`: a concurrent discard
+            // or a vanished mount. The bytes are gone either way.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(DiscardOutcome::Absent);
+            }
+            Err(error) => return Err(FsStoreError::io(error)),
+        };
+        if ContentId::derive(kind, &bytes) == *id {
+            return Ok(DiscardOutcome::NowValid);
+        }
+        let len = bytes.len() as u64;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(DiscardOutcome::Discarded(len)),
+            // Same race as the read above, resolved the same way.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DiscardOutcome::Absent),
+            Err(error) => Err(FsStoreError::io(error)),
+        }
     }
 }
 
@@ -851,6 +903,62 @@ mod tests {
         let absent = ContentId::derive(ObjectKind::Chunk, b"never stored");
         assert_eq!(store.get(&absent).unwrap(), None);
         assert!(!store.has(&absent).unwrap());
+        remove_scratch(&dir);
+    }
+
+    /// Only `Corrupt` authorizes discard: resource and import errors
+    /// must never name content for deletion.
+    #[test]
+    fn only_corruption_is_a_verification_failure() {
+        assert!(FsStoreError::Corrupt.is_verification_failure());
+        assert!(!FsStoreError::Io("torn".into()).is_verification_failure());
+        assert!(!FsStoreError::StorageFull("full".into()).is_verification_failure());
+        assert!(!FsStoreError::PermissionDenied("ro".into()).is_verification_failure());
+        assert!(!FsStoreError::IdentityMismatch.is_verification_failure());
+        assert!(!crate::store::MemoryStoreError::IdentityMismatch {
+            expected: "a".into(),
+            derived: "b".into()
+        }
+        .is_verification_failure());
+    }
+
+    /// Discard unlinks bitrotted bytes and reports their length; a
+    /// second discard is `Absent`, never an error.
+    #[test]
+    fn discard_removes_rejected_bytes_once() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = store.insert(ObjectKind::Chunk, b"pristine").unwrap();
+        fs::write(store.path_for(ObjectKind::Chunk, &id), b"tampered").unwrap();
+        assert!(store.get(&id).is_err());
+        let outcome = store.discard_rejected_representation(&id).unwrap();
+        assert!(
+            matches!(outcome, DiscardOutcome::Discarded(8)),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert_eq!(store.get(&id).unwrap(), None);
+        assert_eq!(
+            store.discard_rejected_representation(&id).unwrap(),
+            DiscardOutcome::Absent
+        );
+        remove_scratch(&dir);
+    }
+
+    /// A refetch that healed the live name between observation and
+    /// discard wins: valid bytes are never unlinked.
+    #[test]
+    fn discard_spares_healed_bytes() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = store.insert(ObjectKind::Chunk, b"pristine").unwrap();
+        // Same bytes, rewritten (what a healing `insert` does): the
+        // live name verifies again.
+        store.insert(ObjectKind::Chunk, b"pristine").unwrap();
+        assert_eq!(
+            store.discard_rejected_representation(&id).unwrap(),
+            DiscardOutcome::NowValid
+        );
+        assert_eq!(store.get(&id).unwrap(), Some(b"pristine".to_vec()));
         remove_scratch(&dir);
     }
 }

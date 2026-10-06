@@ -75,6 +75,18 @@ pub trait StoreError {
     fn failure(&self) -> StoreFailure {
         StoreFailure::Transient
     }
+
+    /// Whether this error reports locally held bytes that failed
+    /// verification against their address (bitrot under the live
+    /// name), as opposed to a resource condition, a missing object,
+    /// or a foreign preimage refused at import. Only a `true` here
+    /// authorizes the quarantine path to name the content for
+    /// discard: every other failure class must never become a
+    /// deletion. Defaults to `false`, so stores that cannot observe
+    /// verification failure implement nothing.
+    fn is_verification_failure(&self) -> bool {
+        false
+    }
 }
 
 pub trait ObjectStore {
@@ -99,6 +111,47 @@ pub trait ObjectStore {
 
     /// Cheap existence check.
     fn has(&self, id: &ContentId) -> Result<bool, Self::Error>;
+}
+
+/// What one discard attempt found. The three cases drive different
+/// claim handling in the caller, so they stay distinct instead of
+/// collapsing to a byte count: `Absent` repairs a stale durable
+/// claim, `NowValid` proves the claim true and forbids touching it,
+/// and only `Discarded` both subtracts from the accountant and
+/// clears the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardOutcome {
+    /// Bad bytes were unlinked; the payload is how many left the disk.
+    Discarded(u64),
+    /// Nothing under any kind directory: a concurrent discard won,
+    /// or the bytes never landed.
+    Absent,
+    /// Bytes are present and verify now: a refetch healed the live
+    /// name between the rejection observation and this call. The
+    /// bytes stay, and the possession claim stays with them.
+    NowValid,
+}
+
+/// The one narrowly-scoped destructive operation the store offers:
+/// remove a single locally held representation that verification
+/// has already rejected. This is deliberately not a method on
+/// [`ObjectStore`] and never becomes a general `remove`: the
+/// four-method interface stays append-only, and deletion exists
+/// only for representations observed invalid (quarantine, scrub).
+/// Callers name the content; the implementation re-verifies before
+/// unlinking, so a concurrent heal wins over a stale rejection.
+pub trait DiscardRejectedRepresentation {
+    type Error: StoreError;
+
+    /// Unlink the representation at `id` after confirming it still
+    /// fails verification. Idempotent: discarding twice reports
+    /// `Absent` the second time, never an error. Takes `&mut self`
+    /// because unlinking mutates even when the bytes live behind a
+    /// lock the caller already holds for writing.
+    fn discard_rejected_representation(
+        &mut self,
+        id: &ContentId,
+    ) -> Result<DiscardOutcome, Self::Error>;
 }
 
 /// Transient fetch status for one content object: the sync-internal
@@ -307,6 +360,23 @@ impl ObjectStore for MemoryObjectStore {
 
     fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
         Ok(self.objects.contains_key(id))
+    }
+}
+
+impl DiscardRejectedRepresentation for MemoryObjectStore {
+    type Error = MemoryStoreError;
+
+    fn discard_rejected_representation(
+        &mut self,
+        id: &ContentId,
+    ) -> Result<DiscardOutcome, Self::Error> {
+        // The memory store never verifies on read, so `NowValid` is
+        // unreachable here: the caller established invalidity before
+        // naming the content, and removal is unconditional.
+        match self.objects.remove(id) {
+            Some((_, bytes)) => Ok(DiscardOutcome::Discarded(bytes.len() as u64)),
+            None => Ok(DiscardOutcome::Absent),
+        }
     }
 }
 

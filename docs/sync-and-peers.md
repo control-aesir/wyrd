@@ -302,12 +302,22 @@ Surfaced as 21d: `sync status` carries a `reconciliation` row —
 statements received plus transitions and capabilities retired,
 all from committed facts, classes and counts only — and `sync now`
 reports the open gap as two gauges: statements never evaluated,
-plus evaluated-but-stuck ones whose requester is still owed. An
-`UnknownEpoch` skip marks answered (it was evaluated) but records
-a stall, so the "asked and permanently skipped" state above reads
-open — never as a healthy drive — until the epoch lands and later
-progress closes it. The stall record is volatile like the answered
-set; the counters are durable.
+plus evaluated-but-stuck ones whose requester is still owed. The
+stall gauge fires if and only if the obligations are still owed at
+end of run — "owed and undeliverable", never a claim about what
+the recipient opened, which the sender cannot distinguish from
+delivered (relay acceptance is the v0.2 guarantee). Concretely: an
+`UnknownEpoch` skip records a stall at evaluation, but the pass's
+unscoped delivery usually discharges the obligation right after
+(relay acceptance commits `Delivered`), so the stall closes behind
+it and reads zero — the sender has nothing left, and the
+recipient's next statement re-opens the conversation if it is still
+behind. What latches the gauge open is the obligation no path can
+discharge — an unresolvable transition, a missing sealing key —
+with the transport refusing alongside: still owed after every
+pass, so the run fails and names it. The stall record itself is
+volatile like the answered set; a restart re-derives it from the
+durable request bucket.
 
 ### Acceptance scenarios (normative)
 

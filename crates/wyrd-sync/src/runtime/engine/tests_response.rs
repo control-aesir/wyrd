@@ -471,12 +471,18 @@ fn unknownepoch_never_reconciles() {
     assert_eq!(report.retired, 0, "sending is still not retiring");
 }
 
-/// The stall gauge (21d): a statement evaluated with obligations
-/// outstanding but zero sends and zero retirements records a stall
-/// — "asked, nothing delivered" — while a covered statement records
-/// none. The gauge counts only stalls whose requester is still owed,
-/// so the install arriving later closes it: closable, never a run
-/// that fails forever.
+/// The stall gauge (21d) through the production pass: a statement
+/// evaluated with obligations outstanding but zero sends and zero
+/// retirements records a stall — "asked, nothing delivered" — while
+/// a covered statement records none. What the gauge reads at end of
+/// run then depends on the unscoped delivery that follows in the
+/// same pass: a live relay discharges the obligation and the stall
+/// closes behind it (the sender has nothing left; the recipient's
+/// next statement re-opens if it is still behind), while a refused
+/// transport leaves it owed and the stall reads open. The gauge is
+/// "owed and undeliverable", never a claim about what the recipient
+/// opened — relay acceptance is the v0.2 guarantee, and the sender
+/// cannot distinguish delivered from opened.
 #[test]
 fn evaluated_without_progress_records_a_live_stall() {
     let (mut fx, _, child) = world();
@@ -506,18 +512,128 @@ fn evaluated_without_progress_records_a_live_stall() {
         1,
         "asked, nothing delivered, obligation still owed"
     );
-    // The epoch-2 install lands in a later statement: the send moves
-    // and the stall closes behind it.
-    let held2 = keyed_evidence(r, &[]);
-    state(&mut fx, r, held2);
-    let report = answer(&mut fx);
-    assert_eq!(report.sent, 1, "keys first, then content");
+    // The pass's unscoped delivery follows: the relay accepts the
+    // blind send, the obligation discharges, and the stall closes
+    // behind it — nothing owed, nothing stuck.
+    let recipient = fx.recipient;
+    {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: recipient,
+        };
+        fx.engine.deliver_pending(&mut mailbox).unwrap();
+    }
     assert_eq!(
         fx.engine.stalled_statement_count().unwrap(),
         0,
-        "the obligation drained, so the stall no longer counts"
+        "the obligation drained through relay acceptance, so the stall no longer counts"
     );
     assert_eq!(fx.engine.unanswered_statement_count(), 0);
+}
+
+/// The gauge's true firing condition: the same stall with a refused
+/// transport. Neither the scoped nor the blind send moves the
+/// obligation, so it is still owed at end of run and the stall reads
+/// open — this is the run `sync now` fails.
+#[test]
+fn stall_with_refused_delivery_reads_open() {
+    let (mut fx, _, child) = world();
+    let (_, r) = requester();
+    let child_id = child.transition_id();
+    fx.engine
+        .commit_facts(&[Fact::TransitionQueued(child_id, r)])
+        .unwrap();
+    let held1 = ReconciliationEvidence {
+        transitions: BTreeSet::new(),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::from([(r, 1)]),
+    };
+    state(&mut fx, r, held1);
+    {
+        let mut mailbox = NullMailbox;
+        let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
+        assert_eq!((report.retired, report.sent), (0, 0));
+        fx.engine.deliver_pending(&mut mailbox).unwrap();
+    }
+    assert_eq!(
+        fx.engine.unanswered_statement_count(),
+        0,
+        "evaluated, not unanswered"
+    );
+    assert_eq!(
+        fx.engine.stalled_statement_count().unwrap(),
+        1,
+        "owed and undeliverable: the gap sync now names and fails on"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_transitions(),
+        vec![(child_id, r)],
+        "refused sends leave the obligation pending for a later pass"
+    );
+}
+
+/// The stall the gauge is actually for: an obligation no pass can
+/// ever discharge. The transition never resolves, so neither the
+/// scoped nor the blind send moves it — the stall latches, and with
+/// no GC in v0 it has no release. A restart re-derives it: the
+/// received-request bucket is durable while the stall set is
+/// volatile, so the re-answer records it again.
+#[test]
+fn orphan_obligation_latches_the_stall_across_restart() {
+    let (mut fx, _, _) = world();
+    let (_, r) = requester();
+    let orphan = TransitionId::from_bytes([0xD0; 32]);
+    fx.engine
+        .commit_facts(&[Fact::TransitionQueued(orphan, r)])
+        .unwrap();
+    let empty = ReconciliationEvidence {
+        transitions: BTreeSet::new(),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::new(),
+    };
+    state(&mut fx, r, empty);
+    let report = answer(&mut fx);
+    assert_eq!(
+        (report.retired, report.sent),
+        (0, 0),
+        "the unresolvable transition moves nothing"
+    );
+    assert_eq!(fx.engine.stalled_statement_count().unwrap(), 1);
+    // The blind pass cannot move it either: the log never resolves
+    // the transition, so the orphan path skips and it stays pending.
+    let recipient = fx.recipient;
+    {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: recipient,
+        };
+        fx.engine.deliver_pending(&mut mailbox).unwrap();
+    }
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_transitions(),
+        vec![(orphan, r)],
+        "no pass will ever discharge this obligation"
+    );
+    assert_eq!(
+        fx.engine.stalled_statement_count().unwrap(),
+        1,
+        "owed and undeliverable: latched"
+    );
+    // Restart: the volatile set resets, the durable bucket replays,
+    // and the re-answer records the stall again.
+    let mut engine = reopen(&mut fx);
+    {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut fx.relay,
+            owner: recipient,
+        };
+        engine.answer_reconciliation(&mut mailbox).unwrap();
+    }
+    assert_eq!(
+        engine.stalled_statement_count().unwrap(),
+        1,
+        "re-derived from durable facts after restart"
+    );
 }
 
 /// The per-statement send cap, with paging through re-statement: 41

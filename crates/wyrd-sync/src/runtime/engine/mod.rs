@@ -1394,6 +1394,13 @@ impl Engine {
     /// read once at end of run, never per pass. Volatile like the
     /// answered set: a restart re-evaluates and re-derives.
     pub fn stalled_statement_count(&self) -> Result<usize, EngineError> {
+        // The common path is no stalls: skip the rebuild entirely.
+        // The gauge beside this one is O(1) with no I/O for the same
+        // reason — a diagnostic read must not cost a load cycle when
+        // there is nothing to decide.
+        if self.stalled_statements.is_empty() {
+            return Ok(0);
+        }
         let state = self.store.rebuild(self.device)?.runtime;
         Ok(self
             .stalled_statements

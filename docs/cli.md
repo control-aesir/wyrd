@@ -363,12 +363,17 @@ sync now
   A quiet outbox does not imply a closed control plane: the run
   reports a `reconciliation` line with two gauges — received
   statements it never evaluated, plus evaluated-but-stuck ones
-  whose requester is still owed ("asked, nothing delivered": the
-  sender-side UnknownEpoch skip, which marks answered yet records
-  a stall). An open gap fails the run even when the outbox is
-  quiet — a peer asked and this device could not prove its state,
-  so automation keying on exit status sees it. Zero
-  prints too: the converged case is grepable, not omitted.
+  whose requester is still owed ("asked, nothing delivered"). The
+  stall gauge fires if and only if the obligations are still owed
+  at end of run: a scoped skip (sender-side UnknownEpoch) that the
+  pass's unscoped delivery then discharges reads zero — relay
+  acceptance is the v0.2 guarantee, and the sender cannot tell
+  delivered from opened — while an obligation no path can
+  discharge (unresolvable transition, missing sealing key, refused
+  transport) latches it open. An open gap fails the run even when
+  the outbox is quiet, so automation keying on exit status sees
+  it. Zero prints too: the converged case is grepable, not
+  omitted.
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run
    as quiet with an explicit `N unfetchable heads` count instead of

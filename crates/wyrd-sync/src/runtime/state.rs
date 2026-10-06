@@ -363,7 +363,8 @@ impl RuntimeState {
         }
     }
 
-    /// Obligations retired through reconciliation per class: the pair    /// sets are the projection (the triple sets beside them are the
+    /// Obligations retired through reconciliation per class: the pair
+    /// sets are the projection (the triple sets beside them are the
     /// audit trail naming the proving statement). Counts only, so the
     /// operator surface never touches identities.
     pub fn reconciled_counts(&self) -> (usize, usize) {

@@ -948,6 +948,14 @@ where
         self.node_addr.as_deref()
     }
 
+    /// The quarantine channel readers submit verification failures
+    /// to: the composer hands it to the backend alongside the want
+    /// registry, so observed-invalid bytes are repaired by the
+    /// loop's drain.
+    pub fn quarantine_queue(&self) -> &Arc<QuarantineQueue> {
+        &self.quarantine
+    }
+
     /// Install the serving-mirror readiness barrier for announcement
     /// discharge: the composer passes its serving endpoint (shared
     /// ownership — the endpoint lifecycle stays with the composer).

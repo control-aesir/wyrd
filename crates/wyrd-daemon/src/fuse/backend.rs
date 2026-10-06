@@ -21,6 +21,7 @@ use wyrd_core::mutation::{
     MutationOutcome, MutationQueue,
 };
 use wyrd_core::projection::Projection;
+use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
 use wyrd_core::session::{FoldLease, WriteBudget};
 use wyrd_core::want::{wait_for_materialization, WantRegistry};
 
@@ -57,6 +58,12 @@ where
     /// makes every mutating callback `EROFS` (a standalone read-only
     /// backend).
     pub(super) mutations: Option<Arc<MutationQueue>>,
+    /// The live daemon's quarantine channel: observed verification
+    /// failures are submitted here and repaired by the loop (bytes
+    /// discarded, claim cleared, next waiter re-demands). `None`
+    /// keeps the instant-EIO behavior for standalone backends, which
+    /// have no loop to repair through.
+    quarantine: Option<Arc<QuarantineQueue>>,
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
     pub(super) budget: Arc<WriteBudget>,
@@ -531,6 +538,7 @@ where
             }),
             wants: None,
             mutations: None,
+            quarantine: None,
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -564,6 +572,7 @@ where
             }),
             wants: None,
             mutations: None,
+            quarantine: None,
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -604,6 +613,7 @@ where
             }),
             wants: Some(wants),
             mutations: Some(mutations),
+            quarantine: None,
             budget: Arc::new(WriteBudget::with_limits(
                 budgets.write_per_handle_bytes,
                 budgets.write_aggregate_bytes,
@@ -618,6 +628,16 @@ where
             uid,
             gid,
         }
+    }
+
+    /// Wire the live daemon's quarantine channel: observed
+    /// verification failures are submitted here for the loop's
+    /// drain. The composer calls this alongside `shared_with_wants`;
+    /// tests wire it when they cover repair, and standalone
+    /// backends leave it `None` (instant EIO, no loop to repair
+    /// through).
+    pub fn set_quarantine(&mut self, quarantine: Arc<QuarantineQueue>) {
+        self.quarantine = Some(quarantine);
     }
 
     /// Publish a new generation over the given view without a durable
@@ -1183,32 +1203,69 @@ where
     /// a maybe, so the bounded `EIO` lands now instead of at the
     /// deadline — while the reopen note it leaves makes the identity
     /// re-demandable on the next pass instead of permanently
-    /// terminal. Anything else (or no demand wiring) keeps the
-    /// instant-errno behavior. This is the only place FUSE expresses
-    /// demand — the engine stays the single synchronization authority.
+    /// terminal. A rejected representation (verification-failed
+    /// bytes) is reported to the loop's quarantine drain and then
+    /// demanded like any other not-local content: the current reader
+    /// is the waiter repair-on-demand requires, so the wait below
+    /// heals in the same read when the refetch lands. Anything else
+    /// (or no demand wiring) keeps the instant-errno behavior. This
+    /// is the only place FUSE expresses demand — the engine stays
+    /// the single synchronization authority.
     fn with_demand<T>(
         &self,
         attempt: impl Fn() -> Result<T, (ViewError, fuser::Errno)>,
         map: impl Fn(Result<T, (ViewError, fuser::Errno)>) -> Result<T, fuser::Errno>,
     ) -> Result<T, fuser::Errno> {
         let first = attempt();
+        // Repair-on-demand entry: observed-invalid bytes are named
+        // to the loop before anything else reads them again. The
+        // error then becomes `NotMaterialized` for the flow below so
+        // the reader waits on the fresh generation, not on doomed
+        // bytes. Without demand wiring there is no loop to repair
+        // through, so the rejection surfaces as EIO untouched — and
+        // nothing is submitted, so a miswired queue can never grow
+        // without a drain.
+        let first = match (&self.quarantine, &self.wants, &first) {
+            (
+                Some(quarantine),
+                Some(_),
+                Err((ViewError::RejectedRepresentation { content, kind }, errno)),
+            ) => {
+                quarantine.submit(VerificationFailure::content_hash_mismatch(*content, *kind));
+                Err((ViewError::NotMaterialized { content: *content }, *errno))
+            }
+            _ => first,
+        };
         if let (Some(registry), Err((ViewError::NotMaterialized { content }, _errno))) =
             (&self.wants, &first)
         {
             let wants = Arc::clone(registry);
+            let quarantine = self.quarantine.clone();
             // Success completes; terminal verdicts complete with
             // themselves (the final retry below surfaces them as
             // EIO) and note reopen demand, so a reader blocked
             // across the verdict still reopens the generation for
             // its retry. Corrupt notes nothing: its repair is
-            // quarantine's job, not rewant's. Any other failure
-            // keeps waiting: the fetch may still land before the
-            // deadline.
+            // quarantine's job, not rewant's — and a rejected
+            // representation observed mid-wait is reported and waited
+            // through: the drain clears the claim and the admitted
+            // want re-drives a fresh generation, while persistent
+            // bad providers terminate through strikes into a
+            // terminal Corrupt verdict, never through an unbounded
+            // quarantine loop. Any other failure keeps waiting: the
+            // fetch may still land before the deadline.
             let retry = || match attempt() {
                 Ok(_) => true,
                 Err((ViewError::Unavailable { content }, _)) => {
                     wants.note_reopen_demand(&content);
                     true
+                }
+                Err((ViewError::RejectedRepresentation { content, kind }, _)) => {
+                    if let Some(quarantine) = &quarantine {
+                        quarantine
+                            .submit(VerificationFailure::content_hash_mismatch(content, kind));
+                    }
+                    false
                 }
                 Err((ViewError::Corrupt, _)) => true,
                 Err(_) => false,

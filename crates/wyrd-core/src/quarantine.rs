@@ -138,9 +138,22 @@ impl QuarantineQueue {
     }
 
     /// Pending rejection count. Diagnostics only, never semantics.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.state.lock().map(|state| state.len()).unwrap_or(0)
+    }
+
+    /// No rejections pending. Diagnostics only, never semantics.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The pending rejections, oldest identity first. Diagnostics
+    /// and tests; the drain is the only consumer that removes.
+    pub fn pending(&self) -> Vec<VerificationFailure> {
+        self.state
+            .lock()
+            .map(|state| state.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 

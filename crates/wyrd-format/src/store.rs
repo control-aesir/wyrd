@@ -436,6 +436,17 @@ impl<E: StoreError> StoreError for SharedStoreError<E> {
             SharedStoreError::Lock => StoreFailure::Transient,
         }
     }
+
+    /// A backing-store verification failure carries through the
+    /// shared handle, so serving reads observe the same rejection
+    /// the store reported. A poisoned lock is never one: no content
+    /// is named for discard on a locking failure.
+    fn is_verification_failure(&self) -> bool {
+        match self {
+            SharedStoreError::Store(error) => error.is_verification_failure(),
+            SharedStoreError::Lock => false,
+        }
+    }
 }
 
 impl<S: ObjectStore> ObjectStore for SharedStore<S>
@@ -695,5 +706,19 @@ mod tests {
             barrier.wait();
         });
         assert!(shared.has(&id).unwrap());
+    }
+
+    /// The shared handle forwards the backing store's rejection
+    /// predicate: serving reads through `SharedStore` observe the
+    /// same verification failure the store reported. A poisoned
+    /// lock never forwards — no content is named for discard on a
+    /// locking failure.
+    #[test]
+    fn shared_store_forwards_verification_failures_only() {
+        use crate::fs_store::FsStoreError;
+        assert!(SharedStoreError::Store(FsStoreError::Corrupt).is_verification_failure());
+        assert!(!SharedStoreError::Store(FsStoreError::IdentityMismatch).is_verification_failure());
+        assert!(!SharedStoreError::Store(FsStoreError::Io("torn".into())).is_verification_failure());
+        assert!(!SharedStoreError::<FsStoreError>::Lock.is_verification_failure());
     }
 }

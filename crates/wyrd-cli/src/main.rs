@@ -863,13 +863,16 @@ fn mount(
     live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
-    let backend = FuseBackend::shared_with_wants(
+    // The quarantine channel rides along: readers submit observed
+    // verification failures for the loop's drain to repair.
+    let mut backend = FuseBackend::shared_with_wants(
         parts.projection,
         parts.wants,
         parts.mutations,
         parts.open_timeout,
         &parts.budgets,
     );
+    backend.set_quarantine(std::sync::Arc::clone(live.quarantine_queue()));
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity

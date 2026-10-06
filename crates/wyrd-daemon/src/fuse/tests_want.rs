@@ -10,6 +10,7 @@ use wyrd_fuse::DriveView;
 use wyrd_core::budgets::ResourceBudgets;
 use wyrd_core::mutation::MutationQueue;
 use wyrd_core::projection::Projection;
+use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
 use wyrd_core::want::WantRegistry;
 
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, SharedStore, Tree};
@@ -166,9 +167,12 @@ fn concurrent_reads_coalesce_into_one_want() {
 /// post-install loss (bytes gone out of band after the closure
 /// verified). In v0 that state is reachable only out of band — the
 /// install gate needs present trees, `status()` trusts the durable
-/// facts over the store, and no public API writes an `ObjectRemoved`
-/// fact — so the hostile-representation walk this blocks against is
-/// pinned at the plan level instead
+/// facts over the store, and the only public writer of an
+/// `ObjectRemoved` fact is quarantine's claim-clearing
+/// (`Engine::record_object_removed`, which fires on observed
+/// verification failure, never on absence) — so the
+/// hostile-representation walk this blocks against is pinned at the
+/// plan level instead
 /// (`corrupt_and_absent_tree_representations_commit_nothing` in
 /// `wyrd-sync`), and this test pins the boundary half: blocking,
 /// bounded `EIO`, registry hygiene, re-registration.
@@ -429,4 +433,70 @@ fn terminal_backend(
         &budgets,
     );
     (backend, registry, polls, chunk)
+}
+
+/// A read that observes verification-rejected bytes reports the
+/// identity to the quarantine channel and fails bounded `EIO` (no
+/// loop heals in this harness, so the waiter times out): the report
+/// half and the boundary errno. A second read re-reports without
+/// duplicating — the queue carries one entry per identity no matter
+/// how many reads saw it.
+#[test]
+fn rejected_read_reports_to_quarantine_and_fails_eio() {
+    use wyrd_format::FsObjectStore;
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-daemon-quarantine-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scratch = FsObjectStore::open(dir.join("store")).unwrap();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
+    let root = Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut scratch)
+        .unwrap();
+    // Bitrot under the live name, at the documented layout.
+    let hex = chunk.to_string();
+    std::fs::write(
+        dir.join("store")
+            .join("objects")
+            .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+            .join(&hex[..2])
+            .join(&hex[2..]),
+        b"tampered",
+    )
+    .unwrap();
+    let store = Arc::new(RwLock::new(scratch));
+    let view = DriveView::new(
+        SharedStore::from(Arc::clone(&store)),
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    );
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
+        Arc::new(WantRegistry::default()),
+        Arc::new(MutationQueue::default()),
+        Duration::from_millis(200),
+        &ResourceBudgets::default(),
+    );
+    let quarantine = Arc::new(QuarantineQueue::default());
+    backend.set_quarantine(Arc::clone(&quarantine));
+
+    let handle = backend.open_at("f.txt").unwrap();
+    assert_eq!(backend.read_handle(handle, 0, 8), Err(fuser::Errno::EIO));
+    assert_eq!(
+        quarantine.pending(),
+        vec![VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk
+        )],
+        "the rejection names the chunk for the loop's drain"
+    );
+    // The waiter polls again before any drain runs: still one entry.
+    assert_eq!(backend.read_handle(handle, 0, 8), Err(fuser::Errno::EIO));
+    assert_eq!(quarantine.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
 }

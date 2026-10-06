@@ -15,7 +15,7 @@ use wyrd_format::{
 };
 
 use super::codec::DecodedFact;
-use super::DurableError;
+use super::{DurableError, ReconciliationEvidence, ReconciliationView};
 use crate::control::{ControlMessageId, SnapshotAnnouncement};
 use crate::keys::capability::Capability;
 use crate::keys::capability::DriveKeyring;
@@ -84,10 +84,33 @@ pub struct LoadedFacts {
     )>,
     pub capability_delivered: Vec<(u64, DeviceId)>,
     pub bootstrap_pending: Vec<Vec<u8>>,
+    /// Stated reconciliation views, in commit order. Statements about
+    /// the base facts, not base facts: derivation
+    /// ([`ReconciliationView`](super::ReconciliationView)) ignores
+    /// this bucket, so stating a view never changes the derived view.
+    pub reconciliation_views: Vec<ReconciliationEvidence>,
+    /// Statements load dropped: committed but not a per-class subset
+    /// of the tip derivation, so refused as evidence and never
+    /// replayed. The programmatic signal for a refused statement —
+    /// without it, an older statement and a dropped one are
+    /// indistinguishable to 21b, which would silently under-claim
+    /// forever. The log names the digests; this names the count.
+    pub dropped_reconciliation_views: usize,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
 impl LoadedFacts {
+    /// The latest stated reconciliation view, if any statement was
+    /// committed. The single place that mints durable provenance:
+    /// the evidence comes from the replayed bucket, never from a
+    /// caller, so retirement weight cannot be constructed around the
+    /// commit protocol.
+    pub fn latest_stated_view(&self) -> Option<ReconciliationView> {
+        self.reconciliation_views
+            .last()
+            .map(|evidence| ReconciliationView::from_replayed(evidence.clone()))
+    }
+
     pub(super) fn push(&mut self, fact: DecodedFact) {
         match fact {
             DecodedFact::Transition(t) => self.transitions.push(t),
@@ -210,6 +233,12 @@ impl LoadedFacts {
             }
             DecodedFact::CarryDone(head) => {
                 self.runtime_facts.push(RuntimeFact::CarryDone(head));
+            }
+            DecodedFact::ReconciliationView(view) => {
+                // No RuntimeFact: stating the view changes no runtime
+                // state. The bucket preserves commit order, so the
+                // latest statement is last.
+                self.reconciliation_views.push(view);
             }
         }
     }

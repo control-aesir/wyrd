@@ -88,9 +88,12 @@
 //!
 //! Children: [`store`] owns lifecycle and the crash-safe commit
 //! protocol; [`codec`] owns the commit envelope and fact records;
-//! [`replay`] owns loaded facts and state reconstruction. The stable
-//! boundary re-exported here is [`DurableStore`], [`Fact`],
-//! [`LoadedFacts`], [`Rebuilt`], and [`DurableError`]; the codec stays
+//! [`replay`] owns loaded facts and state reconstruction;
+//! [`reconciliation`] owns the recipient's reconciliation view over
+//! those facts. The stable boundary re-exported here is
+//! [`DurableStore`], [`Fact`], [`LoadedFacts`], [`Rebuilt`],
+//! [`ReconciliationEvidence`], [`ReconciliationView`], and
+//! [`DurableError`]; the codec stays
 //! private until a second persistence backend exists.
 //!
 //! [`MembershipLog`]: crate::membership::MembershipLog
@@ -99,13 +102,18 @@
 //! [`store`]: mod@store
 //! [`codec`]: mod@codec
 //! [`replay`]: mod@replay
+//! [`reconciliation`]: mod@reconciliation
 
 mod codec;
+mod reconciliation;
 mod replay;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use reconciliation::{
+    ReconciliationError, ReconciliationEvidence, ReconciliationView, ViewProvenance,
+};
 pub(crate) use replay::build_keyring;
 pub use replay::{LoadedFacts, Rebuilt};
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
@@ -187,6 +195,18 @@ pub enum DurableError {
         "commit of {bytes} bytes exceeds the per-commit ceiling of {max} bytes; split the batch and retry"
     )]
     CommitTooLarge { bytes: u64, max: u64 },
+    /// One reconciliation-view section holds more entries than load
+    /// accepts (`MAX_RECORDS_PER_COMMIT`): refused before writing, so
+    /// the store never advances CURRENT onto a view no reopen could
+    /// read. State a narrower view (21b chunks statements) and retry.
+    #[error(
+        "reconciliation view {section} section of {count} entries exceeds the per-section ceiling of {max} entries; state a narrower view and retry"
+    )]
+    OversizedView {
+        section: &'static str,
+        count: usize,
+        max: usize,
+    },
 }
 
 // --- facts -----------------------------------------------------------------
@@ -432,4 +452,17 @@ pub enum Fact {
     /// every fact — pending is derived as queued-minus-done, never by
     /// deletion.
     CarryDone(SnapshotId),
+    /// A stated reconciliation view: the recipient's per-class
+    /// durable evidence (committed transitions, held snapshots,
+    /// installed capability epochs) as the recipient saw it. A
+    /// statement about durable state, not a message receipt — this is
+    /// the fact the recipient's reconciliation statement (21b) is the
+    /// transport representation of, and what the sender's set
+    /// difference (21c) compares against. Committing it changes
+    /// nothing derivable: [`ReconciliationView`] derives from the
+    /// base facts, so a stated view never feeds its own derivation.
+    /// A statement that over-claims — not a per-class subset of the
+    /// base facts — is dropped at load with a warning, never
+    /// replayed: the claim fails closed while the store stays open.
+    ReconciliationView(ReconciliationEvidence),
 }

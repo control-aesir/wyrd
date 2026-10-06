@@ -9,7 +9,8 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use wyrd_format::{DeviceId, DriveId};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -19,7 +20,7 @@ use super::codec::{
     STORE_KEY_AAD,
 };
 use super::replay::{self, LoadedFacts, Rebuilt};
-use super::{DurableError, Fact};
+use super::{DurableError, Fact, ReconciliationView};
 use crate::keys::keystore::{kdf_key, KeystoreError, KDF_SALT_LEN};
 use crate::keys::{aead, random_bytes};
 
@@ -72,11 +73,34 @@ pub struct DurableStore {
     /// tests prove one snapshot per pass instead of one per pair.
     #[cfg(test)]
     rebuilds: AtomicU64,
+    /// First-seen latch for the over-claim warning in `load`: the
+    /// bucket is rebuilt from disk on every call and `load` sits
+    /// behind the convergence loop, so the first dropped statement
+    /// warns loudly once and later loads debug. Per-handle, not
+    /// per-record: a second distinct over-claim on the same handle
+    /// is counted but only ever debug-logged — the latch cannot tell
+    /// "same record again" from "new bad record". Reopening resets
+    /// it, which is the behaviour a daemon restart wants.
+    overclaim_warned: AtomicBool,
 }
 
 /// Crate-visible for the raw-commit test seam alongside `atomic_write`.
 pub(crate) fn commit_name(seq: u64) -> String {
     format!("{seq:016x}.commit")
+}
+
+/// Hex for log lines that must name an identity (digests have no
+/// Display; decimal byte lists are not diagnosable). One pass, one
+/// allocation — this runs on the warn path, but there is no reason
+/// to format per byte.
+fn hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    out
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
@@ -315,6 +339,7 @@ impl DurableStore {
             _lock: lock,
             #[cfg(test)]
             rebuilds: AtomicU64::new(0),
+            overclaim_warned: AtomicBool::new(false),
         })
     }
 
@@ -582,6 +607,60 @@ impl DurableStore {
         }
         if prev_hash != tip_hash {
             return Err(DurableError::CorruptCurrent);
+        }
+        // Over-claims are dropped, never loaded: a stated view that
+        // is not a per-class subset of the committed base facts
+        // claims evidence the store does not hold, so it is refused
+        // as *evidence* — it never reaches the bucket, and the retire
+        // gate cannot see it — while the store itself stays open.
+        // Failing the load here would let one public commit brick the
+        // store, with load() as the root of rebuild()/resync() and no
+        // repair path; this fails the claim closed instead. Base
+        // facts only accumulate (append-only, no GC), so an honestly
+        // stated view is always a subset of the tip derivation — the
+        // drop only fires on statements no honest writer produces.
+        // Nothing stated yet is the common case (no production writer
+        // in 21a): skip the derivation entirely.
+        if facts.reconciliation_views.is_empty() {
+            return Ok(facts);
+        }
+        let derived = ReconciliationView::derive(&facts);
+        let views = std::mem::take(&mut facts.reconciliation_views);
+        // Eager digests, freed views: a dropped statement's identity
+        // is 32 bytes, not its evidence sets. Retaining the views
+        // until load returns would peak at k× evidence size for k bad
+        // records on every convergence-loop iteration; the count and
+        // the first-seen digests below are all any caller needs.
+        let mut dropped = 0usize;
+        let mut dropped_ids = Vec::new();
+        let latch_open = !self.overclaim_warned.load(Ordering::SeqCst);
+        for view in views {
+            if view.is_subset_of(derived.evidence()) {
+                facts.reconciliation_views.push(view);
+            } else {
+                dropped += 1;
+                if latch_open {
+                    dropped_ids.push(hex32(&view.digest()));
+                }
+            }
+        }
+        facts.dropped_reconciliation_views = dropped;
+        // First-seen latch: the same record re-decodes on every load
+        // behind the convergence loop, so the first drop warns and
+        // later loads debug with a count and no identity.
+        if dropped > 0 {
+            if self.overclaim_warned.swap(true, Ordering::SeqCst) {
+                tracing::debug!(
+                    dropped,
+                    "overstated reconciliation views dropped again (first occurrence warned)"
+                );
+            } else {
+                tracing::warn!(
+                    dropped,
+                    statements = ?dropped_ids,
+                    "dropped overstated reconciliation views: claimed evidence the base facts do not hold"
+                );
+            }
         }
         Ok(facts)
     }

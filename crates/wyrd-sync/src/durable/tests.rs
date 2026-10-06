@@ -2,7 +2,8 @@ use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
     AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, CrashStage, DurableError, Fact,
-    SealedCapabilityFactId,
+    LoadedFacts, ReconciliationError, ReconciliationEvidence, ReconciliationView,
+    SealedCapabilityFactId, ViewProvenance,
 };
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
@@ -288,9 +289,11 @@ fn the_replacement_tag_is_a_clean_upgrade_boundary() {
     // Every tag that predates the replacement, as enumerated by the
     // codec. `0x16` must be outside it — including `0x13`, which is
     // `BootstrapPending` and which a careless allocator would reuse.
+    // `0x17` postdates the replacement but is enumerated too, so a
+    // later allocator reusing it breaks here as well.
     let pre_replacement_tags = [
         0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x17,
     ];
     assert!(
         !pre_replacement_tags.contains(&TAG_CAPABILITY_SEALED_REPLACED),
@@ -1598,6 +1601,555 @@ fn commit_fit_boundaries_match_the_load_ceilings() {
     };
     assert_eq!(bytes, MAX_COMMIT_BYTES as usize as u64 + 1);
     assert_eq!(max, MAX_COMMIT_BYTES);
+}
+
+// --- reconciliation view (21a) -------------------------------------------------
+
+/// Base facts with one fact of every evidence class: two transitions,
+/// an announcement plus its body, and an epoch-1..2 capability.
+fn evidence_base() -> Vec<Fact> {
+    let (genesis, child) = chain();
+    let mut log = MembershipLog::new(drive());
+    log.observe(genesis.clone());
+    vec![
+        Fact::Transition(genesis.clone()),
+        Fact::Transition(child.clone()),
+        Fact::Announcement(announcement(&child)),
+        Fact::SnapshotBody(authorized_snapshot_body()),
+        Fact::Capability(authorized_capability(&genesis, &log)),
+    ]
+}
+
+/// The stated view replays: commit the derived view, reopen, and the
+/// bucket holds exactly it while derivation over all facts is
+/// identical — stating the view changed nothing derivable.
+#[test]
+fn reconciliation_view_replays_to_the_same_view() {
+    let dir = TestDir::new("reconciliation-view");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let expected = ReconciliationView::derive(&store.load().unwrap());
+    assert!(
+        !expected.evidence().transitions.is_empty()
+            && !expected.evidence().snapshots.is_empty()
+            && !expected.evidence().capabilities.is_empty(),
+        "the base covers every evidence class: {:?}",
+        expected.evidence()
+    );
+    store
+        .commit(&[Fact::ReconciliationView(expected.evidence().clone())])
+        .unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![expected.evidence().clone()],
+        "the stated view replays verbatim"
+    );
+    assert_eq!(
+        ReconciliationView::derive(&loaded).evidence(),
+        expected.evidence(),
+        "derivation is stable across stating the view"
+    );
+    assert_eq!(
+        loaded.dropped_reconciliation_views, 0,
+        "an honest statement is never dropped"
+    );
+}
+
+/// A torn view commit leaves the previous view, never a partial one:
+/// commit 3 carries a new announcement plus the view derived with it,
+/// so every pre-complete stage must reload to the commit-2 view and
+/// only `Complete` may advance to the new one.
+#[test]
+fn reconciliation_view_survives_every_crash_stage() {
+    let (_, child) = chain();
+    let second = SnapshotAnnouncement {
+        snapshot: SnapshotId::from_bytes([2; 32]),
+        ..announcement(&child)
+    };
+    for stage in ALL_STAGES {
+        let dir = TestDir::new("reconciliation-crash");
+        let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+        store.commit(&evidence_base()).unwrap();
+        let previous = ReconciliationView::derive(&store.load().unwrap());
+        store
+            .commit(&[Fact::ReconciliationView(previous.evidence().clone())])
+            .unwrap();
+        // Commit 3 widens the evidence (a second held snapshot) and
+        // states the widened view alongside it.
+        let widened = {
+            let mut evidence = previous.evidence().clone();
+            evidence.snapshots.insert(second.snapshot);
+            evidence
+        };
+        store
+            .commit_until(
+                &[
+                    Fact::Announcement(second.clone()),
+                    Fact::ReconciliationView(widened.clone()),
+                ],
+                stage,
+            )
+            .unwrap();
+        drop(store);
+        let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+        let derived = ReconciliationView::derive(&store.load().unwrap());
+        // AfterRenameCurrent already renamed both the commit file and
+        // CURRENT — only the final directory fsync is missing — so the
+        // commit is fully committed, not torn.
+        let expected = if stage == CrashStage::Complete || stage == CrashStage::AfterRenameCurrent {
+            &widened
+        } else {
+            previous.evidence()
+        };
+        assert_eq!(
+            derived.evidence(),
+            expected,
+            "stage {stage:?} reloads to the previous or the fully committed view"
+        );
+    }
+}
+
+/// The obligation invariant as a negative test: retirement on an
+/// in-memory-only view is refused, and only a view that survived a
+/// commit/reopen cycle carries retirement weight.
+#[test]
+fn reconciliation_retire_requires_a_durable_fact() {
+    let dir = TestDir::new("reconciliation-retire-gate");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let memory = ReconciliationView::derive(&store.load().unwrap());
+    assert_eq!(memory.provenance(), ViewProvenance::Memory);
+    assert_eq!(
+        memory.check_retire_eligible(),
+        Err(ReconciliationError::InMemoryView),
+        "a live projection retires nothing"
+    );
+    // The same evidence stated durably passes — through a reopen, so
+    // the weight comes from the commit, not the constructor. There
+    // is no other path to durable provenance: `latest_stated_view`
+    // is the single minter, fed only by the replayed bucket.
+    store
+        .commit(&[Fact::ReconciliationView(memory.evidence().clone())])
+        .unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    let stated = loaded
+        .latest_stated_view()
+        .expect("the stated view replayed");
+    assert_eq!(stated.provenance(), ViewProvenance::Durable);
+    assert_eq!(stated.evidence(), memory.evidence());
+    assert!(
+        stated.check_retire_eligible().is_ok(),
+        "a committed view is evidence"
+    );
+}
+
+/// The new tag flows through the same commit ceilings: a full batch
+/// of view facts commits and replays, one record over refuses before
+/// writing.
+#[test]
+fn commit_fit_boundaries_still_hold_for_reconciliation_facts() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    let dir = TestDir::new("reconciliation-fit");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let empty = ReconciliationView::derive(&LoadedFacts::default());
+    assert_eq!(empty.provenance(), ViewProvenance::Memory);
+    let batch: Vec<Fact> = (0..MAX_RECORDS_PER_COMMIT)
+        .map(|_| Fact::ReconciliationView(empty.evidence().clone()))
+        .collect();
+    store.commit(&batch).unwrap();
+    assert_eq!(store.current(), 1);
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views.len(),
+        MAX_RECORDS_PER_COMMIT,
+        "a full batch of view facts replays"
+    );
+    drop(store);
+
+    let dir = TestDir::new("reconciliation-fit-over");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let over: Vec<Fact> = (0..MAX_RECORDS_PER_COMMIT + 1)
+        .map(|_| Fact::ReconciliationView(empty.evidence().clone()))
+        .collect();
+    assert!(matches!(
+        store.commit(&over),
+        Err(DurableError::TooManyRecords { .. })
+    ));
+    assert_eq!(store.current(), 0, "the rejected batch advances nothing");
+}
+
+/// An over-claim is dropped, never loaded: committing a statement
+/// naming a transition the base facts never committed must not brick
+/// the store. The claim fails closed (it never reaches the bucket,
+/// so the retire gate cannot see it) while the store stays open —
+/// through the public commit path, which is the hazard: no raw seam
+/// is needed to write what load must then survive.
+#[test]
+fn reconciliation_over_claim_is_dropped_not_loaded() {
+    let dir = TestDir::new("reconciliation-overclaim");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    // Honest subset first: the derived view commits and loads.
+    let honest = ReconciliationView::derive(&store.load().unwrap());
+    store
+        .commit(&[Fact::ReconciliationView(honest.evidence().clone())])
+        .unwrap();
+    assert_eq!(store.current(), 2);
+    // The over-claim goes through the same public commit a buggy or
+    // hostile writer would use: it commits (the store takes the
+    // bytes), and the reopen drops it.
+    let mut over = honest.evidence().clone();
+    over.transitions
+        .insert(TransitionId::from_bytes([0xFF; 32]));
+    assert!(
+        !over.is_subset_of(honest.evidence()),
+        "the fixture really over-claims"
+    );
+    store.commit(&[Fact::ReconciliationView(over)]).unwrap();
+    assert_eq!(store.current(), 3);
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![honest.evidence().clone()],
+        "the honest statement replays; the over-claim never reaches the bucket"
+    );
+    assert_eq!(
+        loaded.dropped_reconciliation_views, 1,
+        "the drop is visible to callers, so 21b can account for the refused statement"
+    );
+    // A second load replays identically: the drop is stable, not a
+    // first-open accident, and the latch (warn once) has nothing new
+    // to say about it.
+    let reloaded = store.load().unwrap();
+    assert_eq!(
+        reloaded.reconciliation_views, loaded.reconciliation_views,
+        "repeated loads replay the same bucket"
+    );
+    assert_eq!(
+        reloaded.dropped_reconciliation_views, 1,
+        "and the same drop count"
+    );
+    // The latch scope, pinned: a second *distinct* over-claim on the
+    // same handle is counted but only ever debug-logged — the latch
+    // fired on the first load above, so this load takes the post-latch
+    // arm (no reopen: reopening would reset the latch and re-warn).
+    // The bucket still holds just the honest statement, and the count
+    // grows.
+    let mut store = store;
+    let mut second_over = honest.evidence().clone();
+    second_over
+        .snapshots
+        .insert(SnapshotId::from_bytes([0xFE; 32]));
+    assert!(
+        !second_over.is_subset_of(honest.evidence()),
+        "the second fixture over-claims differently"
+    );
+    store
+        .commit(&[Fact::ReconciliationView(second_over)])
+        .unwrap();
+    let twice = store.load().unwrap();
+    assert_eq!(
+        twice.reconciliation_views,
+        vec![honest.evidence().clone()],
+        "both over-claims stay out of the bucket"
+    );
+    assert_eq!(
+        twice.dropped_reconciliation_views, 2,
+        "the count covers every refused statement, first warn or not"
+    );
+    assert_eq!(
+        twice
+            .latest_stated_view()
+            .expect("a view was stated")
+            .evidence(),
+        honest.evidence(),
+        "retire weight survives both drops"
+    );
+}
+
+/// A stated view survives a derive that later grows: base facts only
+/// accumulate, so a statement that was a subset when committed stays
+/// a subset at every later tip — history never invalidates evidence.
+#[test]
+fn reconciliation_stated_view_survives_widened_derive() {
+    let (_, child) = chain();
+    let dir = TestDir::new("reconciliation-widen");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let stated = ReconciliationView::derive(&store.load().unwrap());
+    store
+        .commit(&[Fact::ReconciliationView(stated.evidence().clone())])
+        .unwrap();
+    // The evidence widens after the statement: a second held
+    // snapshot lands with no new statement alongside it.
+    let second = SnapshotAnnouncement {
+        snapshot: SnapshotId::from_bytes([2; 32]),
+        ..announcement(&child)
+    };
+    store.commit(&[Fact::Announcement(second.clone())]).unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![stated.evidence().clone()],
+        "the earlier statement replays under the wider derive"
+    );
+    let widened = ReconciliationView::derive(&loaded);
+    assert!(
+        stated.evidence().is_subset_of(widened.evidence()),
+        "the statement stays conservative as history grows"
+    );
+    assert!(
+        widened.evidence().snapshots.contains(&second.snapshot),
+        "and the derive really did widen"
+    );
+}
+
+/// The `0x18` record layout, byte for byte: u32 LE transition count
+/// ‖ 32 bytes each ‖ u32 LE snapshot count ‖ 32 bytes each ‖ u32 LE
+/// capability count ‖ (device 32 ‖ epoch u64 LE) each. The tag and
+/// the field order are the upgrade boundary old readers skip over,
+/// so both are pinned here rather than left to the round-trip.
+#[test]
+fn reconciliation_record_layout_is_byte_exact() {
+    use super::codec::{encode_reconciliation_view, TAG_RECONCILIATION_VIEW};
+    use crate::durable::codec::encode_fact;
+    let mut evidence = ReconciliationEvidence::default();
+    evidence
+        .transitions
+        .insert(TransitionId::from_bytes([0x01; 32]));
+    evidence
+        .snapshots
+        .insert(SnapshotId::from_bytes([0x02; 32]));
+    evidence
+        .capabilities
+        .insert((DeviceId::from_bytes([0x03; 32]), 7));
+    let (tag, bytes) = encode_fact(&[0u8; 32], &drive(), &Fact::ReconciliationView(evidence))
+        .expect("a bounded view encodes");
+    assert_eq!(
+        tag, TAG_RECONCILIATION_VIEW,
+        "the record carries the view tag"
+    );
+    assert_eq!(
+        tag, 0x18,
+        "the tag is pinned: a different value is a different format"
+    );
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&[0x01; 32]);
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&[0x02; 32]);
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&[0x03; 32]);
+    expected.extend_from_slice(&7u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(
+        encode_reconciliation_view(&ReconciliationEvidence::default()).unwrap(),
+        vec![0u8; 12],
+        "the empty view is three zero counts"
+    );
+}
+
+/// A truncated or overlong `0x18` record poisons the commit: inside
+/// the committed prefix there is no ignorable view.
+#[test]
+fn reconciliation_malformed_record_poisons_the_commit() {
+    use super::codec::{encode_reconciliation_view, TAG_RECONCILIATION_VIEW};
+    let dir = TestDir::new("reconciliation-malformed");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let tip = store.tip_hash_for_test();
+    let mut evidence = ReconciliationEvidence::default();
+    evidence
+        .transitions
+        .insert(TransitionId::from_bytes([0x01; 32]));
+    let mut record = encode_reconciliation_view(&evidence).unwrap();
+    record.pop().expect("the record is non-empty");
+    let (tagged, hash) = encode_commit(&drive(), 2, &tip, &[(TAG_RECONCILIATION_VIEW, record)]);
+    fs::write(dir.path.join("commits").join(commit_name(2)), &tagged).unwrap();
+    let mut current = 2u64.to_le_bytes().to_vec();
+    current.extend_from_slice(&hash);
+    atomic_write(&dir.path, "CURRENT", &current).unwrap();
+    assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
+}
+
+/// Section ceilings are symmetric: the encoder refuses a section
+/// larger than any reopen could read, and the decoder refuses a
+/// count no honest encoder could have written — so a tampered local
+/// commit cannot force unbounded allocation before the trailer hash
+/// is verified.
+#[test]
+fn reconciliation_section_ceilings_hold_both_sides() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    use crate::durable::codec::encode_fact;
+    let mut huge = ReconciliationEvidence::default();
+    for n in 0..MAX_RECORDS_PER_COMMIT + 1 {
+        huge.transitions
+            .insert(TransitionId::from_bytes(id_of(n as u64)));
+    }
+    let error = encode_fact(&[0u8; 32], &drive(), &Fact::ReconciliationView(huge)).unwrap_err();
+    assert!(
+        matches!(error, DurableError::OversizedView { .. }),
+        "the encoder refuses before writing: {error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "reconciliation view transitions section of 65537 entries exceeds the per-section ceiling of 65536 entries; state a narrower view and retry"
+    );
+    // The decode twin: a count no honest encoder wrote poisons the
+    // file instead of allocating for it.
+    let dir = TestDir::new("reconciliation-ceiling");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let tip = store.tip_hash_for_test();
+    let mut record = Vec::new();
+    record.extend_from_slice(&(MAX_RECORDS_PER_COMMIT as u32 + 1).to_le_bytes());
+    let (tagged, hash) = encode_commit(&drive(), 2, &tip, &[(0x18, record)]);
+    fs::write(dir.path.join("commits").join(commit_name(2)), &tagged).unwrap();
+    let mut current = 2u64.to_le_bytes().to_vec();
+    current.extend_from_slice(&hash);
+    atomic_write(&dir.path, "CURRENT", &current).unwrap();
+    assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
+}
+
+/// The stated-view digest, pinned to a known answer:
+/// `BLAKE3-derive-key("wyrd reconciliation view v1", canonical
+/// record bytes)`. A context-string edit or a field reorder silently
+/// re-identifies every stored statement, so the renaming breaks here
+/// instead — the same guarantee the supersession identity pins for
+/// `0x16`.
+#[test]
+fn reconciliation_digest_matches_known_answer() {
+    let mut evidence = ReconciliationEvidence::default();
+    evidence
+        .transitions
+        .insert(TransitionId::from_bytes([0x01; 32]));
+    evidence
+        .snapshots
+        .insert(SnapshotId::from_bytes([0x02; 32]));
+    evidence
+        .capabilities
+        .insert((DeviceId::from_bytes([0x03; 32]), 7));
+    assert_eq!(
+        evidence.digest(),
+        unhex::<32>("2ab65d52ed603f1630bd58814ae1d1969f8870ab23353686ff08d05d90134d42")
+    );
+    // Any evidence bit changes the identity.
+    let mut other = evidence.clone();
+    other.snapshots.insert(SnapshotId::from_bytes([0x04; 32]));
+    assert_ne!(other.digest(), evidence.digest());
+}
+
+/// Hashing holds past the commit ceiling: the digest hashes the
+/// canonical bytes, never the ceiling-checked record, so evidence no
+/// single commit may state still identifies.
+#[test]
+fn reconciliation_digest_holds_above_the_section_ceiling() {
+    use super::codec::MAX_RECORDS_PER_COMMIT;
+    let mut huge = ReconciliationEvidence::default();
+    for n in 0..MAX_RECORDS_PER_COMMIT + 1 {
+        huge.transitions
+            .insert(TransitionId::from_bytes(id_of(n as u64)));
+    }
+    let digest = huge.digest();
+    let mut smaller = huge.clone();
+    smaller
+        .transitions
+        .remove(&TransitionId::from_bytes(id_of(0)));
+    assert_ne!(
+        smaller.digest(),
+        digest,
+        "even above the ceiling, distinct evidence digests distinctly"
+    );
+}
+
+fn id_of(n: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0..8].copy_from_slice(&n.to_le_bytes());
+    id
+}
+
+/// A populated view counts bytes toward the commit like any record:
+/// the realistic ceiling for a stated view is the byte bound, not
+/// the record bound.
+#[test]
+fn populated_reconciliation_view_counts_bytes_toward_the_commit() {
+    let dir = TestDir::new("reconciliation-bytes");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    // The stated evidence must be committed base facts (an over-claim
+    // fails the load), so the population is announced first.
+    let (_, child) = chain();
+    let base: Vec<Fact> = (0..4096u32)
+        .map(|n| {
+            let mut id = [0xA0; 32];
+            id[0..4].copy_from_slice(&n.to_le_bytes());
+            Fact::Announcement(SnapshotAnnouncement {
+                snapshot: SnapshotId::from_bytes(id),
+                ..announcement(&child)
+            })
+        })
+        .collect();
+    store.commit(&base).unwrap();
+    let derived = ReconciliationView::derive(&store.load().unwrap());
+    assert_eq!(
+        derived.evidence().snapshots.len(),
+        4096,
+        "the announcements are the population"
+    );
+    store
+        .commit(&[Fact::ReconciliationView(derived.evidence().clone())])
+        .unwrap();
+    let size = fs::metadata(dir.path.join("commits").join(commit_name(2)))
+        .unwrap()
+        .len();
+    assert!(
+        size > 130_000,
+        "a populated view's bytes land in the commit file: {size}"
+    );
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.reconciliation_views,
+        vec![derived.evidence().clone()],
+        "a populated view replays verbatim"
+    );
+}
+
+/// The view tag is a clean upgrade boundary: `0x18` sits outside the
+/// enumerated pre-view set, and the tag table holds no duplicates —
+/// a duplicate compiles and misdecodes, the exact hazard the `0x16`
+/// boundary test cites.
+#[test]
+fn reconciliation_tag_is_a_clean_upgrade_boundary() {
+    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_VIEW};
+    let pre_view_tags = [
+        0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    ];
+    assert!(
+        !pre_view_tags.contains(&TAG_RECONCILIATION_VIEW),
+        "the view tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_RECONCILIATION_VIEW, 0x18,
+        "the tag is pinned: a different value is a different format"
+    );
+    let mut sorted = KNOWN_TAGS.to_vec();
+    sorted.sort_unstable();
+    let len = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        len,
+        "a duplicate tag decodes as the wrong fact"
+    );
 }
 
 // --- custody file modes ------------------------------------------------------

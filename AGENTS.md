@@ -86,6 +86,9 @@ Lima for macOS dev iteration and as the refactor guard.)
 - `--step` takes a comma list and runs the prefix closure (steps build on
   each other): `--step 4` runs steps 1–4, `--step 4,6` runs 1–6. An empty
   entry or a non-step is refused; an empty value means all steps.
+- The wrapper verifies the guest share serves this checkout before building
+  and refuses on a stale share (worktree switches orphan it). Rerun with
+  `--re-share` to re-point the instance at the current checkout instead.
 - **A repeated `FAIL:` line is a stop, not patience.** The harness exits on
   the first failed check, so two identical polls mean the run is over —
   read the log, pull the failing mount's stderr out of the guest

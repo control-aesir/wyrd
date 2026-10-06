@@ -3,8 +3,14 @@
 # in the guest script (tests/alpha-lima.sh); this only moves the binary
 # into the guest and starts it.
 #
-# Usage: ./lima/run-alpha.sh [--keep] [--step N[,N...]]
+# Usage: ./lima/run-alpha.sh [--keep] [--re-share] [--step N[,N...]]
 #   --keep   leave the instance running afterwards for debugging
+#   --re-share
+#            the guest share is stamped with the checkout path at instance
+#            creation; after switching worktrees it serves the old checkout
+#            (or a deleted one). With --re-share the wrapper re-points the
+#            instance at this checkout and restarts it instead of refusing.
+#            Without it a stale share is a hard stop (see below).
 #   --step   run guest-script steps 1..N (comma lists allowed; the run
 #            is the prefix closure, since steps build on each other)
 #
@@ -13,10 +19,12 @@
 set -euo pipefail
 
 KEEP=0
+RESHARE=0
 ONLY_STEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1; shift ;;
+    --re-share) RESHARE=1; shift ;;
     --step)
       # An explicit but empty value is a mistake, not "all steps".
       [[ -n "${2:-}" ]] || { echo "error: --step needs at least one step" >&2; exit 2; }
@@ -98,6 +106,53 @@ if ! limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]].*Running"; then
     sed "s|/path/to/wyrd-checkout|$ROOT_SED|" "$ROOT/lima/wyrd-alpha.yaml" \
       > "$SHARE/wyrd-alpha.rendered.yaml"
     limactl start --name="$INSTANCE" "$SHARE/wyrd-alpha.rendered.yaml"
+  fi
+fi
+
+# The guest share is stamped with the checkout path at creation time, so a
+# run from a different worktree would silently test the wrong code (or fail
+# obscurely off a deleted checkout). Refuse before building anything. The
+# identity is the .git pointer for linked worktrees (whose .git is a file
+# naming the host git dir, unreadable as a repo from the guest) and HEAD
+# for full checkouts; either way one short call per side settles it.
+share_id() {
+  if [[ -f "$1/.git" ]]; then
+    tr -d '\n' < "$1/.git"
+  else
+    git -C "$1" rev-parse HEAD
+  fi
+}
+HOST_SHARE_ID="$(share_id "$ROOT")"
+GUEST_SHARE_ID="$(limactl shell "$INSTANCE" -- bash -c 'if [[ -f /mnt/wyrd/.git ]]; then tr -d "\n" < /mnt/wyrd/.git; else git -C /mnt/wyrd rev-parse HEAD; fi' 2>/dev/null || true)"
+if [[ "$GUEST_SHARE_ID" != "$HOST_SHARE_ID" ]]; then
+  if [[ $RESHARE -eq 1 ]]; then
+    echo "==> guest share is stale (guest ${GUEST_SHARE_ID:-unreadable}, host $HOST_SHARE_ID); re-pointing $INSTANCE at $ROOT"
+    # The instance config lives next to the instance, not next to the
+    # template: edit the stamped copy while stopped, then start. Only the
+    # /mnt/wyrd mount moves; image locations and the scratch share stay.
+    LIMA_YAML="${LIMA_HOME:-$HOME/.lima}/$INSTANCE/lima.yaml"
+    limactl stop "$INSTANCE"
+    WYRD_ROOT="$ROOT" python3 - "$LIMA_YAML" <<'EOF'
+import json, os, sys
+path = sys.argv[1]
+root = os.environ["WYRD_ROOT"]
+lines = open(path).read().split("\n")
+for i, line in enumerate(lines):
+    if line.strip().startswith("- location:") and 'mountPoint: "/mnt/wyrd"' in lines[i + 1]:
+        indent = line[: line.index("- location:")]
+        lines[i] = indent + "- location: " + json.dumps(root)
+        break
+else:
+    sys.exit("no /mnt/wyrd mount found in " + path)
+open(path, "w").write("\n".join(lines))
+EOF
+    limactl start "$INSTANCE"
+    GUEST_SHARE_ID="$(limactl shell "$INSTANCE" -- bash -c 'if [[ -f /mnt/wyrd/.git ]]; then tr -d "\n" < /mnt/wyrd/.git; else git -C /mnt/wyrd rev-parse HEAD; fi' 2>/dev/null || true)"
+  fi
+  if [[ "$GUEST_SHARE_ID" != "$HOST_SHARE_ID" ]]; then
+    echo "error: guest share is stale (guest ${GUEST_SHARE_ID:-unreadable}, host $HOST_SHARE_ID)" >&2
+    echo "  recreate the instance, or rerun with --re-share to re-point it at this checkout" >&2
+    exit 2
   fi
 fi
 

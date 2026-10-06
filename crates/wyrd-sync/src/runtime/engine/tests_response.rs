@@ -1253,7 +1253,63 @@ fn covered_includes_reconciled() {
     assert!(runtime.capability_covered(2, r));
     assert!(!runtime.record_transition_reconciled(id, r, digest));
     assert!(!runtime.record_capability_reconciled(2, r, digest));
+    // A different statement digest for an already-retired pair is
+    // refused too — the pair is the identity, the digest is audit.
+    // This is the behaviour the companion pair sets exist to
+    // provide: a repeat digest was already refused by the old scan.
+    let other = [0x5B; 32];
+    assert!(!runtime.record_transition_reconciled(id, r, other));
+    assert!(!runtime.record_capability_reconciled(2, r, other));
     assert!(runtime.pending_transitions().is_empty());
     assert!(runtime.pending_capabilities().is_empty());
     assert!(!runtime.announcement_covered(SnapshotId::from_bytes([0xA1; 32]), r));
+}
+
+/// Two distinct statements from one requester in a single pass: the
+/// first retires both obligations, and the second — same coverage,
+/// different digest — commits nothing further. This is the case the
+/// dirty rebuild exists for: without the refresh, the stale snapshot
+/// would still show the pair outstanding and commit a duplicate fact
+/// under the second digest (the commit layer dedupes nothing; only
+/// the projection guard would catch it, one layer too late).
+#[test]
+fn two_statements_one_pass_retire_once() {
+    let (mut fx, genesis, child) = world();
+    let (_, r) = requester();
+    let genesis_id = genesis.transition_id();
+    let child_id = child.transition_id();
+    fx.engine
+        .commit_facts(&[
+            Fact::TransitionQueued(genesis_id, r),
+            Fact::TransitionQueued(child_id, r),
+        ])
+        .unwrap();
+    let first = ReconciliationEvidence {
+        transitions: BTreeSet::from([genesis_id, child_id]),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::new(),
+    };
+    // Same coverage, different digest: the recipient also holds a
+    // snapshot now, so the statement identity differs while the
+    // obligation coverage does not.
+    let second = ReconciliationEvidence {
+        transitions: BTreeSet::from([genesis_id, child_id]),
+        snapshots: BTreeSet::from([SnapshotId::from_bytes([0xB2; 32])]),
+        capabilities: BTreeSet::new(),
+    };
+    state(&mut fx, r, first);
+    state(&mut fx, r, second);
+    let mut mailbox = NullMailbox;
+    let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
+    assert_eq!(report.statements, 2, "both statements evaluated");
+    assert_eq!(
+        report.retired, 2,
+        "the pair retires once, not per statement"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.transition_reconciled.len(),
+        2,
+        "no duplicate fact under the second digest"
+    );
 }

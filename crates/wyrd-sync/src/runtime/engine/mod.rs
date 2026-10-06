@@ -680,9 +680,11 @@ pub struct Engine {
     /// redelivery shape may write a second fact — the durable set is
     /// the backstop the transport's bounded, evicting seen log cannot
     /// be. Hydrated from the received-request bucket at open and
-    /// resync; the request intake arm extends it after every commit
-    /// (the only writer of the fact, via `note_committed_facts`) —
-    /// the projection follows the store, never leads it.
+    /// resync; `commit_facts` extends it for every committed
+    /// statement (the single point where a durable fact becomes a
+    /// live projection, mirroring the committed-capability
+    /// projection) — the projection follows the store, never leads
+    /// it.
     pub(super) received_requests: BTreeSet<(DeviceId, [u8; 32])>,
     /// Statements the response path has answered, as (requester,
     /// statement-digest) pairs: [`Engine::answer_reconciliation`]
@@ -697,11 +699,21 @@ pub struct Engine {
     pub(super) answered_statements: BTreeSet<(DeviceId, [u8; 32])>,
     /// How many received-request bucket entries were answered: the
     /// bucket is append-only in commit order, so each pass scans
-    /// only the suffix past this count. Reset on restart (never
-    /// rebuilt) alongside the set above — the rescan re-answers
-    /// idempotently. Guarded by `min` at use: the bucket only
-    /// grows within a lifetime, but a replaced store must not
-    /// underflow the scan.
+    /// only the suffix past this count. Doubles as the answer
+    /// entry guard's left-hand side (see `runtime::respond`): the
+    /// guard compares this bucket ordinal against the dedupe set's
+    /// cardinality, which agree only while every committed statement
+    /// was deduped before commit — today guaranteed solely by the
+    /// intake arm, the only production writer of the fact. A second
+    /// writer that skipped that check would push this counter past
+    /// the set and silence every statement, so name that premise
+    /// wherever a new statement writer lands. Reset on restart
+    /// (never rebuilt) alongside the set above — the rescan
+    /// re-answers idempotently. Guarded by `min` at use: the bucket
+    /// only grows within a lifetime, but a replaced store must not
+    /// underflow the scan (the `min` covers the scan; the early
+    /// return above it fails in the opposite direction, toward
+    /// silence, on the same premise).
     pub(super) answered_upto: usize,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see

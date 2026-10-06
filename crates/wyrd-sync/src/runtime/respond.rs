@@ -121,7 +121,13 @@ impl Engine {
         // O(1) entry guard: `commit_facts` extends the received set
         // for every committed statement (and resync rebuilds it),
         // so an answered suffix at least as long means no statement
-        // is unanswered — without touching the store. After a
+        // is unanswered — without touching the store. The premise
+        // this leans on: the bucket ordinal and the dedupe-set
+        // cardinality agree only while every committed statement
+        // was deduped by (requester, digest) before commit — today
+        // guaranteed solely by the intake arm, the only production
+        // writer of the fact (see `answered_upto`'s doc for the
+        // failure mode a second writer would introduce). After a
         // restart the counter resets while the set rebuilds, so the
         // first pass correctly rescans.
         if self.answered_upto >= self.received_requests.len() {
@@ -157,13 +163,18 @@ impl Engine {
             // alike. That collapses the post-restart rescan (every
             // old statement finds nothing outstanding) to pure
             // comparisons, and bounds per-statement I/O to
-            // statements that actually move state. The per-statement
-            // rebuild when dirty is the correctness half: two
-            // statements from one recipient in a single pass must
-            // not retire the same obligation twice under two
-            // digests. Statements are rare (one per view change), so
-            // a replay per state-moving statement is the honest
-            // cost of an exact comparison.
+            // statements that actually move state. The rebuild is
+            // what keeps one pass from committing the same pair
+            // twice: without the refresh, a second statement
+            // covering an already-this-pass-retired obligation
+            // would still look outstanding in the stale snapshot
+            // and commit a duplicate fact under its own digest.
+            // The pair-keyed guard in `record_*_reconciled` is the
+            // second layer — it keeps the projection correct even
+            // if a duplicate fact ever lands, and makes replay
+            // robust to them. Statements are rare (one per view
+            // change), so a replay per state-moving statement is
+            // the honest cost of an exact comparison.
             //
             // Marking happens only after every statement processed
             // cleanly: a transport failure aborts the pass with

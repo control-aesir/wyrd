@@ -1126,6 +1126,19 @@ impl Engine {
                 self.committed_capabilities
                     .insert((committed.device, committed.transition), committed.clone());
             }
+            // The received-statement set extends like the capability
+            // projection above: the commit already wrote the fact, so
+            // the live set records the same (requester, digest) pair
+            // resync would rebuild — whichever path committed the
+            // statement (intake, or a direct commit in tests), the
+            // set tracks the bucket within one lifetime, which the
+            // answer path's entry guard relies on.
+            if let Fact::ReconciliationRequestReceived(requester, evidence) = fact {
+                self.received_requests.insert((
+                    *requester,
+                    crate::durable::reconciliation_statement_digest(requester, evidence),
+                ));
+            }
         }
         Ok(seq)
     }

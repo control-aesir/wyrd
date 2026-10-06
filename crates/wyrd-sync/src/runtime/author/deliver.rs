@@ -435,6 +435,12 @@ fn deliver_capabilities(
         // clone below, so an idle pass copies no key material.
         return Ok(0);
     }
+    if scope.as_ref().is_some_and(|s| s.remaining == 0) {
+        // Budget already spent (by the transition loop ahead of this
+        // one): skip the chain walk and the signer clone like the
+        // empty case above — an exhausted scoped send costs no work.
+        return Ok(0);
+    }
     // The canonical chain's epoch-to-transition map, walked once:
     // capability wraps bind to the epoch's canonical transition.
     let mut chain: BTreeMap<u64, TransitionId> = BTreeMap::new();

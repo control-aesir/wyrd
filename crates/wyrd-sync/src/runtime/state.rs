@@ -112,8 +112,13 @@ pub struct RuntimeState {
     /// Transition obligations retired by reconciliation (21c): the
     /// triple names what the runtime needs (the pair) plus the audit
     /// trail (which statement proved it). Pending derives as queued
-    /// minus (delivered ∪ reconciled); nothing is ever deleted.
+    /// minus (delivered ∪ reconciled); nothing is ever deleted. The
+    /// companion pair set below keeps that derivation a lookup: the
+    /// triple set is audit, the pair set is the projection — both
+    /// written together by `record_transition_reconciled`, never
+    /// separately.
     pub(super) transition_reconciled: BTreeSet<(TransitionId, DeviceId, [u8; 32])>,
+    pub(super) transition_reconciled_pairs: BTreeSet<(TransitionId, DeviceId)>,
     /// Capability-delivery outbox: the same triple keyed by epoch.
     /// One entry per (epoch, recipient): the contiguous newcomer
     /// sequence and existing members' new-epoch material share it.
@@ -121,8 +126,9 @@ pub struct RuntimeState {
     pub(super) capability_sealed: BTreeMap<(u64, DeviceId), Vec<u8>>,
     pub(super) capability_delivered: BTreeSet<(u64, DeviceId)>,
     /// Capability obligations retired by reconciliation (21c), same
-    /// triple shape as above.
+    /// triple shape — and same companion pair set — as above.
     pub(super) capability_reconciled: BTreeSet<(u64, DeviceId, [u8; 32])>,
+    pub(super) capability_reconciled_pairs: BTreeSet<(u64, DeviceId)>,
     /// Namespace-carry queue: pre-transition eligible heads still to
     /// re-author at the new epoch, minus discharged ones. Pending is
     /// derived as queued-minus-done; nothing is ever deleted.
@@ -170,10 +176,12 @@ impl RuntimeState {
             transition_sealed: BTreeMap::new(),
             transition_delivered: BTreeSet::new(),
             transition_reconciled: BTreeSet::new(),
+            transition_reconciled_pairs: BTreeSet::new(),
             capability_queued: BTreeSet::new(),
             capability_sealed: BTreeMap::new(),
             capability_delivered: BTreeSet::new(),
             capability_reconciled: BTreeSet::new(),
+            capability_reconciled_pairs: BTreeSet::new(),
             carry_queued: BTreeSet::new(),
             carry_done: BTreeSet::new(),
         }
@@ -388,19 +396,12 @@ impl RuntimeState {
         recipient: DeviceId,
         statement: [u8; 32],
     ) -> bool {
-        if self.transition_reconciled_pair(id, recipient) {
+        if self.transition_reconciled_pairs.contains(&(id, recipient)) {
             return false;
         }
+        self.transition_reconciled_pairs.insert((id, recipient));
         self.transition_reconciled
             .insert((id, recipient, statement))
-    }
-
-    /// Whether any retirement marker covers one transition pair,
-    /// regardless of which statement proved it.
-    fn transition_reconciled_pair(&self, id: TransitionId, recipient: DeviceId) -> bool {
-        self.transition_reconciled
-            .iter()
-            .any(|(t, r, _)| *t == id && *r == recipient)
     }
 
     /// The sealed transition bytes for one transition, if sealed.
@@ -418,7 +419,7 @@ impl RuntimeState {
             .copied()
             .filter(|pair| {
                 !self.transition_delivered.contains(pair)
-                    && !self.transition_reconciled_pair(pair.0, pair.1)
+                    && !self.transition_reconciled_pairs.contains(pair)
             })
             .collect()
     }
@@ -429,7 +430,7 @@ impl RuntimeState {
     pub fn transition_covered(&self, id: TransitionId, recipient: DeviceId) -> bool {
         self.transition_queued.contains(&(id, recipient))
             || self.transition_delivered.contains(&(id, recipient))
-            || self.transition_reconciled_pair(id, recipient)
+            || self.transition_reconciled_pairs.contains(&(id, recipient))
     }
 
     /// Record a capability-delivery obligation for one recipient at
@@ -495,18 +496,15 @@ impl RuntimeState {
         recipient: DeviceId,
         statement: [u8; 32],
     ) -> bool {
-        if self.capability_reconciled_pair(epoch, recipient) {
+        if self
+            .capability_reconciled_pairs
+            .contains(&(epoch, recipient))
+        {
             return false;
         }
+        self.capability_reconciled_pairs.insert((epoch, recipient));
         self.capability_reconciled
             .insert((epoch, recipient, statement))
-    }
-
-    /// Whether any retirement marker covers one capability pair.
-    fn capability_reconciled_pair(&self, epoch: u64, recipient: DeviceId) -> bool {
-        self.capability_reconciled
-            .iter()
-            .any(|(e, r, _)| *e == epoch && *r == recipient)
     }
 
     /// The sealed capability bytes for one recipient at one epoch,
@@ -527,7 +525,7 @@ impl RuntimeState {
             .copied()
             .filter(|pair| {
                 !self.capability_delivered.contains(pair)
-                    && !self.capability_reconciled_pair(pair.0, pair.1)
+                    && !self.capability_reconciled_pairs.contains(pair)
             })
             .collect()
     }
@@ -537,7 +535,9 @@ impl RuntimeState {
     pub fn capability_covered(&self, epoch: u64, recipient: DeviceId) -> bool {
         self.capability_queued.contains(&(epoch, recipient))
             || self.capability_delivered.contains(&(epoch, recipient))
-            || self.capability_reconciled_pair(epoch, recipient)
+            || self
+                .capability_reconciled_pairs
+                .contains(&(epoch, recipient))
     }
 
     /// Record a namespace-carry obligation for one pre-transition

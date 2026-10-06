@@ -136,13 +136,12 @@ impl Mailbox for NullMailbox {
     }
 }
 
-/// The stage split as a pure policy: covered obligations are
-/// excluded from the resend set before any send is attempted, so
-/// stage 4 can only ever attempt the missing set — no mailbox, no
-/// sends, just the comparison both stages share.
+/// Covered obligations never reach the send path: with every
+/// outstanding obligation evidenced, the answer retires everything
+/// and attempts no send — asserted through the real scoped send,
+/// not a test-only helper, so the exclusion is production behavior.
 #[test]
-fn eligible_excludes_covered_before_any_send() {
-    use crate::runtime::respond::eligible_for_resend;
+fn covered_never_reaches_the_send_path() {
     let (mut fx, genesis, child) = world();
     let (_, r) = requester();
     let genesis_id = genesis.transition_id();
@@ -155,22 +154,14 @@ fn eligible_excludes_covered_before_any_send() {
         ])
         .unwrap();
     let evidence = ReconciliationEvidence {
-        transitions: BTreeSet::from([genesis_id]),
+        transitions: BTreeSet::from([genesis_id, child_id]),
         snapshots: BTreeSet::new(),
         capabilities: BTreeSet::from([(r, 2)]),
     };
-    let runtime = fx.engine.runtime_state().unwrap();
-    let (eligible_t, eligible_c) = eligible_for_resend(&runtime, &r, &evidence, &fx.engine.log);
-    assert_eq!(
-        eligible_t,
-        vec![child_id],
-        "the held genesis is covered, never eligible"
-    );
-    assert_eq!(
-        eligible_c,
-        Vec::<u64>::new(),
-        "the installed epoch is covered, never eligible"
-    );
+    state(&mut fx, r, evidence);
+    let report = answer(&mut fx);
+    assert_eq!(report.retired, 3, "everything covered retires");
+    assert_eq!(report.sent, 0, "nothing missing, nothing sends");
 }
 
 /// A transport failure aborts the pass with nothing marked: the
@@ -1125,4 +1116,144 @@ fn divergent_progress_reconciles_to_the_same_durable_state() {
                 .is_empty(),
         "sender and recipient agree: nothing owed, everything held"
     );
+}
+
+/// Retirement is per recipient: a statement from R1 retires R1's
+/// obligation only, even for an obligation identity another
+/// recipient also owes. R2's pair stays pending until R2's own
+/// statement evidences it — the fact always names the statement's
+/// own requester, never a bystander.
+#[test]
+fn retirement_is_per_recipient() {
+    let (mut fx, _, child) = world();
+    let (_, r1) = requester();
+    let (_, r2) = identity(0x0A);
+    let child_id = child.transition_id();
+    fx.engine
+        .commit_facts(&[
+            Fact::TransitionQueued(child_id, r1),
+            Fact::TransitionQueued(child_id, r2),
+        ])
+        .unwrap();
+    let held1 = keyed_evidence(r1, &[child_id]);
+    state(&mut fx, r1, held1.clone());
+    let mut mailbox = NullMailbox;
+    let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
+    assert_eq!(report.retired, 1);
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(
+        loaded.transition_reconciled,
+        vec![(child_id, r1, statement_digest(r1, &held1))],
+        "the retirement names R1, never R2"
+    );
+    assert_eq!(
+        fx.engine.runtime_state().unwrap().pending_transitions(),
+        vec![(child_id, r2)],
+        "R2's pair is untouched by R1's statement"
+    );
+    let held2 = keyed_evidence(r2, &[child_id]);
+    state(&mut fx, r2, held2.clone());
+    let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
+    assert_eq!(report.retired, 1, "R2's own statement retires R2");
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(loaded.transition_reconciled.len(), 2);
+}
+
+/// A frozen drive answers nothing: the conflicted drive stays inert
+/// until resolution — no retirements, no sends — even with an
+/// outstanding obligation and a committed statement. Shares the
+/// frozen drive with the trigger tests.
+#[test]
+fn frozen_drive_answers_nothing() {
+    let (_dir, mut engine) = super::tests_reconciliation::frozen_engine();
+    let (_, r) = requester();
+    let id = TransitionId::from_bytes([0xD0; 32]);
+    engine
+        .commit_facts(&[
+            Fact::TransitionQueued(id, r),
+            Fact::ReconciliationRequestReceived(r, keyed_evidence(r, &[id])),
+        ])
+        .unwrap();
+    let mut mailbox = NullMailbox;
+    let report = engine.answer_reconciliation(&mut mailbox).unwrap();
+    assert_eq!(report, AnswerReport::default());
+    let loaded = engine.store.load().unwrap();
+    assert!(
+        loaded.transition_reconciled.is_empty() && loaded.transition_delivered.is_empty(),
+        "frozen commits no retirements and sends nothing"
+    );
+    assert_eq!(
+        engine.runtime_state().unwrap().pending_transitions(),
+        vec![(id, r)],
+        "the obligation waits out the freeze"
+    );
+}
+
+/// The retire batch chunks: 1025 covered obligations (one more than
+/// a batch) retire across two commits in one answer, with nothing
+/// left pending and nothing double-marked.
+#[test]
+fn retire_commits_across_chunks() {
+    use super::super::respond::RETIRE_COMMIT_BATCH;
+    let (mut fx, _, _) = world();
+    let (_, r) = requester();
+    let ids: Vec<TransitionId> = (0..RETIRE_COMMIT_BATCH as u32 + 1)
+        .map(|i| {
+            let mut bytes = [0xC0; 32];
+            bytes[0..4].copy_from_slice(&i.to_le_bytes());
+            TransitionId::from_bytes(bytes)
+        })
+        .collect();
+    fx.engine
+        .commit_facts(
+            &ids.iter()
+                .map(|id| Fact::TransitionQueued(*id, r))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let evidence = ReconciliationEvidence {
+        transitions: ids.iter().copied().collect(),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::new(),
+    };
+    state(&mut fx, r, evidence);
+    let mut mailbox = NullMailbox;
+    let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
+    assert_eq!(
+        report.retired,
+        RETIRE_COMMIT_BATCH + 1,
+        "both chunks commit in one answer"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert_eq!(loaded.transition_reconciled.len(), RETIRE_COMMIT_BATCH + 1);
+    assert!(fx
+        .engine
+        .runtime_state()
+        .unwrap()
+        .pending_transitions()
+        .is_empty(),);
+}
+
+/// The covered accessors see reconciled pairs: recording a
+/// retirement covers the obligation against re-queueing, for both
+/// classes, while announcements (no retirement kind) stay
+/// uncovered. Pins the reconciled clauses as exercised behavior.
+#[test]
+fn covered_includes_reconciled() {
+    use crate::runtime::RuntimeState;
+    let mut runtime = RuntimeState::new(member_drive());
+    let (_, r) = requester();
+    let id = TransitionId::from_bytes([0xD1; 32]);
+    let digest = [0x5A; 32];
+    assert!(!runtime.transition_covered(id, r));
+    assert!(!runtime.capability_covered(2, r));
+    assert!(runtime.record_transition_reconciled(id, r, digest));
+    assert!(runtime.record_capability_reconciled(2, r, digest));
+    assert!(runtime.transition_covered(id, r));
+    assert!(runtime.capability_covered(2, r));
+    assert!(!runtime.record_transition_reconciled(id, r, digest));
+    assert!(!runtime.record_capability_reconciled(2, r, digest));
+    assert!(runtime.pending_transitions().is_empty());
+    assert!(runtime.pending_capabilities().is_empty());
+    assert!(!runtime.announcement_covered(SnapshotId::from_bytes([0xA1; 32]), r));
 }

@@ -58,6 +58,8 @@
 //! stay unanswered and are picked up after unfreezing (the answered
 //! set is volatile and never marks them).
 
+use std::collections::BTreeSet;
+
 use wyrd_format::{DeviceId, TransitionId};
 
 use super::engine::{Engine, EngineError};
@@ -116,6 +118,15 @@ impl Engine {
         if self.log.frozen_at().is_some() {
             return Ok(AnswerReport::default());
         }
+        // O(1) entry guard: `commit_facts` extends the received set
+        // for every committed statement (and resync rebuilds it),
+        // so an answered suffix at least as long means no statement
+        // is unanswered — without touching the store. After a
+        // restart the counter resets while the set rebuilds, so the
+        // first pass correctly rescans.
+        if self.answered_upto >= self.received_requests.len() {
+            return Ok(AnswerReport::default());
+        }
         let rebuilt = self.store.rebuild(self.device)?;
         let mut report = AnswerReport::default();
         // Suffix scan: the received-request bucket is append-only in
@@ -125,33 +136,56 @@ impl Engine {
         // history never re-hashes per pass. The answered set stays as
         // the backstop (and as 21d's answered query): duplicates
         // within the suffix evaluate idempotently and mark once.
-        let requests = &rebuilt.reconciliation_requests;
-        let start = self.answered_upto.min(requests.len());
+        let request_count = rebuilt.reconciliation_requests.len();
+        let start = self.answered_upto.min(request_count);
         let mut todo = Vec::new();
-        for (requester, evidence) in &requests[start..] {
+        for (requester, evidence) in &rebuilt.reconciliation_requests[start..] {
             let digest = reconciliation_statement_digest(requester, evidence);
             report.statements += 1;
             if !self.answered_statements.contains(&(*requester, digest)) {
                 todo.push((*requester, digest, evidence.clone()));
             }
         }
+        let mut rebuilt = rebuilt;
+        let mut dirty = false;
         for (requester, digest, evidence) in &todo {
-            // Fresh rebuild per statement: the previous statement's
-            // retire and send commits landed since the bucket was
-            // read, and the next comparison must see them — otherwise
-            // two statements from one recipient in a single pass
-            // would retire the same obligation twice under two
+            // Fresh rebuild per statement — but only once something
+            // earlier in this pass committed: the comparison below
+            // reads the pass snapshot until a retire lands, and a
+            // statement with no outstanding obligations for its
+            // requester skips the rebuild, the retire, and the send
+            // alike. That collapses the post-restart rescan (every
+            // old statement finds nothing outstanding) to pure
+            // comparisons, and bounds per-statement I/O to
+            // statements that actually move state. The per-statement
+            // rebuild when dirty is the correctness half: two
+            // statements from one recipient in a single pass must
+            // not retire the same obligation twice under two
             // digests. Statements are rare (one per view change), so
-            // a replay per statement is the honest cost of an exact
-            // comparison.
+            // a replay per state-moving statement is the honest
+            // cost of an exact comparison.
             //
             // Marking happens only after every statement processed
             // cleanly: a transport failure aborts the pass with
             // nothing marked, so the next pass re-answers from the
             // same suffix — idempotently, since retire commits and
             // sealed sends from the partial pass are already durable.
-            let rebuilt = self.store.rebuild(self.device)?;
-            report.retired += self.retire_covered(requester, evidence, digest, &rebuilt)?;
+            if dirty {
+                rebuilt = self.store.rebuild(self.device)?;
+                dirty = false;
+            }
+            let outstanding_t = outstanding_transitions(&rebuilt.runtime, requester);
+            let outstanding_c = outstanding_capabilities(&rebuilt.runtime, requester);
+            if outstanding_t.is_empty() && outstanding_c.is_empty() {
+                continue;
+            }
+            let covered_t = covered_transitions(&outstanding_t, evidence, &rebuilt.log);
+            let covered_c = covered_capabilities(&outstanding_c, requester, evidence);
+            let retired = self.retire_covered(requester, digest, covered_t, covered_c)?;
+            report.retired += retired;
+            if retired > 0 {
+                dirty = true;
+            }
             report.sent += super::author::deliver_scoped(
                 self,
                 mailbox,
@@ -163,33 +197,25 @@ impl Engine {
         for (requester, digest, _) in &todo {
             self.answered_statements.insert((*requester, *digest));
         }
-        self.answered_upto = requests.len();
+        self.answered_upto = request_count;
         Ok(report)
     }
 
-    /// Stage 3 (stages 1–2 are the pure comparison below): commit
+    /// Stage 3 (stages 1–2 are the pure comparison above): commit
     /// `*Reconciled` for the covered set, chunked. Retire-before-send
     /// per statement: a crash after these commits but before the
     /// sends leaves retired obligations that need no send and
     /// pending ones the next pass sends — no loss in either order,
-    /// but never sending what the recipient already holds.
+    /// but never sending what the recipient already holds. Takes the
+    /// covered sets the caller computed for the skip guard, so the
+    /// comparison runs once per statement.
     fn retire_covered(
         &mut self,
         requester: &DeviceId,
-        evidence: &ReconciliationEvidence,
         digest: &[u8; 32],
-        rebuilt: &crate::durable::Rebuilt,
+        covered_t: Vec<TransitionId>,
+        covered_c: Vec<u64>,
     ) -> Result<usize, EngineError> {
-        let covered_t = covered_transitions(
-            &outstanding_transitions(&rebuilt.runtime, requester),
-            evidence,
-            &rebuilt.log,
-        );
-        let covered_c = covered_capabilities(
-            &outstanding_capabilities(&rebuilt.runtime, requester),
-            requester,
-            evidence,
-        );
         let mut facts = Vec::with_capacity(covered_t.len() + covered_c.len());
         for id in covered_t {
             facts.push(Fact::TransitionReconciled(id, *requester, *digest));
@@ -237,43 +263,47 @@ fn outstanding_capabilities(runtime: &RuntimeState, recipient: &DeviceId) -> Vec
 /// an unknown id is retransmitted, never retired. The conservative
 /// direction throughout: omission costs retransmission, assertion
 /// would cost the obligation.
+///
+/// One ancestry pass per statement, not one walk per pair: every
+/// evidenced transition's prev-chain is walked once and its
+/// ancestors marked, then outstanding filters against the marked
+/// set. Predicate bit-identical to the pairwise form — a statement
+/// covers T iff T is held or some known evidenced successor's
+/// validated chain passes through T, with unknown links
+/// (unobserved successors, gaps mid-chain) contributing nothing
+/// either way — without the multiplicative re-walk.
 fn covered_transitions(
     outstanding: &[TransitionId],
     evidence: &ReconciliationEvidence,
     log: &MembershipLog,
 ) -> Vec<TransitionId> {
+    if outstanding.is_empty() {
+        return Vec::new();
+    }
+    let mut ancestral = BTreeSet::new();
+    for successor in &evidence.transitions {
+        if log.transition(successor).is_none() {
+            continue;
+        }
+        let mut cursor = *successor;
+        loop {
+            let Some(t) = log.transition(&cursor) else {
+                break;
+            };
+            match t.prev {
+                Some(prev) => {
+                    ancestral.insert(prev);
+                    cursor = prev;
+                }
+                None => break,
+            }
+        }
+    }
     outstanding
         .iter()
         .copied()
-        .filter(|id| {
-            evidence.transitions.contains(id)
-                || evidence
-                    .transitions
-                    .iter()
-                    .any(|successor| successorship(log, successor, id))
-        })
+        .filter(|id| evidence.transitions.contains(id) || ancestral.contains(id))
         .collect()
-}
-
-/// Whether `successor` is a known transition whose validated
-/// ancestry contains `ancestor`: walk the sender's own observed
-/// prev-chain. Unknown successors (not in the log) return false —
-/// the sender cannot validate what it never observed.
-fn successorship(log: &MembershipLog, successor: &TransitionId, ancestor: &TransitionId) -> bool {
-    if successor == ancestor {
-        return true;
-    }
-    let mut cursor = *successor;
-    loop {
-        let Some(t) = log.transition(&cursor) else {
-            return false;
-        };
-        match t.prev {
-            Some(prev) if prev == *ancestor => return true,
-            Some(prev) => cursor = prev,
-            None => return false,
-        }
-    }
 }
 
 /// Stage 2 for capabilities: which outstanding epochs R's evidence
@@ -298,9 +328,13 @@ fn covered_capabilities(
 /// when the statement shows nothing held. Bounds the scoped send —
 /// transitions sealed past this epoch are skipped, never retired —
 /// so the sender never spends a send the recipient could not open.
-/// Zero holds back every transition until a capability install
-/// arrives; capability sends themselves are never skipped, so the
-/// keys always land first and the skip always converges.
+/// Read it as "no evidenced install, nothing scoped": zero holds
+/// back every transition until a capability install arrives, and a
+/// recipient that never evidences an install (invitation-held keys,
+/// unauthorized rotation deliveries) gets its transitions from the
+/// blind pass instead, indistinguishably for correctness. 21d will
+/// want the "scoped nothing" and "nothing to send" cases told
+/// apart; the report counts sends and retirements only.
 fn newest_held_epoch(evidence: &ReconciliationEvidence, recipient: &DeviceId) -> u64 {
     evidence
         .capabilities
@@ -309,30 +343,4 @@ fn newest_held_epoch(evidence: &ReconciliationEvidence, recipient: &DeviceId) ->
         .map(|(_, epoch)| *epoch)
         .max()
         .unwrap_or(0)
-}
-
-/// Stage 1's complement: outstanding obligations the statement does
-/// not cover — what the capped send may attempt. Pure, for the
-/// policy tests; the send path re-derives it as still-pending after
-/// the retire commits, so the two cannot disagree within a pass.
-#[cfg(test)]
-pub(super) fn eligible_for_resend(
-    runtime: &RuntimeState,
-    recipient: &DeviceId,
-    evidence: &ReconciliationEvidence,
-    log: &MembershipLog,
-) -> (Vec<TransitionId>, Vec<u64>) {
-    let outstanding_t = outstanding_transitions(runtime, recipient);
-    let covered_t = covered_transitions(&outstanding_t, evidence, log);
-    let eligible_t: Vec<TransitionId> = outstanding_t
-        .into_iter()
-        .filter(|id| !covered_t.contains(id))
-        .collect();
-    let outstanding_c = outstanding_capabilities(runtime, recipient);
-    let covered_c = covered_capabilities(&outstanding_c, recipient, evidence);
-    let eligible_c: Vec<u64> = outstanding_c
-        .into_iter()
-        .filter(|epoch| !covered_c.contains(epoch))
-        .collect();
-    (eligible_t, eligible_c)
 }

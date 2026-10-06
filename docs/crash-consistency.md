@@ -139,6 +139,22 @@ recording a transmission the recipient would suppress. Pinned by
 and `preframing_replacement_commit_is_atomic_at_every_crash_stage`
 (`engine/tests_delivery.rs`).
 
+Answering a reconciliation statement adds two more windows, both on
+the retire-before-send ordering. A crash between the retire commits
+and the scoped sends leaves covered obligations durably retired
+(they need no send) and missing ones still pending (the next pass
+sends them): every obligation ends up either retired or pending,
+never both and never neither. Pinned by
+`partial_reconciliation_then_crash_resumes_without_double_sending`
+(`engine/tests_response.rs`), which tears the retire batch and
+asserts the pending set is whole before the next statement
+completes it. A crash inside the chunked retire commit (1024-fact
+batches) leaves a partial durable retirement; the remainder stays
+pending for the next statement, re-derived from fresh durable
+evidence rather than resumed from a cursor. Pinned by
+`retire_commits_across_chunks` for the multi-chunk shape and by
+the same tear test for the atomicity direction.
+
 ### The obligation invariant
 
 > A durable obligation must replay to the same obligation, or to an

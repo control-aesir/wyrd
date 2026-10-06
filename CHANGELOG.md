@@ -42,15 +42,18 @@ version say exactly what changed.
 - Restart-equivalence relation (DG-5): `docs/crash-consistency.md`
   gains the normative predicate over durable externally meaningful
   state as a per-surface table — survives, rebuilt, lost-correctly,
-  or excluded by name — where every row names the observable, the
-  verdict, and the pin that proves it. Serving endpoint identity is
-  excluded by name (residency in, address out); the restart-loss rule
-  for memory-only state not yet written (peer-repair generations) is
-  normative now, rows land with the code. Pinned by nine row and
-  crash-stage tests plus the whole-relation invariant
+  or excluded by name — where every row names its observable, its
+  verdict, and the strongest pin available (a direct test where one
+  can be written, a named derivation where it cannot). Serving
+  endpoint identity is excluded by name (residency in, address out);
+  the restart-loss rule for memory-only state not yet written
+  (peer-repair generations) is normative now, rows land with the
+  code. Pinned by nine row and crash-stage tests plus the
+  whole-relation invariant
   `a_crash_loses_ephemeral_state_but_no_durable_obligation`
   (asserted across a real mid-flight reopen), the named
-  suppression-loss pin, two status tests, and the want-registry
+  suppression-loss pin, the new status row test alongside the
+  pre-existing whole-status tripwire, and the want-registry
   loss test.
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable

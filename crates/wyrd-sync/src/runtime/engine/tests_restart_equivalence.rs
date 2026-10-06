@@ -350,6 +350,13 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
     let mut roots = pair.a.engine.vault().roots().expect("roots before restart");
     roots.sort();
     assert!(!roots.is_empty(), "authored representations resident");
+    let maps = crate::serving::VaultSource::from_state(&state, pair.a.engine.vault())
+        .expect("serving maps build")
+        .maps_for_test();
+    assert!(
+        !maps.0.is_empty(),
+        "recorded snapshots project serving maps"
+    );
     let current = pair.a.engine.current();
 
     restart(&mut pair.a, &controls);
@@ -385,12 +392,14 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
         "materialization row"
     );
     assert_eq!(
-        (
-            pair.a.engine.announcement_projection_for_test(),
-            pair.a.engine.committed_capabilities_for_test(),
-        ),
-        (&projections.0, &projections.1),
-        "control-state row"
+        pair.a.engine.announcement_projection_for_test(),
+        &projections.0,
+        "control-state row: announcement projection"
+    );
+    assert_eq!(
+        pair.a.engine.committed_capabilities_for_test(),
+        &projections.1,
+        "control-state row: committed capabilities"
     );
     let mut roots_after = pair.a.engine.vault().roots().expect("roots after restart");
     roots_after.sort();
@@ -402,9 +411,7 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
         )
         .expect("serving maps rebuild")
         .maps_for_test(),
-        crate::serving::VaultSource::from_state(&state, pair.a.engine.vault(),)
-            .expect("serving maps build")
-            .maps_for_test(),
+        maps,
         "residency row: serving maps rebuilt"
     );
     // The retry pass manufactures nothing: no new commits, no new

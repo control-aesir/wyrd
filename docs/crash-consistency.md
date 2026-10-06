@@ -164,15 +164,18 @@ not a claim about every question an operator can ask (timestamps,
 diagnostic counters, retry generations, telemetry, and transient
 connection state are excluded precisely because several must
 differ across a restart). The table is authoritative in exactly
-this sense: every row names the observable, the verdict, and the
-pin that proves it, so a reader never has to infer intent. The
+this sense: every row names its observable, its verdict, and the
+strongest pin available — a direct test where one can be written,
+a named derivation where it cannot. The
 whole-state snapshot (`SyncStatus`, observed from committed facts
 only) is the aggregate tripwire over the rows it covers — serving
 residency, the seen-id log, the route table, and suppression
 verdicts have no `SyncStatus` field, and the snapshot says nothing
 about them. Nothing here prevents the snapshot from shrinking;
 what prevents silent shrinkage is that each row carries its own
-pin, and a row whose pin stops proving the row fails by name.
+pin, and a row whose direct pin stops proving the row fails by
+name. Rows with derivation pins say so in their cells instead of
+pretending a test exists.
 
 Four verdicts, per surface:
 

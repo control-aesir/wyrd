@@ -154,6 +154,16 @@ mechanism rather than an add-on:
   suffices — a known epoch without its secret authorizes nothing
   until the capability arrives.
 
+Recovery requirements attach to the semantic class, not uniformly
+to all envelopes (`object-model.md` decision 33): transitions and
+capabilities carry the state machine itself, and their loss strands
+protocol progress; loss of announcements does not strand the same
+protocol state machine, so they follow later under their own
+retirement tag. The 21c scope boundary below
+reflects that ordering: transitions and capabilities retire first,
+while announcement obligations stay pending until their own
+retirement kind exists.
+
 Retirement commits a new sender-side durable fact, one kind per
 obligation class (`AnnouncementReconciled`,
 `TransitionReconciled`, `CapabilityReconciled`): each names the

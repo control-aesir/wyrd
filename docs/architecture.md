@@ -121,6 +121,19 @@ lives with sync control, never ambient across the node.
    path-resolution semantics or out-of-band control APIs; Wyrd's own
    metadata lives in the internal object store, never the mounted
    namespace.
+9. **Transport is never correctness evidence. Durable recipient state
+   is.** Relay acceptance, relay retention, retransmission, and
+   `ReconciliationRequest` delivery prove nothing about convergence.
+   A sender obligation retires only when durable recipient state
+   provides the class-specific evidence that subsumes it — the DG-3
+   forget contract in `sync-and-peers.md`.
+10. **Identity layers stay separate.** Wyrd `DeviceId`, cryptographic
+    epoch state, iroh transport endpoint identity, and relay identity
+    are distinct. A new endpoint after restart is a new transport
+    attachment, never a new member; serving endpoint identity is
+    excluded from restart equivalence (`crash-consistency.md`), and
+    device identity itself is immutable (`object-model.md`
+    decision 12).
 
 ## Non-goals (for now)
 

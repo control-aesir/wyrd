@@ -45,9 +45,10 @@ impl Mailbox for RecordingMailbox<'_> {
 /// error, the parked gap persists, and the next evaluation with a
 /// working mailbox fires — arming survives the error because the
 /// gap is recomputed every pass, never consumed. (Edges are
-/// consumed even on failure; in production the supervisor's
-/// recovery attempts re-edge, and any parked gap re-arms on its
-/// own.)
+/// consumed even on failure: a parked gap re-arms regardless, a
+/// real outage re-edges through the supervisor, and a one-off blip
+/// while the transport stays up waits for the next genuine
+/// reconnect, gap, or view change.)
 #[test]
 fn send_failure_leaves_the_trigger_armed() {
     use super::tests_harness::FailingMailbox;
@@ -62,10 +63,10 @@ fn send_failure_leaves_the_trigger_armed() {
         fail_after: 0,
     };
     assert!(
-        pair.a
-            .engine
-            .maybe_request_reconciliation(&mut failing)
-            .is_err(),
+        matches!(
+            pair.a.engine.maybe_request_reconciliation(&mut failing),
+            Err(EngineError::Mailbox(_))
+        ),
         "transport failure surfaces to the caller (the loop absorbs it)"
     );
     assert_eq!(pair.a.engine.pending_count(), 1, "the gap persists");
@@ -80,6 +81,46 @@ fn send_failure_leaves_the_trigger_armed() {
             accepted: 2,
         },
         "arming survives the failed fan-out"
+    );
+}
+
+/// A mid-fan-out failure marks nothing: the first recipient is
+/// mailed, the second send errors, and the early `?` skips the
+/// acceptance mark — so the whole fan-out retries on the next armed
+/// evaluation instead of resuming half-marked.
+#[test]
+fn send_failure_mid_fan_out_marks_nothing() {
+    use super::tests_harness::FailingMailbox;
+    let (mut pair, controls, _) = scenario();
+    converge(&mut pair);
+    park_gap(&mut pair, &controls);
+    pair.a.engine.note_reconnected();
+    // One send succeeds, the next fails: the evaluation errors with
+    // one envelope already out.
+    let mut failing = FailingMailbox {
+        sent: 0,
+        fail_after: 1,
+    };
+    assert!(
+        matches!(
+            pair.a.engine.maybe_request_reconciliation(&mut failing),
+            Err(EngineError::Mailbox(_))
+        ),
+        "the second send fails the evaluation"
+    );
+    assert_eq!(failing.sent, 1, "one envelope left before the failure");
+    assert_eq!(pair.a.engine.pending_count(), 1, "the gap persists");
+    // Unmarked despite a partial send: the still-parked gap fires
+    // the full fan-out again with no new edge.
+    let device = pair.a.device;
+    let mut mailbox = mailbox_for(&mut pair.relay, device);
+    assert_eq!(
+        trigger(&mut pair.a.engine, &mut mailbox),
+        ReconciliationOutcome::Requested {
+            recipients: 2,
+            accepted: 2,
+        },
+        "a partial fan-out retries whole, never resumes marked"
     );
 }
 
@@ -203,6 +244,10 @@ fn reconnect_edge_sends_one_request_per_recipient() {
         .expect("loads")
         .reconciliation_views;
     assert!(views.is_empty(), "triggers commit nothing");
+    assert!(
+        !pair.a.engine.reconnect_latched,
+        "a fired evaluation consumes its edge"
+    );
     // Same view, no new edge, no gap: the trigger disarms back
     // to quiet — AlreadyStated is for an *armed* trigger with a
     // redundant view (pinned below), not for silence.
@@ -599,6 +644,10 @@ fn frozen_edge_stays_silent() {
     assert_eq!(
         trigger(&mut engine, &mut NullMailbox),
         ReconciliationOutcome::Frozen
+    );
+    assert!(
+        engine.reconnect_latched,
+        "frozen keeps the edge for the unfreeze"
     );
 }
 

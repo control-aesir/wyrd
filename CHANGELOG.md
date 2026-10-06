@@ -66,7 +66,8 @@ version say exactly what changed.
   statement digest) so transport seen-log eviction is safe, suppresses
   requester≠sender disagreement and undecodable evidence memory-only,
   and sheds floods relay-held. The send-side trigger (OD-21-4: durable
-  gap or reconnect edge, never a timer, coalesced to one request,
+  gap — parked deferrals today, unfetchable-head deferred — or
+  reconnect edge, never a timer, coalesced to one request,
   volatile already-asked marker, frozen drives silent) derives the
   view live and fans it out without committing — the send path never
   authors facts, so triggers advance no sequence; the live loop feeds

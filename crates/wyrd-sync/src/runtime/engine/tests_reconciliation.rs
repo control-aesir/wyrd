@@ -561,8 +561,9 @@ fn signed_sibling(
 /// children (a rotation and an admission). Intake commits all three
 /// — validity never gates observation — and the analysis freezes.
 /// The envelope sender is a stranger; intake needs no membership
-/// for transitions.
-fn frozen_engine() -> (TestDir, Engine) {
+/// for transitions. Shared with the response tests, which pin the
+/// answer path's frozen short-circuit against the same frozen drive.
+pub(super) fn frozen_engine() -> (TestDir, Engine) {
     let dir = TestDir::new("reconcile-frozen");
     let (identity_sk, device) = identity(0x43);
     let encryption_sk = DeviceEncryptionSecret::from_bytes([0xE0; 32]).unwrap();

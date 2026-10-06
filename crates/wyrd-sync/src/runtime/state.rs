@@ -109,12 +109,26 @@ pub struct RuntimeState {
     pub(super) transition_queued: BTreeSet<(TransitionId, DeviceId)>,
     pub(super) transition_sealed: BTreeMap<TransitionId, Vec<u8>>,
     pub(super) transition_delivered: BTreeSet<(TransitionId, DeviceId)>,
+    /// Transition obligations retired by reconciliation (21c): the
+    /// triple names what the runtime needs (the pair) plus the audit
+    /// trail (which statement proved it). Pending derives as queued
+    /// minus (delivered ∪ reconciled); nothing is ever deleted. The
+    /// companion pair set below keeps that derivation a lookup: the
+    /// triple set is audit, the pair set is the projection — both
+    /// written together by `record_transition_reconciled`, never
+    /// separately.
+    pub(super) transition_reconciled: BTreeSet<(TransitionId, DeviceId, [u8; 32])>,
+    pub(super) transition_reconciled_pairs: BTreeSet<(TransitionId, DeviceId)>,
     /// Capability-delivery outbox: the same triple keyed by epoch.
     /// One entry per (epoch, recipient): the contiguous newcomer
     /// sequence and existing members' new-epoch material share it.
     pub(super) capability_queued: BTreeSet<(u64, DeviceId)>,
     pub(super) capability_sealed: BTreeMap<(u64, DeviceId), Vec<u8>>,
     pub(super) capability_delivered: BTreeSet<(u64, DeviceId)>,
+    /// Capability obligations retired by reconciliation (21c), same
+    /// triple shape — and same companion pair set — as above.
+    pub(super) capability_reconciled: BTreeSet<(u64, DeviceId, [u8; 32])>,
+    pub(super) capability_reconciled_pairs: BTreeSet<(u64, DeviceId)>,
     /// Namespace-carry queue: pre-transition eligible heads still to
     /// re-author at the new epoch, minus discharged ones. Pending is
     /// derived as queued-minus-done; nothing is ever deleted.
@@ -161,9 +175,13 @@ impl RuntimeState {
             transition_queued: BTreeSet::new(),
             transition_sealed: BTreeMap::new(),
             transition_delivered: BTreeSet::new(),
+            transition_reconciled: BTreeSet::new(),
+            transition_reconciled_pairs: BTreeSet::new(),
             capability_queued: BTreeSet::new(),
             capability_sealed: BTreeMap::new(),
             capability_delivered: BTreeSet::new(),
+            capability_reconciled: BTreeSet::new(),
+            capability_reconciled_pairs: BTreeSet::new(),
             carry_queued: BTreeSet::new(),
             carry_done: BTreeSet::new(),
         }
@@ -321,7 +339,11 @@ impl RuntimeState {
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`
     /// order: queued pairs minus delivered ones. Deterministic under
-    /// replay, so resume sends in a stable order.
+    /// replay, so resume sends in a stable order. Deliberately
+    /// minus-delivered only: 21c retires transition and capability
+    /// obligations, never announcements (scope boundary) — no
+    /// announcement retirement set exists to subtract, and a test
+    /// pins that no statement changes this derivation.
     pub fn pending_announcements(&self) -> Vec<(SnapshotId, DeviceId)> {
         self.announcement_queued
             .iter()
@@ -359,6 +381,29 @@ impl RuntimeState {
         self.transition_delivered.insert((id, recipient))
     }
 
+    /// Record one transition obligation retired by reconciliation:
+    /// the response path proved the recipient's durable state
+    /// subsumes it and names the proving statement. Returns `true`
+    /// if this was the first retirement marker for the pair — a
+    /// duplicate evaluation (redelivered statement, restart
+    /// re-answer) commits no second fact because the pair is already
+    /// covered. The statement digest is audit, not identity: pending
+    /// derivation matches on the pair alone, so one pair never needs
+    /// two retirements and a second statement finds nothing to do.
+    pub fn record_transition_reconciled(
+        &mut self,
+        id: TransitionId,
+        recipient: DeviceId,
+        statement: [u8; 32],
+    ) -> bool {
+        if self.transition_reconciled_pairs.contains(&(id, recipient)) {
+            return false;
+        }
+        self.transition_reconciled_pairs.insert((id, recipient));
+        self.transition_reconciled
+            .insert((id, recipient, statement))
+    }
+
     /// The sealed transition bytes for one transition, if sealed.
     pub fn transition_sealed_bytes(&self, id: TransitionId) -> Option<&[u8]> {
         self.transition_sealed.get(&id).map(Vec::as_slice)
@@ -366,19 +411,26 @@ impl RuntimeState {
 
     /// Every still-undischarged transition obligation, in
     /// `(transition, recipient)` order. Deterministic under replay.
+    /// Pending is queued minus (delivered ∪ reconciled): a reconciled
+    /// obligation stops retrying exactly like a delivered one.
     pub fn pending_transitions(&self) -> Vec<(TransitionId, DeviceId)> {
         self.transition_queued
             .iter()
             .copied()
-            .filter(|pair| !self.transition_delivered.contains(pair))
+            .filter(|pair| {
+                !self.transition_delivered.contains(pair)
+                    && !self.transition_reconciled_pairs.contains(pair)
+            })
             .collect()
     }
 
-    /// Whether one transition obligation is already covered — queued
-    /// or discharged.
+    /// Whether one transition obligation is already covered — queued,
+    /// discharged, or reconciled. Re-queueing and re-retiring stay
+    /// idempotent instead of appending duplicate facts per call.
     pub fn transition_covered(&self, id: TransitionId, recipient: DeviceId) -> bool {
         self.transition_queued.contains(&(id, recipient))
             || self.transition_delivered.contains(&(id, recipient))
+            || self.transition_reconciled_pairs.contains(&(id, recipient))
     }
 
     /// Record a capability-delivery obligation for one recipient at
@@ -435,6 +487,26 @@ impl RuntimeState {
         self.capability_delivered.insert((epoch, recipient))
     }
 
+    /// Record one capability obligation retired by reconciliation,
+    /// same rule as the transition retirement above: first marker
+    /// for the pair wins, the statement digest is audit.
+    pub fn record_capability_reconciled(
+        &mut self,
+        epoch: u64,
+        recipient: DeviceId,
+        statement: [u8; 32],
+    ) -> bool {
+        if self
+            .capability_reconciled_pairs
+            .contains(&(epoch, recipient))
+        {
+            return false;
+        }
+        self.capability_reconciled_pairs.insert((epoch, recipient));
+        self.capability_reconciled
+            .insert((epoch, recipient, statement))
+    }
+
     /// The sealed capability bytes for one recipient at one epoch,
     /// if sealed.
     pub fn capability_sealed_bytes(&self, epoch: u64, recipient: DeviceId) -> Option<&[u8]> {
@@ -445,19 +517,27 @@ impl RuntimeState {
 
     /// Every still-undischarged capability obligation, in
     /// `(epoch, recipient)` order. Deterministic under replay.
+    /// Pending is queued minus (delivered ∪ reconciled), like
+    /// transitions above.
     pub fn pending_capabilities(&self) -> Vec<(u64, DeviceId)> {
         self.capability_queued
             .iter()
             .copied()
-            .filter(|pair| !self.capability_delivered.contains(pair))
+            .filter(|pair| {
+                !self.capability_delivered.contains(pair)
+                    && !self.capability_reconciled_pairs.contains(pair)
+            })
             .collect()
     }
 
-    /// Whether one capability obligation is already covered — queued
-    /// or discharged.
+    /// Whether one capability obligation is already covered — queued,
+    /// discharged, or reconciled.
     pub fn capability_covered(&self, epoch: u64, recipient: DeviceId) -> bool {
         self.capability_queued.contains(&(epoch, recipient))
             || self.capability_delivered.contains(&(epoch, recipient))
+            || self
+                .capability_reconciled_pairs
+                .contains(&(epoch, recipient))
     }
 
     /// Record a namespace-carry obligation for one pre-transition

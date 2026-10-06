@@ -965,6 +965,20 @@ where
         // A stalled delivery step must not starve announcements (or
         // vice versa): each step absorbs its own mailbox failure and
         // the pass still attempts the other half.
+        //
+        // Reconciliation answers (21c) run before the blind retry:
+        // each new statement retires what its evidence covers and
+        // retransmits (capped) what it does not, so the pass below
+        // only carries what no statement has yet answered. The
+        // report is dropped here like the trigger outcome (21d
+        // surfaces both); a dead transport stalls the answer, never
+        // the loop, and the statement stays unanswered for the next
+        // pass.
+        sent += match self.engine.answer_reconciliation(mailbox) {
+            Ok(report) => report.sent,
+            Err(EngineError::Mailbox(_)) => 0,
+            Err(other) => return Err(LiveError::Engine(other)),
+        };
         sent += match self.engine.deliver_pending(mailbox) {
             Ok(n) => n,
             Err(EngineError::Mailbox(_)) => 0,

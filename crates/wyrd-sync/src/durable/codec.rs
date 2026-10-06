@@ -83,9 +83,21 @@ pub(super) const TAG_RECONCILIATION_VIEW: u8 = 0x18;
 /// across the wire statement, the stated record, and this record.
 /// Crate-visible for the tag-boundary pin below.
 pub(super) const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
+/// A retired transition obligation: transition id (32) ‖ recipient
+/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1A:
+/// the tag space is append-only. Fixed 96 bytes — a retirement names
+/// the obligation, whom it is retired for, and exactly which
+/// statement proved it, nothing else. 21c retires transitions and
+/// capabilities only; no announcement retirement kind exists (scope
+/// boundary, not a missing case).
+pub(super) const TAG_TRANSITION_RECONCILED: u8 = 0x1A;
+/// A retired capability obligation: epoch u64 LE (8) ‖ recipient
+/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1B,
+/// fixed 72 bytes, same shape and same scope note as above.
+pub(super) const TAG_CAPABILITY_RECONCILED: u8 = 0x1B;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-pub(super) const KNOWN_TAGS: [u8; 25] = [
+pub(super) const KNOWN_TAGS: [u8; 27] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -111,6 +123,8 @@ pub(super) const KNOWN_TAGS: [u8; 25] = [
     TAG_ANNOUNCEMENT_ROUTE_SEALED,
     TAG_RECONCILIATION_VIEW,
     TAG_RECONCILIATION_REQUEST,
+    TAG_TRANSITION_RECONCILED,
+    TAG_CAPABILITY_RECONCILED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -434,6 +448,14 @@ pub(super) fn encode_fact(
             TAG_RECONCILIATION_REQUEST,
             encode_reconciliation_request(requester, evidence)?,
         )),
+        Fact::TransitionReconciled(id, recipient, statement) => Ok((
+            TAG_TRANSITION_RECONCILED,
+            encode_reconciled_transition(id, recipient, statement),
+        )),
+        Fact::CapabilityReconciled(epoch, recipient, statement) => Ok((
+            TAG_CAPABILITY_RECONCILED,
+            encode_reconciled_capability(*epoch, recipient, statement),
+        )),
     }
 }
 
@@ -486,6 +508,29 @@ fn encode_reconciliation_request(
     out.extend_from_slice(requester.as_bytes());
     out.extend_from_slice(&encode_reconciliation_view(evidence)?);
     Ok(out)
+}
+
+/// Encode a retired transition obligation: the fixed 96-byte triple.
+/// Total by construction — fixed length has no ceiling to check.
+fn encode_reconciled_transition(
+    id: &TransitionId,
+    recipient: &DeviceId,
+    statement: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(recipient.as_bytes());
+    out.extend_from_slice(statement);
+    out
+}
+
+/// Encode a retired capability obligation: the fixed 72-byte triple.
+fn encode_reconciled_capability(epoch: u64, recipient: &DeviceId, statement: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(72);
+    out.extend_from_slice(&epoch.to_le_bytes());
+    out.extend_from_slice(recipient.as_bytes());
+    out.extend_from_slice(statement);
+    out
 }
 
 /// The canonical evidence bytes, without any commit ceiling: the
@@ -836,9 +881,38 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
         }
         TAG_RECONCILIATION_VIEW => Some(decode_reconciliation_view(record)?),
         TAG_RECONCILIATION_REQUEST => Some(decode_reconciliation_request(record)?),
+        TAG_TRANSITION_RECONCILED => Some(decode_reconciled_transition(record)?),
+        TAG_CAPABILITY_RECONCILED => Some(decode_reconciled_capability(record)?),
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
+}
+
+/// Decode a retired transition obligation: the exact 96-byte triple.
+/// Any length mismatch poisons the file — a retirement is the
+/// irreversible fact, and it never parses approximately.
+fn decode_reconciled_transition(record: &[u8]) -> Option<DecodedFact> {
+    if record.len() != 96 {
+        return None;
+    }
+    let id = TransitionId::from_bytes(record[0..32].try_into().ok()?);
+    let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+    let statement: [u8; 32] = record[64..96].try_into().ok()?;
+    Some(DecodedFact::TransitionReconciled(id, recipient, statement))
+}
+
+/// Decode a retired capability obligation: the exact 72-byte triple,
+/// same strictness as above.
+fn decode_reconciled_capability(record: &[u8]) -> Option<DecodedFact> {
+    if record.len() != 72 {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(record[0..8].try_into().ok()?);
+    let recipient = DeviceId::from_bytes(record[8..40].try_into().ok()?);
+    let statement: [u8; 32] = record[40..72].try_into().ok()?;
+    Some(DecodedFact::CapabilityReconciled(
+        epoch, recipient, statement,
+    ))
 }
 
 /// Decode a received reconciliation request: requester ahead of the
@@ -1003,6 +1077,8 @@ pub(super) enum DecodedFact {
     CarryDone(SnapshotId),
     ReconciliationView(ReconciliationEvidence),
     ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
+    TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
+    CapabilityReconciled(u64, DeviceId, [u8; 32]),
 }
 
 // Sibling test file under the workspace tests_* naming: #[path] is required

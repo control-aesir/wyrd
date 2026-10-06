@@ -1696,6 +1696,43 @@ fn reconciliation_request_replays_to_the_same_statement() {
     );
 }
 
+/// A retirement replays verbatim into its own bucket, one triple per
+/// class: the obligation, the recipient, and the proving statement
+/// digest survive the reopen, and retiring changes nothing
+/// derivable — the retired sets feed pending derivation, never the
+/// reconciliation projection.
+#[test]
+fn reconciled_facts_replay_to_the_same_retirement() {
+    let dir = TestDir::new("reconciliation-retired");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let transition = TransitionId::from_bytes([0x41; 32]);
+    let recipient = DeviceId::from_bytes([0x31; 32]);
+    let statement = [0x5A; 32];
+    store
+        .commit(&[
+            Fact::TransitionReconciled(transition, recipient, statement),
+            Fact::CapabilityReconciled(7, recipient, statement),
+        ])
+        .unwrap();
+    drop(store);
+    let store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.transition_reconciled,
+        vec![(transition, recipient, statement)],
+        "the transition retirement replays verbatim"
+    );
+    assert_eq!(
+        loaded.capability_reconciled,
+        vec![(7, recipient, statement)],
+        "the capability retirement replays verbatim"
+    );
+    assert!(
+        loaded.reconciliation_views.is_empty() && loaded.reconciliation_requests.is_empty(),
+        "retiring neither states nor receives"
+    );
+}
+
 /// The wire-statement identity is stable content addressing: same
 /// requester plus same evidence digests identically across commits,
 /// while a different requester over identical evidence does not —
@@ -2209,10 +2246,16 @@ fn populated_reconciliation_view_counts_bytes_toward_the_commit() {
 /// enumerated pre-view set, and the tag table holds no duplicates —
 /// a duplicate compiles and misdecodes, the exact hazard the `0x16`
 /// boundary test cites. The received-request tag gets the same pin:
-/// `0x19` is a value, not just a member.
+/// `0x19` is a value, not just a member. The two retirement tags get
+/// it too: `0x1A`/`0x1B` are values, and each names exactly one
+/// obligation class — overloading one tag for both would make the
+/// retired class ambiguous at decode.
 #[test]
 fn reconciliation_tag_is_a_clean_upgrade_boundary() {
-    use super::codec::{KNOWN_TAGS, TAG_RECONCILIATION_REQUEST, TAG_RECONCILIATION_VIEW};
+    use super::codec::{
+        KNOWN_TAGS, TAG_CAPABILITY_RECONCILED, TAG_RECONCILIATION_REQUEST, TAG_RECONCILIATION_VIEW,
+        TAG_TRANSITION_RECONCILED,
+    };
     let pre_view_tags = [
         0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
         0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
@@ -2232,6 +2275,26 @@ fn reconciliation_tag_is_a_clean_upgrade_boundary() {
     assert_eq!(
         TAG_RECONCILIATION_REQUEST, 0x19,
         "the tag is pinned: a different value is a different format"
+    );
+    assert!(
+        !pre_view_tags.contains(&TAG_TRANSITION_RECONCILED),
+        "the transition-retirement tag must be new"
+    );
+    assert_eq!(
+        TAG_TRANSITION_RECONCILED, 0x1A,
+        "the tag is pinned: a different value is a different format"
+    );
+    assert!(
+        !pre_view_tags.contains(&TAG_CAPABILITY_RECONCILED),
+        "the capability-retirement tag must be new"
+    );
+    assert_eq!(
+        TAG_CAPABILITY_RECONCILED, 0x1B,
+        "the tag is pinned: a different value is a different format"
+    );
+    assert_ne!(
+        TAG_TRANSITION_RECONCILED, TAG_CAPABILITY_RECONCILED,
+        "one tag per class: the retired class is unambiguous at decode"
     );
     let mut sorted = KNOWN_TAGS.to_vec();
     sorted.sort_unstable();

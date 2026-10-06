@@ -483,16 +483,12 @@ fn note_committed_facts(engine: &mut Engine, facts: &[Fact]) {
         if let Fact::ControlMessage(id) = fact {
             engine.inbox.remember(id);
         }
-        // The received-statement set extends like the seen set: the
-        // commit already wrote the fact, so the live set records the
-        // same (requester, digest) pair resync would rebuild — a
-        // redelivery later in this drain meets Duplicate either way.
-        if let Fact::ReconciliationRequestReceived(requester, evidence) = fact {
-            engine.received_requests.insert((
-                *requester,
-                crate::durable::reconciliation_statement_digest(requester, evidence),
-            ));
-        }
+        // The received-statement set needs no mirror here:
+        // `commit_facts` records every committed statement itself
+        // (like the committed-capability projection), so the live
+        // set and the resync rebuild cannot disagree within one
+        // lifetime — and a redelivery later in this drain meets
+        // Duplicate either way.
         // The committed-capability projection needs no mirror here:
         // `commit_facts` records every committed capability itself,
         // so rotation deliveries (which never consult the projection)
@@ -679,9 +675,11 @@ fn message_action(
 /// evidence) with the envelope's seen-id fact, inside the same
 /// per-pass budget every other arm charges — a received statement
 /// is one more small fact, never a bypass around the budget
-/// (`docs/resource-limits.md`). Nothing retires here (21c) and no
-/// response is composed here (21c): the commit only preserves the
-/// evidence the set difference will compare against.
+/// (`docs/resource-limits.md`). Nothing retires here and no response
+/// is composed here: the commit only preserves the evidence the set
+/// difference compares against, and the 21c answer path
+/// (`runtime::respond`) retires and sends from these durable facts
+/// on a later pass.
 fn request_action(
     engine: &Engine,
     id: &ControlMessageId,

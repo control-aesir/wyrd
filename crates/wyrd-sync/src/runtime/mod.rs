@@ -20,6 +20,7 @@ mod fetch;
 mod intake;
 mod plan;
 pub(crate) mod reconcile;
+pub(crate) mod respond;
 #[cfg(test)]
 pub(crate) mod test_util;
 

@@ -92,7 +92,7 @@ bytes; `wyrd-sync/src/transport/` wraps it for the Nostr mailbox:
   | Local send attempted | Not delivered — the bytes may have reached nobody |
   | At least one relay accepted | Relay-accepted: the fact's whole meaning |
   | Recipient received | Not guaranteed unless separately acknowledged |
-  | Retention expired before recipient retrieval | Potential loss — no re-push or pull path for control messages past relay retention |
+  | Retention expired before recipient retrieval | Recovered by reconciliation: the recipient's gap statement triggers a retransmit from the sender's durable outbox, and the obligation retires on the statement evidencing possession — no relay re-push exists, and none is needed |
   Recipient receipt is never reported by the send path; anything
   needing it must build an acknowledgement above this boundary.
 - **`SignerSession` trait**: the NIP-46 `sign_message` boundary
@@ -285,6 +285,19 @@ it may omit what the full comparison would use (causing
 retransmission), never assert subsumption the durable facts do not
 support.
 
+Implemented as 21c (`runtime::respond`): the sender answers each
+received statement once per process lifetime (a volatile answered
+set; restarts re-answer idempotently), retiring what the evidence
+covers and retransmitting — at most 32 sends per statement —
+what it does not, through the existing deliver path with no new
+wire kind. Transitions sealed past the recipient's newest
+evidenced install are skipped, never retired, until the
+capability install arrives (rotation framing is never skipped, so
+the keys land first). Scope boundary, stated normatively: 21c
+retires transition and capability obligations; announcement
+obligations remain pending and are not eligible for
+reconciliation retirement in 21c.
+
 ### Acceptance scenarios (normative)
 
 A reader with this contract and the code must be able to state, for
@@ -323,14 +336,15 @@ gate.
    the subsumes predicates above — and the reconciliation statement
    is how the sender learns of it.
 
-Until the reconciliation implementation lands
-(`21-reconciliation-implementation`), the operative rule is today's:
-no relay acceptance, no retirement. The unbounded refusal-retry
-position (`sync-and-peers.md:87-91`) consequently narrows to its
-backoff half only once the forget primitive ships — "retries until
-evidence arrives" — and the peer-repair loop consumes this
-contract's vocabulary to distinguish "unavailable" from "never
-received".
+The reconciliation implementation has landed (21a–21c): the
+operative rule is the forget condition above — an obligation
+retires only on durable evidence the recipient's state subsumes
+it, committed as a `*Reconciled` fact naming the proving
+statement. Relay acceptance alone still retires nothing. The
+unbounded refusal-retry position (`sync-and-peers.md:87-91`)
+consequently narrows to its backoff half — "retries until evidence
+arrives" — and the peer-repair loop consumes this contract's
+vocabulary to distinguish "unavailable" from "never received".
 
 ## What is exchanged
 

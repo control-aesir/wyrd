@@ -680,10 +680,41 @@ pub struct Engine {
     /// redelivery shape may write a second fact — the durable set is
     /// the backstop the transport's bounded, evicting seen log cannot
     /// be. Hydrated from the received-request bucket at open and
-    /// resync; the request intake arm extends it after every commit
-    /// (the only writer of the fact, via `note_committed_facts`) —
-    /// the projection follows the store, never leads it.
+    /// resync; `commit_facts` extends it for every committed
+    /// statement (the single point where a durable fact becomes a
+    /// live projection, mirroring the committed-capability
+    /// projection) — the projection follows the store, never leads
+    /// it.
     pub(super) received_requests: BTreeSet<(DeviceId, [u8; 32])>,
+    /// Statements the response path has answered, as (requester,
+    /// statement-digest) pairs: [`Engine::answer_reconciliation`]
+    /// evaluates each durable statement once per process lifetime.
+    /// Volatile by design and never rebuilt at resync — a restart
+    /// re-answers every statement, which is safe because answering
+    /// is idempotent (covered obligations are no longer
+    /// outstanding, so no second retirement commits; retransmits
+    /// reuse byte-identical sealed bytes). The benign direction,
+    /// like the trigger's volatile marker: re-answer work, never
+    /// resumed silence.
+    pub(super) answered_statements: BTreeSet<(DeviceId, [u8; 32])>,
+    /// How many received-request bucket entries were answered: the
+    /// bucket is append-only in commit order, so each pass scans
+    /// only the suffix past this count. Doubles as the answer
+    /// entry guard's left-hand side (see `runtime::respond`): the
+    /// guard compares this bucket ordinal against the dedupe set's
+    /// cardinality, which agree only while every committed statement
+    /// was deduped before commit — today guaranteed solely by the
+    /// intake arm, the only production writer of the fact. A second
+    /// writer that skipped that check would push this counter past
+    /// the set and silence every statement, so name that premise
+    /// wherever a new statement writer lands. Reset on restart
+    /// (never rebuilt) alongside the set above — the rescan
+    /// re-answers idempotently. Guarded by `min` at use: the bucket
+    /// only grows within a lifetime, but a replaced store must not
+    /// underflow the scan (the `min` covers the scan; the early
+    /// return above it fails in the opposite direction, toward
+    /// silence, on the same premise).
+    pub(super) answered_upto: usize,
     /// Held (deferred) control messages with their unblocking
     /// dependencies: arrival order plus a dependency index (see
     /// [`PendingQueue`]). A flush batch emits the woken entries in
@@ -803,6 +834,8 @@ impl Engine {
             announcements: BTreeMap::new(),
             committed_capabilities: BTreeMap::new(),
             received_requests: BTreeSet::new(),
+            answered_statements: BTreeSet::new(),
+            answered_upto: 0,
             pending: PendingQueue::default(),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
@@ -1104,6 +1137,19 @@ impl Engine {
                 let committed = authorized.capability();
                 self.committed_capabilities
                     .insert((committed.device, committed.transition), committed.clone());
+            }
+            // The received-statement set extends like the capability
+            // projection above: the commit already wrote the fact, so
+            // the live set records the same (requester, digest) pair
+            // resync would rebuild — whichever path committed the
+            // statement (intake, or a direct commit in tests), the
+            // set tracks the bucket within one lifetime, which the
+            // answer path's entry guard relies on.
+            if let Fact::ReconciliationRequestReceived(requester, evidence) = fact {
+                self.received_requests.insert((
+                    *requester,
+                    crate::durable::reconciliation_statement_digest(requester, evidence),
+                ));
             }
         }
         Ok(seq)
@@ -2102,8 +2148,9 @@ mod tests_materialization;
 #[cfg(test)]
 mod tests_properties;
 #[cfg(test)]
-#[cfg(test)]
 mod tests_reconciliation;
+#[cfg(test)]
+mod tests_response;
 #[cfg(test)]
 mod tests_restart_equivalence;
 #[cfg(test)]

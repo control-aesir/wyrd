@@ -213,6 +213,14 @@ statement also lengthens the `store.load()` replay each pass pays. The
 per-pass rate is bounded; the retention is not, and the bound for it
 waits for GC like everything else in this file.
 
+Retirement facts (`0x1A`/`0x1B`) grow the same way, one triple per
+retired obligation per recipient: fixed 96/72 bytes, committed by the
+answer path, never deleted (retirement must not delete a fact — the
+markers accumulate with the dedupe set). Their count is bounded by
+the obligation count they discharge, so they add no new growth
+shape beyond the outbox facts they retire against; like every other
+retention question here, their aggregate ceiling waits for GC.
+
 Authorization in v0 is membership, and membership carries **no retention
 obligation and no refusal right**: `trust.md` records that object
 admission is content verification with no per-object ACLs, and

@@ -163,11 +163,16 @@ after the reopen. The per-surface table below IS the relation —
 not a claim about every question an operator can ask (timestamps,
 diagnostic counters, retry generations, telemetry, and transient
 connection state are excluded precisely because several must
-differ across a restart), and not whatever a snapshot function
-finds convenient to serialize. The surface list is the authority;
-the whole-state snapshot (`SyncStatus`, observed from committed
-facts only) is derived from it, so the snapshot can never
-silently shrink the relation to the fields easiest to compare.
+differ across a restart). The table is authoritative in exactly
+this sense: every row names the observable, the verdict, and the
+pin that proves it, so a reader never has to infer intent. The
+whole-state snapshot (`SyncStatus`, observed from committed facts
+only) is the aggregate tripwire over the rows it covers — serving
+residency, the seen-id log, the route table, and suppression
+verdicts have no `SyncStatus` field, and the snapshot says nothing
+about them. Nothing here prevents the snapshot from shrinking;
+what prevents silent shrinkage is that each row carries its own
+pin, and a row whose pin stops proving the row fails by name.
 
 Four verdicts, per surface:
 
@@ -187,12 +192,13 @@ Four verdicts, per surface:
 | Control state (announcement projection, committed capabilities) | rebuilt | same test; replays through `Engine::resync` (`engine/mod.rs`) |
 | Materialization state (`Cached` / `Pinned` policies, local objects) | survives | `restart_equivalence_materialization_state_matches` |
 | Pending outbox obligations | survives | `restart_equivalence_pending_obligations_match`; replay is the obligation invariant above |
-| Serving residency (vault files, `VaultSource` maps) | survives | `restart_equivalence_serving_residency_matches` |
+| Serving residency: vault files (hex-named sealed roots) | survives | `restart_equivalence_serving_residency_matches` compares `vault().roots()` |
+| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving.rs`); the vault directory above is the durable half |
 | Seen-id log (inbox `seen` set, `mailbox.seen` file) | rebuilt | replayed in `resync`; torn tail truncated on open |
 | Route table | rebuilt | re-published from durable announcements every pass (`transport/routes.rs`) |
 | Want registry (waiter demand, admission cache) | lost, correctly | `want_registry_loss_is_expected_and_re_demands_from_durable_state`; never persisted (`core/want.rs`), re-demands from durable `Cached` |
 | Suppression verdicts | lost, correctly | `suppression_revalidates_after_restart`, `redelivery_after_restart_stays_duplicate`; re-derive to the same outcome |
-| Mutation queue and parent tokens | lost, correctly | session-local by design (`core/mutation.rs`); shutdown completes blocked submitters with `Shutdown` (`nearest_deadline_spans_pending_and_deferred_entries`) |
+| Mutation queue and parent tokens | lost, correctly | session-local by design (`core/mutation.rs`); shutdown completes blocked submitters with `Shutdown` (`shutdown_with_registry_releases_held_wants`, `submit_after_shutdown_fails_fast`) |
 | **Serving endpoint identity/address** | **excluded** | rebound on restart by design; post-restart announcement is convergence, tested separately — never make it durable to satisfy this table |
 | Timestamps, counters, retry generations, telemetry, transient connection state | excluded | must differ; outside the relation |
 

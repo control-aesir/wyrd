@@ -47,8 +47,8 @@ version say exactly what changed.
   excluded by name (residency in, address out); the restart-loss rule
   for memory-only state not yet written (peer-repair generations) is
   normative now, rows land with the code. Pinned by ten engine row
-  and crash-stage tests, two status tests, and the want-registry
-  loss test; the single invariant
+  and crash-stage tests, the named suppression-loss pin, two status
+  tests, and the want-registry loss test; the single invariant
   `a_crash_loses_ephemeral_state_but_no_durable_obligation`
   asserts both halves across a real mid-flight reopen.
 - Normative DG-3 control-message recovery / forget contract in

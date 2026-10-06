@@ -102,8 +102,11 @@ fn restart_equivalence_durable_facts_match() {
 
 /// Membership and control state survive: the same tip over the same
 /// members, the same pending outbox per class with the same totals,
-/// and the same held epoch secrets. Non-vacuous: the admission
-/// queued catch-up obligations A still owes.
+/// the same held epoch secrets — and the same rebuilt projections:
+/// the announcement map and the committed-capability map as
+/// `resync` replays them, not just the facts they derive from.
+/// Non-vacuous: the scenario's intake committed announcements and
+/// capabilities on both sides.
 #[test]
 fn restart_equivalence_membership_and_control_state_match() {
     let (mut pair, controls, _) = scenario();
@@ -129,6 +132,16 @@ fn restart_equivalence_membership_and_control_state_match() {
         state.outbox_totals(),
     );
     let held = pair.a.engine.held_epochs().expect("epochs before restart");
+    let announcements = pair.a.engine.announcement_projection_for_test().clone();
+    assert!(
+        !announcements.is_empty(),
+        "intake projected announcements before restart"
+    );
+    let capabilities = pair.a.engine.committed_capabilities_for_test().clone();
+    assert!(
+        !capabilities.is_empty(),
+        "intake projected capabilities before restart"
+    );
     restart(&mut pair.a, &controls);
     let tip_after = pair
         .a
@@ -157,6 +170,16 @@ fn restart_equivalence_membership_and_control_state_match() {
     assert_eq!(
         pair.a.engine.held_epochs().expect("epochs after restart"),
         held
+    );
+    assert_eq!(
+        pair.a.engine.announcement_projection_for_test(),
+        &announcements,
+        "resync replays the announcement projection"
+    );
+    assert_eq!(
+        pair.a.engine.committed_capabilities_for_test(),
+        &capabilities,
+        "resync replays the committed-capability projection"
     );
 }
 
@@ -224,8 +247,8 @@ fn restart_equivalence_pending_obligations_match() {
 }
 
 /// Serving residency survives: the same vault roots serve after
-/// the reopen. Residency, not endpoint identity — no address
-/// appears in this comparison by construction. Non-vacuous:
+/// the reopen. Residency, not endpoint identity — no endpoint
+/// identity or `node_addr` appears in this comparison. Non-vacuous:
 /// authoring seals the fresh representations into A's vault.
 #[test]
 fn restart_equivalence_serving_residency_matches() {
@@ -298,6 +321,10 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
     assert!(!pending.0.is_empty(), "announcements queued mid-flight");
     let materialization = state.materialization_summary();
     assert_eq!(materialization.pinned, 2, "pin policy held mid-flight");
+    let projections = (
+        pair.a.engine.announcement_projection_for_test().clone(),
+        pair.a.engine.committed_capabilities_for_test().clone(),
+    );
     let mut roots = pair.a.engine.vault().roots().expect("roots before restart");
     roots.sort();
     assert!(!roots.is_empty(), "authored representations resident");
@@ -334,6 +361,14 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
         state_after.materialization_summary(),
         materialization,
         "materialization row"
+    );
+    assert_eq!(
+        (
+            pair.a.engine.announcement_projection_for_test(),
+            pair.a.engine.committed_capabilities_for_test(),
+        ),
+        (&projections.0, &projections.1),
+        "control-state row"
     );
     let mut roots_after = pair.a.engine.vault().roots().expect("roots after restart");
     roots_after.sort();
@@ -429,43 +464,47 @@ fn crash_after_rename_current_replays_obligation() {
 
 /// A crash mid-temp-write leaves an orphan, never state: the reopen
 /// ignores the temp file and still matches the before-state on both
-/// the sequence and the pending outbox.
+/// the sequence and the pending outbox. Both temp stages
+/// (`AfterWriteTemp`, `AfterFsyncTemp`) — neither has renamed
+/// anything into place, so both must read as the before-state.
 #[test]
 fn crash_during_temp_write_ignores_orphan_and_matches_before_state() {
-    let (mut pair, controls, _) = scenario();
-    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
-    author_unannounced(&mut pair);
-    let current = pair.a.engine.current();
-    let pending = pair
-        .a
-        .engine
-        .runtime_state()
-        .expect("state before crash")
-        .pending_announcements();
-    pair.a
-        .engine
-        .store
-        .commit_until(
-            &[Fact::AnnouncementQueued(
-                SnapshotId::from_bytes([0xA9; 32]),
-                DeviceId::from_bytes([0xB9; 32]),
-            )],
-            CrashStage::AfterWriteTemp,
-        )
-        .unwrap();
-    restart(&mut pair.a, &controls);
-    assert_eq!(
-        pair.a.engine.current(),
-        current,
-        "the orphan never became a sequence"
-    );
-    assert_eq!(
-        pair.a
+    for stage in [CrashStage::AfterWriteTemp, CrashStage::AfterFsyncTemp] {
+        let (mut pair, controls, _) = scenario();
+        assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+        author_unannounced(&mut pair);
+        let current = pair.a.engine.current();
+        let pending = pair
+            .a
             .engine
             .runtime_state()
-            .expect("state after crash")
-            .pending_announcements(),
-        pending,
-        "the orphan contributed no obligation"
-    );
+            .expect("state before crash")
+            .pending_announcements();
+        pair.a
+            .engine
+            .store
+            .commit_until(
+                &[Fact::AnnouncementQueued(
+                    SnapshotId::from_bytes([0xA9; 32]),
+                    DeviceId::from_bytes([0xB9; 32]),
+                )],
+                stage,
+            )
+            .unwrap();
+        restart(&mut pair.a, &controls);
+        assert_eq!(
+            pair.a.engine.current(),
+            current,
+            "the orphan never became a sequence ({stage:?})"
+        );
+        assert_eq!(
+            pair.a
+                .engine
+                .runtime_state()
+                .expect("state after crash")
+                .pending_announcements(),
+            pending,
+            "the orphan contributed no obligation ({stage:?})"
+        );
+    }
 }

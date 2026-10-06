@@ -1081,6 +1081,26 @@ impl Engine {
         self.store.release_store_lock();
     }
 
+    /// Test-only: the rebuilt announcement projection, for the
+    /// restart-equivalence control-state row. Compared across a
+    /// reopen to prove `resync` replays the projection rather than
+    /// merely the facts it derives from.
+    #[cfg(test)]
+    pub(crate) fn announcement_projection_for_test(
+        &self,
+    ) -> &BTreeMap<SnapshotId, SnapshotAnnouncement> {
+        &self.announcements
+    }
+
+    /// Test-only: the committed-capability projection, same row and
+    /// same reason as above.
+    #[cfg(test)]
+    pub(crate) fn committed_capabilities_for_test(
+        &self,
+    ) -> &BTreeMap<(DeviceId, TransitionId), Capability> {
+        &self.committed_capabilities
+    }
+
     /// Hold an epoch's control key for inbox ingest. Keys live with
     /// the engine (not just the inbox) so restarts and resyncs keep
     /// them; both copies are zeroizing, so replacement briefly holds

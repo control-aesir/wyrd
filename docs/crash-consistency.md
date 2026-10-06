@@ -193,11 +193,11 @@ Four verdicts, per surface:
 | Materialization state (`Cached` / `Pinned` policies, local objects) | survives | `restart_equivalence_materialization_state_matches` |
 | Pending outbox obligations | survives | `restart_equivalence_pending_obligations_match`; replay is the obligation invariant above |
 | Serving residency: vault files (hex-named sealed roots) | survives | `restart_equivalence_serving_residency_matches` compares `vault().roots()` |
-| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving.rs`); the vault directory above is the durable half |
-| Seen-id log (inbox `seen` set, `mailbox.seen` file) | rebuilt | replayed in `resync`; torn tail truncated on open |
-| Route table | rebuilt | re-published from durable announcements every pass (`transport/routes.rs`) |
-| Want registry (waiter demand, admission cache) | lost, correctly | `want_registry_loss_is_expected_and_re_demands_from_durable_state`; never persisted (`core/want.rs`), re-demands from durable `Cached` |
-| Suppression verdicts | lost, correctly | `suppression_revalidates_after_restart`, `redelivery_after_restart_stays_duplicate`; re-derive to the same outcome |
+| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | `maps_for_test` compared across the reopen in `restart_equivalence_serving_residency_matches`; reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving.rs`) |
+| Seen-id log (inbox `seen` set, `mailbox.seen` file) | rebuilt | replayed in `resync`; torn tail truncated on open; behaviorally pinned by `redelivery_after_restart_stays_duplicate` (duplicates still recognized after the reopen) |
+| Route table | rebuilt | pure derivation of the announcement projection (`publish_recorded_routes` reads `state.announcement(&snapshot)` per recorded snapshot); the projection equality in the control-state row IS the pin — no independent test constructs an iroh bulk source for this |
+| Want registry (waiter demand, admission cache) | lost, correctly | `want_registry_loss_is_expected_and_re_demands_from_durable_state` pins the loss half; never persisted (`core/want.rs`). The re-demand half (loop re-registers from surviving `Cached`) follows from the materialization row but has no dedicated pin — follow-up with the materialization work, not claimed here |
+| Suppression verdicts | lost, correctly | `suppression_cache_loss_re_derives_the_same_verdict` (warm-cache short-circuit vs post-restart revalidation to the same outcome); also `suppression_revalidates_after_restart`, `redelivery_after_restart_stays_duplicate` |
 | Mutation queue and parent tokens | lost, correctly | session-local by design (`core/mutation.rs`); shutdown completes blocked submitters with `Shutdown` (`shutdown_with_registry_releases_held_wants`, `submit_after_shutdown_fails_fast`) |
 | **Serving endpoint identity/address** | **excluded** | rebound on restart by design; post-restart announcement is convergence, tested separately — never make it durable to satisfy this table |
 | Timestamps, counters, retry generations, telemetry, transient connection state | excluded | must differ; outside the relation |

@@ -1020,6 +1020,21 @@ impl VaultSource {
             sealed,
         })
     }
+
+    /// Test-only: the rebuilt serving maps, for the
+    /// restart-equivalence residency row. Compared across a reopen
+    /// to prove `from_state` reconstructs them from durable state
+    /// rather than carrying memory.
+    #[cfg(test)]
+    pub(crate) fn maps_for_test(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<SnapshotId, (ContentId, BaoRoot)>,
+        std::collections::BTreeMap<SnapshotId, Vec<u8>>,
+        std::collections::BTreeMap<StorageId, BaoRoot>,
+    ) {
+        (self.roots.clone(), self.bodies.clone(), self.sealed.clone())
+    }
 }
 
 /// Local vault reads: instantaneous, so the plan's per-attempt cap

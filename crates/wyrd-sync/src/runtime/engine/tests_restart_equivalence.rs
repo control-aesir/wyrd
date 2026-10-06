@@ -249,7 +249,9 @@ fn restart_equivalence_pending_obligations_match() {
 /// Serving residency survives: the same vault roots serve after
 /// the reopen. Residency, not endpoint identity — no endpoint
 /// identity or `node_addr` appears in this comparison. Non-vacuous:
-/// authoring seals the fresh representations into A's vault.
+/// authoring seals the fresh representations into A's vault. Both
+/// halves are compared: the vault directory (survives) and the
+/// `VaultSource` maps rebuilt from recorded state (rebuilt).
 #[test]
 fn restart_equivalence_serving_residency_matches() {
     let (mut pair, controls, _) = scenario();
@@ -262,10 +264,30 @@ fn restart_equivalence_serving_residency_matches() {
         !before.is_empty(),
         "authoring imported representations into the vault"
     );
+    let maps = crate::serving::VaultSource::from_state(
+        &pair.a.engine.runtime_state().expect("state before restart"),
+        pair.a.engine.vault(),
+    )
+    .expect("serving maps build")
+    .maps_for_test();
+    assert!(
+        !maps.0.is_empty(),
+        "recorded snapshots project serving maps"
+    );
     restart(&mut pair.a, &controls);
     let mut after = pair.a.engine.vault().roots().expect("vault lists roots");
     after.sort();
     assert_eq!(after, before);
+    assert_eq!(
+        crate::serving::VaultSource::from_state(
+            &pair.a.engine.runtime_state().expect("state after restart"),
+            pair.a.engine.vault(),
+        )
+        .expect("serving maps rebuild")
+        .maps_for_test(),
+        maps,
+        "from_state reconstructs the maps from durable state"
+    );
 }
 
 /// The invariant as one assertion: a crash loses ephemeral state
@@ -372,7 +394,19 @@ fn a_crash_loses_ephemeral_state_but_no_durable_obligation() {
     );
     let mut roots_after = pair.a.engine.vault().roots().expect("roots after restart");
     roots_after.sort();
-    assert_eq!(roots_after, roots, "residency row");
+    assert_eq!(roots_after, roots, "residency row: vault files");
+    assert_eq!(
+        crate::serving::VaultSource::from_state(
+            &pair.a.engine.runtime_state().expect("state after restart"),
+            pair.a.engine.vault(),
+        )
+        .expect("serving maps rebuild")
+        .maps_for_test(),
+        crate::serving::VaultSource::from_state(&state, pair.a.engine.vault(),)
+            .expect("serving maps build")
+            .maps_for_test(),
+        "residency row: serving maps rebuilt"
+    );
     // The retry pass manufactures nothing: no new commits, no new
     // intake on an empty relay.
     assert_eq!(pair.a.engine.current(), current, "no phantom commit");

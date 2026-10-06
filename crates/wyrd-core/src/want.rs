@@ -563,11 +563,12 @@ mod tests {
     /// memory-only by design (`docs/crash-consistency.md`, "Restart
     /// equivalence"), so dropping it — the process-death half of a
     /// restart — loses every pending demand and every admitted mark,
-    /// and the fresh registry re-demands from nothing. The durable
-    /// half (the `Cached` policy surviving the reopen) is the
-    /// engine's business, pinned by the materialization row; this
-    /// test pins the loss half so nobody persists the registry to
-    /// "fix" a restart that is already correct.
+    /// and the fresh registry re-demands from nothing. This test pins
+    /// the loss half only. The durable half (the `Cached` policy
+    /// surviving the reopen, which is what a re-opened reader
+    /// re-demands against) is the engine's business, pinned by the
+    /// materialization row; the loop's re-registration path has no
+    /// dedicated pin yet, and this test does not claim it.
     #[test]
     fn want_registry_loss_is_expected_and_re_demands_from_durable_state() {
         let registry = WantRegistry::default();

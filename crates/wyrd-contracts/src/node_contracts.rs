@@ -392,6 +392,8 @@ where
     V: NamespaceView<Materialization = RuntimeMaterialization> + Send + Sync,
     V::Store: ObjectStore + Send + Sync,
     <V::Store as ObjectStore>::Error: std::fmt::Debug,
+    V::Store: wyrd_format::DiscardRejectedRepresentation,
+    <V::Store as wyrd_format::DiscardRejectedRepresentation>::Error: std::fmt::Debug,
 {
     let (mut live, parts) = node
         .into_live(Duration::from_secs(5), &LiveConfig::default())

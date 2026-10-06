@@ -1,6 +1,7 @@
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
 use wyrd_core::mutation::{FoldMember, MutationKind};
+use wyrd_core::quarantine::QuarantineReport;
 use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_sync::bulk::MemoryBulkSource;
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
@@ -707,6 +708,10 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         invalid: 0,
         unavailable_keys: 0,
         local_failures: 0,
+        quarantined_observed: 0,
+        quarantine_claims_cleared: 0,
+        quarantine_bytes_discarded: 0,
+        quarantine_failures: 0,
         sent: 0,
         outcome,
         pending: 0,
@@ -922,6 +927,10 @@ fn run_outcome_maps_to_success_or_incomplete() {
         invalid: 0,
         unavailable_keys: 0,
         local_failures: 0,
+        quarantined_observed: 0,
+        quarantine_claims_cleared: 0,
+        quarantine_bytes_discarded: 0,
+        quarantine_failures: 0,
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
@@ -951,6 +960,10 @@ fn run_outcome_maps_to_success_or_incomplete() {
         invalid: 0,
         unavailable_keys: 0,
         local_failures: 0,
+        quarantined_observed: 0,
+        quarantine_claims_cleared: 0,
+        quarantine_bytes_discarded: 0,
+        quarantine_failures: 0,
         sent: 0,
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
@@ -980,6 +993,10 @@ fn run_outcome_maps_to_success_or_incomplete() {
         invalid: 0,
         unavailable_keys: 0,
         local_failures: 0,
+        quarantined_observed: 0,
+        quarantine_claims_cleared: 0,
+        quarantine_bytes_discarded: 0,
+        quarantine_failures: 0,
         sent: 0,
         outcome: RunOutcome::PassLimit,
         pending: 4,
@@ -1356,6 +1373,12 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
                 unavailable_keys: 14,
                 local_failures: 15,
             },
+            quarantined: QuarantineReport {
+                observed: 17,
+                claims_cleared: 18,
+                bytes_discarded: 19,
+                failures: 20,
+            },
             published: true,
             sent: 16,
             generation: 1,
@@ -1381,6 +1404,10 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
     assert_eq!(report.invalid, 156);
     assert_eq!(report.unavailable_keys, 168);
     assert_eq!(report.local_failures, 180);
+    assert_eq!(report.quarantined_observed, 204);
+    assert_eq!(report.quarantine_claims_cleared, 216);
+    assert_eq!(report.quarantine_bytes_discarded, 228);
+    assert_eq!(report.quarantine_failures, 240);
     assert_eq!(report.sent, 192);
     assert_eq!(
         report.peers_observed,

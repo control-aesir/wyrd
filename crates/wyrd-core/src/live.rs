@@ -7,8 +7,9 @@
 //! immutable generation under a short write lock.
 
 use wyrd_format::{
-    chunk, ContentId, DeviceId, Entry, FetchStatus, FsObjectStore, ObjectStore, RetainedBytes,
-    SharedStore, SnapshotId, StoreError, StoreFailure, TransitionId, Tree,
+    chunk, ContentId, DeviceId, DiscardRejectedRepresentation, Entry, FetchStatus, FsObjectStore,
+    ObjectStore, RetainedBytes, SharedStore, SnapshotId, StoreError, StoreFailure, TransitionId,
+    Tree,
 };
 use wyrd_sync::closure::ClosureError;
 use wyrd_sync::durable::{AuthorizedSnapshot, DurableError};
@@ -36,6 +37,7 @@ use crate::mutation::{
     MutationError, MutationKind, MutationOutcome, MutationQueue, WriteStats,
 };
 use crate::projection::{Projection, SharedProjection};
+use crate::quarantine::{drain_quarantine, QuarantineQueue, QuarantineReport};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
 use crate::want::WantRegistry;
@@ -167,6 +169,9 @@ pub struct SyncReport {
     /// Fetch execution: manifests, snapshot bodies, objects committed,
     /// and items still unfulfilled for the next pass.
     pub fetched: ExecuteReport,
+    /// Rejected-representation repair: diagnostics emitted, claims
+    /// cleared, bytes unlinked. Zero on passes with nothing queued.
+    pub quarantined: QuarantineReport,
     /// Whether the pass published a new projection generation.
     pub published: bool,
     /// Outbound sends the pass's publication committed (announcements
@@ -515,6 +520,11 @@ pub struct LiveNode<V: NamespaceView> {
     /// the view. The registry's lock is its own (never the
     /// publication's or the store's).
     pub(super) wants: Arc<WantRegistry>,
+    /// Rejected representations readers observed: backends submit
+    /// verification failures here, the loop's drain discards the
+    /// bytes and clears the claim. Shared with the backend like the
+    /// want registry; the loop alone drains.
+    pub(super) quarantine: Arc<QuarantineQueue>,
     /// Mounted mutations: the backend submits and blocks, the loop
     /// drains and applies them serially each pass (the total order).
     /// Its lock is its own; submitting also wakes the loop's idle wait.
@@ -859,6 +869,7 @@ where
             budgets.max_pending_mutations,
             budgets.max_parent_tokens,
         ));
+        let quarantine = Arc::new(QuarantineQueue::default());
         // One pacing signal for the whole live session: created here,
         // attached to the queue now, and shared with the backend's
         // callers (mailbox intake) so every producer wakes the loop.
@@ -889,6 +900,7 @@ where
                 store,
                 projection,
                 wants,
+                quarantine,
                 mutations,
                 retained_bytes: config.retained_bytes.clone(),
                 published_revision: revision,
@@ -1110,7 +1122,11 @@ where
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
-    ) -> Result<SyncReport, LiveError> {
+    ) -> Result<SyncReport, LiveError>
+    where
+        V::Store: DiscardRejectedRepresentation,
+        <V::Store as DiscardRejectedRepresentation>::Error: std::fmt::Debug,
+    {
         let report = self.sync_pass(mailbox, bulk);
         if report.is_err() {
             self.dirty = true;
@@ -1190,7 +1206,11 @@ where
         &mut self,
         mailbox: &mut M,
         bulk: Option<&mut B>,
-    ) -> Result<SyncReport, LiveError> {
+    ) -> Result<SyncReport, LiveError>
+    where
+        V::Store: DiscardRejectedRepresentation,
+        <V::Store as DiscardRejectedRepresentation>::Error: std::fmt::Debug,
+    {
         let drained = self.engine.drain(mailbox)?;
         // Reconciliation trigger (OD-21-4, C+A): the reconnect edge
         // plus the drain's gap signal, evaluated once per pass. The
@@ -1224,6 +1244,29 @@ where
         for id in self.wants.take_reopen_notes() {
             self.engine.reopen_generation(&id);
         }
+        // Rejected-representation drain (OD-12-1 A, OD-12-2 A): every
+        // verification failure readers submitted since the last pass
+        // is diagnosed, unlinked, and unclaimed here — ahead of
+        // admission, so the same pass reconciles the cleared claim
+        // back to pending and the waiter's want drives a fresh fetch
+        // generation without waiting another pass. The residency
+        // policy is untouched and no waiter is synthesized; the
+        // emission closure is the diagnostic channel
+        // `14-fetch-failure-diagnostics` will persist.
+        let quarantined = drain_quarantine(
+            &self.quarantine,
+            &self.store,
+            self.retained_bytes.as_deref(),
+            &mut self.engine,
+            &mut |failure| {
+                tracing::warn!(
+                    content = ?failure.content(),
+                    kind = ?failure.kind(),
+                    cause = ?failure.cause(),
+                    "representation rejected: discarding bytes and re-demanding"
+                );
+            },
+        )?;
         // Admit outstanding backend demand ahead of fetching, atomically
         // from the registry's perspective: only durably committed
         // identities are marked admitted, so a failing commit leaves
@@ -1414,6 +1457,7 @@ where
             return Ok(SyncReport {
                 drained,
                 fetched,
+                quarantined,
                 published: false,
                 sent: 0,
                 generation,
@@ -1460,6 +1504,7 @@ where
             return Ok(SyncReport {
                 drained,
                 fetched,
+                quarantined,
                 published: false,
                 sent,
                 generation,
@@ -1537,6 +1582,7 @@ where
         Ok(SyncReport {
             drained,
             fetched,
+            quarantined,
             published: true,
             sent,
             generation: generation + 1,
@@ -2885,7 +2931,11 @@ where
         stop: &AtomicBool,
         config: &LiveConfig,
         observe: &mut dyn FnMut(&LiveError, u32),
-    ) -> Result<LiveSummary, LiveError> {
+    ) -> Result<LiveSummary, LiveError>
+    where
+        V::Store: DiscardRejectedRepresentation,
+        <V::Store as DiscardRejectedRepresentation>::Error: std::fmt::Debug,
+    {
         let waker = Arc::clone(&self.waker);
         let mut summary = LiveSummary {
             passes: 0,

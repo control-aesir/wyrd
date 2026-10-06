@@ -93,14 +93,17 @@ pub(super) fn scratch_drive() -> (Engine, std::path::PathBuf, DeviceIdentitySecr
 /// Spawn the live loop on its own thread and return the stop flag
 /// and join handle. The backend half stays on the test thread, so a
 /// blocking mutation submit is completed by the loop concurrently.
-pub(super) fn spawn_live_loop<S: ObjectStore + Send + Sync + 'static>(
+pub(super) fn spawn_live_loop<S>(
     live: LiveNode<DriveView<S, RuntimeMaterialization>>,
 ) -> (
     Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<Result<LiveSummary, LiveError>>,
 )
 where
-    S::Error: std::fmt::Debug,
+    S: ObjectStore + Send + Sync + 'static,
+    <S as ObjectStore>::Error: std::fmt::Debug,
+    S: wyrd_format::DiscardRejectedRepresentation,
+    <S as wyrd_format::DiscardRejectedRepresentation>::Error: std::fmt::Debug,
 {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let loop_stop = Arc::clone(&stop);

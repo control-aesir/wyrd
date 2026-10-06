@@ -18,6 +18,7 @@ pub mod mutation;
 pub mod node;
 pub mod policy;
 pub mod projection;
+pub mod quarantine;
 pub mod session;
 pub mod status;
 pub mod view;

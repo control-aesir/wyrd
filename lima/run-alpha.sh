@@ -39,11 +39,107 @@ ROOT="$(git rev-parse --show-toplevel)"
 INSTANCE="wyrd-alpha"
 SHARE=/tmp/lima
 mkdir -p "$SHARE"
+
+if ! limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]].*Running"; then
+  if limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]]"; then
+    echo "==> starting existing instance $INSTANCE"
+    limactl start "$INSTANCE"
+  else
+    echo "==> creating instance $INSTANCE"
+    # The yaml carries a placeholder checkout path; stamp the real one.
+    # (limactl --set could do this, but a rendered file is easier to
+    # debug.) The replacement is sed-escaped: a checkout path with
+    # `&`, `|`, or `\` must land literally.
+    ROOT_SED="${ROOT//\\/\\\\}"
+    ROOT_SED="${ROOT_SED//|/\\|}"
+    ROOT_SED="${ROOT_SED//&/\\&}"
+    sed "s|/path/to/wyrd-checkout|$ROOT_SED|" "$ROOT/lima/wyrd-alpha.yaml" \
+      > "$SHARE/wyrd-alpha.rendered.yaml"
+    limactl start --name="$INSTANCE" "$SHARE/wyrd-alpha.rendered.yaml"
+  fi
+fi
+
+# The guest share is stamped with the checkout path at creation time, so a
+# run from a different worktree would silently test the wrong code (or fail
+# obscurely off a deleted checkout). Refuse before building anything. The
+# comparison is host-side: the instance yaml records the checkout the share
+# serves, and path equality is strictly stronger than a HEAD probe (two
+# checkouts at the same commit are still different shares). A guest liveness
+# check confirms something shaped like this checkout is actually mounted;
+# the guest needs no toolchain for either half.
+LIMA_YAML="${LIMA_HOME:-$HOME/.lima}/$INSTANCE/lima.yaml"
+# Print the checkout path the instance yaml records for /mnt/wyrd (empty
+# on any failure: missing file, no match). The matcher is quote-agnostic
+# and index-guarded: limactl owns this file's serialization, not us.
+recorded_location() {
+  WYRD_YAML="$1" python3 - <<'EOF' 2>/dev/null || true
+import os
+path = os.environ["WYRD_YAML"]
+lines = open(path).read().split("\n")
+for i, line in enumerate(lines):
+    if not line.strip().startswith("- location:"):
+        continue
+    if i + 1 >= len(lines):
+        break
+    nxt = lines[i + 1].replace('"', "").replace("'", "")
+    if "mountPoint:" in nxt and "/mnt/wyrd" in nxt:
+        print(line.split(":", 1)[1].strip().strip("\"'"))
+        break
+EOF
+}
+# A sentry file, not git: the guest must show a mounted checkout, and the
+# recorded path above says which one.
+share_mounted() {
+  (cd / && limactl shell "$INSTANCE" -- test -f /mnt/wyrd/lima/run-alpha.sh 2>/dev/null)
+}
+RECORDED="$(recorded_location "$LIMA_YAML")"
+if [[ "$RECORDED" != "$ROOT" ]] || ! share_mounted; then
+  if [[ $RESHARE -eq 1 ]]; then
+    echo "==> guest share is stale (recorded ${RECORDED:-unreadable}, checkout $ROOT); re-pointing $INSTANCE"
+    # Validate before stopping: the read above already proved the file
+    # parses and names a /mnt/wyrd mount, so the rewrite below cannot miss.
+    # Back up the operator's config, then rewrite atomically. Only the
+    # /mnt/wyrd mount moves; image locations and the scratch share stay.
+    [[ -n "$RECORDED" ]] || { echo "error: cannot re-share: no /mnt/wyrd mount in $LIMA_YAML" >&2; exit 2; }
+    limactl stop "$INSTANCE"
+    WYRD_YAML="$LIMA_YAML" WYRD_ROOT="$ROOT" python3 - <<'EOF'
+import json, os, shutil
+path = os.environ["WYRD_YAML"]
+root = os.environ["WYRD_ROOT"]
+lines = open(path).read().split("\n")
+for i, line in enumerate(lines):
+    if not line.strip().startswith("- location:"):
+        continue
+    if i + 1 >= len(lines):
+        break
+    nxt = lines[i + 1].replace('"', "").replace("'", "")
+    if "mountPoint:" in nxt and "/mnt/wyrd" in nxt:
+        indent = line[: line.index("- location:")]
+        lines[i] = indent + "- location: " + json.dumps(root)
+        break
+else:
+    raise SystemExit("no /mnt/wyrd mount found in " + path)
+shutil.copy(path, path + ".bak")
+tmp = path + ".tmp"
+open(tmp, "w").write("\n".join(lines))
+os.replace(tmp, path)
+EOF
+    limactl start "$INSTANCE"
+    RECORDED="$(recorded_location "$LIMA_YAML")"
+  fi
+  if [[ "$RECORDED" != "$ROOT" ]] || ! share_mounted; then
+    echo "error: guest share is stale (recorded ${RECORDED:-unreadable}, checkout $ROOT)" >&2
+    echo "  recreate the instance, or rerun with --re-share to re-point it at this checkout" >&2
+    exit 2
+  fi
+fi
+
 # The guest copies each run's logs to $SHARE/logs/<timestamp>; prune
 # to the five newest before this run adds its own, so per-run
 # forensics stay available without the shared host dir growing
 # without bound. Names sort by intent already (%Y%m%d-%H%M%S), so
-# order by name, not mtime.
+# order by name, not mtime. This sits below the verification above so a
+# refused run leaves host state untouched.
 if [[ -d "$SHARE/logs" ]]; then
   # Only directories rank: a stray file must neither consume a keep
   # slot nor be deleted.
@@ -89,72 +185,6 @@ REV="$(python3 -c "import json; print(json.load(open('$ROOT/flake.lock'))['nodes
   [[ -z "$ONLY_STEP" ]] || printf 'E2E_ONLY_STEP=%q\n' "$ONLY_STEP"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
 } > "$SHARE/e2e-env.sh"
-
-if ! limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]].*Running"; then
-  if limactl list 2>/dev/null | grep -q "^$INSTANCE[[:space:]]"; then
-    echo "==> starting existing instance $INSTANCE"
-    limactl start "$INSTANCE"
-  else
-    echo "==> creating instance $INSTANCE"
-    # The yaml carries a placeholder checkout path; stamp the real one.
-    # (limactl --set could do this, but a rendered file is easier to
-    # debug.) The replacement is sed-escaped: a checkout path with
-    # `&`, `|`, or `\` must land literally.
-    ROOT_SED="${ROOT//\\/\\\\}"
-    ROOT_SED="${ROOT_SED//|/\\|}"
-    ROOT_SED="${ROOT_SED//&/\\&}"
-    sed "s|/path/to/wyrd-checkout|$ROOT_SED|" "$ROOT/lima/wyrd-alpha.yaml" \
-      > "$SHARE/wyrd-alpha.rendered.yaml"
-    limactl start --name="$INSTANCE" "$SHARE/wyrd-alpha.rendered.yaml"
-  fi
-fi
-
-# The guest share is stamped with the checkout path at creation time, so a
-# run from a different worktree would silently test the wrong code (or fail
-# obscurely off a deleted checkout). Refuse before building anything. The
-# identity is the .git pointer for linked worktrees (whose .git is a file
-# naming the host git dir, unreadable as a repo from the guest) and HEAD
-# for full checkouts; either way one short call per side settles it.
-share_id() {
-  if [[ -f "$1/.git" ]]; then
-    tr -d '\n' < "$1/.git"
-  else
-    git -C "$1" rev-parse HEAD
-  fi
-}
-HOST_SHARE_ID="$(share_id "$ROOT")"
-GUEST_SHARE_ID="$(limactl shell "$INSTANCE" -- bash -c 'if [[ -f /mnt/wyrd/.git ]]; then tr -d "\n" < /mnt/wyrd/.git; else git -C /mnt/wyrd rev-parse HEAD; fi' 2>/dev/null || true)"
-if [[ "$GUEST_SHARE_ID" != "$HOST_SHARE_ID" ]]; then
-  if [[ $RESHARE -eq 1 ]]; then
-    echo "==> guest share is stale (guest ${GUEST_SHARE_ID:-unreadable}, host $HOST_SHARE_ID); re-pointing $INSTANCE at $ROOT"
-    # The instance config lives next to the instance, not next to the
-    # template: edit the stamped copy while stopped, then start. Only the
-    # /mnt/wyrd mount moves; image locations and the scratch share stay.
-    LIMA_YAML="${LIMA_HOME:-$HOME/.lima}/$INSTANCE/lima.yaml"
-    limactl stop "$INSTANCE"
-    WYRD_ROOT="$ROOT" python3 - "$LIMA_YAML" <<'EOF'
-import json, os, sys
-path = sys.argv[1]
-root = os.environ["WYRD_ROOT"]
-lines = open(path).read().split("\n")
-for i, line in enumerate(lines):
-    if line.strip().startswith("- location:") and 'mountPoint: "/mnt/wyrd"' in lines[i + 1]:
-        indent = line[: line.index("- location:")]
-        lines[i] = indent + "- location: " + json.dumps(root)
-        break
-else:
-    sys.exit("no /mnt/wyrd mount found in " + path)
-open(path, "w").write("\n".join(lines))
-EOF
-    limactl start "$INSTANCE"
-    GUEST_SHARE_ID="$(limactl shell "$INSTANCE" -- bash -c 'if [[ -f /mnt/wyrd/.git ]]; then tr -d "\n" < /mnt/wyrd/.git; else git -C /mnt/wyrd rev-parse HEAD; fi' 2>/dev/null || true)"
-  fi
-  if [[ "$GUEST_SHARE_ID" != "$HOST_SHARE_ID" ]]; then
-    echo "error: guest share is stale (guest ${GUEST_SHARE_ID:-unreadable}, host $HOST_SHARE_ID)" >&2
-    echo "  recreate the instance, or rerun with --re-share to re-point it at this checkout" >&2
-    exit 2
-  fi
-fi
 
 echo "==> provisioning the guest (idempotent)"
 # Run from a host directory that exists in the guest: limactl adopts

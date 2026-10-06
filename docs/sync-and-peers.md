@@ -154,6 +154,15 @@ mechanism rather than an add-on:
   suffices — a known epoch without its secret authorizes nothing
   until the capability arrives.
 
+Recovery requirements attach to the semantic class, not uniformly
+to all envelopes (`object-model.md` decision 33): transitions and
+capabilities carry the state machine itself, and their loss strands
+protocol progress; announcements are content-plane-recoverable and
+follow later under their own tag. The 21c scope boundary below
+reflects that ordering: transitions and capabilities retire first,
+while announcement obligations stay pending until their own
+retirement kind exists.
+
 Retirement commits a new sender-side durable fact, one kind per
 obligation class (`AnnouncementReconciled`,
 `TransitionReconciled`, `CapabilityReconciled`): each names the
@@ -297,14 +306,6 @@ the keys land first). Scope boundary, stated normatively: 21c
 retires transition and capability obligations; announcement
 obligations remain pending and are not eligible for
 reconciliation retirement in 21c.
-
-Recovery requirements attach to the semantic class, not uniformly
-to all envelopes. Transitions and capabilities carry the state
-machine itself: losing them changes what the recipient believes
-exists or what it can decrypt. Announcements and content objects
-are independently recoverable through the content plane. That is
-why 21c retires transition and capability obligations first and
-leaves announcements pending.
 
 ### Acceptance scenarios (normative)
 

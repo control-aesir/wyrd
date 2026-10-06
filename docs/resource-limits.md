@@ -9,7 +9,9 @@ doc bounds the live process holding and moving it.
 Principle: the node is authoritative about its own validated state,
 but never entitled to unbounded work because remote input requests
 it. Locally authoritative does not mean locally unbounded. Every
-budget below is how that principle is enforced.
+budget below is how that principle is enforced as far as these live
+bounds reach; rows marked unbounded and resources that escape all
+live bounds are named where they occur.
 
 Those bounds are per operation. One resource escapes all of them in a
 way that amplifies — how much is *retained* over time, which no live

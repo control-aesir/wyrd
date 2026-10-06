@@ -130,7 +130,9 @@ lives with sync control, never ambient across the node.
     epoch state, iroh transport endpoint identity, and relay identity
     are distinct. A new endpoint after restart is a new transport
     attachment, never a new member; serving endpoint identity is
-    excluded from restart equivalence (`crash-consistency.md`).
+    excluded from restart equivalence (`crash-consistency.md`), and
+    device identity itself is immutable (`object-model.md`
+    decision 12).
 
 ## Non-goals (for now)
 

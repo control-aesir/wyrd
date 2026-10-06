@@ -19,7 +19,11 @@ use wyrd_core::live::LiveConfig;
 use wyrd_core::node::WyrdNode;
 use wyrd_core::view::RuntimeMaterialization;
 use wyrd_core::want::wait_for_materialization;
-use wyrd_format::{BaoRoot, ContentId, FetchStatus, MemoryObjectStore, StorageId};
+use wyrd_daemon::fuse::FuseBackend;
+use wyrd_format::{
+    BaoRoot, ContentId, FetchStatus, FsObjectStore, MemoryObjectStore, ObjectKind, ObjectStore,
+    StorageId,
+};
 use wyrd_fuse::DriveView;
 use wyrd_sync::bulk::{AttemptBudget, BulkError, BulkSource, MemoryBulkSource, SealedManifest};
 use wyrd_sync::runtime::{EngineError, RoutePublishing, RouteReport, RuntimeState};
@@ -134,7 +138,13 @@ fn terminal_setup() -> (Loaded, TerminalLive, TerminalParts, DeadObjects, Conten
     (loaded, live, parts, dead, chunk)
 }
 
-fn view_status(parts: &TerminalParts, id: &ContentId) -> FetchStatus {
+fn view_status<S: ObjectStore>(
+    parts: &wyrd_core::live::LiveParts<DriveView<S, RuntimeMaterialization>>,
+    id: &ContentId,
+) -> FetchStatus
+where
+    S::Error: std::fmt::Debug,
+{
     parts.projection.read().unwrap().view().status(id)
 }
 
@@ -305,4 +315,173 @@ fn a_new_waiter_after_terminal_starts_a_new_generation() {
     }
     assert!(available, "the second generation fulfills once routes heal");
     loaded.rig.teardown();
+}
+
+/// Contract 52 (`quarantined_chunk_heals_from_a_live_peer_without_remount`):
+/// the full repair lifecycle over public APIs with a real serving
+/// peer and the real FUSE demand path — bad bytes, observed
+/// verification failure, discard and unclaim, re-want, live
+/// refetch, verified `Available`, and the original waiter served —
+/// with no remount or restart anywhere. This is OD-12-1 and OD-12-2
+/// together: removal plus repair-on-demand closing into serving.
+///
+/// The reader asserts the designed contract, not transparent
+/// retry: the rejected first read converts into the demand flow
+/// (`with_demand`), so the waiting reader heals in the same read
+/// when the peer serves promptly — and fails bounded `EIO` when it
+/// does not.
+#[test]
+fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wyrd_core::live::LiveParts;
+
+    const BODY: &[u8] = b"healed through repair";
+    let mut loaded = Loaded::new("heal.txt", BODY);
+    loaded.publish_all();
+    loaded.publish_body_and_announcement(None);
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let chunk = *loaded
+        .content
+        .content_ids
+        .iter()
+        .find(|id| **id != loaded.content.tree_id)
+        .expect("the fixture carries a chunk beside its tree");
+
+    // The member stores on disk: bitrot needs a real live name.
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-contracts-quarantine-heal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let LiveParts {
+        projection,
+        wants,
+        mutations,
+        open_timeout,
+        budgets,
+    } = &parts;
+    // The fetch lands through the live peer: drive until the chunk
+    // is verified local and the published generation serves the
+    // path (the reader opens through the projection, not the
+    // materialization status). Deadline-bounded, not
+    // fixed-iteration: under gate load the same passes take
+    // longer, and a pass budget must never be what fails the
+    // test.
+    let started = std::time::Instant::now();
+    let mut available = false;
+    while started.elapsed() < Duration::from_secs(120) {
+        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            .unwrap();
+        let slot = parts.projection.read().unwrap();
+        if slot.view().status(&chunk) == FetchStatus::Available
+            && slot.view().lookup("heal.txt").is_ok()
+        {
+            available = true;
+            break;
+        }
+    }
+    assert!(available, "the member fetched the chunk verified");
+    assert_eq!(
+        view_status(&parts, &chunk),
+        FetchStatus::Available,
+        "step 7 precondition: verified bytes are local"
+    );
+
+    // Step 1: host-side surgery — the live name stops hashing back.
+    // Length-identical tampering: fail-closed on content, not size.
+    let hex = chunk.to_string();
+    let live_name = dir
+        .join("objects")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::write(&live_name, b"tampered-------------").unwrap();
+
+    // The production demand path: the backend reports the
+    // rejection and the reader waits the demand flow.
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::clone(projection),
+        Arc::clone(wants),
+        Arc::clone(mutations),
+        *open_timeout,
+        budgets,
+    );
+    backend.set_quarantine(Arc::clone(live.quarantine_queue()));
+    let done = Arc::new(AtomicBool::new(false));
+    let mut quarantined = 0u64;
+    std::thread::scope(|scope| {
+        let reader_done = Arc::clone(&done);
+        let reader = scope.spawn(move || {
+            let handle = backend
+                .open_at("heal.txt")
+                .expect("the path still resolves");
+            let bytes = backend
+                .read_handle(handle, 0, BODY.len() as u32)
+                .expect("the waiting reader heals in the same read");
+            reader_done.store(true, Ordering::SeqCst);
+            bytes
+        });
+        // The loop repairs and refetches while the reader waits:
+        // drain, unclaim, re-pend, and the live peer serves the
+        // fresh generation. No restart, no remount — one engine,
+        // one store, one live node throughout. Deadline-bounded
+        // for the same reason as above: the reader's own 30s
+        // demand deadline is what bounds the wait, and the drive
+        // loop must not stop first under load.
+        let started = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(120) {
+            let pass = live
+                .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+                .unwrap();
+            quarantined += pass.quarantined.observed;
+        }
+        let bytes = reader.join().expect("the reader thread joins");
+        // Steps 2-8: the tampered bytes were never served (the
+        // reader holds the original body, byte for byte), the
+        // rejection was diagnosed, and the refetch verified.
+        assert_eq!(bytes, BODY, "fail-closed: original bytes, never tampered");
+        assert!(
+            quarantined > 0,
+            "the rejection was diagnosed through the drain"
+        );
+    });
+    assert!(
+        done.load(Ordering::SeqCst),
+        "the original waiter succeeded, not a later one"
+    );
+    assert_eq!(
+        view_status(&parts, &chunk),
+        FetchStatus::Available,
+        "the new representation is locally Available"
+    );
+    // Serving continues on the healed bytes: a fresh open reads
+    // them back through the same backend and loop.
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::clone(projection),
+        Arc::clone(wants),
+        Arc::clone(mutations),
+        *open_timeout,
+        budgets,
+    );
+    backend.set_quarantine(Arc::clone(live.quarantine_queue()));
+    let handle = backend.open_at("heal.txt").unwrap();
+    assert_eq!(
+        backend.read_handle(handle, 0, BODY.len() as u32).unwrap(),
+        BODY,
+        "post-heal reads serve verified bytes"
+    );
+    loaded.rig.teardown();
+    std::fs::remove_dir_all(dir).unwrap();
 }

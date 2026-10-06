@@ -776,8 +776,11 @@ impl ServingEndpoint {
         // Boot rebuild: every root the vault holds becomes servable.
         // A sealed() read that fails verification names a corrupt
         // vault file and is skipped (absence, not bytes under the
-        // wrong root); the vault is the truth and the next scrub or
-        // refetch repairs serving.
+        // wrong root). The vault is the truth for serving, and it
+        // repairs on its own plane: client-plane quarantine (`12`)
+        // discards rejected representations without touching vault
+        // bytes, and vault-byte repair belongs to scrub (`13`) —
+        // never to a client read's side effects.
         for root in vault.roots().map_err(std::io::Error::other)? {
             let Some(sealed) = vault.sealed(&root).map_err(std::io::Error::other)? else {
                 continue;

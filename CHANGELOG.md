@@ -26,6 +26,18 @@ version say exactly what changed.
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.
+- Local quarantine with re-want (peer-repair Part 1, second child;
+  OD-12-1 A remove, OD-12-2 A re-want-on-next-waiter, SD-1 A
+  client-plane-only): a read that observes verification-rejected
+  bytes names the representation to the loop's drain, which emits
+  the diagnostic, discards the bytes (new narrow
+  `DiscardRejectedRepresentation` operation — verify-then-unlink,
+  never a general store `remove`), clears the possession claim via
+  the sole `ObjectRemoved` writer, and leaves the `Cached` policy
+  and the waiting reader to re-demand a fresh generation. New
+  `ViewError::RejectedRepresentation` verdict (identity + kind);
+  structural corruption keeps its unrepairable shape. No durable
+  quarantine state; the vault is untouched.
 
 ### Added
 

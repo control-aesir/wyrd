@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use wyrd_format::store::MemoryStoreError;
 use wyrd_format::{
     ContentId, DeviceId, Entry, FetchStatus, MemoryObjectStore, ObjectKind, ObjectStore, Snapshot,
-    TransitionId, Tree, MAX_PATH_DEPTH,
+    StoreError, TransitionId, Tree, MAX_PATH_DEPTH,
 };
 
 /// Test materialization: explicit statuses, everything else
@@ -312,6 +312,137 @@ fn unavailable_content_fails_cleanly() {
     assert!(matches!(
         view.read(&remote, 0, 6),
         Err(ViewError::NotMaterialized { .. })
+    ));
+}
+
+/// A store that fails reads by class: named identities fail
+/// verification (bitrot under the live name), others fail
+/// opaquely (a torn data path, never a deletion order).
+struct RejectingStore {
+    inner: MemoryObjectStore,
+    rejected: Vec<ContentId>,
+    unreadable: Vec<ContentId>,
+}
+
+impl ObjectStore for RejectingStore {
+    type Error = RejectedRead;
+    fn insert(&mut self, kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+        self.inner
+            .insert(kind, data)
+            .map_err(|_| RejectedRead::Refused)
+    }
+    fn insert_verified(
+        &mut self,
+        kind: ObjectKind,
+        expected: &ContentId,
+        data: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .insert_verified(kind, expected, data)
+            .map_err(|_| RejectedRead::Refused)
+    }
+    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+        if self.rejected.contains(id) {
+            return Err(RejectedRead::Rejected);
+        }
+        if self.unreadable.contains(id) {
+            return Err(RejectedRead::Unreadable);
+        }
+        self.inner.get(id).map_err(|_| RejectedRead::Refused)
+    }
+    fn has(&self, id: &ContentId) -> Result<bool, Self::Error> {
+        self.inner.has(id).map_err(|_| RejectedRead::Refused)
+    }
+}
+
+/// One error type, three classes: only `Rejected` is a
+/// verification failure, so only it may name content for discard.
+#[derive(Debug)]
+enum RejectedRead {
+    Rejected,
+    Unreadable,
+    Refused,
+}
+
+impl StoreError for RejectedRead {
+    fn failure(&self) -> wyrd_format::StoreFailure {
+        wyrd_format::StoreFailure::Transient
+    }
+    fn is_verification_failure(&self) -> bool {
+        matches!(self, RejectedRead::Rejected)
+    }
+}
+
+/// A drive whose chunk fails verification: the read names the
+/// chunk and its kind for discard-and-redemand — the view-level
+/// proof that only observed-invalid bytes become a deletion.
+#[test]
+fn store_verification_failure_names_chunk_for_redemand() {
+    let drive = small_drive();
+    let chunk = drive.hello_chunks[0];
+    let view = DriveView::new(
+        RejectingStore {
+            inner: drive.store,
+            rejected: vec![chunk],
+            unreadable: Vec::new(),
+        },
+        FakeMaterialization::empty(),
+        heads(vec![drive.head]),
+    );
+    let file = view.open(&view.lookup("hello.txt").unwrap()).unwrap();
+    assert_eq!(
+        view.read(&file, 0, 7),
+        Err(ViewError::RejectedRepresentation {
+            content: chunk,
+            kind: ObjectKind::Chunk,
+        })
+    );
+}
+
+/// A drive whose root tree fails verification: resolution names
+/// the tree (not the file) for discard-and-redemand.
+#[test]
+fn store_verification_failure_names_tree_for_redemand() {
+    let drive = small_drive();
+    let root = drive.head.tree;
+    let view = DriveView::new(
+        RejectingStore {
+            inner: drive.store,
+            rejected: vec![root],
+            unreadable: Vec::new(),
+        },
+        FakeMaterialization::empty(),
+        heads(vec![drive.head]),
+    );
+    assert_eq!(
+        view.lookup("hello.txt"),
+        Err(ViewError::RejectedRepresentation {
+            content: root,
+            kind: ObjectKind::Tree,
+        })
+    );
+}
+
+/// A torn data path is not a verification failure: the read keeps
+/// its classified store shape and names nothing for discard —
+/// transport damage never quarantines.
+#[test]
+fn non_verification_store_failure_keeps_classified_shape() {
+    let drive = small_drive();
+    let chunk = drive.hello_chunks[0];
+    let view = DriveView::new(
+        RejectingStore {
+            inner: drive.store,
+            rejected: Vec::new(),
+            unreadable: vec![chunk],
+        },
+        FakeMaterialization::empty(),
+        heads(vec![drive.head]),
+    );
+    let file = view.open(&view.lookup("hello.txt").unwrap()).unwrap();
+    assert!(matches!(
+        view.read(&file, 0, 7),
+        Err(ViewError::Store(_, _))
     ));
 }
 

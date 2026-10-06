@@ -30,7 +30,11 @@ encrypted manifests, roles × materialization.
 - Nostr identity verification: snapshot signatures against member pubkeys,
   encrypted control plane for membership/rotation (never public relays)
 - Scrub detection downstream of the store and repair from other peers
-  (pending: needs the repair loop)
+  (landed for verification-rejected bytes: the store fails reads
+  closed, the view names the rejected representation, and the
+  loop's quarantine drain discards, unclaims, and re-demands —
+  `docs/peer-repair.md`, child 12; whole-store re-stat against
+  durable facts is still `13-local-scrub`)
 
 ## What does not belong here
 
@@ -46,7 +50,8 @@ fetch-on-open demand machinery, the vault serving path, the real-iroh
 serving router (`ServingEndpoint` over the vault; `IrohBulkSource` is the
 client side and routes publish from announcement `node_addr` bytes on
 every pass), and recovery. Pending: multi-relay supervision, NIP-46
-remote signing, and scrub/repair wiring.
+remote signing, and whole-store scrub (`13-local-scrub`; per-read
+rejected-representation repair is landed).
 
 ## Version policy
 

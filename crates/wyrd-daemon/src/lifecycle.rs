@@ -52,7 +52,7 @@ use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 use wyrd_core::live::{LiveConfig, LiveError, LiveNode, LiveSummary};
 use wyrd_core::mutation::MutationQueue;
 use wyrd_core::view::{NamespaceView, RuntimeMaterialization};
-use wyrd_format::ObjectStore;
+use wyrd_format::{DiscardRejectedRepresentation, ObjectStore};
 use wyrd_sync::runtime::RoutePublishing;
 use wyrd_sync::transport::mailbox::Mailbox;
 
@@ -169,8 +169,9 @@ impl Supervisor {
     ) -> std::thread::JoinHandle<LoopReturn<V, M, B>>
     where
         V: NamespaceView<Materialization = RuntimeMaterialization> + Send + Sync + 'static,
-        V::Store: ObjectStore + Send + Sync + 'static,
+        V::Store: ObjectStore + DiscardRejectedRepresentation + Send + Sync + 'static,
         <V::Store as ObjectStore>::Error: std::fmt::Debug,
+        <V::Store as DiscardRejectedRepresentation>::Error: std::fmt::Debug,
         M: Mailbox + Send + 'static,
         B: RoutePublishing + Send + 'static,
     {

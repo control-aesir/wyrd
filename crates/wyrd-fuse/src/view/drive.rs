@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use wyrd_format::{
-    Component, ContentId, EntryContent, FetchStatus, ObjectStore, Snapshot, StoreError,
+    Component, ContentId, EntryContent, FetchStatus, ObjectKind, ObjectStore, Snapshot, StoreError,
     StoreFailure, Tree, MAX_PATH_DEPTH,
 };
 
@@ -366,11 +366,24 @@ where
     }
 
     /// Load and decode a tree. Present-but-undecodable bytes are
-    /// corrupt local data, never served.
+    /// corrupt local data, never served: the bytes verified against
+    /// their address (so no refetch can repair them — an authored or
+    /// version-skewed tree, not bitrot), which is structural damage,
+    /// not a rejected representation.
+    ///
+    /// A store verification failure is the opposite case: bytes that
+    /// no longer hash back, attributable to exactly this identity,
+    /// which the daemon discards and re-demands.
     fn load_tree(&self, id: &ContentId) -> Result<Tree, ViewError> {
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Tree::decode(&bytes).map_err(|_| ViewError::Corrupt),
             Ok(None) => Err(self.absent(id)),
+            Err(error) if error.is_verification_failure() => {
+                Err(ViewError::RejectedRepresentation {
+                    content: *id,
+                    kind: ObjectKind::Tree,
+                })
+            }
             Err(error) => Err(ViewError::Store(error.failure(), format!("{error:?}"))),
         }
     }
@@ -383,6 +396,12 @@ where
         let bytes = match self.store_read()?.get(id) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Err(self.absent(id)),
+            Err(error) if error.is_verification_failure() => {
+                return Err(ViewError::RejectedRepresentation {
+                    content: *id,
+                    kind: ObjectKind::Tree,
+                });
+            }
             Err(error) => return Err(ViewError::Store(error.failure(), format!("{error:?}"))),
         };
         let work = u64::try_from(bytes.len())
@@ -396,11 +415,19 @@ where
             .map_err(|_| ViewError::Corrupt)
     }
 
-    /// Load one chunk's bytes.
+    /// Load one chunk's bytes. A verification failure names the
+    /// chunk for discard-and-redemand; every other store failure
+    /// keeps its classified shape.
     fn load_chunk(&self, id: &ContentId) -> Result<Vec<u8>, ViewError> {
         match self.store_read()?.get(id) {
             Ok(Some(bytes)) => Ok(bytes),
             Ok(None) => Err(self.absent(id)),
+            Err(error) if error.is_verification_failure() => {
+                Err(ViewError::RejectedRepresentation {
+                    content: *id,
+                    kind: ObjectKind::Chunk,
+                })
+            }
             Err(error) => Err(ViewError::Store(error.failure(), format!("{error:?}"))),
         }
     }

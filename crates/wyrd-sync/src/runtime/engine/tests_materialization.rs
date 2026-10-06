@@ -2,6 +2,7 @@ use super::*;
 
 use wyrd_format::{ContentId, ObjectKind};
 
+use crate::durable::Fact;
 use crate::keys::DeviceIdentitySecret;
 use crate::runtime::test_util::TestDir;
 
@@ -193,5 +194,106 @@ fn unavailable_content_open_amplification_measurement() {
         "MEASUREMENT unavailable-opens: opens={OPENS} facts=1 commits={commits} \
          fsyncs={} fact_log_bytes={bytes} rebuilds={rebuilds}",
         commits * 4,
+    );
+}
+
+/// Claim-clearing commits exactly once: the first removal of a
+/// locally claimed identity appends one `ObjectRemoved` fact and the
+/// claim reads back absent; repeating it commits nothing, so a
+/// quarantine loop over one identity cannot grow the log. The
+/// residency policy is untouched throughout.
+#[test]
+fn record_object_removed_clears_the_claim_once() {
+    let dir = TestDir::new("materialization-remove");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let content = ContentId::derive(ObjectKind::Chunk, b"rejected bytes");
+
+    engine
+        .set_materialization(content, MaterializationState::Cached)
+        .unwrap();
+    engine.commit_facts(&[Fact::LocalObject(content)]).unwrap();
+    assert!(engine.runtime_state().unwrap().is_local(&content));
+    let committed = engine.current();
+
+    assert!(engine.record_object_removed(content).unwrap());
+    assert_eq!(engine.current(), committed + 1);
+    assert!(!engine.runtime_state().unwrap().is_local(&content));
+    // Policy untouched: still Cached, so the next waiter re-demands.
+    assert_eq!(
+        engine.runtime_state().unwrap().materialization(&content),
+        MaterializationState::Cached
+    );
+
+    assert!(!engine.record_object_removed(content).unwrap());
+    assert_eq!(engine.current(), committed + 1);
+}
+
+/// Batch claim-clearing pays one rebuild and one commit for N
+/// identities: already-absent claims filter in memory, duplicates
+/// collapse, and an all-absent batch commits nothing.
+#[test]
+fn record_objects_removed_batches_many_identities() {
+    let dir = TestDir::new("materialization-remove-batch");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let held: Vec<ContentId> = (0u8..4)
+        .map(|byte| ContentId::derive(ObjectKind::Chunk, &[byte]))
+        .collect();
+    let absent = ContentId::derive(ObjectKind::Chunk, b"never claimed");
+    for id in &held {
+        engine.commit_facts(&[Fact::LocalObject(*id)]).unwrap();
+    }
+    let committed = engine.current();
+
+    // Two held, one absent, one duplicate: two facts commit.
+    let cleared = engine
+        .record_objects_removed(&[held[0], held[1], absent, held[0]])
+        .unwrap();
+    assert_eq!(cleared, 2);
+    assert_eq!(engine.current(), committed + 1);
+    assert!(!engine.runtime_state().unwrap().is_local(&held[0]));
+    assert!(!engine.runtime_state().unwrap().is_local(&held[1]));
+    assert!(engine.runtime_state().unwrap().is_local(&held[2]));
+
+    // An all-absent batch commits nothing.
+    assert_eq!(engine.record_objects_removed(&[absent]).unwrap(), 0);
+    assert_eq!(engine.current(), committed + 1);
+}
+
+/// The idempotence trap quarantine relies on: after the claim is
+/// cleared the policy is still `Cached`, so re-setting `Cached`
+/// commits nothing — and that no-op must stay harmless, because
+/// re-want never goes through `set_materialization`. Re-demand
+/// reads the cleared claim plus the intact policy out of
+/// `reconcile` (pinned loop-side by contract 50); anyone
+/// re-driving a fetch by re-setting an unchanged policy would
+/// silently do nothing. This test pins the no-op so a future
+/// change to the early return cannot pretend otherwise.
+#[test]
+fn set_materialization_cached_after_claim_left_commits_nothing() {
+    let dir = TestDir::new("materialization-quarantine-noop");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let content = ContentId::derive(ObjectKind::Chunk, b"quarantined");
+
+    engine
+        .set_materialization(content, MaterializationState::Cached)
+        .unwrap();
+    engine.commit_facts(&[Fact::LocalObject(content)]).unwrap();
+    assert!(engine.record_object_removed(content).unwrap());
+    let committed = engine.current();
+
+    // The policy never left: re-setting it is correctly a no-op.
+    engine
+        .set_materialization(content, MaterializationState::Cached)
+        .unwrap();
+    assert_eq!(engine.current(), committed);
+    // And the claim is what changed: not local, still wanted.
+    let runtime = engine.runtime_state().unwrap();
+    assert!(!runtime.is_local(&content));
+    assert_eq!(
+        runtime.materialization(&content),
+        MaterializationState::Cached
     );
 }

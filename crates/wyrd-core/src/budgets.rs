@@ -10,8 +10,11 @@
 //! (admission was previously uncapped per pass), `max_open_handles`
 //! (the table was previously bounded only by the kernel descriptor
 //! limit), `max_open_capture_bytes` (the count cap could not bound
-//! retained chunk-list bytes), and `max_parent_tokens` (the
-//! create-parent registry was new in the parent-race fix) — all sized
+//! retained chunk-list bytes), `max_parent_tokens` (the
+//! create-parent registry was new in the parent-race fix), and
+//! `max_quarantine_per_pass` (the claim-clear is one batched
+//! commit per pass, but every repair still pays its own
+//! verify-read and store write lock) — all sized
 //! generously (see each default). The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds
@@ -39,6 +42,16 @@ use crate::want::MAX_PENDING_WANTS;
 /// pathological backlog converges over passes instead of fetching
 /// everything at once.
 pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
+
+/// Most rejected representations repaired per sync pass (diagnosed,
+/// unclaimed, unlinked). Leftover queued rejections wait for the
+/// next pass — never dropped, never silently unrepaired. Sized far
+/// below the admission family (64): the claim-clear is one batched
+/// commit, but each repair still takes its own verify-read and
+/// store write lock, so a drive with many bitrotted chunks
+/// converges over passes instead of stretching one pass by an
+/// unbounded amount.
+pub const DEFAULT_MAX_QUARANTINE_PER_PASS: usize = 64;
 
 /// Most open file handles at once (read captures plus writable
 /// images). Refusals are `EMFILE`: the table is per-process, like the
@@ -85,6 +98,10 @@ pub struct ResourceBudgets {
     pub max_parent_tokens: usize,
     /// Wants admitted per sync pass (see the module note on bytes).
     pub max_admit_per_pass: usize,
+    /// Rejected representations repaired per sync pass (see
+    /// [`DEFAULT_MAX_QUARANTINE_PER_PASS`]). Overflow waits for the
+    /// next pass.
+    pub max_quarantine_per_pass: usize,
     /// Largest logical image one writable handle may buffer (`ENOSPC`
     /// past it).
     pub write_per_handle_bytes: usize,
@@ -133,6 +150,7 @@ impl Default for ResourceBudgets {
             max_pending_mutations: MAX_PENDING_MUTATIONS,
             max_parent_tokens: DEFAULT_MAX_PARENT_TOKENS,
             max_admit_per_pass: DEFAULT_MAX_ADMIT_PER_PASS,
+            max_quarantine_per_pass: DEFAULT_MAX_QUARANTINE_PER_PASS,
             write_per_handle_bytes: MAX_WRITE_BUFFER_BYTES,
             write_aggregate_bytes: MAX_BUFFERED_BYTES,
             write_dirty_handles: MAX_DIRTY_HANDLES,

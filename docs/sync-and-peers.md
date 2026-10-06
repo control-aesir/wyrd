@@ -557,14 +557,24 @@ happens only at the boundary: opening a non-local path blocks on
 fetch with visible progress, serves the read once verified and
 cached, and fails with `EIO` when no representation serves and the object
 is not cached. A terminal generation completes its waiters with that
-bounded `EIO` instead of the full deadline. Corrupt or unreachable representations fall back to the
+bounded `EIO` instead of the full deadline — unless a rejection
+was observed for the identity within the repair window (30 s,
+memory-only, unobservable to the reader), in which case the waiter
+waits out the repair behind the stale projection instead of
+failing fast on it. Corrupt or unreachable representations fall back to the
 next recorded representation inside the fetch walk — and, within one
 representation, its transport root before its storage address —
-hash/AEAD-verified, never committed on mismatch. There is no scrub
-pass and no repair loop: the store verifies on read and fails closed,
-but a bitrotted object stays recorded as local and is never
-re-fetched, so persistent failure surfaces as a bounded `EIO`, never
-as unverified bytes. The repair design — generation-scoped terminal
-state, route-set policy, measurement before replication — is recorded
-in `docs/peer-repair.md`. Eviction never affects the
-drive — only what this device holds.
+hash/AEAD-verified, never committed on mismatch. The store
+verifies on read and fails closed; when locally held bytes fail
+verification the read names the rejected representation
+(`ViewError::RejectedRepresentation`, carrying the identity and
+kind) to the loop's quarantine drain, which emits the diagnostic,
+discards the bytes, and clears the possession claim — while the
+`Cached` policy and the waiting reader survive, so the same read
+re-demands the identity as a fresh generation
+(`docs/peer-repair.md`, child 12). Corrupt authored structure
+(undecodable trees, lying sizes) is not rejected bytes and still
+fails `EIO` with no repair. The rest of the repair design —
+generation-scoped terminal state, route-set policy, measurement
+before replication — is recorded in `docs/peer-repair.md`.
+Eviction never affects the drive — only what this device holds.

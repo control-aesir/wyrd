@@ -10,6 +10,7 @@ use wyrd_fuse::DriveView;
 use wyrd_core::budgets::ResourceBudgets;
 use wyrd_core::mutation::MutationQueue;
 use wyrd_core::projection::Projection;
+use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
 use wyrd_core::want::WantRegistry;
 
 use wyrd_format::{ContentId, Entry, MemoryObjectStore, ObjectKind, SharedStore, Tree};
@@ -166,9 +167,12 @@ fn concurrent_reads_coalesce_into_one_want() {
 /// post-install loss (bytes gone out of band after the closure
 /// verified). In v0 that state is reachable only out of band — the
 /// install gate needs present trees, `status()` trusts the durable
-/// facts over the store, and no public API writes an `ObjectRemoved`
-/// fact — so the hostile-representation walk this blocks against is
-/// pinned at the plan level instead
+/// facts over the store, and the only public writer of an
+/// `ObjectRemoved` fact is quarantine's claim-clearing
+/// (`Engine::record_object_removed`, which fires on observed
+/// verification failure, never on absence) — so the
+/// hostile-representation walk this blocks against is pinned at the
+/// plan level instead
 /// (`corrupt_and_absent_tree_representations_commit_nothing` in
 /// `wyrd-sync`), and this test pins the boundary half: blocking,
 /// bounded `EIO`, registry hygiene, re-registration.
@@ -429,4 +433,157 @@ fn terminal_backend(
         &budgets,
     );
     (backend, registry, polls, chunk)
+}
+
+/// A read that observes verification-rejected bytes reports the
+/// identity to the quarantine channel and fails bounded `EIO` (no
+/// loop heals in this harness, so the waiter times out): the report
+/// half and the boundary errno. A second read re-reports without
+/// duplicating — the queue carries one entry per identity no matter
+/// how many reads saw it.
+#[test]
+fn rejected_read_reports_to_quarantine_and_fails_eio() {
+    use wyrd_format::FsObjectStore;
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-daemon-quarantine-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scratch = FsObjectStore::open(dir.join("store")).unwrap();
+    let chunk = scratch.insert(ObjectKind::Chunk, b"streamed").unwrap();
+    let root = Tree::from_entries(vec![Entry::file("f.txt", 8, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut scratch)
+        .unwrap();
+    // Bitrot under the live name, at the documented layout.
+    let hex = chunk.to_string();
+    std::fs::write(
+        dir.join("store")
+            .join("objects")
+            .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+            .join(&hex[..2])
+            .join(&hex[2..]),
+        b"tampered",
+    )
+    .unwrap();
+    let store = Arc::new(RwLock::new(scratch));
+    let view = DriveView::new(
+        SharedStore::from(Arc::clone(&store)),
+        NoMaterialization,
+        heads(vec![snapshot_of(root)]),
+    );
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
+        Arc::new(WantRegistry::default()),
+        Arc::new(MutationQueue::default()),
+        Duration::from_millis(200),
+        &ResourceBudgets::default(),
+    );
+    let quarantine = Arc::new(QuarantineQueue::default());
+    backend.set_quarantine(Arc::clone(&quarantine));
+
+    let handle = backend.open_at("f.txt").unwrap();
+    assert_eq!(backend.read_handle(handle, 0, 8), Err(fuser::Errno::EIO));
+    assert_eq!(
+        quarantine.pending(),
+        vec![VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk
+        )],
+        "the rejection names the chunk for the loop's drain"
+    );
+    // The waiter polls again before any drain runs: still one entry.
+    assert_eq!(backend.read_handle(handle, 0, 8), Err(fuser::Errno::EIO));
+    assert_eq!(quarantine.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A stale claim that always reports local: models the served
+/// projection between the drain's claim-clear and the next
+/// publishable generation.
+struct AvailableMaterialization;
+
+impl wyrd_fuse::Materialization for AvailableMaterialization {
+    fn status(&self, _id: &ContentId) -> wyrd_format::FetchStatus {
+        wyrd_format::FetchStatus::Available
+    }
+}
+
+/// The repair-window rule in both directions, beside
+/// `rejected_read_reports_to_quarantine_and_fails_eio`: with a
+/// quarantine queue wired and a rejection observed for the
+/// identity, an `Unavailable` on first touch enters the demand
+/// flow and an `Unavailable` mid-wait keeps waiting — the repair
+/// is still in flight behind the stale projection. With no recent
+/// rejection both fail fast exactly as before quarantine existed.
+/// Timing margins are wide on purpose (fast path is syscalls,
+/// the wait path is the 300 ms demand deadline), and load only
+/// stretches the waited direction.
+#[test]
+fn unavailable_with_recent_rejection_waits_without_fails_fast() {
+    use wyrd_format::FsObjectStore;
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-daemon-repair-window-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scratch = FsObjectStore::open(dir.join("store")).unwrap();
+    let chunk = ContentId::derive(ObjectKind::Chunk, b"eleven bytes");
+    let root = Tree::from_entries(vec![Entry::file("f.txt", 12, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut scratch)
+        .unwrap();
+    let chunk_path = dir
+        .join("store")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()));
+    let hex = chunk.to_string();
+    let live = chunk_path.join(&hex[..2]).join(&hex[2..]);
+    let store = Arc::new(RwLock::new(scratch));
+    let view = DriveView::new(
+        SharedStore::from(Arc::clone(&store)),
+        AvailableMaterialization,
+        heads(vec![snapshot_of(root)]),
+    );
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::new(RwLock::new(Arc::new(Projection::initial(view, 0)))),
+        Arc::new(WantRegistry::default()),
+        Arc::new(MutationQueue::default()),
+        Duration::from_millis(300),
+        &ResourceBudgets::default(),
+    );
+    backend.set_quarantine(Arc::new(QuarantineQueue::default()));
+
+    // No rejection ever observed: store-absent with a stale
+    // `Available` fails fast, exactly as before.
+    let handle = backend.open_at("f.txt").unwrap();
+    let started = Instant::now();
+    assert_eq!(backend.read_handle(handle, 0, 12), Err(fuser::Errno::EIO));
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "no recent rejection: fast EIO, not the deadline"
+    );
+
+    // Now the rejection: bitrotted bytes are observed, reported,
+    // and waited through.
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, b"tampered!!!!").unwrap();
+    let remover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::remove_file(&live).unwrap();
+    });
+    let started = Instant::now();
+    assert_eq!(backend.read_handle(handle, 0, 12), Err(fuser::Errno::EIO));
+    remover.join().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "recent rejection: the stale view waits out the demand deadline"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

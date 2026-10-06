@@ -334,10 +334,17 @@ what retries:
 
 In all three cases the timeout cancels the wait, not the fetch
 (property 6): a concurrent success still publishes and caches.
-And in all three cases v0.2 provides no way back: stranded local
-content has no sanctioned recovery path and there is no
-root-recovery workflow — both book to v0.3 (`ROADMAP.md`, known
-limitations). A peer that holds the epoch material but never learns
+Genuinely unavailable content still has no way back in v0.2, but
+locally held bytes that fail verification do: the read names the
+rejected representation to the loop's quarantine drain, which
+discards the bytes, clears the claim, and lets the waiting reader
+re-demand the identity as a fresh generation
+(`docs/peer-repair.md`, child 12; pinned by
+`rejected_read_reports_to_quarantine_and_fails_eio` in
+`crates/wyrd-daemon/src/fuse/tests_want.rs`). Corrupt authored
+structure (undecodable trees, lying sizes) is not rejected bytes —
+no refetch can repair it — and still fails `EIO` with no repair.
+A peer that holds the epoch material but never learns
 a snapshot id (the late-joiner horizon) is the same shape of absence
 from the other side: keys without knowledge fetch nothing.
 

@@ -863,13 +863,16 @@ fn mount(
     live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
-    let backend = FuseBackend::shared_with_wants(
+    // The quarantine channel rides along: readers submit observed
+    // verification failures for the loop's drain to repair.
+    let mut backend = FuseBackend::shared_with_wants(
         parts.projection,
         parts.wants,
         parts.mutations,
         parts.open_timeout,
         &parts.budgets,
     );
+    backend.set_quarantine(std::sync::Arc::clone(live.quarantine_queue()));
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity
@@ -1438,8 +1441,8 @@ fn cache_policy_render(
         None => out.push_str("  retained_bytes_quota: unlimited\n"),
     }
     out.push_str(&format!(
-        "  max_admit_per_pass: {}\n  max_pending_wants: {}\n",
-        budgets.max_admit_per_pass, budgets.max_pending_wants,
+        "  max_admit_per_pass: {}\n  max_pending_wants: {}\n  max_quarantine_per_pass: {}\n",
+        budgets.max_admit_per_pass, budgets.max_pending_wants, budgets.max_quarantine_per_pass,
     ));
     // The retention breakdown: one row per resident dimension, each
     // labelled with whether it backs enforcement or merely observes.
@@ -1577,6 +1580,14 @@ struct SyncRunReport {
     invalid: usize,
     unavailable_keys: usize,
     local_failures: usize,
+    /// Rejected-representation repair, accumulated like the rest:
+    /// stored for the surface that renders them
+    /// (`14-fetch-failure-diagnostics` owns the class renderer —
+    /// this report must not print them, or the two collide here).
+    quarantined_observed: usize,
+    quarantine_claims_cleared: usize,
+    quarantine_bytes_discarded: usize,
+    quarantine_failures: usize,
     /// Outbound sends committed by per-pass publication.
     sent: usize,
     /// Distinct senders named by intake envelopes this run (OD-17-4
@@ -1631,6 +1642,10 @@ impl SyncRunReport {
         self.invalid += pass.fetched.invalid;
         self.unavailable_keys += pass.fetched.unavailable_keys;
         self.local_failures += pass.fetched.local_failures;
+        self.quarantined_observed += pass.quarantined.observed as usize;
+        self.quarantine_claims_cleared += pass.quarantined.claims_cleared as usize;
+        self.quarantine_bytes_discarded += pass.quarantined.bytes_discarded as usize;
+        self.quarantine_failures += pass.quarantined.failures as usize;
         self.sent += pass.sent;
         self.unfetchable_heads = pass.pending_heads;
         // Union, not append: the same peer heard on twelve passes is
@@ -1715,6 +1730,8 @@ where
     V: NamespaceView<Materialization = RuntimeMaterialization>,
     V::Store: ObjectStore,
     <V::Store as ObjectStore>::Error: std::fmt::Debug,
+    V::Store: wyrd_format::DiscardRejectedRepresentation,
+    <V::Store as wyrd_format::DiscardRejectedRepresentation>::Error: std::fmt::Debug,
     M: Mailbox,
     B: RoutePublishing,
 {
@@ -1738,6 +1755,10 @@ where
         invalid: 0,
         unavailable_keys: 0,
         local_failures: 0,
+        quarantined_observed: 0,
+        quarantine_claims_cleared: 0,
+        quarantine_bytes_discarded: 0,
+        quarantine_failures: 0,
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,

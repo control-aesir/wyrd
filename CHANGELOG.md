@@ -39,6 +39,13 @@ version say exactly what changed.
   structural corruption keeps its unrepairable shape. No durable
   quarantine state; the vault is untouched.
 
+### Fixed
+
+- Disambiguate the bare invariant 9/10 refs in
+  `crates/wyrd-contracts/src/lib.rs` to name `docs/upgrade-contract.md`
+  explicitly (comment only): `docs/architecture.md` now also carries ten
+  invariants, so the bare counts were ambiguous.
+
 ### Added
 
 - Explicit convergence-over-delivery invariants (docs only, no behavior

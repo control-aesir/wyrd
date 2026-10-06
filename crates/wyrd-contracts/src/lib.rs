@@ -177,11 +177,11 @@
 //!     files stay byte-identical (invariant 8).
 //! 32. `upgrade_orphaned_temps_are_ignored` — stale `*.tmp` siblings
 //!     are walked past by open and load; the full crash boundary is
-//!     pinned in wyrd-sync's crash-matrix tests (invariant 9,
-//!     orphaned-temps form).
+//!     pinned in wyrd-sync's crash-matrix tests
+//!     (`docs/upgrade-contract.md`, invariant 9, orphaned-temps form).
 //! 33. `upgrade_unknown_refuses_loudly` — unknown envelope and control
 //!     versions and a flipped commit version refuse with their names
-//!     (invariant 10).
+//!     (`docs/upgrade-contract.md`, invariant 10).
 //!
 //! Deliberately ignored until their blockers land:
 //! `upgrade_replays_previous_fact_payload_versions` (fact-payload

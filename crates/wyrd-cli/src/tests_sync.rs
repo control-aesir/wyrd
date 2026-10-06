@@ -710,6 +710,7 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         sent: 0,
         outcome,
         pending: 0,
+        reconciliation_outstanding: 0,
         unfetchable_heads: 0,
         mailbox,
         peers_observed: Vec::new(),
@@ -898,6 +899,64 @@ fn offline_completion_names_its_limits() {
     );
 }
 
+/// `sync_now_names_the_gap_before_it_closes_it`: a run that went
+/// quiet with received statements still unanswered names the
+/// control-plane gap and exits non-zero, so automation sees it —
+/// even though the outbox itself is quiet.
+#[test]
+fn sync_now_names_the_gap_before_it_closes_it() {
+    let mut gap = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    gap.reconciliation_outstanding = 2;
+    let error = run_outcome_error(&gap).unwrap_err();
+    assert!(
+        matches!(error, CliError::ReconciliationOutstanding { statements: 2 }),
+        "a quiet run with unanswered statements fails as outstanding, got: {error}"
+    );
+    let rendered = sync_now_render(&gap);
+    assert!(
+        rendered.contains("reconciliation: 2 statements awaiting answer"),
+        "the report names the gap before it closes it: {rendered}"
+    );
+    assert!(
+        !rendered.contains("completed: quiet"),
+        "a run with an open gap never claims completion: {rendered}"
+    );
+    // The converged twin succeeds and still prints the row: zero is
+    // the case automation greps for, not an omitted line.
+    let converged = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    assert!(run_outcome_error(&converged).is_ok());
+    assert!(
+        sync_now_render(&converged).contains("reconciliation: 0 statements awaiting answer"),
+        "the converged run prints its zero: {}",
+        sync_now_render(&converged),
+    );
+}
+
+/// The status reconciliation row names classes and counts, never
+/// identities: the exact line is pinned so a future field cannot
+/// smuggle a TransitionId, DeviceId, or membership content onto
+/// this surface (the 21d privacy boundary).
+#[test]
+fn sync_status_reconciliation_row_names_classes_not_identities() {
+    let fixture = Fixture::new();
+    let engine = fixture.open();
+    let status = observe(&engine, 0).unwrap();
+    assert_eq!(
+        status.reconciliation,
+        wyrd_core::status::ReconciliationView::default(),
+        "no statements flow on a fresh drive: {status:?}"
+    );
+    let rendered = sync_status_render(&status);
+    let row = rendered
+        .lines()
+        .find(|line| line.starts_with("reconciliation: "))
+        .expect("the reconciliation row renders: {rendered}");
+    assert_eq!(
+        row, "reconciliation: 0 statements received, 0 transitions + 0 capabilities retired",
+        "classes and counts only: {rendered}"
+    );
+}
+
 /// The outcome maps to the process result: quiet succeeds, a capped
 /// run fails as incomplete with its pass and pending counts.
 #[test]
@@ -925,6 +984,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,
+        reconciliation_outstanding: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
@@ -954,6 +1014,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::RemoteStalled,
         pending: 0,
+        reconciliation_outstanding: 0,
         unfetchable_heads: 1,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
@@ -983,6 +1044,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         sent: 0,
         outcome: RunOutcome::PassLimit,
         pending: 4,
+        reconciliation_outstanding: 0,
         unfetchable_heads: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),

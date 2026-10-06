@@ -2796,6 +2796,15 @@ where
         })
     }
 
+    /// Received reconciliation statements this process has not
+    /// answered yet: the live gap `sync now` reports and exits on.
+    /// A pure observation over volatile evaluation state — answering
+    /// resets on restart — so this never feeds the durable status
+    /// surface, only the end-of-run gauge.
+    pub fn unanswered_statements(&self) -> usize {
+        self.engine.unanswered_statement_count()
+    }
+
     /// Whether the last pass left no actionable work: a pure
     /// observation over the pass report plus the durable outbox. It
     /// performs no sync work itself — intake, fetch, and publish

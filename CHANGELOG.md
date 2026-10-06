@@ -90,6 +90,14 @@ version say exactly what changed.
   pending, pinned by test. Recorded in `docs/upgrade-contract.md`,
   `docs/object-model.md`, `docs/resource-limits.md`,
   `docs/storage-growth.md`, `docs/sync-and-peers.md`.
+- Reconciliation diagnostics (`21d-reconciliation-diagnostics`):
+  `sync status` gains a `reconciliation` row — statements received
+  plus transitions and capabilities retired, all from committed
+  facts, classes and counts only (no identities, pinned by test) —
+  and `sync now` reports received-but-unanswered statements as its
+  control-plane gap, failing the run while the gap is open even when
+  the outbox is quiet, so automation keying on exit status sees it.
+  Recorded in `docs/cli.md`, `docs/sync-and-peers.md`.
 - Normative DG-3 control-message recovery / forget contract in
   `docs/sync-and-peers.md`: retire an obligation only on durable
   evidence the recipient's state subsumes it (per-class predicates),

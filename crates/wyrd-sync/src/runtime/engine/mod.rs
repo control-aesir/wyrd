@@ -1338,6 +1338,36 @@ impl Engine {
         Ok(self.store.rebuild(self.device)?.runtime)
     }
 
+    /// Reconciliation progress rebuilt from committed facts: received
+    /// statements plus per-class retirements. The durable half of the
+    /// operator surface (`sync status`): identical before and after a
+    /// restart over the same state, like every other status input.
+    /// Rebuilt from the store rather than read off the live sets, so
+    /// a process that answered statements in memory but never retired
+    /// them reports the facts, not its volatile evaluation.
+    pub fn reconciliation_counters(&self) -> Result<super::ReconciliationCounters, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let (transitions_reconciled, capabilities_reconciled) = rebuilt.runtime.reconciled_counts();
+        Ok(super::ReconciliationCounters {
+            statements_received: rebuilt.reconciliation_requests.len(),
+            transitions_reconciled,
+            capabilities_reconciled,
+        })
+    }
+
+    /// Received statements this process has not answered yet: the live
+    /// reconciliation gap a run reports and exits on. Volatile by
+    /// design — answering resets on restart and re-answering is
+    /// idempotent — so this is a run observation, never a status
+    /// input. Every answered statement came from a received one, so
+    /// the subtraction is exact; the saturating floor is
+    /// defense-in-depth against a future second writer.
+    pub fn unanswered_statement_count(&self) -> usize {
+        self.received_requests
+            .len()
+            .saturating_sub(self.answered_statements.len())
+    }
+
     /// The drive's durable sealed-representation vault: the composer
     /// layers durable runtime state over it (`serving::VaultSource`) to
     /// serve what peers fetch.

@@ -123,8 +123,26 @@ impl QueueDepth {
     }
 }
 
-/// Convergence from durable facts: whether the node has anything
-/// left it could do, plus the heads that keep it from saying so.
+/// Reconciliation progress from durable facts (21d): received peer
+/// statements plus obligations retired through reconciliation rather
+/// than relay acceptance. Counts over committed facts only — classes,
+/// never identities — so the renderer cannot leak a TransitionId or
+/// DeviceId through this row. The outstanding gap is deliberately
+/// absent: answering is a live, volatile evaluation, so unanswered
+/// statements are a run observation (`sync now`), not a status input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconciliationView {
+    /// Received reconciliation statements: peers that asked this
+    /// device to prove its state. Outstanding until the obligations
+    /// they cover retire — answering alone does not close the gap.
+    pub statements_received: usize,
+    /// Transition obligations retired by reconciliation.
+    pub transitions_reconciled: usize,
+    /// Capability obligations retired by reconciliation.
+    pub capabilities_reconciled: usize,
+}
+
+/// Convergence from durable facts: whether the node has anything/// left it could do, plus the heads that keep it from saying so.
 /// Pending heads may still resolve (bytes, routes, or capabilities
 /// outstanding); unfetchable heads are authorization-rejected —
 /// terminal damage, not pending work — and are reported, never spun
@@ -176,6 +194,8 @@ pub struct SyncStatus {
     /// Outstanding durable work: owed obligations plus missing
     /// fetches, from committed facts only.
     pub queue: QueueDepth,
+    /// Reconciliation progress, from committed facts only.
+    pub reconciliation: ReconciliationView,
     /// Whether the node has converged, from durable facts.
     pub convergence: ConvergenceState,
     /// Materialization as counts: explicit residency policies plus
@@ -319,6 +339,12 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         unfetchable_heads: head_classes.rejected,
     };
     let materialization = state.materialization_summary();
+    let counters = engine.reconciliation_counters()?;
+    let reconciliation = ReconciliationView {
+        statements_received: counters.statements_received,
+        transitions_reconciled: counters.transitions_reconciled,
+        capabilities_reconciled: counters.capabilities_reconciled,
+    };
     Ok(SyncStatus {
         tip,
         held_epochs,
@@ -330,6 +356,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         known_members,
         peers,
         queue,
+        reconciliation,
         convergence,
         materialization,
     })
@@ -542,6 +569,36 @@ mod tests {
         .unwrap();
         let after = observe(&reopened, 0).unwrap();
         assert_eq!(before, after);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The reconciliation row reads the durable counters: no
+    /// statement received and nothing retired on these fixtures, and
+    /// the row survives the reopen like every other status input.
+    /// Nonzero progress is pinned where the statements live
+    /// (`reconciliation_counters_replay_from_durable_facts`); this
+    /// test pins that `observe` surfaces those counters rather than
+    /// a live guess.
+    #[test]
+    fn reconciliation_row_is_a_durable_projection() {
+        let identity = DeviceIdentitySecret::from_bytes([0xC2; 32]).unwrap();
+        let (engine, dir) = scratch_authored_with(identity);
+        let before = observe(&engine, 0).unwrap();
+        assert_eq!(
+            before.reconciliation,
+            ReconciliationView::default(),
+            "no statements flow through these fixtures: {before:?}"
+        );
+        drop(engine);
+        let reopened = Engine::open_keystore(
+            dir.clone(),
+            "core-test-pass",
+            DeviceIdentitySecret::from_bytes([0xC2; 32]).unwrap(),
+        )
+        .unwrap();
+        let after = observe(&reopened, 0).unwrap();
+        assert_eq!(before.reconciliation, after.reconciliation);
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }

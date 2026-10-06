@@ -298,6 +298,16 @@ retires transition and capability obligations; announcement
 obligations remain pending and are not eligible for
 reconciliation retirement in 21c.
 
+Surfaced as 21d: `sync status` carries a `reconciliation` row —
+statements received plus transitions and capabilities retired,
+all from committed facts, classes and counts only — and `sync now`
+reports received-but-unanswered statements as its control-plane
+gap, failing the run while the gap is open even when the outbox
+is quiet. The "asked and permanently skipped" state above is
+exactly what that gap names: an `UnknownEpoch` skip never answers,
+so it stays outstanding until the epoch lands and a later pass
+(or run) answers.
+
 ### Acceptance scenarios (normative)
 
 A reader with this contract and the code must be able to state, for

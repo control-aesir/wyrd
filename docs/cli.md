@@ -290,7 +290,12 @@ sync now
   transitions per transition id, capabilities per epoch), the known
   membership tip against held epoch secrets (knowledge is not
   possession), live heads with classification counts over every DAG
-  head, and mailbox posture. Read-only against durable state only:
+  head, and mailbox posture. A `reconciliation` row reports control-plane
+  recovery progress from committed facts only: statements received,
+  plus transitions and capabilities retired by reconciliation. The row
+  names classes and counts, never identities — the outstanding gap
+  itself is volatile (answering resets on restart), so it lives on
+  `now`, not here. Read-only against durable state only:
   with no `--relay` the mailbox reads idle, and with relays it
   reports the configured count — status never connects, so there is
   no liveness to show and no seen log, delivery mark, outbox
@@ -354,6 +359,12 @@ sync now
   Quiet is never trusted on first sight: relay delivery races the
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
+  A quiet outbox does not imply a closed control plane: the run
+  reports a `reconciliation` line naming received statements it
+  never answered, and an open gap fails the run even when the
+  outbox is quiet — a peer asked and this device could not prove
+  its state, so automation keying on exit status sees it. Zero
+  prints too: the converged case is grepable, not omitted.
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run
    as quiet with an explicit `N unfetchable heads` count instead of
@@ -506,6 +517,9 @@ Both are read and hardened by wyrd code, never by clap:
   the tip line names the applied head, per-item lines name the owed
   obligation, live-head lines name the held heads — that is their job
   as merge identities, and no DeviceId appears beside them there.
+  The `reconciliation` row goes further and names no identities at
+  all: three counts (statements received, transitions and capabilities
+  retired), so a future field cannot smuggle an id onto the surface.
   DeviceIds never reach the durable `sync status` surface or the
   log; `sync now` alone names the senders its intake actually
   heard, because that process connected and the operator holds the

@@ -298,6 +298,14 @@ retires transition and capability obligations; announcement
 obligations remain pending and are not eligible for
 reconciliation retirement in 21c.
 
+Recovery requirements attach to the semantic class, not uniformly
+to all envelopes. Transitions and capabilities carry the state
+machine itself: losing them changes what the recipient believes
+exists or what it can decrypt. Announcements and content objects
+are independently recoverable through the content plane. That is
+why 21c retires transition and capability obligations first and
+leaves announcements pending.
+
 ### Acceptance scenarios (normative)
 
 A reader with this contract and the code must be able to state, for

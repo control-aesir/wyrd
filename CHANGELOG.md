@@ -29,6 +29,14 @@ version say exactly what changed.
 
 ### Added
 
+- Explicit convergence-over-delivery invariants (docs only, no behavior
+  change): `docs/architecture.md` gains transport-is-never-evidence
+  and identity-layering invariants pointing at the DG-3 forget
+  contract and `docs/crash-consistency.md`; `docs/sync-and-peers.md`
+  states recovery attaches to the semantic class (transitions and
+  capabilities are state-essential, announcements and content objects
+  recover independently); `docs/resource-limits.md` states locally
+  authoritative does not mean locally unbounded.
 - Reconciliation view fact kind (`0x18`) and replay arm
   (`21a-reconciliation-fact`): the recipient's per-class durable
   evidence (committed transitions, held snapshots, installed

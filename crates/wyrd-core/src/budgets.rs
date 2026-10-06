@@ -10,8 +10,10 @@
 //! (admission was previously uncapped per pass), `max_open_handles`
 //! (the table was previously bounded only by the kernel descriptor
 //! limit), `max_open_capture_bytes` (the count cap could not bound
-//! retained chunk-list bytes), and `max_parent_tokens` (the
-//! create-parent registry was new in the parent-race fix) — all sized
+//! retained chunk-list bytes), `max_parent_tokens` (the
+//! create-parent registry was new in the parent-race fix), and
+//! `max_quarantine_per_pass` (each repair commits and fsyncs, so
+//! unbounded repair would stretch a single pass) — all sized
 //! generously (see each default). The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds

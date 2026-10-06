@@ -5,7 +5,9 @@
 //!
 //! Three separations carry the OD-12 verdicts:
 //! - The bad physical representation (unlinked from disk) is not the
-//!   durable possession claim ([`Engine::record_object_removed`]), is
+//!   durable possession claim ([`Engine::record_objects_removed`],
+//!   batching the single-identity
+//!   [`Engine::record_object_removed`]), is
 //!   not the residency policy (untouched: `Cached` stays `Cached`),
 //!   and is not demand (the waiter's want stays registered; with no
 //!   waiter nothing refetches — OD-12-2 A).
@@ -22,6 +24,7 @@
 //! root mismatch, and a client-plane repair must not mutate
 //! storage capacity as a side effect.
 //!
+//! [`Engine::record_objects_removed`]: wyrd_sync::runtime::Engine::record_objects_removed
 //! [`Engine::record_object_removed`]: wyrd_sync::runtime::Engine::record_object_removed
 
 use std::collections::BTreeSet;
@@ -186,9 +189,15 @@ pub struct QuarantineReport {
 ///    `Available` for bytes already gone, while a reader
 ///    interleaving between the two observes the rejection again and
 ///    waits on — never served by — the doomed bytes. A commit
-///    failure aborts the drain with bytes and claims still
-///    consistent for the next pass (the waiter re-reports what is
-///    still bad).
+///    failure aborts the drain (and the pass, as dirty) with bytes
+///    and claims still consistent for the next pass: the popped
+///    items are dropped, but the waiter re-reports what is still
+///    bad, so nothing is silently abandoned. Note the reporting
+///    consequence: diagnostics emitted in phase 1 may describe
+///    repairs the aborted phases never performed — they are
+///    re-emitted when the waiter re-reports, so the log duplicates
+///    rather than loses. The `failures` counter covers per-item
+///    discard failures only, not this abort.
 /// 3. Discard the bytes one by one (verify-then-delete: a concurrent
 ///    heal wins), subtracting what left the disk from the
 ///    accountant. One bad file never blocks the rest: per-item
@@ -220,6 +229,12 @@ where
         report.observed += 1;
         emit(failure);
         pending.push(failure);
+    }
+    if pending.is_empty() {
+        // The idle path costs nothing: no rebuild, no commit, no
+        // store lock. A pass with no queued rejection must not pay
+        // for the repair machinery.
+        return Ok(report);
     }
     let ids: Vec<ContentId> = pending.iter().map(VerificationFailure::content).collect();
     report.claims_cleared += engine.record_objects_removed(&ids)? as u64;
@@ -545,6 +560,27 @@ mod tests {
         assert_eq!(report.observed, 1);
         assert!(queue.is_empty());
         assert_eq!(emitted.len(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An empty queue costs nothing: no rebuild, no commit, no
+    /// store lock, no emission. The idle pass must not pay for the
+    /// repair machinery.
+    #[test]
+    fn idle_drain_touches_nothing() {
+        let (mut engine, dir) = test_engine("idle");
+        let store = RwLock::new(MemoryObjectStore::default());
+        let queue = QuarantineQueue::default();
+        let committed = engine.current();
+        let mut emitted = Vec::new();
+        let report = drain_quarantine(&queue, &store, None, &mut engine, 64, &mut |failure| {
+            emitted.push(failure)
+        })
+        .unwrap();
+
+        assert_eq!(report, QuarantineReport::default());
+        assert!(emitted.is_empty());
+        assert_eq!(engine.current(), committed);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -23,12 +23,14 @@ owner-gated and grows per transition, not an amplification path.)
 All bounds live in one struct, [`ResourceBudgets`](../crates/wyrd-core/src/budgets.rs),
 threaded from `LiveConfig` into the loop, the registries, and the
 backend at composition time. Defaults are the historical hardcoded
-bounds — with four intentional new ones: the per-pass admission cap
+bounds — with five intentional new ones: the per-pass admission cap
 (admission was previously uncapped per pass), the open-handle cap
 (the table previously relied on the kernel descriptor limit alone),
 the open-capture byte ceiling (the count cap could not bound
-retained chunk-list bytes), and the parent-token retention cap for
-the create-parent registry.
+retained chunk-list bytes), the parent-token retention cap for
+the create-parent registry, and the per-pass quarantine-repair cap
+(each repair commits and fsyncs, so unbounded repair would stretch
+a single pass).
 4096 handles is far above plausible interactive use (tens of open
 descriptors) while bounding handle count, so it does not
 regress supported workloads. Retained capture bytes have their own
@@ -45,6 +47,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 |---|---|---|
 | Want registry identities (pending + admitted) | `max_pending_wants` (4096) | registration fails; `EIO` at the POSIX boundary, never a silent drop |
 | Want admission per sync pass | `max_admit_per_pass` (1024) | remainder stays pending for the next pass — paced, never dropped |
+| Quarantine repairs per sync pass | `max_quarantine_per_pass` (64) | remainder stays queued for the next pass — paced, never dropped |
 | Mutation queue (admitted-but-incomplete) | `max_pending_mutations` (4096) | submission fails `Saturated`; `EAGAIN` |
 | Parent create tokens (distinct retained paths) | `max_parent_tokens` (4096) | new parent capture fails closed; `ESTALE` at the FUSE boundary |
 | Write buffer per dirty handle | `write_per_handle_bytes` (64 MiB) | reservation refused; `ENOSPC`, handle unchanged |

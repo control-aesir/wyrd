@@ -295,7 +295,8 @@ sync now
   plus transitions and capabilities retired by reconciliation. The row
   names classes and counts, never identities — the outstanding gap
   itself is volatile (answering resets on restart), so it lives on
-  `now`, not here. Read-only against durable state only:
+  `now` as two gauges — never evaluated, plus evaluated-but-stuck —
+  not here. Read-only against durable state only:
   with no `--relay` the mailbox reads idle, and with relays it
   reports the configured count — status never connects, so there is
   no liveness to show and no seen log, delivery mark, outbox
@@ -360,10 +361,13 @@ sync now
   first drain, so a quiet verdict parks a short settle window
   (arrival short-circuits it) and confirms with a second pass.
   A quiet outbox does not imply a closed control plane: the run
-  reports a `reconciliation` line naming received statements it
-  never answered, and an open gap fails the run even when the
-  outbox is quiet — a peer asked and this device could not prove
-  its state, so automation keying on exit status sees it. Zero
+  reports a `reconciliation` line with two gauges — received
+  statements it never evaluated, plus evaluated-but-stuck ones
+  whose requester is still owed ("asked, nothing delivered": the
+  sender-side UnknownEpoch skip, which marks answered yet records
+  a stall). An open gap fails the run even when the outbox is
+  quiet — a peer asked and this device could not prove its state,
+  so automation keying on exit status sees it. Zero
   prints too: the converged case is grepable, not omitted.
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run

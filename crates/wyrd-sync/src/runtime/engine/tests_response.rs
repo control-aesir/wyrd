@@ -471,6 +471,55 @@ fn unknownepoch_never_reconciles() {
     assert_eq!(report.retired, 0, "sending is still not retiring");
 }
 
+/// The stall gauge (21d): a statement evaluated with obligations
+/// outstanding but zero sends and zero retirements records a stall
+/// — "asked, nothing delivered" — while a covered statement records
+/// none. The gauge counts only stalls whose requester is still owed,
+/// so the install arriving later closes it: closable, never a run
+/// that fails forever.
+#[test]
+fn evaluated_without_progress_records_a_live_stall() {
+    let (mut fx, _, child) = world();
+    let (_, r) = requester();
+    let child_id = child.transition_id();
+    fx.engine
+        .commit_facts(&[Fact::TransitionQueued(child_id, r)])
+        .unwrap();
+    // The statement evidences only the epoch-1 install: the epoch-2
+    // transition is unopenable, so nothing sends and nothing retires.
+    let held1 = ReconciliationEvidence {
+        transitions: BTreeSet::new(),
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::from([(r, 1)]),
+    };
+    state(&mut fx, r, held1);
+    let report = answer(&mut fx);
+    assert_eq!(report.retired, 0, "no evidence, no retirement");
+    assert_eq!(report.sent, 0, "the unopenable envelope does not send");
+    assert_eq!(
+        fx.engine.unanswered_statement_count(),
+        0,
+        "evaluated is not unanswered: the stall gauge carries this case"
+    );
+    assert_eq!(
+        fx.engine.stalled_statement_count().unwrap(),
+        1,
+        "asked, nothing delivered, obligation still owed"
+    );
+    // The epoch-2 install lands in a later statement: the send moves
+    // and the stall closes behind it.
+    let held2 = keyed_evidence(r, &[]);
+    state(&mut fx, r, held2);
+    let report = answer(&mut fx);
+    assert_eq!(report.sent, 1, "keys first, then content");
+    assert_eq!(
+        fx.engine.stalled_statement_count().unwrap(),
+        0,
+        "the obligation drained, so the stall no longer counts"
+    );
+    assert_eq!(fx.engine.unanswered_statement_count(), 0);
+}
+
 /// The per-statement send cap, with paging through re-statement: 41
 /// missing transitions against a cap of 32 send exactly 32; the
 /// recipient's next statement (covering the landed chunk, as its own

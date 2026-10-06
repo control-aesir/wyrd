@@ -563,6 +563,29 @@ fn reconciliation_counters_replay_from_durable_facts() {
         1,
         "received, not yet answered"
     );
+    // An answering pass drives the live gauge to zero: the converged
+    // scenario owes nothing, so the statement marks answered as
+    // covered-empty — evaluated, no stall recorded.
+    let b_dev = pair.b.device;
+    let mut mailbox = mailbox_for(&mut pair.relay, b_dev);
+    pair.b
+        .engine
+        .answer_reconciliation(&mut mailbox)
+        .expect("answer pass evaluates");
+    drop(mailbox);
+    assert_eq!(
+        pair.b.engine.unanswered_statement_count(),
+        0,
+        "the answer pass closed the live gap"
+    );
+    assert_eq!(
+        pair.b
+            .engine
+            .stalled_statement_count()
+            .expect("stall gauge reads"),
+        0,
+        "covered-empty is closed, not stuck"
+    );
     // A restart replays the same facts: the counters are identical
     // while the volatile answer evaluation resets.
     restart(&mut pair.b, &controls);

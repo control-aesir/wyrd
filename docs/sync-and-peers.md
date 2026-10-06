@@ -301,12 +301,13 @@ reconciliation retirement in 21c.
 Surfaced as 21d: `sync status` carries a `reconciliation` row —
 statements received plus transitions and capabilities retired,
 all from committed facts, classes and counts only — and `sync now`
-reports received-but-unanswered statements as its control-plane
-gap, failing the run while the gap is open even when the outbox
-is quiet. The "asked and permanently skipped" state above is
-exactly what that gap names: an `UnknownEpoch` skip never answers,
-so it stays outstanding until the epoch lands and a later pass
-(or run) answers.
+reports the open gap as two gauges: statements never evaluated,
+plus evaluated-but-stuck ones whose requester is still owed. An
+`UnknownEpoch` skip marks answered (it was evaluated) but records
+a stall, so the "asked and permanently skipped" state above reads
+open — never as a healthy drive — until the epoch lands and later
+progress closes it. The stall record is volatile like the answered
+set; the counters are durable.
 
 ### Acceptance scenarios (normative)
 

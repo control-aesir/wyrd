@@ -15,7 +15,7 @@ use wyrd_format::{DeviceId, SnapshotId};
 use wyrd_sync::{
     authorization::Classification,
     membership::KnownState,
-    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals},
+    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals, ReconciliationCounters},
 };
 
 use crate::live::PendingObligations;
@@ -123,26 +123,8 @@ impl QueueDepth {
     }
 }
 
-/// Reconciliation progress from durable facts (21d): received peer
-/// statements plus obligations retired through reconciliation rather
-/// than relay acceptance. Counts over committed facts only — classes,
-/// never identities — so the renderer cannot leak a TransitionId or
-/// DeviceId through this row. The outstanding gap is deliberately
-/// absent: answering is a live, volatile evaluation, so unanswered
-/// statements are a run observation (`sync now`), not a status input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReconciliationView {
-    /// Received reconciliation statements: peers that asked this
-    /// device to prove its state. Outstanding until the obligations
-    /// they cover retire — answering alone does not close the gap.
-    pub statements_received: usize,
-    /// Transition obligations retired by reconciliation.
-    pub transitions_reconciled: usize,
-    /// Capability obligations retired by reconciliation.
-    pub capabilities_reconciled: usize,
-}
-
-/// Convergence from durable facts: whether the node has anything/// left it could do, plus the heads that keep it from saying so.
+/// Convergence from durable facts: whether the node has anything
+/// left it could do, plus the heads that keep it from saying so.
 /// Pending heads may still resolve (bytes, routes, or capabilities
 /// outstanding); unfetchable heads are authorization-rejected —
 /// terminal damage, not pending work — and are reported, never spun
@@ -194,8 +176,15 @@ pub struct SyncStatus {
     /// Outstanding durable work: owed obligations plus missing
     /// fetches, from committed facts only.
     pub queue: QueueDepth,
-    /// Reconciliation progress, from committed facts only.
-    pub reconciliation: ReconciliationView,
+    /// Reconciliation progress, from committed facts only: received
+    /// peer statements plus obligations retired through
+    /// reconciliation rather than relay acceptance. Counts only —
+    /// classes, never identities — so the renderer cannot leak a
+    /// TransitionId or DeviceId through this row. The outstanding
+    /// gap is deliberately absent: answering is a live, volatile
+    /// evaluation, so unanswered and stalled statements are a run
+    /// observation (`sync now`), not a status input.
+    pub reconciliation: ReconciliationCounters,
     /// Whether the node has converged, from durable facts.
     pub convergence: ConvergenceState,
     /// Materialization as counts: explicit residency policies plus
@@ -339,12 +328,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         unfetchable_heads: head_classes.rejected,
     };
     let materialization = state.materialization_summary();
-    let counters = engine.reconciliation_counters()?;
-    let reconciliation = ReconciliationView {
-        statements_received: counters.statements_received,
-        transitions_reconciled: counters.transitions_reconciled,
-        capabilities_reconciled: counters.capabilities_reconciled,
-    };
+    let reconciliation = engine.reconciliation_counters()?;
     Ok(SyncStatus {
         tip,
         held_epochs,
@@ -587,7 +571,7 @@ mod tests {
         let before = observe(&engine, 0).unwrap();
         assert_eq!(
             before.reconciliation,
-            ReconciliationView::default(),
+            ReconciliationCounters::default(),
             "no statements flow through these fixtures: {before:?}"
         );
         drop(engine);

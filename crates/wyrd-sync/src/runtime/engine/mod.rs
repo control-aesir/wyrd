@@ -697,6 +697,20 @@ pub struct Engine {
     /// like the trigger's volatile marker: re-answer work, never
     /// resumed silence.
     pub(super) answered_statements: BTreeSet<(DeviceId, [u8; 32])>,
+    /// Statements evaluated with obligations outstanding but zero
+    /// sends and zero retirements ("asked, nothing delivered"), as
+    /// (requester, statement-digest) pairs: the sender-side
+    /// UnknownEpoch skip is the pre-existing shape — the transition's
+    /// epoch is past everything the statement shows the recipient
+    /// holding, so the envelopes stay pending for the statement that
+    /// carries the capability install. Volatile like the answered set
+    /// and never rebuilt: a restart re-evaluates every statement and
+    /// re-derives the stalls idempotently. Entries are insert-only
+    /// within a lifetime; liveness is decided at read time
+    /// ([`Engine::stalled_statement_count`]), so obligations that
+    /// drain through another path (relay acceptance, a newer
+    /// statement) close the stall without event plumbing.
+    pub(super) stalled_statements: BTreeSet<(DeviceId, [u8; 32])>,
     /// How many received-request bucket entries were answered: the
     /// bucket is append-only in commit order, so each pass scans
     /// only the suffix past this count. Doubles as the answer
@@ -835,6 +849,7 @@ impl Engine {
             committed_capabilities: BTreeMap::new(),
             received_requests: BTreeSet::new(),
             answered_statements: BTreeSet::new(),
+            stalled_statements: BTreeSet::new(),
             answered_upto: 0,
             pending: PendingQueue::default(),
             fetch_run: 0,
@@ -1366,6 +1381,25 @@ impl Engine {
         self.received_requests
             .len()
             .saturating_sub(self.answered_statements.len())
+    }
+
+    /// Evaluated-but-stuck statements whose requester is still owed:
+    /// "asked, nothing delivered" with a live gap behind it. The set
+    /// is insert-only within a lifetime, so liveness is decided here
+    /// against rebuilt durable state — a stall whose obligations
+    /// drained through another path (relay acceptance, a newer
+    /// statement's retirements) stops counting without event
+    /// plumbing. Rebuilt rather than read off a live projection so
+    /// the gauge agrees with the durable counters by construction;
+    /// read once at end of run, never per pass. Volatile like the
+    /// answered set: a restart re-evaluates and re-derives.
+    pub fn stalled_statement_count(&self) -> Result<usize, EngineError> {
+        let state = self.store.rebuild(self.device)?.runtime;
+        Ok(self
+            .stalled_statements
+            .iter()
+            .filter(|(requester, _)| state.has_outstanding_for(requester))
+            .count())
     }
 
     /// The drive's durable sealed-representation vault: the composer

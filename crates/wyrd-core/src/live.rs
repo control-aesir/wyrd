@@ -969,11 +969,12 @@ where
         // Reconciliation answers (21c) run before the blind retry:
         // each new statement retires what its evidence covers and
         // retransmits (capped) what it does not, so the pass below
-        // only carries what no statement has yet answered. The
-        // report is dropped here like the trigger outcome (21d
-        // surfaces both); a dead transport stalls the answer, never
-        // the loop, and the statement stays unanswered for the next
-        // pass.
+        // only carries what no statement has yet answered. Sends fold
+        // into the pass total here; the evaluated-but-stuck half is
+        // read off the engine once at end of run (21d's stall gauge),
+        // not accumulated per pass. A dead transport stalls the
+        // answer, never the loop, and the statement stays unanswered
+        // for the next pass.
         sent += match self.engine.answer_reconciliation(mailbox) {
             Ok(report) => report.sent,
             Err(EngineError::Mailbox(_)) => 0,
@@ -1200,7 +1201,9 @@ where
         // absorb like every other send in this pass (see `publish`):
         // a dead transport stalls the probe, never the loop. The
         // outcome is dropped here (the loop stays free of reporting
-        // dependencies); 21d surfaces it.
+        // dependencies): the sent half is observable on the recipient
+        // as a received statement — which is what 21d surfaces — so
+        // the local probe needs no counter of its own.
         let reconnects = mailbox.reconnects();
         if self.last_mailbox_reconnects.replace(reconnects) != Some(reconnects) {
             self.engine.note_reconnected();
@@ -2803,6 +2806,17 @@ where
     /// surface, only the end-of-run gauge.
     pub fn unanswered_statements(&self) -> usize {
         self.engine.unanswered_statement_count()
+    }
+
+    /// Evaluated-but-stuck statements whose requester is still owed
+    /// ("asked, nothing delivered"): the stall half of the run gauge
+    /// beside the unanswered half above. Rebuilt-backed like the
+    /// durable counters, so it agrees with them by construction;
+    /// volatile like the answered set, so a restart re-derives it.
+    pub fn stalled_statements(&self) -> Result<usize, LiveError> {
+        self.engine
+            .stalled_statement_count()
+            .map_err(LiveError::Engine)
     }
 
     /// Whether the last pass left no actionable work: a pure

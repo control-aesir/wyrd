@@ -557,7 +557,11 @@ happens only at the boundary: opening a non-local path blocks on
 fetch with visible progress, serves the read once verified and
 cached, and fails with `EIO` when no representation serves and the object
 is not cached. A terminal generation completes its waiters with that
-bounded `EIO` instead of the full deadline. Corrupt or unreachable representations fall back to the
+bounded `EIO` instead of the full deadline — unless a rejection
+was observed for the identity within the repair window (30 s,
+memory-only, unobservable to the reader), in which case the waiter
+waits out the repair behind the stale projection instead of
+failing fast on it. Corrupt or unreachable representations fall back to the
 next recorded representation inside the fetch walk — and, within one
 representation, its transport root before its storage address —
 hash/AEAD-verified, never committed on mismatch. The store

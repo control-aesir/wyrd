@@ -93,7 +93,10 @@ bounded result of one failed generation, not durable poison. A new
 waiter reopens the attempt as a new generation. The demand reaches
 the loop as a sticky note, not as a blocked waiter: an unavailable
 read records reopen demand and fails fast, and the next pass rotates
-the generation for the retry. (Corrupt verdicts complete waiters
+the generation for the retry — unless a rejection was observed for
+the identity within the repair window (30 s, memory-only), in
+which case the waiter waits out the in-flight repair instead of
+failing fast on the stale projection. (Corrupt verdicts complete waiters
 but record no note: their repair is quarantine's, not rewant's —
 see child 12.) Flaky networks cause
 EIOs, but each is bounded and recoverable — no EIO-storm-to-permanent

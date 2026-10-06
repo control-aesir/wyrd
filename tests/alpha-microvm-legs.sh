@@ -298,10 +298,13 @@ leg_fetch_member() {
     || die "cold-bytes is not unique in the member store"
   printf 'tampered!!\n' > "$cold_chunk" \
     || die "host-side chunk surgery failed"
-  # The terminal verdict for the now-unfetchable identity may still
-  # be forming (same tolerance as the stale-2 probe above): every
-  # attempt must fail closed with EIO and serve nothing, whether it
-  # runs to the deadline or fails fast on the formed verdict.
+  # The reads fail closed at the demand deadline (or on a formed
+  # verdict), never fast on the stale view and never with bytes:
+  # the first read reports the rejection — starting the backend's
+  # repair window — and every read waits out the in-flight repair
+  # instead of completing on the projection that still shows the
+  # pre-repair state. With the owner stopped no refetch can land,
+  # so each attempt must end bounded-EIO having served nothing.
   attempt=0
   while (( attempt < 3 )); do
     rc=0

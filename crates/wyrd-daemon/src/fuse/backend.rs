@@ -22,6 +22,64 @@ use wyrd_core::mutation::{
 };
 use wyrd_core::projection::Projection;
 use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
+
+/// How long an observed rejection keeps a later boundary verdict
+/// from completing its waiter. The window covers the repair the
+/// observation started — drain, unclaim, re-pend, refetch — while
+/// the served projection still shows the pre-repair state (claim
+/// present, bytes doomed, then bytes absent with a stale `Available`
+/// until a publishable head re-installs). Past the window the
+/// waiter falls back to the verdict it sees. Bounded by the wait's
+/// own deadline in practice: no wait outlives `open_timeout`, so
+/// the window can only delay, never hang, a genuinely terminal EIO.
+const REPAIR_OBSERVATION_TTL: Duration = Duration::from_secs(30);
+
+/// Identities with an observed-but-possibly-unrepaired rejection:
+/// content id to the last observation time. Written when the
+/// backend reports a rejection, read when a boundary verdict would
+/// otherwise complete a waiter mid-wait or fail a first touch fast.
+/// Entries expire lazily on record (a background sweep would be a
+/// thread for a map that holds only in-flight repairs); the set
+/// stays tiny because only live repairs are ever queried.
+#[derive(Debug, Default)]
+struct RecentRejections {
+    seen: Mutex<HashMap<wyrd_format::ContentId, Instant>>,
+}
+
+impl RecentRejections {
+    /// Record an observation at `now`, dropping entries older than
+    /// the repair window.
+    fn note(&self, content: wyrd_format::ContentId, now: Instant) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.retain(|_, at| now.duration_since(*at) < REPAIR_OBSERVATION_TTL);
+            seen.insert(content, now);
+        }
+    }
+
+    /// Whether a repair started by an observation may still be in
+    /// flight: an entry exists and is younger than the window. A
+    /// poisoned lock reads as no repair — the holder panicked, so
+    /// the loop is not draining anymore and the waiter surfaces
+    /// whatever the verdict says.
+    fn contains(&self, content: &wyrd_format::ContentId, now: Instant) -> bool {
+        self.seen.lock().is_ok_and(|seen| {
+            seen.get(content)
+                .is_some_and(|at| now.duration_since(*at) < REPAIR_OBSERVATION_TTL)
+        })
+    }
+}
+
+/// Whether a boundary verdict observed mid-wait completes the
+/// waiter now. A recent rejection means the repair this observation
+/// may belong to is still in flight — the projection lags the
+/// claim-clear and the unlink, and the refetch may land at any
+/// moment — so the waiter keeps waiting for it. Otherwise the
+/// verdict is terminal-on-its-face (a genuine terminal generation,
+/// or an out-of-band loss no repair was ever started for) and
+/// completes boundedly, exactly as before quarantine existed.
+fn complete_waiter_on_terminal(recently_rejected: bool) -> bool {
+    !recently_rejected
+}
 use wyrd_core::session::{FoldLease, WriteBudget};
 use wyrd_core::want::{wait_for_materialization, WantRegistry};
 
@@ -64,6 +122,13 @@ where
     /// keeps the instant-EIO behavior for standalone backends, which
     /// have no loop to repair through.
     quarantine: Option<Arc<QuarantineQueue>>,
+    /// Rejections this backend observed (and reported) within the
+    /// repair window: while an entry is fresh, a boundary verdict
+    /// for the same identity does not complete a waiter — the
+    /// repair may still be in flight behind a stale projection.
+    /// Independent of the queue (which the drain consumes): this
+    /// remembers the observation, not the outstanding work.
+    recent_rejections: RecentRejections,
     /// The session's write budget: bounds the buffered logical images of
     /// writable handles. Independent of the projection and store locks.
     pub(super) budget: Arc<WriteBudget>,
@@ -539,6 +604,7 @@ where
             wants: None,
             mutations: None,
             quarantine: None,
+            recent_rejections: RecentRejections::default(),
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -573,6 +639,7 @@ where
             wants: None,
             mutations: None,
             quarantine: None,
+            recent_rejections: RecentRejections::default(),
             budget: Arc::new(WriteBudget::default()),
             max_open_handles: DEFAULT_MAX_OPEN_HANDLES,
             max_open_capture_bytes: DEFAULT_MAX_OPEN_CAPTURE_BYTES,
@@ -614,6 +681,7 @@ where
             wants: Some(wants),
             mutations: Some(mutations),
             quarantine: None,
+            recent_rejections: RecentRejections::default(),
             budget: Arc::new(WriteBudget::with_limits(
                 budgets.write_per_handle_bytes,
                 budgets.write_aggregate_bytes,
@@ -1199,7 +1267,12 @@ where
     /// Run `attempt`; when it fails on a not-materialized identity and
     /// demand is wired, register the want and block bounded on it, then
     /// retry once. A terminally unavailable identity completes the
-    /// waiter immediately: `Unavailable(generation)` is a verdict, not
+    /// waiter immediately — unless a rejection was observed for it
+    /// moments ago, in which case the repair is still in flight
+    /// behind a stale projection (claim cleared, bytes unlinked,
+    /// refetch running, served generation not yet republished) and
+    /// the waiter waits it out instead of failing fast on the stale
+    /// view. `Unavailable(generation)` is otherwise a verdict, not
     /// a maybe, so the bounded `EIO` lands now instead of at the
     /// deadline — while the reopen note it leaves makes the identity
     /// re-demandable on the next pass instead of permanently
@@ -1232,6 +1305,21 @@ where
                 Err((ViewError::RejectedRepresentation { content, kind }, errno)),
             ) => {
                 quarantine.submit(VerificationFailure::content_hash_mismatch(*content, *kind));
+                self.recent_rejections.note(*content, Instant::now());
+                Err((ViewError::NotMaterialized { content: *content }, *errno))
+            }
+            _ => first,
+        };
+        // A first-touch `Unavailable` with a fresh rejection is the
+        // same repair seen one observation later: the claim is
+        // cleared (or clearing) and the projection lags, so the
+        // identity enters the demand flow and waits it out like a
+        // rejected first read. Without a recent rejection this stays
+        // the fast terminal EIO it has always been.
+        let first = match (&self.quarantine, &self.wants, &first) {
+            (Some(_), Some(_), Err((ViewError::Unavailable { content }, errno)))
+                if self.recent_rejections.contains(content, Instant::now()) =>
+            {
                 Err((ViewError::NotMaterialized { content: *content }, *errno))
             }
             _ => first,
@@ -1245,29 +1333,46 @@ where
             // themselves (the final retry below surfaces them as
             // EIO) and note reopen demand, so a reader blocked
             // across the verdict still reopens the generation for
-            // its retry. Corrupt notes nothing: its repair is
-            // quarantine's job, not rewant's — and a rejected
-            // representation observed mid-wait is reported and waited
-            // through: the drain clears the claim and the admitted
-            // want re-drives a fresh generation, while persistent
-            // bad providers terminate through strikes into a
-            // terminal Corrupt verdict, never through an unbounded
-            // quarantine loop. Any other failure keeps waiting: the
-            // fetch may still land before the deadline.
+            // its retry — unless a rejection was observed for the
+            // identity moments ago, in which case the repair is
+            // still in flight behind a stale projection and the
+            // waiter waits it out instead of failing fast on the
+            // stale view (see `complete_waiter_on_terminal`).
+            // Corrupt notes nothing: its repair is quarantine's job,
+            // not rewant's — and a rejected representation observed
+            // mid-wait is reported and waited through: the drain
+            // clears the claim and the admitted want re-drives a
+            // fresh generation, while persistent bad providers
+            // terminate through strikes into a terminal Corrupt
+            // verdict, never through an unbounded quarantine loop.
+            // Any other failure keeps waiting: the fetch may still
+            // land before the deadline.
             let retry = || match attempt() {
                 Ok(_) => true,
                 Err((ViewError::Unavailable { content }, _)) => {
                     wants.note_reopen_demand(&content);
-                    true
+                    complete_waiter_on_terminal(
+                        self.recent_rejections.contains(&content, Instant::now()),
+                    )
                 }
                 Err((ViewError::RejectedRepresentation { content, kind }, _)) => {
                     if let Some(quarantine) = &quarantine {
                         quarantine
                             .submit(VerificationFailure::content_hash_mismatch(content, kind));
                     }
+                    self.recent_rejections.note(content, Instant::now());
                     false
                 }
                 Err((ViewError::Corrupt, _)) => true,
+                // `Corrupt` stays unconditional: the variant carries
+                // no identity to key recency against, and most of
+                // what lands here is structural damage no repair can
+                // fix — delaying it on any-recent global state would
+                // trade a fail-fast for unrelated in-flight repairs.
+                // A terminal-corrupt verdict behind a lagging
+                // projection still completes here; the noted reopen
+                // demand and the intact policy re-drive the next
+                // waiter.
                 Err(_) => false,
             };
             match wait_for_materialization(&wants, *content, self.open_timeout, retry) {
@@ -3580,5 +3685,52 @@ where
         Ok(Node::Symlink { .. }) => fuser::Errno::EOPNOTSUPP,
         Ok(_) => fuser::Errno::EINVAL,
         Err(error) => errno_of(&error),
+    }
+}
+
+#[cfg(test)]
+mod tests_recent_rejections {
+    use super::*;
+
+    fn content(byte: u8) -> wyrd_format::ContentId {
+        wyrd_format::ContentId::from_bytes([byte; 32])
+    }
+
+    /// The repair window: a noted identity reads recent until the
+    /// TTL lapses, other identities are unaffected, and expiry
+    /// prunes without a sweep thread.
+    #[test]
+    fn repair_window_covers_observations_until_expiry() {
+        let recent = RecentRejections::default();
+        let noted = Instant::now();
+        recent.note(content(1), noted);
+        assert!(recent.contains(&content(1), noted));
+        assert!(recent.contains(
+            &content(1),
+            noted + REPAIR_OBSERVATION_TTL - Duration::from_secs(1)
+        ));
+        assert!(!recent.contains(&content(2), noted));
+        assert!(!recent.contains(&content(1), noted + REPAIR_OBSERVATION_TTL));
+        assert!(!recent.contains(
+            &content(1),
+            noted + REPAIR_OBSERVATION_TTL + Duration::from_secs(1)
+        ));
+        // Re-noting refreshes the window: a waiter that keeps
+        // observing keeps waiting.
+        recent.note(content(1), noted + REPAIR_OBSERVATION_TTL);
+        assert!(recent.contains(
+            &content(1),
+            noted + REPAIR_OBSERVATION_TTL + Duration::from_secs(1)
+        ));
+    }
+
+    /// The completion rule: only a verdict with no live repair
+    /// behind it completes the waiter. A recent rejection keeps
+    /// every boundary verdict waiting; without one everything
+    /// completes exactly as before quarantine existed.
+    #[test]
+    fn completion_rule_pins_the_stale_window() {
+        assert!(complete_waiter_on_terminal(false));
+        assert!(!complete_waiter_on_terminal(true));
     }
 }

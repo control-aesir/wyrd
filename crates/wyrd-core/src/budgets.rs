@@ -12,8 +12,9 @@
 //! limit), `max_open_capture_bytes` (the count cap could not bound
 //! retained chunk-list bytes), `max_parent_tokens` (the
 //! create-parent registry was new in the parent-race fix), and
-//! `max_quarantine_per_pass` (each repair commits and fsyncs, so
-//! unbounded repair would stretch a single pass) — all sized
+//! `max_quarantine_per_pass` (the claim-clear is one batched
+//! commit per pass, but every repair still pays its own
+//! verify-read and store write lock) — all sized
 //! generously (see each default). The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds
@@ -45,9 +46,11 @@ pub const DEFAULT_MAX_ADMIT_PER_PASS: usize = 1024;
 /// Most rejected representations repaired per sync pass (diagnosed,
 /// unclaimed, unlinked). Leftover queued rejections wait for the
 /// next pass — never dropped, never silently unrepaired. Sized far
-/// below the admission family (64): each repair commits and fsyncs,
-/// so a drive with many bitrotted chunks converges over passes
-/// instead of stretching one pass by an unbounded amount.
+/// below the admission family (64): the claim-clear is one batched
+/// commit, but each repair still takes its own verify-read and
+/// store write lock, so a drive with many bitrotted chunks
+/// converges over passes instead of stretching one pass by an
+/// unbounded amount.
 pub const DEFAULT_MAX_QUARANTINE_PER_PASS: usize = 64;
 
 /// Most open file handles at once (read captures plus writable

@@ -374,13 +374,17 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
     // The fetch lands through the live peer: drive until the chunk
     // is verified local and the published generation serves the
     // path (the reader opens through the projection, not the
-    // materialization status).
+    // materialization status). Deadline-bounded, not
+    // fixed-iteration: under gate load the same passes take
+    // longer, and a pass budget must never be what fails the
+    // test.
+    let started = std::time::Instant::now();
     let mut available = false;
-    for _ in 0..60 {
+    while started.elapsed() < Duration::from_secs(120) {
         live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
             .unwrap();
         let slot = parts.projection.read().unwrap();
-        if view_status(&parts, &chunk) == FetchStatus::Available
+        if slot.view().status(&chunk) == FetchStatus::Available
             && slot.view().lookup("heal.txt").is_ok()
         {
             available = true;
@@ -432,11 +436,12 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
         // The loop repairs and refetches while the reader waits:
         // drain, unclaim, re-pend, and the live peer serves the
         // fresh generation. No restart, no remount — one engine,
-        // one store, one live node throughout.
-        for _ in 0..200 {
-            if done.load(Ordering::SeqCst) {
-                break;
-            }
+        // one store, one live node throughout. Deadline-bounded
+        // for the same reason as above: the reader's own 30s
+        // demand deadline is what bounds the wait, and the drive
+        // loop must not stop first under load.
+        let started = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(120) {
             let pass = live
                 .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
                 .unwrap();

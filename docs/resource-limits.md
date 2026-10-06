@@ -29,8 +29,9 @@ bounds — with five intentional new ones: the per-pass admission cap
 the open-capture byte ceiling (the count cap could not bound
 retained chunk-list bytes), the parent-token retention cap for
 the create-parent registry, and the per-pass quarantine-repair cap
-(each repair commits and fsyncs, so unbounded repair would stretch
-a single pass).
+(the claim-clear is one batched commit per pass, but every repair
+still pays its own verify-read and store write lock, so unbounded
+repair would stretch a single pass).
 4096 handles is far above plausible interactive use (tens of open
 descriptors) while bounding handle count, so it does not
 regress supported workloads. Retained capture bytes have their own

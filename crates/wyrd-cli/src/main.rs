@@ -1441,8 +1441,8 @@ fn cache_policy_render(
         None => out.push_str("  retained_bytes_quota: unlimited\n"),
     }
     out.push_str(&format!(
-        "  max_admit_per_pass: {}\n  max_pending_wants: {}\n",
-        budgets.max_admit_per_pass, budgets.max_pending_wants,
+        "  max_admit_per_pass: {}\n  max_pending_wants: {}\n  max_quarantine_per_pass: {}\n",
+        budgets.max_admit_per_pass, budgets.max_pending_wants, budgets.max_quarantine_per_pass,
     ));
     // The retention breakdown: one row per resident dimension, each
     // labelled with whether it backs enforcement or merely observes.

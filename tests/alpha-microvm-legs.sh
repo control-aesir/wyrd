@@ -315,6 +315,12 @@ leg_fetch_member() {
   done
   grep -q "representation rejected" "$LOGDIR/mount-xmember-f.err" \
     || die "mount log never named the rejected representation for quarantine"
+  # OD-12-1 A end to end: the bad representation is unlinked, not
+  # merely unclaimed. (A failed discard would still heal below —
+  # the refetch's insert heals the live name — so only the
+  # absence proves removal.)
+  [[ ! -e "$cold_chunk" ]] \
+    || die "bitrotted chunk file still on disk after the quarantine drain"
   pass "bitrotted read fails closed, serves nothing, names the rejection"
   # The owner is back on a fresh endpoint with a new route (see
   # owner leg). Converge its head BEFORE authoring: the scratch and

@@ -364,8 +364,8 @@ live claim cannot happen: the unlink never runs before the commit.
 Two bounds, both by process lifetime: the in-memory queue loses a
 diagnostic emitted microseconds before the crash (child 14's
 persistence will close this), and the retained-bytes counter keeps
-charging the unlinked-but-uncleared bytes until `FsObjectStore::open`
-re-seeds from disk. Pinned by `record_objects_removed_batches_many_identities`
+charging the claimed-cleared-but-still-present bytes until
+`FsObjectStore::open` re-seeds from disk. Pinned by `record_objects_removed_batches_many_identities`
 (one batch, duplicates collapse) and the drain's phase order
 (`wyrd-core/src/quarantine.rs`).
 

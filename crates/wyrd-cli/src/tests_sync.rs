@@ -723,6 +723,7 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         reconciliation_outstanding: 0,
         reconciliation_stalled: 0,
         unfetchable_heads: 0,
+        terminal_identities: 0,
         mailbox,
         peers_observed: Vec::new(),
         write: WriteStats::default(),
@@ -1083,6 +1084,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         reconciliation_outstanding: 0,
         reconciliation_stalled: 0,
         unfetchable_heads: 0,
+        terminal_identities: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
         write: WriteStats::default(),
@@ -1122,6 +1124,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         reconciliation_outstanding: 0,
         reconciliation_stalled: 0,
         unfetchable_heads: 1,
+        terminal_identities: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
         write: WriteStats::default(),
@@ -1161,6 +1164,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         reconciliation_outstanding: 0,
         reconciliation_stalled: 0,
         unfetchable_heads: 0,
+        terminal_identities: 0,
         mailbox: Some(fixture_mailbox()),
         peers_observed: Vec::new(),
         write: WriteStats::default(),
@@ -1900,6 +1904,267 @@ fn vault_trust_position_is_documented_as_unimplemented() {
         ),
         "the never-print list keeps its shape, tail anchored so an appended item fails too"
     );
+}
+
+/// One report with every fetch-failure class firing at a distinct
+/// value, plus repair activity and terminal identities: the shared
+/// fixture for the fetch-diagnostics rendering tests, so a class the
+/// renderer names is a class these tests cover.
+fn report_with_all_classes() -> SyncRunReport {
+    let mut report = report_with(RunOutcome::RemoteStalled, Some(fixture_mailbox()));
+    report.unfulfilled = 14;
+    report.transport_errors = 2;
+    report.deadlines = 1;
+    report.missing = 8;
+    report.invalid = 3;
+    report.unavailable_keys = 4;
+    report.local_failures = 5;
+    report.terminal_identities = 2;
+    report.quarantined_observed = 1;
+    report.quarantine_claims_cleared = 1;
+    report.quarantine_bytes_discarded = 64;
+    report.scrubbed_observed = 1;
+    report.scrub_claims_cleared = 1;
+    report.scrub_bytes_subtracted = 128;
+    report
+}
+
+/// Verification 1 of `14-fetch-failure-diagnostics`: every class the
+/// run counted renders under its own label beside the total, with
+/// the terminal gauge and the repair lines alongside.
+#[test]
+fn sync_now_render_reports_every_fetch_failure_class() {
+    let rendered = sync_now_render(&report_with_all_classes());
+    assert!(
+        rendered.contains("(14 unfulfilled)"),
+        "the total still anchors the line: {rendered}"
+    );
+    for (label, count) in [
+        ("transport_errors", 2),
+        ("missing", 8),
+        ("invalid", 3),
+        ("unavailable_keys", 4),
+        ("local_failures", 5),
+    ] {
+        assert!(
+            rendered.contains(&format!("  {label}: {count}")),
+            "the {label} class renders with its own label: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("deadlines: 1 discarded under budget pressure"),
+        "budget pressure renders on its own line: {rendered}"
+    );
+    assert!(
+        rendered.contains("terminal: 2 identities exhausted"),
+        "the terminal gauge renders: {rendered}"
+    );
+    assert!(
+        rendered
+            .contains("quarantine: 1 observed, 1 claims cleared, 64 bytes discarded, 0 failures"),
+        "quarantine repair renders: {rendered}"
+    );
+    assert!(
+        rendered.contains("scrub: 1 observed, 1 claims cleared, 128 bytes subtracted, 0 failures"),
+        "scrub repair renders: {rendered}"
+    );
+}
+
+/// Verification 2: a quiet run prints the total, the unconditional
+/// budget and terminal lines, and no class breakdown — no wall of
+/// zeros in the common case.
+#[test]
+fn a_quiet_run_prints_the_total_and_no_zero_classes() {
+    let rendered = sync_now_render(&report_with(RunOutcome::Quiet, Some(fixture_mailbox())));
+    assert!(
+        rendered.contains("(0 unfulfilled)"),
+        "the total prints even at zero: {rendered}"
+    );
+    assert!(
+        rendered.contains("deadlines: 0 discarded under budget pressure"),
+        "the budget line is unconditional: {rendered}"
+    );
+    assert!(
+        rendered.contains("terminal: 0 identities exhausted"),
+        "the terminal gauge is unconditional: {rendered}"
+    );
+    assert!(
+        !rendered.contains("fetch classes"),
+        "no breakdown section on a quiet run: {rendered}"
+    );
+    for label in [
+        "transport_errors",
+        "missing",
+        "invalid",
+        "unavailable_keys",
+        "local_failures",
+    ] {
+        assert!(
+            !rendered.contains(label),
+            "no zero {label} line on a quiet run: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("quarantine:") && !rendered.contains("scrub:"),
+        "no repair lines without repair work: {rendered}"
+    );
+}
+
+/// Verification 3: budget pressure that never became an unfulfilled
+/// item still surfaces — the `engine/mod.rs:308-322` case where a
+/// nonzero slice is discarded when the fallback reports absence.
+#[test]
+fn deadlines_print_even_when_unfulfilled_is_zero() {
+    let mut report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    report.deadlines = 3;
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("(0 unfulfilled)"),
+        "the total stays zero: {rendered}"
+    );
+    assert!(
+        rendered.contains("deadlines: 3 discarded under budget pressure"),
+        "the pressure is not hidden by the quiet total: {rendered}"
+    );
+    assert!(
+        !rendered.contains("fetch classes"),
+        "no breakdown section for pressure alone: {rendered}"
+    );
+}
+
+/// Verification 4: the classes are diagnostic counts, never
+/// arithmetic on the total. The total line carries the bare count
+/// with no class beside it, no class line names the total, and the
+/// header states the contract outright — so a future renderer
+/// cannot turn the counters into fake accounting unnoticed.
+#[test]
+fn the_fetch_classes_are_not_presented_as_a_sum_of_unfulfilled() {
+    let rendered = sync_now_render(&report_with_all_classes());
+    let total = rendered
+        .lines()
+        .find(|line| line.contains("unfulfilled"))
+        .expect("the total line renders");
+    assert!(
+        !total.contains('+') && !total.contains("transport_errors"),
+        "the total line is a bare count, never a sum: {total}"
+    );
+    for line in rendered.lines().filter(|line| line.starts_with("  ")) {
+        assert!(
+            !line.contains("unfulfilled"),
+            "no class line reaches back to the total: {line}"
+        );
+        assert!(!line.contains('+'), "no class line does arithmetic: {line}");
+    }
+    assert!(
+        rendered.contains("fetch classes (diagnostic counts, not shares of unfulfilled):"),
+        "the header states the non-decomposition contract: {rendered}"
+    );
+}
+
+/// Verification 6: every class line through the renderer carries
+/// counts only — a 64-hex run anywhere in the full-class render is
+/// a leak, whatever its kind. The fixture names no peers, so no
+/// scrubbed exception applies here.
+#[test]
+fn fetch_class_lines_contain_no_content_ids() {
+    let rendered = sync_now_render(&report_with_all_classes());
+    assert!(
+        !contains_hex_run(&rendered),
+        "counts by reason never smuggle an identity: {rendered}"
+    );
+}
+
+/// Verification 7: even with an observed peer on the report, the
+/// fetch-diagnostic lines name no device and carry no path. The
+/// senders-observed section is the one deliberate identity
+/// exception; these lines are not it.
+#[test]
+fn fetch_diagnostic_lines_name_no_device_or_path() {
+    use wyrd_format::DeviceId;
+    let device = DeviceId::from_bytes([0xC0; 32]);
+    let mut report = report_with_all_classes();
+    report.peers_observed = vec![device];
+    let rendered = sync_now_render(&report);
+    let hex = device.to_string();
+    assert!(
+        rendered.contains(&hex),
+        "the fixture really exercises the exception: {rendered}"
+    );
+    for prefix in [
+        "  transport_errors:",
+        "  missing:",
+        "  invalid:",
+        "  unavailable_keys:",
+        "  local_failures:",
+        "deadlines:",
+        "terminal:",
+        "quarantine:",
+        "scrub:",
+    ] {
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line renders: {rendered}"));
+        assert!(
+            !line.contains(&hex),
+            "no device id on the diagnostic line: {line}"
+        );
+        assert!(
+            !line.contains('/'),
+            "no path on the diagnostic line: {line}"
+        );
+    }
+}
+
+/// Verification 8: the trust-position statement ships in the docs
+/// the operator reads, following the
+/// `vault_trust_position_is_documented_as_unimplemented` pattern —
+/// a grep over `docs/cli.md` that fails if the client-position
+/// statement for this surface is ever dropped.
+#[test]
+fn fetch_diagnostic_states_its_trust_position() {
+    let reference =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli.md"))
+            .expect("the CLI reference reads");
+    // Whitespace-normalized: the sentence wraps across lines in
+    // the source, and the pin is on the words, not the wrapping.
+    let flat = reference.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("This fetch surface is client-position"),
+        "the surface states its trust position"
+    );
+    assert!(
+        reference.contains("docs/trust.md:880-957"),
+        "the statement points at the privacy boundary"
+    );
+    assert!(
+        reference.contains("17-observability"),
+        "the statement names the matrix owner"
+    );
+}
+
+/// Verification 9: `sync status` is the durable-only read half and
+/// never connects — it must not acquire a run-scoped counter, so
+/// none of the seven labels may appear in its render.
+#[test]
+fn sync_status_prints_no_fetch_class() {
+    let fixture = Fixture::new();
+    let engine = fixture.open();
+    let rendered = sync_status_render(&observe(&engine, 0).unwrap());
+    for label in [
+        "transport_errors",
+        "deadlines",
+        "missing",
+        "invalid",
+        "unavailable_keys",
+        "local_failures",
+        "unfulfilled",
+    ] {
+        assert!(
+            !rendered.contains(label),
+            "durable-only status never carries the run-scoped {label} class: {rendered}"
+        );
+    }
 }
 
 /// A live-attached mailbox posture for the pressure-counter tests:

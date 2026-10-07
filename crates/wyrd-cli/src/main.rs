@@ -391,6 +391,8 @@ enum SyncAction {
     /// relay-less run exits 0 having contacted nothing, which reads
     /// as converged to automation — so without `--relay` the command
     /// refuses unless `--offline` explicitly opts into the local run.
+    /// Reports per-class fetch diagnostics (client-position counts,
+    /// never identities) beside the unfulfilled total.
     Now {
         /// Run without relays: intake stays idle, only local
         /// obligations discharge, nothing new is fetched. Cannot be
@@ -1637,6 +1639,12 @@ struct SyncRunReport {
     /// remote condition (no route, no bytes, no capability yet),
     /// never local work. Reported, never spun on.
     unfetchable_heads: usize,
+    /// Identities holding a completed terminal fetch generation when
+    /// the run stopped: a live gauge read once at the end beside
+    /// `pending`, never accumulated per pass. Fulfillment dissolves
+    /// terminality and reopen clears it, so this answers "how many
+    /// are terminal now", never a cumulative total.
+    terminal_identities: usize,
     /// Mailbox posture the stopping verdict rests on. `drive_quiet`
     /// is generic over the mailbox and cannot observe it, so it
     /// leaves `None` and `sync_now` stores the observed snapshot
@@ -1806,6 +1814,7 @@ where
         reconciliation_outstanding: 0,
         reconciliation_stalled: 0,
         unfetchable_heads: 0,
+        terminal_identities: 0,
         mailbox: None,
         peers_observed: Vec::new(),
         write: WriteStats::default(),
@@ -1864,6 +1873,12 @@ where
     // per-pass accumulation would misread re-evaluation as growth.
     report.reconciliation_outstanding = live.unanswered_statements();
     report.reconciliation_stalled = live.stalled_statements()?;
+    // The terminal count beside the gap gauges: identities whose
+    // fetch generation completed terminally and still hold the
+    // verdict. Read once at the end like `pending` — terminality is
+    // volatile attempt state, so a per-pass accumulation would
+    // misread reopening as growth.
+    report.terminal_identities = live.terminal_identities();
     // Lifetime write-path totals: the run's own passes above carry
     // sync load; this carries the local durability load the run
     // observed, so the report distinguishes the two.
@@ -2153,6 +2168,72 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         "reconciliation: {} statements awaiting answer, {} stalled\n",
         report.reconciliation_outstanding, report.reconciliation_stalled,
     ));
+    // Fetch-attempt diagnostics beside the `(N unfulfilled)` total
+    // above. Each class counts observed attempts, never a share of
+    // the total: budget pressure discarded when a fallback reports
+    // absence lands in `deadlines` without becoming an unfulfilled
+    // item, so the classes are diagnostic counts, not a
+    // decomposition of `unfulfilled` — no line here may read as
+    // arithmetic on it. The breakdown prints only when the run left
+    // work behind and only for classes that fired, so quiet runs
+    // stay quiet; `deadlines` and `terminal` print unconditionally
+    // because they describe the execution itself, not the backlog.
+    // Counts only, grouped by reason — never by identity: this
+    // surface is client-position and must stay reusable from a
+    // vault, where ContentIds are forbidden.
+    let classes = [
+        ("transport_errors", report.transport_errors),
+        ("missing", report.missing),
+        ("invalid", report.invalid),
+        ("unavailable_keys", report.unavailable_keys),
+        ("local_failures", report.local_failures),
+    ];
+    if report.unfulfilled > 0 && classes.iter().any(|(_, count)| *count > 0) {
+        out.push_str("fetch classes (diagnostic counts, not shares of unfulfilled):\n");
+        for (label, count) in classes {
+            if count > 0 {
+                out.push_str(&format!("  {label}: {count}\n"));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "deadlines: {} discarded under budget pressure\n",
+        report.deadlines,
+    ));
+    out.push_str(&format!(
+        "terminal: {} identities exhausted\n",
+        report.terminal_identities,
+    ));
+    // Repair diagnostics the earlier peer-repair children stored for
+    // this renderer: rejected-representation quarantine and
+    // out-of-band-loss scrub, one line each, only when the run did
+    // repair work. Counts only, like the fetch classes above.
+    if report.quarantined_observed > 0
+        || report.quarantine_claims_cleared > 0
+        || report.quarantine_bytes_discarded > 0
+        || report.quarantine_failures > 0
+    {
+        out.push_str(&format!(
+            "quarantine: {} observed, {} claims cleared, {} bytes discarded, {} failures\n",
+            report.quarantined_observed,
+            report.quarantine_claims_cleared,
+            report.quarantine_bytes_discarded,
+            report.quarantine_failures,
+        ));
+    }
+    if report.scrubbed_observed > 0
+        || report.scrub_claims_cleared > 0
+        || report.scrub_bytes_subtracted > 0
+        || report.scrub_failures > 0
+    {
+        out.push_str(&format!(
+            "scrub: {} observed, {} claims cleared, {} bytes subtracted, {} failures\n",
+            report.scrubbed_observed,
+            report.scrub_claims_cleared,
+            report.scrub_bytes_subtracted,
+            report.scrub_failures,
+        ));
+    }
     // Local durability load beside sync load: the run's passes above
     // say what the network did; these lines say what the disk did.
     // Sources are variant classes, never paths — the `Debug` impls

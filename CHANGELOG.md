@@ -58,6 +58,20 @@ version say exactly what changed.
 
 ### Added
 
+- Fetch-failure diagnostics on `sync now` (peer-repair Part 1, fourth
+  and last child; OD-14-1 A sync-now-only, OD-14-2 C total-always
+  with conditional breakdown and unconditional deadlines, OD-14-3 A
+  counts-only): the run prints one line per fired fetch class
+  (`transport_errors`, `missing`, `invalid`, `unavailable_keys`,
+  `local_failures`) when work is left behind, plus unconditional
+  `deadlines` (budget-pressure discards) and `terminal` (identities
+  holding a completed terminal generation, a live gauge read once
+  at run end) lines, and `quarantine` / `scrub` lines when the run
+  did repair work. Class counters are diagnostic counts, never a
+  decomposition of `unfulfilled`; the surface is client-position
+  (counts by reason, never identities). `sync status` stays
+  durable-only. MicroVM suite defaults to `wyrd_core=debug` like
+  Lima so diagnostics legs can grep pass lines.
 - Lima harness guards the guest share: `lima/run-alpha.sh` verifies the
   guest serves this checkout before building (the instance yaml's
   recorded path, plus a guest mount check — no guest toolchain needed)

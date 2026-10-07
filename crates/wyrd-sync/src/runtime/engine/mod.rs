@@ -2283,6 +2283,15 @@ impl Engine {
         self.fetch_terminal.clone()
     }
 
+    /// Identities holding a completed terminal generation right now:
+    /// a live gauge, never a cumulative total. Fulfillment dissolves
+    /// terminality, reopen clears it, and restart wipes it, so the
+    /// count only ever answers "how many are terminal at this
+    /// instant" for the run-scoped diagnostics surface.
+    pub fn terminal_count(&self) -> usize {
+        self.fetch_terminal.len()
+    }
+
     /// The current attempt generation for one demanded identity, if
     /// the engine tracks one. Generations open at 1 on first demand
     /// and advance monotonically while the identity stays demanded:

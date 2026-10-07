@@ -192,7 +192,13 @@ No separate metrics pipeline in v0; pressure reads through existing
 surfaces:
 
 - `SyncReport` / `ExecuteReport`: per-pass admitted wants, committed
-  objects, `unfulfilled`, `local_failures`, `transport_errors`.
+  objects, `unfulfilled`, and the full fetch-failure class set
+  (`transport_errors`, `deadlines`, `missing`, `invalid`,
+  `unavailable_keys`, `local_failures`). The classes are kept as
+  `sync now` run output (`docs/cli.md`, "Diagnostics and exit
+  codes"): per-pass structs are the accounting, the rendered run
+  report is the pressure surface, and the class counters are
+  diagnostic counts — never a decomposition of `unfulfilled`.
 - `DrainReport`'s deferred-cause split (`deferred_unseen`,
   `deferred_status_blocked`, `deferred_shed`): membership waits
   name a fetchable gap, status-blocked waits drain by themselves,

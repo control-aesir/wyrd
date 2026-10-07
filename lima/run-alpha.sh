@@ -15,7 +15,7 @@
 #            is the prefix closure, since steps build on each other)
 #
 # Prerequisites on the host: nix (with the linux-builder for the
-# guest-arch binary) and limactl. The guest needs no toolchain.
+# guest-arch binary), limactl, and realpath. The guest needs no toolchain.
 set -euo pipefail
 
 KEEP=0
@@ -79,15 +79,19 @@ LIMA_YAML="${LIMA_HOME:-$HOME/.lima}/$INSTANCE/lima.yaml"
 # owns this file's serialization, not us. ensure_ascii=False keeps the
 # write byte-identical to what the read returns for non-ASCII paths.
 mount_location() {
-  WYRD_MODE="$1" WYRD_YAML="$LIMA_YAML" WYRD_ROOT="$ROOT" python3 - <<'EOF' 2>/dev/null || true
+  # Reads stay silent (empty record is a normal mismatch input); writes fail
+  # loudly (a traceback under set -e aborts before the start below).
+  local err=/dev/stderr
+  if [[ "$1" == read ]]; then err=/dev/null; fi
+  WYRD_MODE="$1" WYRD_YAML="$LIMA_YAML" WYRD_ROOT="$ROOT" python3 - <<'EOF' 2>"$err" || [[ "$1" == read ]]
 import json, os, shutil
 path = os.environ["WYRD_YAML"]
-lines = open(path).read().split("\n")
+lines = open(path, encoding="utf-8").read().split("\n")
 for i, line in enumerate(lines):
     if not line.strip().startswith("- location:"):
         continue
     if i + 1 >= len(lines):
-        break
+        continue
     nxt = lines[i + 1].replace('"', "").replace("'", "")
     if "mountPoint:" in nxt and "/mnt/wyrd" in nxt:
         break
@@ -100,7 +104,7 @@ else:
     lines[i] = indent + "- location: " + json.dumps(os.environ["WYRD_ROOT"], ensure_ascii=False)
     shutil.copy(path, path + ".bak")
     tmp = path + ".tmp"
-    open(tmp, "w").write("\n".join(lines))
+    open(tmp, "w", encoding="utf-8").write("\n".join(lines))
     os.replace(tmp, path)
 EOF
 }
@@ -112,9 +116,10 @@ share_mounted() {
 # The 9p share may lag the READY state by a moment after a start; retry
 # briefly before calling a freshly started instance unmounted.
 wait_mounted() {
-  for _ in 1 2 3 4 5; do
+  local attempt
+  for attempt in 1 2 3 4 5; do
     share_mounted && return 0
-    sleep 3
+    [[ $attempt -lt 5 ]] && sleep 3
   done
   return 1
 }
@@ -124,9 +129,10 @@ recorded_ok() {
 RECORDED="$(mount_location read)"
 if ! recorded_ok || ! share_mounted; then
   if [[ $RESHARE -eq 1 ]] && ! recorded_ok; then
-    # Validate before announcing or stopping: an empty record means the
-    # rewrite below would miss, so refuse with the VM still running.
-    [[ -n "$RECORDED" ]] || { echo "error: cannot re-share: no /mnt/wyrd mount in $LIMA_YAML" >&2; exit 2; }
+    # Validate before announcing or stopping: an empty record means
+    # unreadable yaml or no match (not just a wrong path), so refuse with
+    # the VM still running.
+    [[ -n "$RECORDED" ]] || { echo "error: cannot re-share: no readable /mnt/wyrd mount in $LIMA_YAML" >&2; exit 2; }
     echo "==> guest share points elsewhere (recorded $RECORDED, checkout $ROOT); re-pointing $INSTANCE"
     # Back up the operator's config, then rewrite atomically. Only the
     # /mnt/wyrd mount moves; image locations and the scratch share stay.

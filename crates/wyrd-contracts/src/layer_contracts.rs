@@ -143,7 +143,6 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "libc",
                 "clap",
                 "nostr",
-                "nostr-connect",
                 "nostr-sdk",
                 "thiserror",
                 "tokio",

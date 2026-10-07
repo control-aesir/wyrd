@@ -290,6 +290,16 @@ leg_fetch_member() {
   [[ "$fast" == 1 ]] \
     || die "stale-2 read never failed fast: the identity never went terminal (all attempts ran to the deadline)"
   pass "second stale identity fails closed, bounded, and fast (terminal verdict, not deadline)"
+  # Fetch-failure classes outside a debug-attached session
+  # (peer-repair child 14): the probes above forced fetch attempts
+  # against a gone peer, so a pass line must name peer absence or
+  # transport failure non-zero — "peer gone" distinguished from
+  # "budget exhausted" in the member's own log. Needs
+  # wyrd_core=debug, the suite default like Lima.
+  grep "sync pass published" "$LOGDIR/mount-xmember-f.err" \
+    | grep -qE "missing=[1-9]|transport_errors=[1-9]" \
+    || die "member log never named a fetch-failure class for the dead-route probes"
+  pass "dead-route probes surface peer absence in the pass log"
   touch "$E2E_ROOT/member-probed-done"
   # Bitrot with a live claim (quarantine leg, peer-repair child
   # 12): cold-2.txt is verified local on the member — the blocking
@@ -478,7 +488,28 @@ leg_fetch_member() {
   awk 'length($0) > 64 { exit 1 }' "$d/mailbox.seen" \
     || die "mailbox.seen holds an over-long record"
   pass "dedupe log holds only well-formed records"
+  # The fetch surface through the real binary (peer-repair child
+  # 14): the mount is down, so a headless `sync now` owns the
+  # drive — no concurrent loop, no shared relay identity. Runs
+  # after the dedupe proofs because a live run acks mail and would
+  # move `mailbox.seen` under them. Exit status is intentionally
+  # unasserted (a live run may still find transient work); the
+  # shape asserts below hold on any completed run, quiet or not.
+  set +e
+  timeout 300 with_creds "$c" sync "$d" now --relay "$relay" \
+    >"$E2E_ROOT/sync-now-member.out" 2>"$E2E_ROOT/sync-now-member.err"
+  set -e
+  grep -qE "\([0-9]+ unfulfilled\)" "$E2E_ROOT/sync-now-member.out" \
+    || die "sync now stdout lost the unfulfilled total"
+  grep -qE "^deadlines: [0-9]+ discarded under budget pressure$" "$E2E_ROOT/sync-now-member.out" \
+    || die "sync now stdout lost the unconditional deadlines line"
+  grep -qE "^terminal: [0-9]+ identities exhausted$" "$E2E_ROOT/sync-now-member.out" \
+    || die "sync now stdout lost the terminal gauge"
+  pass "sync now renders the fetch surface (total, deadlines, terminal)"
+  check_no_content_ids "$E2E_ROOT/sync-now-member.out"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$E2E_ROOT/sync-now-member.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$E2E_ROOT/sync-now-member.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 # leg_conflict_owner <drive> <creds> <relay>: mount, drive the rename

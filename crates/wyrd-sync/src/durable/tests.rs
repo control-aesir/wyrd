@@ -2101,7 +2101,7 @@ fn reconciliation_malformed_record_poisons_the_commit() {
     assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
 }
 
-/// Reader-set format break, store-layer half (contract 53's format
+/// Reader-set format break, store-layer half (contract 55's format
 /// half lives in wyrd-contracts): a commit carrying a
 /// pre-readers_root transition record fails the load with the
 /// commit's name, and a fresh handle still refuses it identically.

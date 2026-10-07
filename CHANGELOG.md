@@ -236,6 +236,12 @@ version say exactly what changed.
   operator's modes); pre-existing files, directories, and established
   drives are otherwise untouched (inspect a pre-fix drive with `stat`,
   repair by hand).
+- Disambiguate the bare invariant refs in the upgrade-contracts index
+  (`crates/wyrd-contracts/src/lib.rs`) to name `docs/upgrade-contract.md`
+  explicitly (comment only): `docs/architecture.md` now also carries ten
+  invariants, so the bare counts were ambiguous. The orphan-ignore half
+  of entry 32 additionally points at `docs/crash-consistency.md`, where
+  `orphan_files_are_ignored` is pinned.
 
 ## [0.2.0-alpha]
 

@@ -1,5 +1,5 @@
 //! Control-plane message types: the evidence the Nostr mailbox delivers
-//! (see the control-plane issue; transport wiring is a later issue).
+//! (relay delivery via `wyrd-core`'s `LiveMailbox` over `transport::mailbox`).
 //!
 //! Five kinds, each versioned by the envelope and duplicate-delivery
 //! idempotent within the retained inbox state: receivers dedupe by

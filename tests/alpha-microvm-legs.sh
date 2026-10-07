@@ -510,7 +510,11 @@ leg_fetch_member() {
   # unasserted (a live run may still find transient work); the
   # shape asserts below hold on any completed run, quiet or not.
   set +e
-  timeout 300 with_creds "$c" sync "$d" now --relay "$relay" \
+  # No `timeout` wrapper: `with_creds` is a shell function and
+  # `timeout` can only exec binaries, so wrapping it fails with
+  # "No such file or directory" and an empty stdout. The run is
+  # bounded internally by MAX_SYNC_NOW_PASSES.
+  with_creds "$c" sync "$d" now --relay "$relay" \
     >"$E2E_ROOT/sync-now-member.out" 2>"$E2E_ROOT/sync-now-member.err"
   set -e
   grep -qE "\([0-9]+ unfulfilled\)" "$E2E_ROOT/sync-now-member.out" \

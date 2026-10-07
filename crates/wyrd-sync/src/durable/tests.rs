@@ -1,4 +1,4 @@
-use super::codec::{encode_commit, TAG_SNAPSHOT_BODY};
+use super::codec::{encode_commit, TAG_SNAPSHOT_BODY, TAG_TRANSITION};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
     reconciliation_statement_digest, AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot,
@@ -2099,6 +2099,58 @@ fn reconciliation_malformed_record_poisons_the_commit() {
     current.extend_from_slice(&hash);
     atomic_write(&dir.path, "CURRENT", &current).unwrap();
     assert!(matches!(store.load(), Err(DurableError::CorruptCommit(2))));
+}
+
+/// Reader-set format break, store-layer half (contract 53's format
+/// half lives in wyrd-contracts): a commit carrying a
+/// pre-readers_root transition record fails the load with the
+/// commit's name, and the CURRENT pointer does not move — nothing
+/// partial survives. Built the way
+/// `reconciliation_malformed_record_poisons_the_commit` builds its
+/// malformed record: excise readers_root from canonical bytes and
+/// plant the short record under TAG_TRANSITION. Planting through the
+/// public commit path is impossible by construction
+/// (`encode_fact` re-canonicalizes `Fact::Transition`), so the raw
+/// seam is the honest one.
+#[test]
+fn legacy_transition_record_without_readers_root_poisons_the_commit() {
+    let dir = TestDir::new("legacy-transition");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    store.commit(&evidence_base()).unwrap();
+    let tip = store.tip_hash_for_test();
+    let (_builder, genesis) = Builder::genesis(0x11);
+    let bytes = genesis.canonical_bytes();
+    let cut = bytes.len() - 136;
+    let mut legacy = bytes[..cut].to_vec();
+    legacy.extend_from_slice(&bytes[cut + 32..]);
+    assert_eq!(
+        legacy.len(),
+        bytes.len() - 32,
+        "the legacy record drops exactly readers_root"
+    );
+    let (tagged, hash) = encode_commit(&drive(), 2, &tip, &[(TAG_TRANSITION, legacy)]);
+    fs::write(dir.path.join("commits").join(commit_name(2)), &tagged).unwrap();
+    let mut current = 2u64.to_le_bytes().to_vec();
+    current.extend_from_slice(&hash);
+    atomic_write(&dir.path, "CURRENT", &current).unwrap();
+    assert!(
+        matches!(store.load(), Err(DurableError::CorruptCommit(2))),
+        "a legacy transition record fails the load with the commit name"
+    );
+    // `current()` is open-time state; the CURRENT rewrite happened
+    // behind this handle. Reopen: the failed load must have left
+    // nothing behind, so a fresh handle fails identically.
+    drop(store);
+    let reopened = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert_eq!(
+        reopened.current(),
+        2,
+        "CURRENT still names the poisoned commit"
+    );
+    assert!(
+        matches!(reopened.load(), Err(DurableError::CorruptCommit(2))),
+        "a fresh handle fails identically: no halfway state"
+    );
 }
 
 /// Section ceilings are symmetric: the encoder refuses a section

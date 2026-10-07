@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
+use wyrd_format::membership::Admission;
 use wyrd_format::{
     Change, ContentId, DeviceId, FsObjectStore, FsStoreError, MembershipError,
     MembershipTransition, MemoryObjectStore, MemoryStoreError, ObjectKind, ObjectStore,
@@ -801,7 +802,11 @@ fn upgrade_unknown_refuses_loudly() {
 /// readers_root from a current document and assert the decoder refuses
 /// the legacy shape with a named error instead of reinterpreting the
 /// tail (without the cut, author/epoch/signature would all shift 32
-/// bytes and still parse).
+/// bytes and still parse). The constructed document carries an
+/// `AdmitReader` change so the forward assert also covers the break's
+/// tag half, not just the missing root. Store-layer twin:
+/// `legacy_transition_record_without_readers_root_poisons_the_commit`
+/// in wyrd-sync's durable tests.
 #[test]
 fn upgrade_legacy_transition_without_readers_root_refuses_named() {
     let author = device(0x11);
@@ -809,7 +814,10 @@ fn upgrade_legacy_transition_without_readers_root_refuses_named() {
         2,
         None,
         Vec::new(),
-        vec![Change::Rotate],
+        vec![Change::AdmitReader(Admission {
+            device: author.id,
+            encryption_key: author.encryption_key,
+        })],
         [0x20; 32],
         [0x21; 32],
         [0x22; 32],
@@ -822,6 +830,11 @@ fn upgrade_legacy_transition_without_readers_root_refuses_named() {
     let cut = bytes.len() - 136;
     let mut legacy = bytes[..cut].to_vec();
     legacy.extend_from_slice(&bytes[cut + 32..]);
+    assert_eq!(
+        legacy.len(),
+        bytes.len() - 32,
+        "the legacy document drops exactly readers_root"
+    );
     assert!(
         matches!(
             MembershipTransition::from_canonical_bytes(&legacy),

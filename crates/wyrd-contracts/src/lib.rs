@@ -269,7 +269,9 @@
 //! 55. `upgrade_legacy_transition_without_readers_root_refuses_named` —
 //!     a pre-readers_root transition document refuses with
 //!     `MembershipError::Truncated`: two roots where three are declared
-//!     is short, never reinterpreted.
+//!     is short, never reinterpreted. Store-layer twin
+//!     (`legacy_transition_record_without_readers_root_poisons_the_commit`)
+//!     fails the load with the commit name and moves no pointer.
 
 #[cfg(test)]
 mod egress_contracts;

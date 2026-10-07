@@ -248,7 +248,9 @@ version say exactly what changed.
 - Negative contract for the reader-set format break (contract 53):
   a synthetic pre-`readers_root` transition document refuses with
   `MembershipError::Truncated` instead of reinterpreting the tail,
-  pinning the 0.2.0-alpha compatibility claim (test only, no
+  and a commit carrying the short record fails load with
+  `DurableError::CorruptCommit` while CURRENT does not move —
+  pinning the 0.2.0-alpha compatibility claim (tests only, no
   behavior change).
 
 ### Fixed

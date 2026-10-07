@@ -730,8 +730,8 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// shutdowns into mount failures. Still bounded, so a peer that
 /// never answers cannot hang teardown forever; a timeout still fails
 /// the mount. (Bulk no longer uses this bound: it closes under the
-/// graceful-or-abort policy in `wyrd_sync::close`, which succeeds on
-/// expiry instead of failing.) This is a per-endpoint wedge bound,
+/// graceful-or-abort policy in `wyrd_sync` (`GRACEFUL_CLOSE_DEADLINE`),
+/// which succeeds on expiry instead of failing.) This is a per-endpoint wedge bound,
 /// not a share of a total: back-to-back wedge timeouts can exceed
 /// the e2e stop budgets, but any timeout already fails the step —
 /// the 90s budget binds the clean-but-slow path on the big-vault
@@ -1150,7 +1150,12 @@ fn mount(
         .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
         .map_err(CliError::Serving);
     if let Err(error) = &serving_status {
-        tracing::warn!(stage = "serving", elapsed_ms = teardown_start.elapsed().as_millis(), error = %error, "serving shutdown failed");
+        tracing::warn!(
+            stage = "serving",
+            elapsed_ms = teardown_start.elapsed().as_millis(),
+            error = %error,
+            "serving shutdown failed"
+        );
     } else {
         tracing::info!(
             stage = "teardown",

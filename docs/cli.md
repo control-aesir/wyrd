@@ -550,7 +550,6 @@ Both are read and hardened by wyrd code, never by clap:
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)
-  are failures too, not help text. A transport teardown failure also
-  fails the mount: a bulk close that times out exits as a bulk error,
-  a serving shutdown failure as a serving error — after the
-  mountpoint is already unmounted.
+  are failures too, not help text. A serving shutdown failure also
+  fails the mount (as a serving error, after the mountpoint is
+  already unmounted); bulk closes graceful-or-abort and cannot fail.

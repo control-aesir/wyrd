@@ -257,7 +257,7 @@ version say exactly what changed.
 
 - Bulk transport shutdown is graceful-or-abort instead of fail-on-wedge:
   the endpoint close gets a short bounded graceful attempt (5s,
-  `wyrd_sync::close::GRACEFUL_CLOSE_DEADLINE`); on expiry the endpoint
+  `wyrd_sync::GRACEFUL_CLOSE_DEADLINE`); on expiry the endpoint
   is aborted, a warning names the graceful-close timeout, and shutdown
   still exits 0. Shutdown success means Wyrd stopped its own work and
   released its resources — it no longer requires relay infrastructure

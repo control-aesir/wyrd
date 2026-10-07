@@ -429,7 +429,7 @@ impl IrohBulkSource {
     }
 
     /// Close the owned endpoint under the graceful-close policy
-    /// ([`close::GRACEFUL_CLOSE_DEADLINE`]): a clean drain reports
+    /// ([`crate::GRACEFUL_CLOSE_DEADLINE`]): a clean drain reports
     /// success; an expiry warns and the endpoint (with its runtime)
     /// is dropped by the caller — the abort. Draining waits on
     /// acknowledgements from relay infrastructure that is not part

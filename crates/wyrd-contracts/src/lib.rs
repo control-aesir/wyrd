@@ -271,7 +271,8 @@
 //!     `MembershipError::Truncated`: two roots where three are declared
 //!     is short, never reinterpreted. Store-layer twin
 //!     (`legacy_transition_record_without_readers_root_poisons_the_commit`)
-//!     fails the load with the commit name and moves no pointer.
+//!     fails the load with the commit name, and a fresh handle still
+//!     refuses it identically.
 
 #[cfg(test)]
 mod egress_contracts;

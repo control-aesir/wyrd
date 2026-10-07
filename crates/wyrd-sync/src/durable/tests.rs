@@ -2104,8 +2104,7 @@ fn reconciliation_malformed_record_poisons_the_commit() {
 /// Reader-set format break, store-layer half (contract 53's format
 /// half lives in wyrd-contracts): a commit carrying a
 /// pre-readers_root transition record fails the load with the
-/// commit's name, and the CURRENT pointer does not move — nothing
-/// partial survives. Built the way
+/// commit's name, and a fresh handle still refuses it identically. Built the way
 /// `reconciliation_malformed_record_poisons_the_commit` builds its
 /// malformed record: excise readers_root from canonical bytes and
 /// plant the short record under TAG_TRANSITION. Planting through the
@@ -2127,7 +2126,7 @@ fn legacy_transition_record_without_readers_root_poisons_the_commit() {
     // decodes, and the spliced window is its readers_root — so the
     // refusal below is attributable to the excision, not the
     // fixture, and a layout change fails loudly here instead of
-    // silently halving owners_root.
+    // silently excising the wrong root.
     let uncut = MembershipTransition::from_canonical_bytes(&bytes)
         .expect("the uncut genesis record decodes");
     assert_eq!(

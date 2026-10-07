@@ -150,10 +150,11 @@ fn bootstrap_aad(
     inviter: &DeviceId,
     ephemeral: &[u8; 32],
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(BOOTSTRAP_AAD_DOMAIN.len() + 161);
+    let mut aad = Vec::with_capacity(BOOTSTRAP_AAD_DOMAIN.len() + UNSIGNED_HEADER_LEN);
     aad.extend_from_slice(BOOTSTRAP_AAD_DOMAIN);
-    // The version leads, as in `rotation_aad`: intake dispatches on this
-    // byte before either framing decodes, so it must not be malleable.
+    // The version leads, as in `rotation_aad`: the version byte is the
+    // compatibility boundary, and once it rides inside the tag a refusal
+    // to open old bytes is the new construction's job.
     aad.push(version);
     aad.extend_from_slice(drive.as_bytes());
     aad.extend_from_slice(recipient.as_bytes());
@@ -575,9 +576,11 @@ mod tests {
         );
     }
 
-    /// The version byte rides the clear header: flipping it must break
-    /// the AEAD tag, not a later structural check — mirroring
-    /// `version_byte_is_covered_by_the_tag` on the rotation framing.
+    /// A flipped version byte must fail the seal: the direct
+    /// assertions below prove the tag covers it, and the whole path
+    /// rejects the flipped envelope rather than routing it onward —
+    /// mirroring `version_byte_is_covered_by_the_tag` on the rotation
+    /// framing.
     #[test]
     fn version_byte_is_covered_by_the_tag() {
         let (device, enc_key, genesis, capability) = invitation_parts();

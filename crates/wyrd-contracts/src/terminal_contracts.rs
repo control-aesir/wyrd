@@ -641,8 +641,8 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
         "the append healed through the scrub drain, not around it"
     );
     assert!(
-        commit_started.elapsed() < Duration::from_secs(60),
-        "the writer finished on its own deadline, not the loop's 120s bound"
+        commit_started.elapsed() < Duration::from_secs(35),
+        "the writer finished on its own 30s deadline, not the loop's 120s bound"
     );
 
     // Serving continues on the extended bytes: a fresh open reads

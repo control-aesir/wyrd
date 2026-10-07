@@ -52,6 +52,12 @@ version say exactly what changed.
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.
+- CI's `nix` job no longer assembles the microVM runner disk images on
+  every PR (bare `nix flake check` OOMed the runner building
+  `microvm-store-disk.erofs`): it builds the `wyrd` and `wyrd-dist`
+  checks and evaluates the whole flake with `--no-build`, proving the
+  VM topology still evaluates. The runner closures build when a
+  microVM run needs them (`nix/microvm/run-microvm.sh`).
 - Local quarantine with re-want (peer-repair Part 1, second child;
   OD-12-1 A remove, OD-12-2 A re-want-on-next-waiter, SD-1 A
   client-plane-only): a read that observes verification-rejected

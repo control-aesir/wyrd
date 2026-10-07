@@ -134,8 +134,11 @@
       # The package build plus the release archive, per system.
       # `nix flake check` builds the current system's entries; CI covers
       # linux, the maintainer's machine darwin.
-      # On x86_64-linux the microVM runners join the gate: they prove
-      # the VM topology evaluates and builds (kernel, shares, tapes).
+      # On x86_64-linux the microVM runners join the gate as
+      # evaluation only (CI runs `nix flake check --no-build`): they
+      # prove the VM topology evaluates (kernel, shares, tapes) without
+      # assembling disk images on every PR. The closures build when a
+      # microVM run needs them.
       # Suite *execution* needs KVM and runs on the maintainer's Linux
       # host via nix/microvm/run-microvm.sh, never in CI.
       checks = forAllSystems (system: {

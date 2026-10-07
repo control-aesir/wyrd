@@ -272,14 +272,25 @@ jobs:
             fi
           } 2>&1 | tee -a /tmp/nix.log
 
-      # Builds packages.wyrd, packages.wyrd-dist, and checks.wyrd* for the
-      # runner's system (linux-x86_64). Darwin coverage comes from the
-      # maintainer's machine; see the packaging issue.
+      # Builds the wyrd package and the release archive for the
+      # runner's system (linux-x86_64), then evaluates the whole flake
+      # without building: this proves the microVM topology still
+      # evaluates while the runner system closures themselves only build
+      # when a microVM run needs them (nix/microvm/run-microvm.sh).
+      # A bare `nix flake check` would assemble three full VM disk
+      # images on every PR and OOMs this runner (signal 9 on
+      # microvm-store-disk.erofs); nothing a Rust change can break
+      # lives in those images beyond the wyrd package built above.
+      # Darwin coverage comes from the maintainer's machine; see the
+      # packaging issue.
       - name: Flake check
         run: |
           set -o pipefail
           echo "===== flake check =====" >> /tmp/nix.log
-          nix flake check --print-build-logs 2>&1 | tee -a /tmp/nix.log
+          {
+            nix build .#checks.x86_64-linux.wyrd .#checks.x86_64-linux.wyrd-dist --print-build-logs
+            nix flake check --no-build
+          } 2>&1 | tee -a /tmp/nix.log
 
       # Proves the release archive path end to end via the same script
       # releases use (.ngit/scripts/build.sh): capability detection

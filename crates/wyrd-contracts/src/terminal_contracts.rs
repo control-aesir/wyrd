@@ -317,6 +317,85 @@ fn a_new_waiter_after_terminal_starts_a_new_generation() {
     loaded.rig.teardown();
 }
 
+type RepairMemberLive = wyrd_core::live::LiveNode<DriveView<FsObjectStore, RuntimeMaterialization>>;
+type RepairMemberParts =
+    wyrd_core::live::LiveParts<DriveView<FsObjectStore, RuntimeMaterialization>>;
+
+/// Shared member-side setup for the repair contracts (52-54):
+/// publish one file through the rig, want it all, serve it to a
+/// directory-store member over the live peer, and drive until the
+/// chunk is verified local and the published generation serves the
+/// path (readers open through the projection, not the
+/// materialization status). Deadline-bounded, not fixed-iteration:
+/// under gate load the same passes take longer, and a pass budget
+/// must never be what fails the test. Returns the rig (relay,
+/// bulk, teardown), the live node and its parts, the chunk, the
+/// member dir, and the chunk's live name on disk — the member
+/// stores on disk because loss and bitrot both need a real live
+/// name for host-side surgery.
+fn fetch_member(
+    file: &'static str,
+    tag: &str,
+    body: &'static [u8],
+) -> (
+    Loaded,
+    RepairMemberLive,
+    RepairMemberParts,
+    ContentId,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let mut loaded = Loaded::new(file, body);
+    loaded.publish_all();
+    loaded.publish_body_and_announcement(None);
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let chunk = *loaded
+        .content
+        .content_ids
+        .iter()
+        .find(|id| **id != loaded.content.tree_id)
+        .expect("the fixture carries a chunk beside its tree");
+
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-contracts-{tag}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    // The fetch lands through the live peer.
+    let started = std::time::Instant::now();
+    let mut available = false;
+    while started.elapsed() < Duration::from_secs(120) {
+        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            .unwrap();
+        let slot = parts.projection.read().unwrap();
+        if slot.view().status(&chunk) == FetchStatus::Available && slot.view().lookup(file).is_ok()
+        {
+            available = true;
+            break;
+        }
+    }
+    assert!(available, "the member fetched the chunk verified");
+    let hex = chunk.to_string();
+    let live_name = dir
+        .join("objects")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    (loaded, live, parts, chunk, dir, live_name)
+}
+
 /// Contract 52 (`quarantined_chunk_heals_from_a_live_peer_without_remount`):
 /// the full repair lifecycle over public APIs with a real serving
 /// peer and the real FUSE demand path — bad bytes, observed
@@ -336,34 +415,8 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
     use wyrd_core::live::LiveParts;
 
     const BODY: &[u8] = b"healed through repair";
-    let mut loaded = Loaded::new("heal.txt", BODY);
-    loaded.publish_all();
-    loaded.publish_body_and_announcement(None);
-    let report = loaded.drain();
-    assert_eq!(report.accepted, 2, "the capability and the announcement");
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    let chunk = *loaded
-        .content
-        .content_ids
-        .iter()
-        .find(|id| **id != loaded.content.tree_id)
-        .expect("the fixture carries a chunk beside its tree");
-
-    // The member stores on disk: bitrot needs a real live name.
-    let dir = std::env::temp_dir().join(format!(
-        "wyrd-contracts-quarantine-heal-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
-        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
-    let (mut live, parts) = node
-        .into_live(Duration::from_secs(30), &LiveConfig::default())
-        .unwrap();
+    let (mut loaded, mut live, parts, chunk, dir, live_name) =
+        fetch_member("heal.txt", "quarantine-heal", BODY);
     let LiveParts {
         projection,
         wants,
@@ -371,27 +424,6 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
         open_timeout,
         budgets,
     } = &parts;
-    // The fetch lands through the live peer: drive until the chunk
-    // is verified local and the published generation serves the
-    // path (the reader opens through the projection, not the
-    // materialization status). Deadline-bounded, not
-    // fixed-iteration: under gate load the same passes take
-    // longer, and a pass budget must never be what fails the
-    // test.
-    let started = std::time::Instant::now();
-    let mut available = false;
-    while started.elapsed() < Duration::from_secs(120) {
-        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
-            .unwrap();
-        let slot = parts.projection.read().unwrap();
-        if slot.view().status(&chunk) == FetchStatus::Available
-            && slot.view().lookup("heal.txt").is_ok()
-        {
-            available = true;
-            break;
-        }
-    }
-    assert!(available, "the member fetched the chunk verified");
     assert_eq!(
         view_status(&parts, &chunk),
         FetchStatus::Available,
@@ -400,13 +432,6 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
 
     // Step 1: host-side surgery — the live name stops hashing back.
     // Length-identical tampering: fail-closed on content, not size.
-    let hex = chunk.to_string();
-    let live_name = dir
-        .join("objects")
-        .join("objects")
-        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
-        .join(&hex[..2])
-        .join(&hex[2..]);
     std::fs::write(&live_name, b"tampered-------------").unwrap();
 
     // The production demand path: the backend reports the
@@ -498,56 +523,10 @@ fn quarantined_chunk_heals_from_a_live_peer_without_remount() {
 #[test]
 fn scrubbed_chunk_heals_from_a_live_peer_without_a_waiter() {
     const BODY: &[u8] = b"healed through scrub";
-    let mut loaded = Loaded::new("scrub.txt", BODY);
-    loaded.publish_all();
-    loaded.publish_body_and_announcement(None);
-    let report = loaded.drain();
-    assert_eq!(report.accepted, 2, "the capability and the announcement");
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    let chunk = *loaded
-        .content
-        .content_ids
-        .iter()
-        .find(|id| **id != loaded.content.tree_id)
-        .expect("the fixture carries a chunk beside its tree");
-
-    let dir = std::env::temp_dir().join(format!(
-        "wyrd-contracts-scrub-heal-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
-        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
-    let (mut live, parts) = node
-        .into_live(Duration::from_secs(30), &LiveConfig::default())
-        .unwrap();
-    let started = std::time::Instant::now();
-    let mut available = false;
-    while started.elapsed() < Duration::from_secs(120) {
-        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
-            .unwrap();
-        let slot = parts.projection.read().unwrap();
-        if slot.view().status(&chunk) == FetchStatus::Available
-            && slot.view().lookup("scrub.txt").is_ok()
-        {
-            available = true;
-            break;
-        }
-    }
-    assert!(available, "the member fetched the chunk verified");
+    let (mut loaded, mut live, parts, chunk, dir, live_name) =
+        fetch_member("scrub.txt", "scrub-heal", BODY);
 
     // Step 1: host-side surgery — the live file simply vanishes.
-    let hex = chunk.to_string();
-    let live_name = dir
-        .join("objects")
-        .join("objects")
-        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
-        .join(&hex[..2])
-        .join(&hex[2..]);
     std::fs::remove_file(&live_name).unwrap();
 
     // No reader, no waiter: the loop alone must observe the loss,
@@ -603,62 +582,16 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
 
     const BODY: &[u8] = b"append through scrub";
     const APPEND: &[u8] = b"!";
-    let mut loaded = Loaded::new("extend.txt", BODY);
-    loaded.publish_all();
-    loaded.publish_body_and_announcement(None);
-    let report = loaded.drain();
-    assert_eq!(report.accepted, 2, "the capability and the announcement");
-    let mut engine = loaded.rig.take_engine();
-    loaded.want_all(&mut engine);
-    let chunk = *loaded
-        .content
-        .content_ids
-        .iter()
-        .find(|id| **id != loaded.content.tree_id)
-        .expect("the fixture carries a chunk beside its tree");
-
-    let dir = std::env::temp_dir().join(format!(
-        "wyrd-contracts-scrub-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
-        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
-    let (mut live, parts) = node
-        .into_live(Duration::from_secs(30), &LiveConfig::default())
-        .unwrap();
-    let started = std::time::Instant::now();
-    let mut available = false;
-    while started.elapsed() < Duration::from_secs(120) {
-        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
-            .unwrap();
-        let slot = parts.projection.read().unwrap();
-        if slot.view().status(&chunk) == FetchStatus::Available
-            && slot.view().lookup("extend.txt").is_ok()
-        {
-            available = true;
-            break;
-        }
-    }
-    assert!(available, "the member fetched the chunk verified");
+    let (mut loaded, mut live, parts, _chunk, dir, live_name) =
+        fetch_member("extend.txt", "scrub-append", BODY);
 
     // Step 1: out-of-band loss — the live file simply vanishes.
-    let hex = chunk.to_string();
-    let live_name = dir
-        .join("objects")
-        .join("objects")
-        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
-        .join(&hex[..2])
-        .join(&hex[2..]);
     std::fs::remove_file(&live_name).unwrap();
 
     // Step 2: the appending writer commits while the loop pumps
-    // against the live peer. The base is gone, so the first
-    // evaluation defers — then the scrub unclaims, the refetch
-    // heals, and the commit lands.
+    // against the live peer. The commit is deferred while the
+    // base is gone, the scrub unclaims it, the refetch heals,
+    // and the commit lands.
     let LiveParts {
         projection,
         wants,
@@ -676,7 +609,8 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
     backend.set_quarantine(Arc::clone(live.quarantine_queue()));
     backend.set_scrub(Arc::clone(live.scrub_queue()));
     let done = Arc::new(AtomicBool::new(false));
-    let mut committed = false;
+    let commit_started = std::time::Instant::now();
+    let mut claims_cleared = 0u64;
     std::thread::scope(|scope| {
         let commit_done = Arc::clone(&done);
         let writer = scope.spawn(move || {
@@ -697,14 +631,22 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
         // bounds the writer even if the loop stalls.
         let started = std::time::Instant::now();
         while !done.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(120) {
-            live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            let pass = live
+                .sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
                 .unwrap();
+            claims_cleared += pass.scrubbed.claims_cleared;
         }
         let outcome = writer.join().expect("the writer thread joins");
         assert_eq!(outcome, Ok(()), "the append lands once the refetch heals");
-        committed = true;
     });
-    assert!(committed, "the writer finished inside the deadline");
+    assert_eq!(
+        claims_cleared, 1,
+        "the append healed through the scrub drain, not around it"
+    );
+    assert!(
+        commit_started.elapsed() < Duration::from_secs(120),
+        "the writer finished inside the deadline"
+    );
 
     // Serving continues on the extended bytes: a fresh open reads
     // the original body plus the append through the same backend.

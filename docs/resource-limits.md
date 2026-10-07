@@ -202,8 +202,13 @@ surfaces:
 - `DrainReport`'s deferred-cause split (`deferred_unseen`,
   `deferred_status_blocked`, `deferred_shed`): membership waits
   name a fetchable gap, status-blocked waits drain by themselves,
-  shed waits are budget pacing — one "deferred" total cannot tell
-  them apart, and only the first ever needs an operator.
+  unclassified shed is budget pacing — one "deferred" total cannot
+  tell them apart, and only the first ever needs an operator.
+  Pending-bound sheds carry their classified wait into
+  `deferred_shed_unseen` / `deferred_shed_status_blocked` (the
+  classification ran before the bound tripped); the sub-counters
+  partition `shed` and nothing else, and `sync now` renders them
+  beside the shed total only when the run shed anything.
 - `WriteStats` on the mutation queue: queue depth (queued but
   unexecuted, per dispatch in `mount.log` beside the dispatch
   latency), snapshot rate with per-source share, and

@@ -878,6 +878,34 @@ holds — a removed device that retained a transport root can keep
 fetching that content from any serving member that still answers
 (see `docs/cli.md`'s `remove` section).
 
+### Diagnostic surfaces: the observation × trust-position matrix (OD-17-6)
+
+The party table above says what each party may know. This matrix
+says what each diagnostic surface may show — the two compose: a
+surface readable by a party must show nothing that party may not
+know. Diagnostics never leave the device on the wire: no count, no
+sender, no identity from the surfaces below appears in an
+announcement, a mailbox message, or a serving response. What a
+relay or vault learns from a diagnosing device is exactly what the
+party table already allows — the matrix adds nothing to either.
+
+| Surface | May show | Must never show | Readers |
+|---|---|---|---|
+| `sync now` run output | counts by cause (`unseen`, `status-blocked`, `shed` with its wait detail; fetch classes; `deadlines`; `terminal`); sender `DeviceId`s the run's intake actually heard (OD-17-4 B) | `ContentId`s; per-representation identity (OD-14-3 A, OD-17-1 B) | the invoking operator: this process connected and the operator holds the keys |
+| `sync status` durable surface | counts; peers by position, never by key (OD-17-4 A); queue depths and convergence from committed facts only; restart-equivalent (OD-17-3 C) | identities; `ContentId`s; anything volatile (live peer set, pending waits) | local readers of drive state; status never connects, so it says the omission out loud |
+| debug log (`tracing`) | everything observed: `ContentId`s, waits, senders, causes | nothing is withheld — instead the log is opt-in | the operator who enabled it, for their selected retention |
+| durable drive metadata | protocol-required identities only: member `DeviceId`s in the encrypted membership log, possession-commit `ContentId`s in the local fact log | diagnostic identities: `VerificationFailure` never persists (OD-17-1 B); no diagnostic ring, no identity-bearing sidecar | key holders, locally |
+| the wire | nothing diagnostic | — | relay and vault positions unchanged (party table) |
+
+Two consequences are pinned. First, **more classification never
+widens a surface**: a new `VerificationCause` or a new shed-wait
+bucket feeds the counts its surface already shows; promoting an
+identity onto a surface that must never show one is a trust change,
+not a diagnostics change, and needs its own decision. Second, the
+run output's senders are a sender list, never a membership roster
+(OD-17-4 B): any key that mailed the device appears, member or not,
+and membership questions go to the membership surfaces, not here.
+
 ### Vault-side metadata confidentiality (stated precisely)
 
 The relay side settles for best-effort metadata confidentiality "exactly

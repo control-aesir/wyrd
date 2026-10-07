@@ -2175,12 +2175,8 @@ fn fetch_diagnostic_states_its_trust_position() {
         "the surface states its trust position"
     );
     assert!(
-        reference.contains("docs/trust.md:880-957"),
-        "the statement points at the privacy boundary"
-    );
-    assert!(
-        reference.contains("17-observability"),
-        "the statement names the matrix owner"
+        reference.contains("OD-17-6"),
+        "the statement points at the observation x trust-position matrix"
     );
 }
 

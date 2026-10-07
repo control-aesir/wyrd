@@ -21,6 +21,32 @@ version say exactly what changed.
 
 ## [Unreleased]
 
+### Added
+
+- Shed-wait attribution on `sync now` (`17-observability`, OD-17-2
+  extension): pending-bound sheds carry their already-classified wait
+  into `deferred_shed_unseen` / `deferred_shed_status_blocked`, and
+  the shed total renders its wait detail in parentheses when the run
+  shed anything (classified waits first, then the unclassified
+  budget/quota remainder — a partition of `shed`, and of nothing
+  else). Budget, quota, and charge-time sheds stay unclassified by
+  design: the shed decision runs before classification to avoid
+  spending verification.
+- Observation × trust-position matrix (`17-observability`, OD-17-6,
+  `docs/trust.md`): what each diagnostic surface (`sync now` run
+  output, `sync status` durable surface, debug log, durable drive
+  metadata, the wire) may show and must never show, composed with
+  the party table. More classification never widens a surface.
+- Explicit no-persistence policy for verification identities
+  (`17-observability`, OD-17-1 B): per-representation verification
+  identities are intentionally not persisted — deliberate
+  privacy/data-minimality policy, documented in
+  `docs/peer-repair.md` with the evidence hierarchy
+  (`VerificationFailure` → debug log → run-report counts →
+  identity-free durable metadata). The implementation distinguishes
+  a single genuine rejection class, so no cause-taxonomy extension
+  was warranted.
+
 ### Changed
 
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering

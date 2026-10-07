@@ -731,8 +731,8 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// never answers cannot hang teardown forever; a timeout still fails
 /// the mount. (Bulk no longer uses this bound: it closes under the
 /// graceful-or-abort policy in `wyrd_sync` (`GRACEFUL_CLOSE_DEADLINE`),
-/// which succeeds on expiry instead of failing.) This is a per-endpoint wedge bound,
-/// not a share of a total: back-to-back wedge timeouts can exceed
+/// which succeeds on expiry instead of failing.) This is a per-endpoint
+/// wedge bound, not a share of a total: back-to-back wedge timeouts can exceed
 /// the e2e stop budgets, but any timeout already fails the step —
 /// the 90s budget binds the clean-but-slow path on the big-vault
 /// step: 10-14s for the owner stop under throttle, 44s for the
@@ -1068,7 +1068,7 @@ fn mount(
     // drain exits on the close after one final sweep. Closing before
     // the join would strand destroy's submits; closing after the loop
     // join would leave the drain parked. Every teardown outcome is
-    // collected, not short-circuited: a failed loop, bulk, or serving
+    // collected, not short-circuited: a failed loop or serving
     // close must not skip the remaining shutdowns, and the combined
     // status reports the first failure.
     supervisor.close_admission();

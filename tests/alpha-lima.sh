@@ -482,10 +482,10 @@ EOF
   # closure (head installed, chunks partly remote-only) behind a dead
   # route, and its TERM exit persists the serving store then closes
   # serving inside the 60s bound (TRANSPORT_SHUTDOWN_DEADLINE) while
-  # bulk closes graceful-or-abort — bounded, but far past the 15s
-  # small-vault budget. The budget binds the clean-but-slow path; a
-  # wedged serving close still fails the step via stop_mount's exit
-  # verdict.
+  # bulk closes graceful-or-abort. The stop is bounded, but far past
+  # the 15s small-vault budget: the budget binds the clean-but-slow
+  # path; a wedged serving close still fails the step via stop_mount's
+  # exit verdict.
   stop_mount member-relay TERM 90
   pass "peer-down pair stopped"
 

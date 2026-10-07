@@ -400,8 +400,8 @@ matrix is kept: the windows above name the scrub-specific order
 Unmount commits still-dirty handles best-effort before dropping the
 handle table, and stops the mailbox, bulk source, and serving endpoint
 under bounded deadlines with the fallible outcomes folded into the
-exit status (bulk is graceful-or-abort and cannot fail). The commit executes
-against the still-open queue on every
+exit status (bulk is graceful-or-abort and cannot fail). The commit
+executes against the still-open queue on every
 shutdown path: the loop returns without settling, the session joins
 first (destroy submits while the post-return drain executes
 concurrently), admission closes only after the join — the session

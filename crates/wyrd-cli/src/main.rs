@@ -731,12 +731,13 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 /// never answers cannot hang teardown forever; a timeout still fails
 /// the mount. (Bulk no longer uses this bound: it closes under the
 /// graceful-or-abort policy in `wyrd_sync` (`GRACEFUL_CLOSE_DEADLINE`),
-/// which succeeds on expiry instead of failing.) This is a per-endpoint
-/// wedge bound, not a share of a total: back-to-back wedge timeouts can exceed
-/// the e2e stop budgets, but any timeout already fails the step —
-/// the 90s budget binds the clean-but-slow path on the big-vault
-/// step: 10-14s for the owner stop under throttle, 44s for the
-/// member dead-route TERM stop after the throttle is removed.
+/// which succeeds on expiry instead of failing.) This is a
+/// per-endpoint wedge bound, not a share of a total: back-to-back
+/// wedge timeouts can exceed the e2e stop budgets, but any timeout
+/// already fails the step — the 90s budget binds the clean-but-slow
+/// path on the big-vault step: 10-14s for the owner stop under
+/// throttle, 44s for the member dead-route TERM stop after the
+/// throttle is removed.
 const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the

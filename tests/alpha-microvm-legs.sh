@@ -220,7 +220,16 @@ leg_fetch_owner() {
 leg_fetch_member() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane member leg"
+  # Debug for this mount only, Lima step-6 style: the class
+  # assertion below greps a debug-level pass line, but a suite-wide
+  # `wyrd_core=debug` would suppress the `wyrd`-target warn line
+  # step 2 requires in mount.log (EnvFilter target directives
+  # silence unmatched targets below error). Scoped save/restore so
+  # later mounts keep the default info level.
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xmember-f "$c" "$d" "$MNTS/xmember-f" --relay "$relay"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   # Announcement first (listing shows the new head), bytes second
   # (the single cat below): this split is what makes the cat a
   # blocking-open proof rather than a find-ready-bytes no-op.
@@ -298,8 +307,8 @@ leg_fetch_member() {
   # (peer-repair child 14): the probes above forced fetch attempts
   # against a gone peer, so a pass line must name peer absence or
   # transport failure non-zero — "peer gone" distinguished from
-  # "budget exhausted" in the member's own log. Needs
-  # wyrd_core=debug, the suite default like Lima.
+  # "budget exhausted" in the member's own log. The mount runs at
+  # the debug level exported above for exactly this grep.
   tail -n +"$((probed_from + 1))" "$LOGDIR/mount-xmember-f.err" \
     | grep "sync pass published" \
     | grep -qE "missing=[1-9]|transport_errors=[1-9]" \

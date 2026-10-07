@@ -67,11 +67,12 @@ version say exactly what changed.
   `deadlines` (budget-pressure discards) and `terminal` (identities
   holding a completed terminal generation, a live gauge read once
   at run end) lines, and `quarantine` / `scrub` lines when the run
-  did repair work. Class counters are diagnostic counts, never a
+  did   repair work. Class counters are diagnostic counts, never a
   decomposition of `unfulfilled`; the surface is client-position
   (counts by reason, never identities). `sync status` stays
-  durable-only. MicroVM suite defaults to `wyrd_core=debug` like
-  Lima so diagnostics legs can grep pass lines.
+  durable-only. The step-9 leg scopes `wyrd_core=debug` to its own
+  mount (Lima step-6 style) for the pass-line grep; suite-wide
+  debug would suppress the `wyrd`-target warn step 2 requires.
 - Lima harness guards the guest share: `lima/run-alpha.sh` verifies the
   guest serves this checkout before building (the instance yaml's
   recorded path, plus a guest mount check — no guest toolchain needed)

@@ -196,10 +196,7 @@ cp "$SSH_KEY.pub" "$STATE_DIR/authorized_keys.pub"
   printf 'RELAY_MANAGED=%q\n' "0"
   printf 'CHECKOUT=%q\n' "/etc/wyrd-tests"
   printf 'E2E_ROOT=%q\n' "/mnt/wyrd-state/run"
-  # Debug by default, matching the Lima suite (`alpha-lima.sh`
-  # exports the same default): diagnostics legs grep debug-level
-  # pass lines, and stuck-peer forensics need them suite-wide.
-  printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-wyrd_core=debug}"
+  printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
 } > "$STATE_DIR/e2e-env.sh"
 
 echo "==> booting guests"

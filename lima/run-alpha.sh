@@ -36,6 +36,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROOT="$(git rev-parse --show-toplevel)"
+ROOT_REAL="$(realpath "$ROOT")"
 INSTANCE="wyrd-alpha"
 SHARE=/tmp/lima
 mkdir -p "$SHARE"
@@ -64,16 +65,22 @@ fi
 # obscurely off a deleted checkout). Refuse before building anything. The
 # comparison is host-side: the instance yaml records the checkout the share
 # serves, and path equality is strictly stronger than a HEAD probe (two
-# checkouts at the same commit are still different shares). A guest liveness
-# check confirms something shaped like this checkout is actually mounted;
-# the guest needs no toolchain for either half.
+# checkouts at the same commit are still different shares); both the raw and
+# the resolved checkout path match, so a symlinked checkout is not a false
+# refusal. A guest liveness check confirms something shaped like this
+# checkout is actually mounted; the guest needs no toolchain for either
+# half. A wrong path and an unmounted share fail differently on purpose: the
+# remedies are different (re-point versus restart the VM).
 LIMA_YAML="${LIMA_HOME:-$HOME/.lima}/$INSTANCE/lima.yaml"
-# Print the checkout path the instance yaml records for /mnt/wyrd (empty
-# on any failure: missing file, no match). The matcher is quote-agnostic
-# and index-guarded: limactl owns this file's serialization, not us.
-recorded_location() {
-  WYRD_YAML="$1" python3 - <<'EOF' 2>/dev/null || true
-import os
+# Read ($1=read, prints the recorded path, empty on any failure) or rewrite
+# ($1=write) the /mnt/wyrd mount location. One matcher for both: the read
+# already proves the file parses and names the mount, so a write after a
+# successful read cannot miss. Quote-agnostic and index-guarded: limactl
+# owns this file's serialization, not us. ensure_ascii=False keeps the
+# write byte-identical to what the read returns for non-ASCII paths.
+mount_location() {
+  WYRD_MODE="$1" WYRD_YAML="$LIMA_YAML" WYRD_ROOT="$ROOT" python3 - <<'EOF' 2>/dev/null || true
+import json, os, shutil
 path = os.environ["WYRD_YAML"]
 lines = open(path).read().split("\n")
 for i, line in enumerate(lines):
@@ -83,8 +90,18 @@ for i, line in enumerate(lines):
         break
     nxt = lines[i + 1].replace('"', "").replace("'", "")
     if "mountPoint:" in nxt and "/mnt/wyrd" in nxt:
-        print(line.split(":", 1)[1].strip().strip("\"'"))
         break
+else:
+    raise SystemExit("no /mnt/wyrd mount found in " + path)
+if os.environ["WYRD_MODE"] == "read":
+    print(line.split(":", 1)[1].strip().strip("\"'"))
+else:
+    indent = line[: line.index("- location:")]
+    lines[i] = indent + "- location: " + json.dumps(os.environ["WYRD_ROOT"], ensure_ascii=False)
+    shutil.copy(path, path + ".bak")
+    tmp = path + ".tmp"
+    open(tmp, "w").write("\n".join(lines))
+    os.replace(tmp, path)
 EOF
 }
 # A sentry file, not git: the guest must show a mounted checkout, and the
@@ -92,44 +109,39 @@ EOF
 share_mounted() {
   (cd / && limactl shell "$INSTANCE" -- test -f /mnt/wyrd/lima/run-alpha.sh 2>/dev/null)
 }
-RECORDED="$(recorded_location "$LIMA_YAML")"
-if [[ "$RECORDED" != "$ROOT" ]] || ! share_mounted; then
-  if [[ $RESHARE -eq 1 ]]; then
-    echo "==> guest share is stale (recorded ${RECORDED:-unreadable}, checkout $ROOT); re-pointing $INSTANCE"
-    # Validate before stopping: the read above already proved the file
-    # parses and names a /mnt/wyrd mount, so the rewrite below cannot miss.
+# The 9p share may lag the READY state by a moment after a start; retry
+# briefly before calling a freshly started instance unmounted.
+wait_mounted() {
+  for _ in 1 2 3 4 5; do
+    share_mounted && return 0
+    sleep 3
+  done
+  return 1
+}
+recorded_ok() {
+  [[ "$RECORDED" == "$ROOT" || "$RECORDED" == "$ROOT_REAL" ]]
+}
+RECORDED="$(mount_location read)"
+if ! recorded_ok || ! share_mounted; then
+  if [[ $RESHARE -eq 1 ]] && ! recorded_ok; then
+    # Validate before announcing or stopping: an empty record means the
+    # rewrite below would miss, so refuse with the VM still running.
+    [[ -n "$RECORDED" ]] || { echo "error: cannot re-share: no /mnt/wyrd mount in $LIMA_YAML" >&2; exit 2; }
+    echo "==> guest share points elsewhere (recorded $RECORDED, checkout $ROOT); re-pointing $INSTANCE"
     # Back up the operator's config, then rewrite atomically. Only the
     # /mnt/wyrd mount moves; image locations and the scratch share stay.
-    [[ -n "$RECORDED" ]] || { echo "error: cannot re-share: no /mnt/wyrd mount in $LIMA_YAML" >&2; exit 2; }
     limactl stop "$INSTANCE"
-    WYRD_YAML="$LIMA_YAML" WYRD_ROOT="$ROOT" python3 - <<'EOF'
-import json, os, shutil
-path = os.environ["WYRD_YAML"]
-root = os.environ["WYRD_ROOT"]
-lines = open(path).read().split("\n")
-for i, line in enumerate(lines):
-    if not line.strip().startswith("- location:"):
-        continue
-    if i + 1 >= len(lines):
-        break
-    nxt = lines[i + 1].replace('"', "").replace("'", "")
-    if "mountPoint:" in nxt and "/mnt/wyrd" in nxt:
-        indent = line[: line.index("- location:")]
-        lines[i] = indent + "- location: " + json.dumps(root)
-        break
-else:
-    raise SystemExit("no /mnt/wyrd mount found in " + path)
-shutil.copy(path, path + ".bak")
-tmp = path + ".tmp"
-open(tmp, "w").write("\n".join(lines))
-os.replace(tmp, path)
-EOF
+    mount_location write
     limactl start "$INSTANCE"
-    RECORDED="$(recorded_location "$LIMA_YAML")"
+    RECORDED="$(mount_location read)"
   fi
-  if [[ "$RECORDED" != "$ROOT" ]] || ! share_mounted; then
-    echo "error: guest share is stale (recorded ${RECORDED:-unreadable}, checkout $ROOT)" >&2
+  if ! recorded_ok; then
+    echo "error: guest share points elsewhere (recorded ${RECORDED:-unreadable}, checkout $ROOT)" >&2
     echo "  recreate the instance, or rerun with --re-share to re-point it at this checkout" >&2
+    exit 2
+  elif ! wait_mounted; then
+    echo "error: guest share is not mounted (recorded $RECORDED matches this checkout, but /mnt/wyrd is not serving it)" >&2
+    echo "  restart the instance (limactl stop/start) or recreate it" >&2
     exit 2
   fi
 fi

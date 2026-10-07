@@ -134,8 +134,20 @@ Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
   the bytes are discarded, as an explicit sequencing contract the
   drain enforces structurally (child 14 owns the record in full —
   delivered as counts by reason on the `sync now` run surface per
-  OD-14-3 A; the per-representation identity record and its
-  persistence belong to `17-observability`).
+  OD-14-3 A). Decided for `17-observability` (OD-17-1 B): no durable
+  per-representation identity record exists. Child 12 needs
+  diagnostic-before-delete as an execution invariant, not survival
+  of the diagnostic past process death — the sequence verify →
+  construct `VerificationFailure` → report to the drain → account →
+  unlink → discard the in-memory identity satisfies the safety
+  property. The evidence hierarchy is `VerificationFailure`
+  (identity and cause, current operation) → debug log (identity,
+  operator-selected retention) → run report (counts and cause,
+  current run) → durable metadata (no identities, persistent).
+  Per-representation verification identities are intentionally not
+  persisted: deliberate privacy/data-minimality policy, not an
+  implementation omission. More diagnostic classification does not
+  imply more durable identity retention.
 - **Deletion stays narrow**: only a representation just verified
   invalid may be deleted, through a narrowly named discard — never
   a general `ObjectStore::remove`. The implementation distinguishes

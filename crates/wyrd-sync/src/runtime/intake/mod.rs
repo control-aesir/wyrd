@@ -112,9 +112,20 @@ enum Outcome {
     /// (pending is volatile), so the drain settles `Retry`. Carries
     /// the attributable cause for the report's cause counters.
     Deferred(DeferredCause),
-    /// Shed past the pending bound: the engine holds nothing, so the
-    /// drain settles `Retry` and the relay retains the envelope.
+    /// Shed before classification (intake commit budget, sender
+    /// quota, rotation charge, or the defensive charge-time check):
+    /// the engine holds nothing, so the drain settles `Retry` and
+    /// the relay retains the envelope. Carries no cause: these sheds
+    /// are decided before classification, so nothing was learned to
+    /// keep.
     RelayHeld,
+    /// Shed past the pending bound after classification: the envelope
+    /// was fully classified (verification spent) and only the full
+    /// pending map refused it. The engine still holds nothing — the
+    /// drain settles `Retry` exactly like `RelayHeld` — but the wait
+    /// survives into the report's shed sub-counters, so a bound trip
+    /// says what it turned away.
+    ShedWithCause(DeferredCause),
     /// Not yet processable (unknown epoch key); the drain settles
     /// `Retry` and the relay retains the envelope.
     Skipped,
@@ -170,6 +181,18 @@ pub(super) fn drain(
             Outcome::RelayHeld => {
                 report.deferred += 1;
                 report.deferred_shed += 1;
+                Disposition::Retry
+            }
+            Outcome::ShedWithCause(cause) => {
+                // Nothing parked — this is a shed, not a hold — but
+                // the classified wait partitions the shed total, so
+                // the run surface can say what the bound turned away.
+                report.deferred += 1;
+                report.deferred_shed += 1;
+                match cause {
+                    DeferredCause::Unseen => report.deferred_shed_unseen += 1,
+                    DeferredCause::StatusBlocked => report.deferred_shed_status_blocked += 1,
+                }
                 Disposition::Retry
             }
             Outcome::Skipped => {
@@ -288,15 +311,17 @@ fn commit_action(
             engine.inbox.suppress(id);
             return Ok(Outcome::Accepted);
         }
-        Ok(Action::Defer(_)) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
+        Ok(Action::Defer(wait)) if engine.pending.len() >= MAX_PENDING_MESSAGES => {
             // Shed without consuming: the bound protects memory, but a
             // resource decision must never write a semantic fact. The
             // relay retains the envelope (the drain settles `Retry`),
             // and the inbox forgets the id so the redelivery ingests
             // fresh instead of reporting a false duplicate. No durable
-            // fact is written for a message never processed.
+            // fact is written for a message never processed. The wait
+            // was already classified above, so it rides along for the
+            // report — the only shed site with a cause to keep.
             engine.inbox.forget(id);
-            return Ok(Outcome::RelayHeld);
+            return Ok(Outcome::ShedWithCause(DeferredCause::from(wait)));
         }
         Ok(Action::Defer(wait)) => {
             engine.hold_pending(*id, message.clone(), wait);

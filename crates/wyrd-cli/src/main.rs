@@ -1608,6 +1608,12 @@ struct SyncRunReport {
     deferred_unseen: usize,
     deferred_status_blocked: usize,
     deferred_shed: usize,
+    /// Pending-bound sheds whose wait was classified, accumulated
+    /// like the rest: stored for the surface that renders them (the
+    /// deferred-clause renderer below owns the shed detail — this
+    /// report must not print it, or the two collide here).
+    deferred_shed_unseen: usize,
+    deferred_shed_status_blocked: usize,
     skipped: usize,
     discarded: usize,
     manifests: usize,
@@ -1695,12 +1701,23 @@ impl SyncRunReport {
     /// this so a counter added here cannot be forgotten there.
     fn accumulate(&mut self, pass: &SyncReport) {
         self.passes += 1;
+        // The shed sub-counters partition the shed total: a pass
+        // reporting more classified sheds than sheds is corrupt
+        // input, and the renderer's saturating arithmetic would
+        // silently hide it — fail here instead.
+        debug_assert!(
+            pass.drained.deferred_shed_unseen + pass.drained.deferred_shed_status_blocked
+                <= pass.drained.deferred_shed,
+            "shed sub-counters partition the shed total: {pass:?}"
+        );
         self.accepted += pass.drained.accepted;
         self.duplicates += pass.drained.duplicates;
         self.deferred += pass.drained.deferred;
         self.deferred_unseen += pass.drained.deferred_unseen;
         self.deferred_status_blocked += pass.drained.deferred_status_blocked;
         self.deferred_shed += pass.drained.deferred_shed;
+        self.deferred_shed_unseen += pass.drained.deferred_shed_unseen;
+        self.deferred_shed_status_blocked += pass.drained.deferred_shed_status_blocked;
         self.skipped += pass.drained.skipped;
         self.discarded += pass.drained.discarded;
         self.manifests += pass.fetched.manifests;
@@ -1818,6 +1835,8 @@ where
         deferred_unseen: 0,
         deferred_status_blocked: 0,
         deferred_shed: 0,
+        deferred_shed_unseen: 0,
+        deferred_shed_status_blocked: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
@@ -2170,8 +2189,40 @@ fn reconciliation_gap_reason(report: &SyncRunReport) -> String {
 /// Render a headless run report. Built as a string so tests assert
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
+    // Shed detail beside the `shed` total below: pending-bound sheds
+    // whose wait was classified, bucketed by that wait, plus the
+    // unclassified remainder (budget/quota/charge-time sheds, decided
+    // before classification by design). The buckets partition shed —
+    // a genuine partition of this count, and of nothing else — so no
+    // line here may read as arithmetic on any other total. Prints
+    // only when the run shed anything, and only nonzero buckets, so
+    // quiet runs stay quiet.
+    let shed_detail = {
+        let mut parts = Vec::new();
+        if report.deferred_shed_unseen > 0 {
+            parts.push(format!("{} unseen-wait", report.deferred_shed_unseen));
+        }
+        if report.deferred_shed_status_blocked > 0 {
+            parts.push(format!(
+                "{} status-blocked-wait",
+                report.deferred_shed_status_blocked
+            ));
+        }
+        let unclassified = report
+            .deferred_shed
+            .saturating_sub(report.deferred_shed_unseen)
+            .saturating_sub(report.deferred_shed_status_blocked);
+        if unclassified > 0 {
+            parts.push(format!("{unclassified} unclassified"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    };
     let mut out = format!(
-        "sync now: {} passes, intake {} accepted ({} duplicates, {} deferred [{} unseen, {} status-blocked, {} shed], {} skipped, {} discarded), fetch {} manifests, {} bodies, {} objects ({} unfulfilled), publish {} sends, {} obligations pending, {} unfetchable heads\n",
+        "sync now: {} passes, intake {} accepted ({} duplicates, {} deferred [{} unseen, {} status-blocked, {} shed{}], {} skipped, {} discarded), fetch {} manifests, {} bodies, {} objects ({} unfulfilled), publish {} sends, {} obligations pending, {} unfetchable heads\n",
         report.passes,
         report.accepted,
         report.duplicates,
@@ -2179,6 +2230,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         report.deferred_unseen,
         report.deferred_status_blocked,
         report.deferred_shed,
+        shed_detail,
         report.skipped,
         report.discarded,
         report.manifests,

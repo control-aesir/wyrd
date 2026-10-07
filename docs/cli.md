@@ -329,7 +329,11 @@ sync now
   without mounting. Stops on the first quiet pass and prints pass
   and intake/fetch totals with the obligations still pending.
   The intake clause splits deferred holds by cause (`unseen`,
-  `status-blocked`, `shed`), the fetch clause counts sends, and a
+  `status-blocked`, `shed`), with the shed total carrying its wait
+  detail in parentheses when the run shed anything (classified
+  pending-bound waits first, then the unclassified
+  budget/quota remainder — a partition of `shed`, and of nothing
+  else), the fetch clause counts sends, and a
   `write path` section reports the local durability load beside
   the sync load: mutation-seam snapshots with their per-minute
   rate, the per-source share (mkdir, create-file, commit-file,
@@ -537,12 +541,14 @@ Both are read and hardened by wyrd code, never by clap:
   all: three counts (statements received, transitions and capabilities
   retired), so a future field cannot smuggle an id onto the surface.
   DeviceIds never reach the durable `sync status` surface or the
-  log; `sync now` alone names the senders its intake actually
-  heard, because that process connected and the operator holds the
-  keys. (`member list`, `member log`, and `snapshot list` are
+  structured dispatch lines; `sync now` alone names the senders its
+  intake actually heard, because that process connected and the
+  operator holds the keys. (`member list`, `member log`, and `snapshot list` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
-  them.)
+  them.) Debug-level tracing is the exception: `mount.log` is the
+  file layer of the same subscriber, so at debug it names what
+  tracing observed, senders included — see the matrix.
 - `sync now` reports fetch-attempt diagnostics beside the
   unfulfilled total: one line per fired class
   (`transport_errors`, `missing`, `invalid`, `unavailable_keys`,
@@ -562,9 +568,10 @@ Both are read and hardened by wyrd code, never by clap:
   identities holding a completed terminal generation right now —
   generation-scoped, cleared by a new waiter or a restart, never a
   property of the identity. This fetch
-  surface is client-position: counts by reason, never identities —
-  see `docs/trust.md:880-957`, with the observation ×
-  trust-position matrix itself owned by `17-observability`.
+surface is client-position: counts by reason, never identities —
+see `docs/trust.md`'s observation × trust-position matrix
+("Diagnostic surfaces", OD-17-6), which pins what each surface may
+show and composes with the party table.
 - `E2E_RUST_LOG` (honored by the Lima suite in `lima/run-alpha.sh`
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.

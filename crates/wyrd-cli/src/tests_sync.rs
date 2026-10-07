@@ -697,6 +697,8 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         deferred_unseen: 0,
         deferred_status_blocked: 0,
         deferred_shed: 0,
+        deferred_shed_unseen: 0,
+        deferred_shed_status_blocked: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
@@ -1058,6 +1060,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         deferred_unseen: 0,
         deferred_status_blocked: 0,
         deferred_shed: 0,
+        deferred_shed_unseen: 0,
+        deferred_shed_status_blocked: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
@@ -1098,6 +1102,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         deferred_unseen: 0,
         deferred_status_blocked: 0,
         deferred_shed: 0,
+        deferred_shed_unseen: 0,
+        deferred_shed_status_blocked: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
@@ -1138,6 +1144,8 @@ fn run_outcome_maps_to_success_or_incomplete() {
         deferred_unseen: 0,
         deferred_status_blocked: 0,
         deferred_shed: 0,
+        deferred_shed_unseen: 0,
+        deferred_shed_status_blocked: 0,
         skipped: 0,
         discarded: 0,
         manifests: 0,
@@ -1514,7 +1522,9 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
                 deferred: 3,
                 deferred_unseen: 1,
                 deferred_status_blocked: 1,
-                deferred_shed: 1,
+                deferred_shed: 51,
+                deferred_shed_unseen: 25,
+                deferred_shed_status_blocked: 26,
                 skipped: 4,
                 discarded: 5,
                 // Alternating senders with overlap: every pass names
@@ -1561,7 +1571,9 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
     assert_eq!(report.deferred, 36);
     assert_eq!(report.deferred_unseen, 12);
     assert_eq!(report.deferred_status_blocked, 12);
-    assert_eq!(report.deferred_shed, 12);
+    assert_eq!(report.deferred_shed, 612);
+    assert_eq!(report.deferred_shed_unseen, 300);
+    assert_eq!(report.deferred_shed_status_blocked, 312);
     assert_eq!(report.skipped, 48);
     assert_eq!(report.discarded, 60);
     assert_eq!(report.manifests, 72);
@@ -1588,6 +1600,35 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
         vec![peer_a, peer_b],
         "union, deduplicated and sorted: {report:?}"
     );
+}
+
+/// The shed detail partitions the shed total: classified waits by
+/// their wait, budget/quota sheds as unclassified. Nonzero buckets
+/// only, and no detail at all on a quiet run — the parens must never
+/// appear beside `0 shed`, or quiet runs stop being quiet.
+#[test]
+fn sync_now_render_partitions_shed_only_when_nonzero() {
+    let mut mixed = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    mixed.deferred = 5;
+    mixed.deferred_shed = 3;
+    mixed.deferred_shed_unseen = 1;
+    mixed.deferred_shed_status_blocked = 1;
+    let rendered = sync_now_render(&mixed);
+    assert!(
+        rendered.contains("3 shed (1 unseen-wait, 1 status-blocked-wait, 1 unclassified)"),
+        "{rendered}"
+    );
+
+    let mut unclassified = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    unclassified.deferred = 2;
+    unclassified.deferred_shed = 2;
+    let rendered = sync_now_render(&unclassified);
+    assert!(rendered.contains("2 shed (2 unclassified)"), "{rendered}");
+
+    let quiet = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    let rendered = sync_now_render(&quiet);
+    assert!(rendered.contains("0 shed]"), "{rendered}");
+    assert!(!rendered.contains("shed ("), "{rendered}");
 }
 
 /// A scripted writer produces commits from known sources while a
@@ -2134,12 +2175,8 @@ fn fetch_diagnostic_states_its_trust_position() {
         "the surface states its trust position"
     );
     assert!(
-        reference.contains("docs/trust.md:880-957"),
-        "the statement points at the privacy boundary"
-    );
-    assert!(
-        reference.contains("17-observability"),
-        "the statement names the matrix owner"
+        reference.contains("OD-17-6"),
+        "the statement points at the observation x trust-position matrix"
     );
 }
 

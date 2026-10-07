@@ -514,7 +514,7 @@ leg_fetch_member() {
   # `timeout` can only exec binaries, so wrapping it fails with
   # "No such file or directory" and an empty stdout. The run is
   # bounded internally by MAX_SYNC_NOW_PASSES.
-  with_creds "$c" sync "$d" now --relay "$relay" \
+  with_creds "$c" sync "$d" --relay "$relay" now \
     >"$E2E_ROOT/sync-now-member.out" 2>"$E2E_ROOT/sync-now-member.err"
   set -e
   grep -qE "\([0-9]+ unfulfilled\)" "$E2E_ROOT/sync-now-member.out" \

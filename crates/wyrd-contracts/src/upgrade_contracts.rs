@@ -831,9 +831,9 @@ fn upgrade_legacy_transition_without_readers_root_refuses_named() {
     let mut legacy = bytes[..cut].to_vec();
     legacy.extend_from_slice(&bytes[cut + 32..]);
     assert_eq!(
-        legacy.len(),
-        bytes.len() - 32,
-        "the legacy document drops exactly readers_root"
+        &bytes[cut..cut + 32],
+        &[0x22; 32],
+        "the spliced window is readers_root"
     );
     assert!(
         matches!(

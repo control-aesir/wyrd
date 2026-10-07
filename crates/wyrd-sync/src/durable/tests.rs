@@ -2123,10 +2123,17 @@ fn legacy_transition_record_without_readers_root_poisons_the_commit() {
     let cut = bytes.len() - 136;
     let mut legacy = bytes[..cut].to_vec();
     legacy.extend_from_slice(&bytes[cut + 32..]);
+    // Positive control and window identity in one: the uncut record
+    // decodes, and the spliced window is its readers_root — so the
+    // refusal below is attributable to the excision, not the
+    // fixture, and a layout change fails loudly here instead of
+    // silently halving owners_root.
+    let uncut = MembershipTransition::from_canonical_bytes(&bytes)
+        .expect("the uncut genesis record decodes");
     assert_eq!(
-        legacy.len(),
-        bytes.len() - 32,
-        "the legacy record drops exactly readers_root"
+        &bytes[cut..cut + 32],
+        uncut.readers_root,
+        "the spliced window is readers_root"
     );
     let (tagged, hash) = encode_commit(&drive(), 2, &tip, &[(TAG_TRANSITION, legacy)]);
     fs::write(dir.path.join("commits").join(commit_name(2)), &tagged).unwrap();

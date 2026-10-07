@@ -245,6 +245,13 @@ version say exactly what changed.
   derived from the commit protocol, not counted). No CLI quota flag,
   no default ceiling, no enforcement change: fetched bytes, the vault,
   and the fact log still cross no ceiling.
+- Negative contract for the reader-set format break (contract 55):
+  a synthetic pre-`readers_root` transition document refuses with
+  `MembershipError::Truncated` instead of reinterpreting the tail,
+  and a commit carrying the short record fails load with
+  `DurableError::CorruptCommit` while a fresh handle still refuses
+  it identically — pinning the 0.2.0-alpha compatibility claim
+  (tests only, no behavior change).
 
 ### Fixed
 

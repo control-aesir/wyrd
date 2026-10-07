@@ -263,6 +263,16 @@
 //!     the peer-served half of the write-path loss claim: an
 //!     append over a lost base commits once the refetch heals,
 //!     through the same mount with no remount or restart.
+//!
+//! The version refusal (CHANGELOG 0.2.0-alpha format break):
+//!
+//! 55. `upgrade_legacy_transition_without_readers_root_refuses_named` —
+//!     a pre-readers_root transition document refuses with
+//!     `MembershipError::Truncated`: two roots where three are declared
+//!     is short, never reinterpreted. Store-layer twin
+//!     (`legacy_transition_record_without_readers_root_poisons_the_commit`)
+//!     fails the load with the commit name, and a fresh handle still
+//!     refuses it identically.
 
 #[cfg(test)]
 mod egress_contracts;

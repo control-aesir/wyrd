@@ -288,6 +288,7 @@ jobs:
           set -o pipefail
           echo "===== flake check =====" >> /tmp/nix.log
           {
+            set -euo pipefail
             nix build .#checks.x86_64-linux.wyrd .#checks.x86_64-linux.wyrd-dist --print-build-logs
             nix flake check --no-build
           } 2>&1 | tee -a /tmp/nix.log

@@ -181,9 +181,10 @@ sudo ./nix/microvm/run-microvm.sh --teardown # stop a kept run (daemons, taps, b
 Linux with `/dev/kvm` is required (no nested KVM under macOS
 virtualization, and vfkit lacks the tap/bridge networking the
 topology needs). The topology is declared in `nix/microvm/`
-(`flake.nix` `nixosConfigurations.wyrd-*`); `nix flake check` on
-x86_64-linux builds the three runners as the eval+build gate,
-while suite *execution* stays on the KVM host. Logs land under
+(`flake.nix` `nixosConfigurations.wyrd-*`); `nix flake check
+--no-build` evaluates the three runners as the eval gate, the runner
+closures build when a microVM run needs them, while suite *execution*
+stays on the KVM host. Logs land under
 `/var/lib/wyrd-microvm/state/run/logs` (overridable with
 `--state-dir`).
 

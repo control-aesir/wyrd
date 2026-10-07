@@ -2107,9 +2107,8 @@ fn reconciliation_malformed_record_poisons_the_commit() {
 /// commit's name, and a fresh handle still refuses it identically.
 /// Built the way `reconciliation_malformed_record_poisons_the_commit`
 /// builds its malformed record: excise readers_root from canonical
-/// bytes and plant the short record under TAG_TRANSITION.
-/// Planting through the public commit path is impossible by
-/// public commit path is impossible by construction
+/// bytes and plant the short record under TAG_TRANSITION. Planting
+/// through the public commit path is impossible by construction
 /// (`encode_fact` re-canonicalizes `Fact::Transition`), so the raw
 /// seam is the honest one.
 #[test]

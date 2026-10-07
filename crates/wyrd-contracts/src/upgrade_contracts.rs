@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
 
 use wyrd_format::envelope::{Envelope, EnvelopeError, HEADER_LEN, MAGIC};
 use wyrd_format::{
-    ContentId, DeviceId, FsObjectStore, FsStoreError, MemoryObjectStore, MemoryStoreError,
-    ObjectKind, ObjectStore, TransitionId,
+    Change, ContentId, DeviceId, FsObjectStore, FsStoreError, MembershipError,
+    MembershipTransition, MemoryObjectStore, MemoryStoreError, ObjectKind, ObjectStore,
+    TransitionId,
 };
 use wyrd_sync::control::{self, ControlError, ControlMessageId, Message, TransitionPayload};
 use wyrd_sync::durable::{DurableStore, Fact, ReconciliationView};
@@ -792,6 +793,45 @@ fn upgrade_unknown_refuses_loudly() {
     assert!(
         store.load().is_err(),
         "a flipped commit version refuses to load"
+    );
+}
+
+/// Reader-set format break (CHANGELOG 0.2.0-alpha): a v0.1.0-alpha.1
+/// transition document carries two set roots, not three. Excise
+/// readers_root from a current document and assert the decoder refuses
+/// the legacy shape with a named error instead of reinterpreting the
+/// tail (without the cut, author/epoch/signature would all shift 32
+/// bytes and still parse).
+#[test]
+fn upgrade_legacy_transition_without_readers_root_refuses_named() {
+    let author = device(0x11);
+    let current = MembershipTransition::new(
+        2,
+        None,
+        Vec::new(),
+        vec![Change::Rotate],
+        [0x20; 32],
+        [0x21; 32],
+        [0x22; 32],
+        author.id,
+    )
+    .unwrap();
+    let bytes = current.canonical_bytes();
+    // readers_root is the third root: author (32) + epoch (8) +
+    // signature (64) trail it, so it spans [len-136, len-104).
+    let cut = bytes.len() - 136;
+    let mut legacy = bytes[..cut].to_vec();
+    legacy.extend_from_slice(&bytes[cut + 32..]);
+    assert!(
+        matches!(
+            MembershipTransition::from_canonical_bytes(&legacy),
+            Err(MembershipError::Truncated)
+        ),
+        "a pre-readers_root transition document refuses with its name"
+    );
+    assert!(
+        MembershipTransition::from_canonical_bytes(&bytes).is_ok(),
+        "the uncut document still decodes"
     );
 }
 

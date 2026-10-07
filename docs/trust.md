@@ -382,12 +382,17 @@ version (1) ‖ drive (32) ‖ ephemeral pk (32) ‖ recipient DeviceId (32)
 ‖ AEAD ciphertext
 ```
 
-AAD is the header minus the nonce; the plaintext repeats the header,
-then the genesis transition bytes, the wrapped capability bytes, and the
-owner's BIP-340 signature over the whole payload. The signed challenge is
-`BLAKE3-derive_key("wyrd bootstrap challenge v1", drive ‖ inviter ‖
-invitee ‖ encryption key ‖ counted genesis ‖ counted capability)` (the
-context separates this challenge from every other derived value).
+AAD is the domain tag, the version byte, and the header minus the
+nonce, closed by the ephemeral key (`"wyrd bootstrap v1"` ‖ version ‖
+drive ‖ recipient ‖ encryption key ‖ inviter ‖ ephemeral pk); the
+plaintext repeats the full header (`version ‖ drive ‖ ephemeral pk ‖
+recipient ‖ encryption key ‖ inviter`), then the genesis transition
+bytes, the wrapped capability bytes, and the owner's BIP-340 signature
+over the whole payload. The signed challenge is
+`BLAKE3-derive_key("wyrd bootstrap challenge v1", version ‖ drive ‖
+ephemeral pk ‖ invitee ‖ encryption key ‖ inviter ‖ counted genesis ‖
+counted capability)` (the context separates this challenge from every
+other derived value).
 Redelivery is safe downstream without inbox dedupe: capability install is
 monotonic and genesis processing idempotent.
 

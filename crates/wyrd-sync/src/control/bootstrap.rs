@@ -29,10 +29,12 @@
 //! ‖ AEAD ciphertext
 //! ```
 //!
-//! The AAD is the header minus the nonce; the plaintext repeats the
-//! header ahead of the payload, then the owner signature over the whole
-//! payload. Redelivery is safe downstream without inbox dedupe here:
-//! capability install is monotonic and genesis processing idempotent.
+//! The AAD is the domain tag, the version byte, and the header minus
+//! the nonce, closed by the ephemeral key; the plaintext repeats the
+//! full header ahead of the payload, then the owner signature over the
+//! whole payload. Redelivery is safe downstream without inbox dedupe
+//! here: capability install is monotonic and genesis processing
+//! idempotent.
 
 use hkdf::Hkdf;
 use secp256k1::{Keypair, SecretKey, XOnlyPublicKey, SECP256K1};
@@ -51,8 +53,10 @@ pub const BOOTSTRAP_VERSION: u8 = 0x00;
 /// (32) + encryption key (32) + inviter (32) + nonce (24).
 pub const BOOTSTRAP_HEADER_LEN: usize = 185;
 
-/// AAD domain tag (trust.md): domain ‖ drive ‖ recipient ‖
-/// encryption key ‖ inviter.
+/// AAD domain tag (trust.md): domain ‖ version ‖ drive ‖ recipient ‖
+/// encryption key ‖ inviter ‖ ephemeral pk. The version leads, as in
+/// `rotation_aad`, and the ephemeral key closes: substituting either
+/// breaks the tag.
 pub(crate) const BOOTSTRAP_AAD_DOMAIN: &[u8] = b"wyrd bootstrap v1";
 
 /// HKDF info context for the bootstrap AEAD key.
@@ -139,17 +143,26 @@ pub(crate) fn hkdf_bootstrap_key(shared: &Zeroizing<[u8; 32]>) -> Zeroizing<[u8;
 }
 
 fn bootstrap_aad(
+    version: u8,
     drive: &DriveId,
     recipient: &DeviceId,
     encryption_key: &DeviceEncryptionKey,
     inviter: &DeviceId,
+    ephemeral: &[u8; 32],
 ) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(BOOTSTRAP_AAD_DOMAIN.len() + 96);
+    let mut aad = Vec::with_capacity(BOOTSTRAP_AAD_DOMAIN.len() + 161);
     aad.extend_from_slice(BOOTSTRAP_AAD_DOMAIN);
+    // The version leads, as in `rotation_aad`: intake dispatches on this
+    // byte before either framing decodes, so it must not be malleable.
+    aad.push(version);
     aad.extend_from_slice(drive.as_bytes());
     aad.extend_from_slice(recipient.as_bytes());
     aad.extend_from_slice(encryption_key.as_bytes());
     aad.extend_from_slice(inviter.as_bytes());
+    // The ephemeral key closes the AAD: swapping the key the ECDH ran
+    // under must break the tag even when the substitute is a valid
+    // curve point that ECDH would otherwise accept.
+    aad.extend_from_slice(ephemeral);
     aad
 }
 
@@ -158,20 +171,32 @@ fn push_blob(out: &mut Vec<u8>, blob: &[u8]) {
     out.extend_from_slice(blob);
 }
 
+/// Unsigned-payload header length: version (1) + drive (32) +
+/// ephemeral (32) + invitee (32) + encryption key (32) + inviter (32).
+/// The plaintext repeats the sealed header field-for-field in wire
+/// order, so the inner agreement check covers every non-secret header
+/// field the seal authenticates.
+const UNSIGNED_HEADER_LEN: usize = 161;
+
 /// The unsigned payload: everything the owner signature covers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unsigned_bytes(
+    version: u8,
     drive: &DriveId,
-    inviter: &DeviceId,
+    ephemeral: &[u8; 32],
     invitee: &DeviceId,
     encryption_key: &DeviceEncryptionKey,
+    inviter: &DeviceId,
     genesis: &[u8],
     capability: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + 8 + genesis.len() + capability.len());
+    let mut out = Vec::with_capacity(UNSIGNED_HEADER_LEN + 8 + genesis.len() + capability.len());
+    out.push(version);
     out.extend_from_slice(drive.as_bytes());
-    out.extend_from_slice(inviter.as_bytes());
+    out.extend_from_slice(ephemeral);
     out.extend_from_slice(invitee.as_bytes());
     out.extend_from_slice(encryption_key.as_bytes());
+    out.extend_from_slice(inviter.as_bytes());
     push_blob(&mut out, genesis);
     push_blob(&mut out, capability);
     out
@@ -207,11 +232,14 @@ pub fn seal_bootstrap(
     let (ephemeral_sk, _seed, ephemeral_pk) = crate::keys::ephemeral::generate_ephemeral()?;
     let shared = ecdh_shared(&ephemeral_sk, &target)?;
     let aead_key = hkdf_bootstrap_key(&shared);
+    let ephemeral = ephemeral_pk.serialize();
     let unsigned = unsigned_bytes(
+        BOOTSTRAP_VERSION,
         drive,
-        &inviter,
+        &ephemeral,
         &invitee,
         encryption_key,
+        &inviter,
         genesis,
         capability,
     );
@@ -224,12 +252,19 @@ pub fn seal_bootstrap(
     plaintext.extend_from_slice(&sig);
     let mut nonce = [0u8; 24];
     random_bytes(&mut nonce)?;
-    let aad = bootstrap_aad(drive, &invitee, encryption_key, &inviter);
+    let aad = bootstrap_aad(
+        BOOTSTRAP_VERSION,
+        drive,
+        &invitee,
+        encryption_key,
+        &inviter,
+        &ephemeral,
+    );
     let ciphertext = crate::keys::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad)?;
     Ok(SealedBootstrap {
         version: BOOTSTRAP_VERSION,
         drive: *drive,
-        ephemeral: ephemeral_pk.serialize(),
+        ephemeral,
         recipient: invitee,
         encryption_key: *encryption_key,
         inviter,
@@ -255,30 +290,40 @@ pub fn open_bootstrap(
         XOnlyPublicKey::from_slice(&sealed.ephemeral).map_err(|_| CryptoError::Malformed)?;
     let shared = ecdh_shared(&encryption_secret.secret_key(), &ephemeral_pk)?;
     let aead_key = hkdf_bootstrap_key(&shared);
+    // The received version feeds the AAD, as in `open_rotation`: the
+    // version check above already pinned it to the envelope version, so
+    // this is the authenticated encoding of this envelope, not trust in
+    // the byte.
     let aad = bootstrap_aad(
+        sealed.version,
         &sealed.drive,
         &sealed.recipient,
         &sealed.encryption_key,
         &sealed.inviter,
+        &sealed.ephemeral,
     );
     let plaintext =
         crate::keys::aead::open(aead_key.as_slice(), &sealed.nonce, &sealed.ciphertext, &aad)?;
-    if plaintext.len() < 128 + 8 + 64 {
+    if plaintext.len() < UNSIGNED_HEADER_LEN + 8 + 64 {
         return Err(CryptoError::Malformed.into());
     }
-    let pt_drive = DriveId::from_bytes(plaintext[0..32].try_into().expect("bounds checked"));
-    let pt_inviter = DeviceId::from_bytes(plaintext[32..64].try_into().expect("bounds checked"));
-    let pt_invitee = DeviceId::from_bytes(plaintext[64..96].try_into().expect("bounds checked"));
+    let pt_version = plaintext[0];
+    let pt_drive = DriveId::from_bytes(plaintext[1..33].try_into().expect("bounds checked"));
+    let pt_ephemeral: [u8; 32] = plaintext[33..65].try_into().expect("bounds checked");
+    let pt_invitee = DeviceId::from_bytes(plaintext[65..97].try_into().expect("bounds checked"));
     let pt_key: DeviceEncryptionKey =
-        DeviceEncryptionKey::from_bytes(plaintext[96..128].try_into().expect("bounds checked"));
-    if pt_drive != sealed.drive
+        DeviceEncryptionKey::from_bytes(plaintext[97..129].try_into().expect("bounds checked"));
+    let pt_inviter = DeviceId::from_bytes(plaintext[129..161].try_into().expect("bounds checked"));
+    if pt_version != sealed.version
+        || pt_drive != sealed.drive
+        || pt_ephemeral != sealed.ephemeral
         || pt_inviter != sealed.inviter
         || pt_invitee != sealed.recipient
         || pt_key != sealed.encryption_key
     {
         return Err(CryptoError::HeaderMismatch.into());
     }
-    let mut pos = 128usize;
+    let mut pos = UNSIGNED_HEADER_LEN;
     let blob = |pos: &mut usize| -> Result<Vec<u8>, ControlError> {
         if plaintext.len() < *pos + 4 {
             return Err(CryptoError::Malformed.into());
@@ -317,10 +362,12 @@ pub fn open_bootstrap(
         return Err(CryptoError::HeaderMismatch.into());
     }
     let unsigned = unsigned_bytes(
+        pt_version,
         &pt_drive,
-        &pt_inviter,
+        &pt_ephemeral,
         &pt_invitee,
         &pt_key,
+        &pt_inviter,
         &genesis,
         &capability,
     );
@@ -458,7 +505,17 @@ mod tests {
         let eph_pk = XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(SECP256K1, &eph_sk)).0;
         let target = XOnlyPublicKey::from_slice(enc_key.as_bytes()).unwrap();
         let aead_key = hkdf_bootstrap_key(&ecdh_shared(&eph_sk, &target).unwrap());
-        let unsigned = unsigned_bytes(&drive(), &owner, &device, &enc_key, &genesis, &capability);
+        let eph_bytes = eph_pk.serialize();
+        let unsigned = unsigned_bytes(
+            BOOTSTRAP_VERSION,
+            &drive(),
+            &eph_bytes,
+            &device,
+            &enc_key,
+            &owner,
+            &genesis,
+            &capability,
+        );
         let challenge = bootstrap_challenge(&unsigned);
         let attacker_kp = Keypair::from_secret_key(SECP256K1, &attacker_sk);
         let sig = SECP256K1
@@ -467,13 +524,20 @@ mod tests {
         let mut plaintext = unsigned;
         plaintext.extend_from_slice(&sig);
         let nonce = [0x77u8; 24];
-        let aad = bootstrap_aad(&drive(), &device, &enc_key, &owner);
+        let aad = bootstrap_aad(
+            BOOTSTRAP_VERSION,
+            &drive(),
+            &device,
+            &enc_key,
+            &owner,
+            &eph_bytes,
+        );
         let ciphertext =
             crate::keys::aead::seal(aead_key.as_slice(), &nonce, &plaintext, &aad).unwrap();
         let forged = SealedBootstrap {
             version: BOOTSTRAP_VERSION,
             drive: drive(),
-            ephemeral: eph_pk.serialize(),
+            ephemeral: eph_bytes,
             recipient: device,
             encryption_key: enc_key,
             inviter: owner,
@@ -505,6 +569,137 @@ mod tests {
         let mut tampered = sealed.encode();
         tampered[BOOTSTRAP_HEADER_LEN] ^= 0x01;
         let parsed = SealedBootstrap::decode(&tampered).unwrap();
+        assert_eq!(
+            open_bootstrap(&enc_secret, &parsed),
+            Err(ControlError::Crypto(CryptoError::OpenFailed))
+        );
+    }
+
+    /// The version byte rides the clear header: flipping it must break
+    /// the AEAD tag, not a later structural check — mirroring
+    /// `version_byte_is_covered_by_the_tag` on the rotation framing.
+    #[test]
+    fn version_byte_is_covered_by_the_tag() {
+        let (device, enc_key, genesis, capability) = invitation_parts();
+        let sealed = seal_bootstrap(
+            &owner_sk(),
+            &drive(),
+            device,
+            &enc_key,
+            &genesis,
+            &capability,
+        )
+        .unwrap();
+        let (enc_secret, _) = enc_pair(0x30);
+
+        // Reproduce exactly what `open_bootstrap` authenticates.
+        let eph = XOnlyPublicKey::from_slice(&sealed.ephemeral).unwrap();
+        let shared = ecdh_shared(&enc_secret.secret_key(), &eph).unwrap();
+        let key = hkdf_bootstrap_key(&shared);
+
+        // The only envelope version is `BOOTSTRAP_VERSION`; the flip
+        // moves one past it.
+        let aad_sealed = bootstrap_aad(
+            sealed.version,
+            &sealed.drive,
+            &sealed.recipient,
+            &sealed.encryption_key,
+            &sealed.inviter,
+            &sealed.ephemeral,
+        );
+        let aad_flipped = bootstrap_aad(
+            sealed.version + 1,
+            &sealed.drive,
+            &sealed.recipient,
+            &sealed.encryption_key,
+            &sealed.inviter,
+            &sealed.ephemeral,
+        );
+        assert_ne!(
+            aad_sealed, aad_flipped,
+            "the AAD must distinguish the two versions"
+        );
+        // POSITIVE control: the untouched AAD still opens the same bytes,
+        // so the failure below is the flip and not a broken fixture.
+        assert!(crate::keys::aead::open(
+            key.as_slice(),
+            &sealed.nonce,
+            &sealed.ciphertext,
+            &aad_sealed
+        )
+        .is_ok());
+        assert!(
+            crate::keys::aead::open(
+                key.as_slice(),
+                &sealed.nonce,
+                &sealed.ciphertext,
+                &aad_flipped
+            )
+            .is_err(),
+            "a flipped version byte must break the tag"
+        );
+        // And the whole path refuses the flipped envelope outright.
+        let mut forged = sealed.clone();
+        forged.version = BOOTSTRAP_VERSION + 1;
+        assert_eq!(
+            open_bootstrap(&enc_secret, &forged),
+            Err(ControlError::UnknownVersion(BOOTSTRAP_VERSION + 1))
+        );
+    }
+
+    /// A substituted ephemeral key is a valid curve point `decode`
+    /// accepts, but ECDH under it derives the wrong AEAD key: the seal
+    /// must break at key derivation, before the plaintext is parsed.
+    #[test]
+    fn substituted_ephemeral_fails_before_any_structural_check() {
+        let (device, enc_key, genesis, capability) = invitation_parts();
+        let sealed = seal_bootstrap(
+            &owner_sk(),
+            &drive(),
+            device,
+            &enc_key,
+            &genesis,
+            &capability,
+        )
+        .unwrap();
+        let (enc_secret, _) = enc_pair(0x30);
+        let other = XOnlyPublicKey::from_keypair(&Keypair::from_secret_key(
+            SECP256K1,
+            &SecretKey::from_slice(&[0x0D; 32]).unwrap(),
+        ))
+        .0
+        .serialize();
+        assert_ne!(
+            other, sealed.ephemeral,
+            "the substitute must differ from the sealed key"
+        );
+        // AAD-level: the construction distinguishes the two keys, so a
+        // substitute cannot ride the original tag.
+        assert_ne!(
+            bootstrap_aad(
+                sealed.version,
+                &sealed.drive,
+                &sealed.recipient,
+                &sealed.encryption_key,
+                &sealed.inviter,
+                &sealed.ephemeral,
+            ),
+            bootstrap_aad(
+                sealed.version,
+                &sealed.drive,
+                &sealed.recipient,
+                &sealed.encryption_key,
+                &sealed.inviter,
+                &other,
+            ),
+            "the AAD must bind the ephemeral key"
+        );
+        // Wire-level: splice the substitute into the encoded envelope.
+        // Decode accepts it (valid curve point); opening must fail at
+        // the tag over the wrongly derived key.
+        let mut wire = sealed.encode();
+        wire[33..65].copy_from_slice(&other);
+        let parsed = SealedBootstrap::decode(&wire).unwrap();
         assert_eq!(
             open_bootstrap(&enc_secret, &parsed),
             Err(ControlError::Crypto(CryptoError::OpenFailed))

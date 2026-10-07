@@ -105,6 +105,7 @@ else:
     shutil.copy(path, path + ".bak")
     tmp = path + ".tmp"
     open(tmp, "w", encoding="utf-8").write("\n".join(lines))
+    shutil.copymode(path, tmp)
     os.replace(tmp, path)
 EOF
 }
@@ -136,6 +137,8 @@ if ! recorded_ok || ! share_mounted; then
     echo "==> guest share points elsewhere (recorded $RECORDED, checkout $ROOT); re-pointing $INSTANCE"
     # Back up the operator's config, then rewrite atomically. Only the
     # /mnt/wyrd mount moves; image locations and the scratch share stay.
+    # A write failure here leaves the instance stopped; the next run
+    # restarts it (see the start block above).
     limactl stop "$INSTANCE"
     mount_location write
     limactl start "$INSTANCE"
@@ -157,7 +160,9 @@ fi
 # forensics stay available without the shared host dir growing
 # without bound. Names sort by intent already (%Y%m%d-%H%M%S), so
 # order by name, not mtime. This sits below the verification above so a
-# refused run leaves host state untouched.
+# refused run performs no build and prunes no logs (the mkdir and the
+# instance start above still run: both are idempotent, and the start is
+# required to verify at all).
 if [[ -d "$SHARE/logs" ]]; then
   # Only directories rank: a stray file must neither consume a keep
   # slot nor be deleted.

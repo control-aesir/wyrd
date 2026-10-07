@@ -1308,35 +1308,6 @@ where
                 );
             },
         )?;
-        // Local scrub, drain half (child 13): clear the claims
-        // readers reported missing since the last pass — ahead of
-        // admission, so the same pass reconciles each cleared claim
-        // back to pending and the waiter's want drives a fresh
-        // fetch without waiting another pass. The residency policy
-        // is untouched, no waiter is synthesized, and no bytes are
-        // unlinked: loss is unclaimed, never deleted. Capped like
-        // quarantine: leftovers wait for the next pass.
-        //
-        // The walk half runs after admission below and submits for
-        // the *next* pass: a walk-found loss heals one pass later
-        // than a read-found one, which is immaterial beside a full
-        // sweep's rotation — and the split lets the walk reuse the
-        // admission snapshot instead of paying its own rebuild on
-        // every pass.
-        let mut scrubbed = drain_scrub(
-            &self.scrub,
-            &self.store,
-            self.retained_bytes.as_deref(),
-            &mut self.engine,
-            self.budgets.max_scrub_per_pass,
-            &mut |loss| {
-                tracing::warn!(
-                    content = ?loss.content(),
-                    kind = ?loss.kind(),
-                    "claimed bytes absent from the store: unclaiming and re-demanding"
-                );
-            },
-        )?;
         // Admit outstanding backend demand ahead of fetching, atomically
         // from the registry's perspective: only durably committed
         // identities are marked admitted, so a failing commit leaves
@@ -1371,16 +1342,21 @@ where
         })?;
         // Local scrub, walk half (child 13): re-stat locally
         // claimed identities against the store from the rotating
-        // cursor, submitting misses for the next pass's drain.
-        // The snapshot is admission's when it took one (passes
-        // with pending wants pay no second rebuild); otherwise
-        // one rebuild serves the walk. Either way the scan is
-        // O(claims), never O(history) — and a pass whose queue
-        // the drain just emptied still sweeps, because out-of-band
-        // loss has no other signal. Slightly stale either way
-        // (commits landed since): the drain re-verifies before
-        // clearing, so staleness only re-stats, never wrongly
-        // unclaims.
+        // cursor, submitting misses for the drain below. The
+        // snapshot is admission's when it took one (passes with
+        // pending wants pay no second rebuild); otherwise one
+        // rebuild serves the walk. Either way the scan is
+        // O(claims), never O(history) — and the walk runs even
+        // when the queue is empty, because out-of-band loss has
+        // no other signal. Slightly stale either way (commits
+        // landed since): the drain re-verifies before clearing,
+        // so staleness only re-stats, never wrongly unclaims.
+        // Coupling note: the reused snapshot is the one
+        // `admit_wants` just mutated in place through
+        // `set_materialization_from` — safe because admission
+        // commits only `Fact::Materialization`, which never
+        // moves a local claim. If admission ever commits a
+        // claim-moving fact, the walk needs its own snapshot.
         let walk_snapshot = match admission {
             Some(snapshot) => snapshot,
             None => self.engine.runtime_state()?,
@@ -1394,6 +1370,30 @@ where
         for loss in losses {
             self.scrub.submit(loss);
         }
+        // Local scrub, drain half (child 13): clear the claims
+        // the walk and the readers found missing — after the
+        // walk, so walk-found losses clear on the same pass they
+        // are observed, and ahead of fetching, so the same pass
+        // reconciles each cleared claim back to pending and the
+        // plan re-drives the fetch without waiting another pass.
+        // The residency policy is untouched, no waiter is
+        // synthesized, and no bytes are unlinked: loss is
+        // unclaimed, never deleted. Capped like quarantine:
+        // leftovers wait for the next pass.
+        let mut scrubbed = drain_scrub(
+            &self.scrub,
+            &self.store,
+            self.retained_bytes.as_deref(),
+            &mut self.engine,
+            self.budgets.max_scrub_per_pass,
+            &mut |loss| {
+                tracing::warn!(
+                    content = ?loss.content(),
+                    kind = ?loss.kind(),
+                    "claimed bytes absent from the store: unclaiming and re-demanding"
+                );
+            },
+        )?;
         scrubbed.failures += probe_failures;
         let phase = std::time::Instant::now();
         let fetched = match bulk {

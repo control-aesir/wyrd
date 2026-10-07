@@ -42,16 +42,19 @@ version say exactly what changed.
   child): claimed-but-absent bytes are observed at read time (new
   `ViewError::LostRepresentation` verdict, identity + kind — a
   stale `Available` no longer reads as an unreachable peer) and by
-  a bounded per-pass presence walk over manifest entries from a
-  rotating in-memory cursor. The loop's drain emits the
-  diagnostic, re-verifies presence (a concurrent heal keeps its
-  claim with no redundant fetch), clears the stale claim via the
-  second `ObjectRemoved` writer
+  a bounded per-pass presence walk over locally claimed
+  identities from a rotating in-memory cursor. The loop's drain
+  emits the diagnostic, re-verifies presence (a concurrent heal
+  keeps its claim with no redundant fetch), clears the stale
+  claim via the second `ObjectRemoved` writer
   (`Engine::record_missing_objects`, resolving each cleared
-  identity's retained size from its manifest entry), and leaves
-  the intact `Cached` policy for the background plan to refetch
-  with no waiter synthesized. No bytes are unlinked, no protocol
-  change, no new durable-fact kind; the vault is untouched.
+  identity's retained size from its manifest entry in one batch
+  pass), and leaves the intact `Cached` policy for the background
+  plan to refetch with no waiter synthesized. The walk runs after
+  admission (reusing its snapshot) and the drain clears ahead of
+  fetching, so walk-found losses clear on the same pass they are
+  observed. No bytes are unlinked, no protocol change, no new
+  durable-fact kind; the vault is untouched.
 
 ### Added
 

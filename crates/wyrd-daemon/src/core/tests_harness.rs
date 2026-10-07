@@ -143,9 +143,29 @@ pub(super) fn live_backend<S: ObjectStore + Send + Sync + 'static>(
 where
     S::Error: std::fmt::Debug,
 {
-    let (live, parts) = daemon
-        .into_live(Duration::from_secs(30), &LiveConfig::default())
-        .unwrap();
+    live_backend_with_mutation_wait(daemon, Duration::from_secs(30))
+}
+
+/// [`live_backend`] with an explicit prerequisite deadline: the
+/// deadline lives on the node (set at composition), not on the
+/// loop config, so boundary tests take the short wait here (their
+/// point is the bounded failure, not the full 30s production
+/// budget).
+pub(super) fn live_backend_with_mutation_wait<S: ObjectStore + Send + Sync + 'static>(
+    daemon: WyrdNode<DriveView<S, RuntimeMaterialization>>,
+    max_mutation_wait: Duration,
+) -> (
+    LiveNode<DriveView<S, RuntimeMaterialization>>,
+    crate::fuse::FuseBackend<S, RuntimeMaterialization>,
+)
+where
+    S::Error: std::fmt::Debug,
+{
+    let config = LiveConfig {
+        max_mutation_wait,
+        ..LiveConfig::default()
+    };
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config).unwrap();
     let backend = crate::fuse::FuseBackend::shared_with_wants(
         parts.projection,
         parts.wants,

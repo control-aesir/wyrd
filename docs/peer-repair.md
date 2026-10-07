@@ -160,11 +160,17 @@ memory-only cursor, OD-13-3 clear-with-size-zero):
   (OD-13-3): the projection must stop lying even when the
   accountant has nothing to subtract, and the reopen walk
   re-seeds the count from the store.
-- **Placement: drain ahead of admission, walk after it.** The
-  drain clears read-found losses on the same pass they are
-  reported, so the waiter's want drives a fresh fetch without
-  waiting another pass; the walk submits for the next pass's
-  drain. Recorded here because the issue left the placement open.
+- **Placement: admission, then walk, then drain, all ahead of
+  fetch.** The walk reuses admission's snapshot when it took one
+  (no second rebuild on active passes); the drain clears
+  walk-found and read-found losses on the same pass they are
+  observed, so the fetch plan reconciles each cleared claim back
+  to pending without waiting another pass. The walk reads the
+  snapshot `admit_wants` just mutated in place — safe because
+  admission commits only `Fact::Materialization`, which never
+  moves a local claim; if admission ever commits a claim-moving
+  fact, the walk needs its own snapshot. Recorded here because
+  the issue left the placement open.
 - **The install gate's tree/chunk asymmetry bounds what the
   placement buys.** `verify_head_closure` reads every tree
   through the store (a lost tree fails the install as

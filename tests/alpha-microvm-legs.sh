@@ -367,6 +367,8 @@ leg_fetch_member() {
   # refetched bytes in the same read. No remount, no restart.
   cold_chunk=$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | head -n 1)
   [[ -n "$cold_chunk" ]] || die "member store holds no cold-bytes chunk to delete"
+  [[ "$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | wc -l)" == 1 ]] \
+    || die "cold-bytes is not unique in the member store after the quarantine heal"
   rm "$cold_chunk" \
     || die "host-side chunk deletion failed"
   timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2-relost.got" \

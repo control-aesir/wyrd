@@ -169,7 +169,10 @@ pub struct ScrubReport {
 /// identities the drive holds. `cursor` is memory-only
 /// (strike-ledger precedent): a restart restarts the sweep,
 /// deterministically ordered, so no loss is ever skipped — only
-/// re-statted.
+/// re-statted. The sweep wraps past the end back to the
+/// beginning as one chained iteration; the probe-budget break is
+/// what stops it, so "wrap once" is a consequence of the budget,
+/// not a separate mechanism.
 ///
 /// The store read lock is acquired once around the walk: the walk
 /// never mutates the store, so one acquisition is both cheaper
@@ -260,11 +263,10 @@ where
 ///    for already-absent claims, so a repeated report commits
 ///    nothing) and subtract their manifest-recorded sizes from the
 ///    retained accountant. The intact residency policy reconciles
-///    each cleared identity back to pending — on the same pass
-///    for read-found losses (the drain runs ahead of admission),
-///    on the next pass for walk-found ones (the walk submits
-///    after admission) — and the background plan re-drives the
-///    fetch with no waiter synthesized.
+///    each cleared identity back to pending on the same pass —
+///    the drain runs after the walk and ahead of fetching — and
+///    the background plan re-drives the fetch with no waiter
+///    synthesized.
 ///
 /// A poisoned store lock aborts the drain with the remaining items
 /// still queued.
@@ -282,7 +284,7 @@ where
 {
     let mut report = ScrubReport::default();
     let mut pending = Vec::new();
-    while pending.len() < max_per_pass {
+    for _ in 0..max_per_pass {
         let Some(observation) = queue.pop() else {
             break;
         };

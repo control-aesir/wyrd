@@ -642,7 +642,7 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
     );
     assert!(
         commit_started.elapsed() < Duration::from_secs(35),
-        "the writer finished on its own 30s deadline, not the loop's 120s bound"
+        "the writer finished within its 30s prerequisite deadline plus open/buffer slack"
     );
 
     // Serving continues on the extended bytes: a fresh open reads

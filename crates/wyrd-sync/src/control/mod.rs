@@ -1,5 +1,5 @@
 //! The control-plane message set: the evidence the Nostr mailbox delivers
-//! (control-plane issue; relay/iroh wiring is a later issue).
+//! (relay delivery via `wyrd-core`'s `LiveMailbox` over `transport::mailbox`).
 //!
 //! Sealed envelope (pinned):
 //!

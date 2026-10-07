@@ -246,6 +246,10 @@ version say exactly what changed.
   the gate-half probe forges a sealed control version and fails closed
   with `ControlError::UnknownVersion`, not a forged envelope version
   failing open (comment only).
+- Refresh two stale control-plane wiring comments
+  (`crates/wyrd-sync/src/control/mod.rs`, `message.rs`): relay delivery
+  via `wyrd-core`'s `LiveMailbox` has landed, so they no longer read
+  as pending work (comment only).
 
 ## [0.2.0-alpha]
 

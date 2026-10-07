@@ -256,6 +256,11 @@ version say exactly what changed.
   (`crates/wyrd-sync/src/control/mod.rs`, `message.rs`): relay delivery
   via `wyrd-core`'s `LiveMailbox` has landed, so they no longer read
   as pending work (comment only).
+- Drop the unused `nostr-connect` workspace pin and its pre-granted
+  `wyrd-daemon` allow-list entry: no member declares it, nothing
+  imports it, and the pre-grant would let a future addition slide
+  past the layer check silently. Re-add both with the NIP-46 session
+  wiring (trust.md T16).
 
 ## [0.2.0-alpha]
 

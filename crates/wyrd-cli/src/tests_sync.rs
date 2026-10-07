@@ -1522,7 +1522,7 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
                 deferred: 3,
                 deferred_unseen: 1,
                 deferred_status_blocked: 1,
-                deferred_shed: 1,
+                deferred_shed: 51,
                 deferred_shed_unseen: 25,
                 deferred_shed_status_blocked: 26,
                 skipped: 4,
@@ -1571,7 +1571,7 @@ fn sync_run_report_accumulates_every_pass_not_just_the_last() {
     assert_eq!(report.deferred, 36);
     assert_eq!(report.deferred_unseen, 12);
     assert_eq!(report.deferred_status_blocked, 12);
-    assert_eq!(report.deferred_shed, 12);
+    assert_eq!(report.deferred_shed, 612);
     assert_eq!(report.deferred_shed_unseen, 300);
     assert_eq!(report.deferred_shed_status_blocked, 312);
     assert_eq!(report.skipped, 48);

@@ -1701,6 +1701,15 @@ impl SyncRunReport {
     /// this so a counter added here cannot be forgotten there.
     fn accumulate(&mut self, pass: &SyncReport) {
         self.passes += 1;
+        // The shed sub-counters partition the shed total: a pass
+        // reporting more classified sheds than sheds is corrupt
+        // input, and the renderer's saturating arithmetic would
+        // silently hide it — fail here instead.
+        debug_assert!(
+            pass.drained.deferred_shed_unseen + pass.drained.deferred_shed_status_blocked
+                <= pass.drained.deferred_shed,
+            "shed sub-counters partition the shed total: {pass:?}"
+        );
         self.accepted += pass.drained.accepted;
         self.duplicates += pass.drained.duplicates;
         self.deferred += pass.drained.deferred;

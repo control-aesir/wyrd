@@ -541,12 +541,14 @@ Both are read and hardened by wyrd code, never by clap:
   all: three counts (statements received, transitions and capabilities
   retired), so a future field cannot smuggle an id onto the surface.
   DeviceIds never reach the durable `sync status` surface or the
-  log; `sync now` alone names the senders its intake actually
-  heard, because that process connected and the operator holds the
-  keys. (`member list`, `member log`, and `snapshot list` are
+  structured dispatch lines; `sync now` alone names the senders its
+  intake actually heard, because that process connected and the
+  operator holds the keys. (`member list`, `member log`, and `snapshot list` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
-  them.)
+  them.) Debug-level tracing is the exception: `mount.log` is the
+  file layer of the same subscriber, so at debug it names what
+  tracing observed, senders included — see the matrix.
 - `sync now` reports fetch-attempt diagnostics beside the
   unfulfilled total: one line per fired class
   (`transport_errors`, `missing`, `invalid`, `unavailable_keys`,

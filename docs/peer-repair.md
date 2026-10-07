@@ -132,7 +132,10 @@ Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
 - **Diagnostic before delete**: the diagnostic record identifying
   the representation and the verification failure is emitted before
   the bytes are discarded, as an explicit sequencing contract the
-  drain enforces structurally (child 14 owns the record in full).
+  drain enforces structurally (child 14 owns the record in full —
+  delivered as counts by reason on the `sync now` run surface per
+  OD-14-3 A; the per-representation identity record and its
+  persistence belong to `17-observability`).
 - **Deletion stays narrow**: only a representation just verified
   invalid may be deleted, through a narrowly named discard — never
   a general `ObjectStore::remove`. The implementation distinguishes

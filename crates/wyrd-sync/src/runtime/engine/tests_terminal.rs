@@ -287,6 +287,51 @@ fn terminal_state_requires_every_eligible_representation_exhausted() {
     );
 }
 
+/// Verification 5 of `14-fetch-failure-diagnostics`: the terminal
+/// count the diagnostics surface reports is the live map size, never
+/// an accumulation. An identity driven terminal counts once; a new
+/// waiter reopening it uncounts it; a fresh engine counts zero.
+/// Pins `docs/peer-repair.md:78-79` (a terminal result completes
+/// waiters, never a permanent identity state) into the diagnostic.
+#[test]
+fn the_terminal_generation_count_is_live_not_cumulative() {
+    let mut fixture = fixture();
+    assert_eq!(
+        fixture.engine.terminal_count(),
+        0,
+        "nothing demanded, nothing terminal"
+    );
+    let (content, storage_a, root_a, storage_b, root_b, mut directed) =
+        two_representation_setup(&mut fixture);
+    let mut objects = MemoryObjectStore::default();
+    directed.dead_storage.insert(storage_a);
+    directed.dead_storage.insert(storage_b);
+    directed.dead_roots.insert(root_a);
+    directed.dead_roots.insert(root_b);
+    directed.missing_storage.clear();
+    directed.missing_roots.clear();
+    drive_to_terminal(&mut fixture, &mut directed, &mut objects, &content, 32);
+    assert_eq!(
+        fixture.engine.terminal_count(),
+        1,
+        "one terminal identity counts once, however many passes it took"
+    );
+    // A new waiter reopens the attempt as a new generation: the
+    // completed verdict clears, so the count drops back to zero
+    // without any fulfillment landing.
+    fixture.engine.reopen_generation(&content);
+    assert_eq!(
+        fixture.engine.terminal_status(&content),
+        None,
+        "reopen clears the completed generation"
+    );
+    assert_eq!(
+        fixture.engine.terminal_count(),
+        0,
+        "reopen uncounts: the diagnostic never accumulates"
+    );
+}
+
 #[test]
 fn a_cooled_candidate_never_accumulates_evidence() {
     // A representation in cooldown is skipped, never attempted, and

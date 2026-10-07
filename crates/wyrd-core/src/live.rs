@@ -2950,6 +2950,15 @@ where
         self.engine.unanswered_statement_count()
     }
 
+    /// Identities holding a completed terminal fetch generation right
+    /// now: the live count `sync now` reports. A pure observation
+    /// over volatile attempt state — fulfillment, reopen, and restart
+    /// all shrink it — so this never feeds the durable status
+    /// surface, only the end-of-run gauge.
+    pub fn terminal_identities(&self) -> usize {
+        self.engine.terminal_count()
+    }
+
     /// Evaluated-but-stuck statements whose requester is still owed
     /// ("asked, nothing delivered"): the stall half of the run gauge
     /// beside the unanswered half above. Rebuilt-backed like the

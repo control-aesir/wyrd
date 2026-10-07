@@ -166,6 +166,25 @@ check_no_leaks() {
   pass "no secrets in $(basename "$log")"
 }
 
+# check_no_content_ids <rendered-file>: fail on any 64-hex run — the
+# e2e counterpart of the CLI's hex-run detector, guarding the
+# identity boundary on operator surfaces. This is NOT a secrets
+# check (see check_no_leaks): 64-hex device ids are not secrets,
+# and the senders-observed section deliberately names heard peers,
+# so those lines are scrubbed first exactly like the unit test
+# scrubs them. Never point this at a whole mount debug log: mount
+# logs legitimately carry ContentIds on pre-existing warn lines —
+# this helper targets rendered command output only.
+check_no_content_ids() {
+  local log="$1"
+  # Fail closed: an unreadable target must never report clean — a
+  # privacy assertion that fails open is the wrong default.
+  [[ -r "$log" ]] || die "check_no_content_ids: $log unreadable"
+  grep -v "^  sender " "$log" | grep -qE "[0-9a-f]{64}" \
+    && die "content-id-shaped token in $log"
+  pass "no content-id-shaped tokens in $(basename "$log")"
+}
+
 # --- mount helpers -------------------------------------------------------
 # Mounts run as background jobs in this shell so `wait` reports their real
 # exit status. Readiness is polled via mountpoint(1), not via listing: an

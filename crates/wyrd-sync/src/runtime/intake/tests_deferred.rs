@@ -188,8 +188,10 @@ fn drain_report_splits_deferred_by_cause() {
 
     // Fill the pending bound with unseen-bound announcements, then
     // one status-blocked announcement (held: the bound is exact),
-    // then one more unseen announcement (sheds past the bound).
-    let mut mail = Vec::with_capacity(MAX_PENDING_MESSAGES + 1);
+    // then one more unseen announcement (sheds past the bound with
+    // its wait classified), then one more status-blocked
+    // announcement (sheds the same way).
+    let mut mail = Vec::with_capacity(MAX_PENDING_MESSAGES + 2);
     for _ in 0..MAX_PENDING_MESSAGES - 1 {
         mail.push(deliver(
             &fixture,
@@ -207,11 +209,22 @@ fn drain_report_splits_deferred_by_cause() {
         2,
         &announcement_for(2, child_b.transition_id()),
     ));
+    mail.push(deliver(
+        &fixture,
+        2,
+        &announcement_for(2, child_a.transition_id()),
+    ));
     queue(&mut fixture, mail);
     let report = drain(&mut fixture);
     assert_eq!(report.deferred_unseen, MAX_PENDING_MESSAGES - 1);
     assert_eq!(report.deferred_status_blocked, 1);
-    assert_eq!(report.deferred_shed, 1);
+    assert_eq!(report.deferred_shed, 2);
+    // Pending-bound sheds carry the wait classification already
+    // computed: the bound turned away one unseen wait and one
+    // status-blocked wait, and parked nothing for either.
+    assert_eq!(report.deferred_shed_unseen, 1);
+    assert_eq!(report.deferred_shed_status_blocked, 1);
+    assert_eq!(fixture.engine.pending_count(), MAX_PENDING_MESSAGES);
     assert_eq!(
         report.deferred,
         report.deferred_unseen + report.deferred_status_blocked + report.deferred_shed

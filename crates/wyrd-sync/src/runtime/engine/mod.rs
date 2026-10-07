@@ -296,7 +296,23 @@ pub struct DrainReport {
     /// Shed past the intake commit budget, the sender quota, or the
     /// pending bound: the relay retains the envelope and the next pass
     /// revalidates from scratch. Self-resolving, nothing to diagnose.
+    /// Budget, quota, and charge-time sheds stay unclassified by
+    /// design — the shed decision runs before classification precisely
+    /// to avoid spending verification, so no cause exists to record —
+    /// and only pending-bound sheds (classified first, shed second)
+    /// carry a wait into the two sub-counters below.
     pub deferred_shed: usize,
+    /// Pending-bound sheds whose dependency was already classified
+    /// when the bound tripped: the classification ran (verification
+    /// spent) before the resource decision, so the wait is known
+    /// exactly. Partitions `deferred_shed` alongside
+    /// `deferred_shed_status_blocked` and the unclassified remainder
+    /// below — a genuine partition of shed, and of nothing else.
+    pub deferred_shed_unseen: usize,
+    /// Pending-bound sheds held on an observed-but-not-yet-
+    /// authorizing transition: same classification discipline as
+    /// `deferred_shed_unseen`, same partition membership.
+    pub deferred_shed_status_blocked: usize,
     /// Envelopes not yet processable (unknown epoch key); left unacked
     /// for redelivery.
     pub skipped: usize,

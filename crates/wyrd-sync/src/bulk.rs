@@ -443,6 +443,7 @@ impl IrohBulkSource {
         ));
         if !finished {
             tracing::warn!(
+                stage = "bulk",
                 graceful_deadline_ms = deadline.as_millis(),
                 "bulk endpoint close exceeded the graceful deadline; aborting the endpoint"
             );

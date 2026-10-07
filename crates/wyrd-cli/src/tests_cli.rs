@@ -167,7 +167,6 @@ fn combine_status_fails_dead_sessions() {
     let clean = || TeardownStatus {
         loop_result: Ok(()),
         session_result: Ok(()),
-        bulk_result: Ok(()),
         serving_result: Ok(()),
     };
     assert!(
@@ -198,7 +197,6 @@ fn combine_status_fails_dead_sessions() {
         combine_status(TeardownStatus {
             loop_result: Err(CliError::Live(LiveError::Lock)),
             session_result: Err(CliError::Mount(std::io::Error::other("dead"))),
-            bulk_result: Err(CliError::Bulk(std::io::Error::other("bulk"))),
             serving_result: Err(CliError::Serving(std::io::Error::other("serving"))),
         })
         .is_err(),
@@ -209,14 +207,12 @@ fn combine_status_fails_dead_sessions() {
 /// Transport shutdown failures fail the mount instead of vanishing:
 /// a serving shutdown that errored is an operational cause the exit
 /// status must name. (Bulk is graceful-or-abort and infallible by
-/// construction, so only serving can fail here; the fold still maps
-/// a bulk Err to Bulk for shape stability.)
+/// construction, so only serving can fail here.)
 #[test]
 fn combine_status_reports_transport_shutdown_failures() {
     let clean = || TeardownStatus {
         loop_result: Ok(()),
         session_result: Ok(()),
-        bulk_result: Ok(()),
         serving_result: Ok(()),
     };
     assert!(

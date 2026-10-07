@@ -38,6 +38,9 @@ SIGINT/SIGTERM, which tears down in order: unmount and session join
 first (`destroy` commits still-dirty handles against the still-open
 mutation queue), then admission close and the loop join, then
 transport (mailbox, bulk source, serving) under bounded deadlines.
+Bulk closes graceful-or-abort (always success; a wedged drain warns
+and aborts), so only loop, session, and serving outcomes fold into
+the exit status.
 A process holding a file open on the mount delays the session join
 until it closes — unmount refuses a busy mount — so SIGINT waits
 for the last descriptor; the stop budgets bind the unmount itself,

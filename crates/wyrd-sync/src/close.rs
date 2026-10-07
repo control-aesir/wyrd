@@ -1,8 +1,16 @@
-//! Shared teardown primitive: bound a graceful transport stop by a
-//! deadline. A stalled peer must turn into a reported `TimedOut`
-//! instead of an unbounded wait. One home for both transport
-//! shutdowns (bulk source, serving endpoint) so the bound cannot
-//! drift between them.
+//! Shared teardown primitives: bound a transport stop by a
+//! deadline, and bound the graceful half of an endpoint close
+//! separately from failure. A stalled graceful close must turn into
+//! an abort (drop the endpoint and its runtime) instead of an
+//! unbounded wait or a failed shutdown: shutdown success means Wyrd
+//! stopped its own work and released its resources, not that relay
+//! infrastructure acknowledged graceful closure. One home for the
+//! teardown bounds (bulk graceful-or-abort, serving fail-on-wedge)
+//! so they cannot drift silently: serving keeps fail-on-wedge
+//! because its stop folds a router shutdown whose failure is a
+//! product signal (a panicked accept task names a real defect),
+//! while a bulk graceful drain waits only on drain-acks from relay
+//! connections that carry no product signal at all.
 
 /// Bound on the graceful half of transport shutdown: long enough
 /// for ordinary local/loopback close completion (clean closes land

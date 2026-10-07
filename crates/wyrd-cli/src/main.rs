@@ -1135,7 +1135,7 @@ fn mount(
     // abort), so teardown proceeds to serving unconditionally. A
     // wedged drain must not fail a shutdown whose application work
     // already stopped; see GRACEFUL_CLOSE_DEADLINE.
-    bulk.shutdown(wyrd_sync::close::GRACEFUL_CLOSE_DEADLINE);
+    bulk.shutdown(wyrd_sync::GRACEFUL_CLOSE_DEADLINE);
     tracing::info!(
         stage = "teardown",
         elapsed_ms = teardown_start.elapsed().as_millis(),
@@ -1161,7 +1161,6 @@ fn mount(
     combine_status(TeardownStatus {
         loop_result: loop_result.map(|_| ()),
         session_result,
-        bulk_result: Ok(()),
         serving_result: serving_status,
     })
 }
@@ -2456,7 +2455,7 @@ fn sync_now(
     // A sync failure still tears transport down before returning it.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
     if let Some(bulk) = bulk.take() {
-        bulk.shutdown(wyrd_sync::close::GRACEFUL_CLOSE_DEADLINE);
+        bulk.shutdown(wyrd_sync::GRACEFUL_CLOSE_DEADLINE);
     }
     drop(bulk);
     drop(live);
@@ -2467,7 +2466,6 @@ fn sync_now(
     combine_status(TeardownStatus {
         loop_result: outcome,
         session_result: Ok(()),
-        bulk_result: Ok(()),
         serving_result: Ok(()),
     })
 }

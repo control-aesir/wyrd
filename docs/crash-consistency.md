@@ -399,8 +399,8 @@ matrix is kept: the windows above name the scrub-specific order
 
 Unmount commits still-dirty handles best-effort before dropping the
 handle table, and stops the mailbox, bulk source, and serving endpoint
-under bounded deadlines with every outcome folded into the exit
-status. The commit executes against the still-open queue on every
+under bounded deadlines with the fallible outcomes folded into the
+exit status (bulk is graceful-or-abort and cannot fail). The commit executes against the still-open queue on every
 shutdown path: the loop returns without settling, the session joins
 first (destroy submits while the post-return drain executes
 concurrently), admission closes only after the join — the session
@@ -425,8 +425,10 @@ Pinned by
 `destroy_commits_dirty_write_handles_while_queue_live`,
 `destroy_after_queue_shutdown_clears_without_hanging`
 (`wyrd-daemon/src/fuse/tests_backend.rs`),
-`close_deadline_reports_a_stalled_close` and
-`zero_deadline_trips_a_stalled_stop_but_spares_a_ready_one`
+`close_deadline_reports_a_stalled_close`,
+`zero_deadline_trips_a_stalled_stop_but_spares_a_ready_one`,
+`graceful_close_inside_the_deadline_reports_finished`, and
+`stalled_close_reports_unfinished_inside_a_bound`
 (`wyrd-sync/src/close.rs`),
 `live_close_returns_past_a_zero_deadline` (`wyrd-sync/src/bulk.rs`),
 `live_serving_stop_returns_past_a_zero_deadline` and

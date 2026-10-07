@@ -587,3 +587,144 @@ fn scrubbed_chunk_heals_from_a_live_peer_without_a_waiter() {
     loaded.rig.teardown();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Contract 54 (`scrubbed_append_heals_from_a_live_peer_without_remount`):
+/// the peer-served half of the write-path loss claim. The member
+/// holds a verified chunk under a durable claim; host-side surgery
+/// deletes the live file; an appending writer then commits while
+/// the loop runs against the live peer. The first evaluation finds
+/// the base gone, the scrub unclaims it on the same pass, the
+/// refetch heals, and the commit lands — extended content served
+/// through the same mount, no remount, no restart.
+#[test]
+fn scrubbed_append_heals_from_a_live_peer_without_remount() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wyrd_core::live::LiveParts;
+
+    const BODY: &[u8] = b"append through scrub";
+    const APPEND: &[u8] = b"!";
+    let mut loaded = Loaded::new("extend.txt", BODY);
+    loaded.publish_all();
+    loaded.publish_body_and_announcement(None);
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+    let mut engine = loaded.rig.take_engine();
+    loaded.want_all(&mut engine);
+    let chunk = *loaded
+        .content
+        .content_ids
+        .iter()
+        .find(|id| **id != loaded.content.tree_id)
+        .expect("the fixture carries a chunk beside its tree");
+
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-contracts-scrub-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+    let (mut live, parts) = node
+        .into_live(Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut available = false;
+    while started.elapsed() < Duration::from_secs(120) {
+        live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+            .unwrap();
+        let slot = parts.projection.read().unwrap();
+        if slot.view().status(&chunk) == FetchStatus::Available
+            && slot.view().lookup("extend.txt").is_ok()
+        {
+            available = true;
+            break;
+        }
+    }
+    assert!(available, "the member fetched the chunk verified");
+
+    // Step 1: out-of-band loss — the live file simply vanishes.
+    let hex = chunk.to_string();
+    let live_name = dir
+        .join("objects")
+        .join("objects")
+        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::remove_file(&live_name).unwrap();
+
+    // Step 2: the appending writer commits while the loop pumps
+    // against the live peer. The base is gone, so the first
+    // evaluation defers — then the scrub unclaims, the refetch
+    // heals, and the commit lands.
+    let LiveParts {
+        projection,
+        wants,
+        mutations,
+        open_timeout,
+        budgets,
+    } = &parts;
+    let mut backend = FuseBackend::shared_with_wants(
+        Arc::clone(projection),
+        Arc::clone(wants),
+        Arc::clone(mutations),
+        *open_timeout,
+        budgets,
+    );
+    backend.set_quarantine(Arc::clone(live.quarantine_queue()));
+    backend.set_scrub(Arc::clone(live.scrub_queue()));
+    let done = Arc::new(AtomicBool::new(false));
+    let mut committed = false;
+    std::thread::scope(|scope| {
+        let commit_done = Arc::clone(&done);
+        let writer = scope.spawn(move || {
+            let handle = backend
+                .open_write("extend.txt", libc::O_WRONLY | libc::O_APPEND)
+                .expect("the path still resolves");
+            backend
+                .write_handle(handle, 0, APPEND)
+                .expect("the append buffers");
+            let outcome = backend.commit_handle(handle);
+            commit_done.store(true, Ordering::SeqCst);
+            outcome
+        });
+        // The loop repairs and refetches while the commit waits:
+        // unclaim on an early pass, refetch from the live peer,
+        // author over the healed base. Deadline-bounded like the
+        // contracts above; the commit's own prerequisite deadline
+        // bounds the writer even if the loop stalls.
+        let started = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(120) {
+            live.sync_once(&mut loaded.rig.relay, Some(&mut loaded.bulk))
+                .unwrap();
+        }
+        let outcome = writer.join().expect("the writer thread joins");
+        assert_eq!(outcome, Ok(()), "the append lands once the refetch heals");
+        committed = true;
+    });
+    assert!(committed, "the writer finished inside the deadline");
+
+    // Serving continues on the extended bytes: a fresh open reads
+    // the original body plus the append through the same backend.
+    let backend = FuseBackend::shared_with_wants(
+        Arc::clone(projection),
+        Arc::clone(wants),
+        Arc::clone(mutations),
+        *open_timeout,
+        budgets,
+    );
+    let handle = backend.open_at("extend.txt").unwrap();
+    let mut expected = BODY.to_vec();
+    expected.extend_from_slice(APPEND);
+    assert_eq!(
+        backend
+            .read_handle(handle, 0, expected.len() as u32)
+            .unwrap(),
+        expected,
+        "post-heal reads serve the extended bytes"
+    );
+    loaded.rig.teardown();
+    std::fs::remove_dir_all(dir).unwrap();
+}

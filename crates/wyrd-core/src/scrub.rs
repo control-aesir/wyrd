@@ -6,9 +6,9 @@
 //! Two detectors feed one queue:
 //! - readers that hit a claimed identity with no bytes report the
 //!   loss at read time (the view's `LostRepresentation` shape);
-//! - a bounded per-pass walk re-stats manifest entries against the
-//!   store from a rotating in-memory cursor, so loss no reader has
-//!   touched is still found within a sweep.
+//! - a bounded per-pass walk re-stats locally claimed identities
+//!   against the store from a rotating in-memory cursor, so loss
+//!   no reader has touched is still found within a sweep.
 //!
 //! Three separations mirror the quarantine drain's:
 //! - The missing bytes are not unlinked (there is nothing to
@@ -164,15 +164,15 @@ pub struct ScrubReport {
 /// `max_probes` stats: each claim costs one `has`, and claims are
 /// iterated directly (never the manifest history), so a healthy
 /// mostly-remote drive pays almost nothing per pass. The sweep
-/// resumes past `cursor` and wraps once, so every pass makes
-/// coverage progress and a full sweep completes no matter how many
-/// identities the drive holds. `cursor` is memory-only
+/// resumes past `cursor` and wraps once — one chained iteration
+/// past the end back to the beginning, stopped by the
+/// probe-budget break rather than by a separate wrap mechanism —
+/// so every pass makes coverage progress and a full sweep
+/// completes no matter how many identities the drive holds.
+/// `cursor` is memory-only
 /// (strike-ledger precedent): a restart restarts the sweep,
 /// deterministically ordered, so no loss is ever skipped — only
-/// re-statted. The sweep wraps past the end back to the
-/// beginning as one chained iteration; the probe-budget break is
-/// what stops it, so "wrap once" is a consequence of the budget,
-/// not a separate mechanism.
+/// re-statted.
 ///
 /// The store read lock is acquired once around the walk: the walk
 /// never mutates the store, so one acquisition is both cheaper

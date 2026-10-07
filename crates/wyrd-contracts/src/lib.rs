@@ -259,6 +259,10 @@
 //!     claim, the intact `Cached` policy reconciles back to
 //!     pending, and the live peer serves the fresh fetch back to
 //!     verified `Available` (`docs/peer-repair.md`, child 13).
+//! 54. `scrubbed_append_heals_from_a_live_peer_without_remount` —
+//!     the peer-served half of the write-path loss claim: an
+//!     append over a lost base commits once the refetch heals,
+//!     through the same mount with no remount or restart.
 
 #[cfg(test)]
 mod egress_contracts;

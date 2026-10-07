@@ -149,9 +149,7 @@ memory-only cursor, OD-13-3 clear-with-size-zero):
   trigger signal, so the presence walk runs on every pass —
   bounded by `max_scrub_per_pass` stats over locally claimed
   identities (O(claims), never O(history)), reusing admission's
-  snapshot when it took one. A walk-found loss heals one pass
-  later than a read-found one; beside a full sweep's rotation
-  that latency is immaterial.
+  snapshot when it took one.
 - **Memory-only cursor** (OD-13-2): the sweep position resets on
   restart like the strike ledgers. A restart re-sweeps from the
   beginning, deterministically ordered — coverage, never
@@ -165,7 +163,11 @@ memory-only cursor, OD-13-3 clear-with-size-zero):
   (no second rebuild on active passes); the drain clears
   walk-found and read-found losses on the same pass they are
   observed, so the fetch plan reconciles each cleared claim back
-  to pending without waiting another pass. The walk reads the
+  to pending without waiting another pass. The quarantine drain
+  deliberately stays ahead of admission (its cleared claim must
+  reconcile before the waiter's want admits) while the scrub
+  drain sits after the walk: the asymmetry is load-bearing, not
+  a tidy-up candidate. The walk reads the
   snapshot `admit_wants` just mutated in place — safe because
   admission commits only `Fact::Materialization`, which never
   moves a local claim; if admission ever commits a claim-moving

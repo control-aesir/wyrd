@@ -102,8 +102,12 @@ if os.environ["WYRD_MODE"] == "read":
 else:
     indent = line[: line.index("- location:")]
     lines[i] = indent + "- location: " + json.dumps(os.environ["WYRD_ROOT"], ensure_ascii=False)
-    shutil.copy(path, path + ".bak")
-    tmp = path + ".tmp"
+    # Unlink first: a previous read-only backup must not block this one;
+    # unlinking needs directory permission, which the operator has.
+    for stale in (path + ".bak", tmp):
+        if os.path.exists(stale):
+            os.unlink(stale)
+    shutil.copyfile(path, path + ".bak")
     open(tmp, "w", encoding="utf-8").write("\n".join(lines))
     shutil.copymode(path, tmp)
     os.replace(tmp, path)

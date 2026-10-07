@@ -242,6 +242,10 @@ version say exactly what changed.
   invariants, so the bare counts were ambiguous. The orphan-ignore half
   of entry 32 additionally points at `docs/crash-consistency.md`, where
   `orphan_files_are_ignored` is pinned.
+- Correct entry 28's wording in the upgrade-contracts index and its test:
+  the gate-half probe forges a sealed control version and fails closed
+  with `ControlError::UnknownVersion`, not a forged envelope version
+  failing open (comment only).
 
 ## [0.2.0-alpha]
 

@@ -581,8 +581,8 @@ fn upgrade_derived_state_rebuilds_from_facts() {
 }
 
 /// Invariant 5 (gate half): protocol negotiation is capability-based,
-/// and anything outside the matrix fails with a named error. A sealed
-/// message with a forged envelope version fails open loudly — the
+/// and anything outside the matrix fails closed with a named error. A
+/// sealed control message with a forged version refuses loudly — the
 /// pre-v1 gate today is `CONTROL_VERSION` equality.
 #[test]
 fn upgrade_mixed_versions_fail_named() {

@@ -111,6 +111,8 @@ n0-future = "=0.3.2"
 # pulls defmt/bitflags-1.3.2 entries into the lock that nothing compiles,
 # though the audit gate still covers them.
 nostr = { version = "0.45.5", default-features = false, features = ["std", "nip44", "nip59", "os-rng"] }
+# (nostr-connect was dropped as an unused pin; NIP-46 session wiring
+# re-adds it here with the wyrd-daemon allow-list entry — trust.md T16.)
 nostr-sdk = { version = "0.45.2", default-features = false, features = ["rustls-tls-webpki-roots"] }
 
 # property testing (dev-only: generated-sequence suites for the state

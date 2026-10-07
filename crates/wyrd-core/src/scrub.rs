@@ -20,7 +20,8 @@
 //!   observation and travels the queue, so emission precedes the
 //!   claim-clear structurally: the drain cannot clear a claim it
 //!   has not already reported.
-//! - Missing bytes are not corruption evidence (invariant 7 binds
+//! - Missing bytes are not corruption evidence (invariant 7 of
+//!   the peer-repair design, `docs/peer-repair.md:171`, binds
 //!   quarantine to that): the scrub queue is separate from the
 //!   quarantine queue, and a verification failure never lands here.
 //!
@@ -159,19 +160,24 @@ pub struct ScrubReport {
     pub failures: u64,
 }
 
-/// Re-stat claimed manifest entries against the store, at most
-/// `max_probes` stats: memory-only filtering (`is_local`) costs
-/// nothing, each claimed entry costs one `has`. The sweep resumes
-/// past `cursor` and wraps once, so every pass makes coverage
-/// progress and a full sweep completes no matter how many entries
-/// the drive holds. `cursor` is memory-only (strike-ledger
-/// precedent): a restart restarts the sweep, deterministically
-/// ordered, so no loss is ever skipped — only re-statted.
+/// Re-stat locally claimed identities against the store, at most
+/// `max_probes` stats: each claim costs one `has`, and claims are
+/// iterated directly (never the manifest history), so a healthy
+/// mostly-remote drive pays almost nothing per pass. The sweep
+/// resumes past `cursor` and wraps once, so every pass makes
+/// coverage progress and a full sweep completes no matter how many
+/// identities the drive holds. `cursor` is memory-only
+/// (strike-ledger precedent): a restart restarts the sweep,
+/// deterministically ordered, so no loss is ever skipped — only
+/// re-statted.
 ///
-/// A store stat failure counts the entry and moves on: an
-/// unreadable store must neither wedge the sweep on one identity
-/// nor submit an observation the drain cannot re-verify. Returns
-/// the observations alongside the probe failure count; the caller
+/// The store read lock is acquired once around the walk: the walk
+/// never mutates the store, so one acquisition is both cheaper
+/// and a steadier snapshot than per-probe locking. A store stat
+/// failure counts the identity and moves on: an unreadable store
+/// must neither wedge the sweep on one identity nor submit an
+/// observation the drain cannot re-verify. Returns the
+/// observations alongside the probe failure count; the caller
 /// submits the former and reports the latter.
 pub fn probe_presence<S>(
     snapshot: &RuntimeState,
@@ -183,40 +189,48 @@ where
     S: ObjectStore,
     S::Error: std::fmt::Debug,
 {
-    let entries = snapshot.manifest_contents();
-    if entries.is_empty() || max_probes == 0 {
+    let claims = snapshot.local_claims();
+    if claims.is_empty() || max_probes == 0 {
         return Ok((Vec::new(), 0));
     }
     let start = match cursor {
-        Some(id) => entries.partition_point(|(entry, _)| entry <= id),
+        Some(id) => claims.partition_point(|claim| claim <= id),
         None => 0,
     };
     let mut observations = Vec::new();
     let mut failures = 0u64;
-    let mut probes = 0usize;
     let mut last: Option<ContentId> = None;
+    let guard = store.read().map_err(|_| LiveError::Lock)?;
     // One wrap at most: the head segment runs only when the tail
     // did not fill the probe budget.
-    for (entry, kind) in entries[start..].iter().chain(entries[..start].iter()) {
+    for (probes, claim) in claims[start..]
+        .iter()
+        .chain(claims[..start].iter())
+        .enumerate()
+    {
         if probes >= max_probes {
-            // The budget ran out before this entry was considered:
+            // The budget ran out before this claim was statted:
             // the cursor stays behind it, so the next pass stats
             // it instead of skipping it forever.
             break;
         }
-        last = Some(*entry);
-        if !snapshot.is_local(entry) {
-            continue;
-        }
-        probes += 1;
-        let guard = store.read().map_err(|_| LiveError::Lock)?;
-        match guard.has(entry) {
+        last = Some(*claim);
+        match guard.has(claim) {
             Ok(true) => {}
-            Ok(false) => observations.push(ScrubObservation::missing(*entry, *kind)),
+            Ok(false) => {
+                // Miss-path only: resolve the diagnostic kind from
+                // the manifests here, so the per-pass walk never
+                // pays the O(history) scan for healthy claims. A
+                // claim no entry names still reports (the drain
+                // clears it with size zero); the kind falls back
+                // to the chunk domain.
+                let kind = snapshot.content_kind(claim).unwrap_or(ObjectKind::Chunk);
+                observations.push(ScrubObservation::missing(*claim, kind));
+            }
             Err(error) => {
                 tracing::error!(
                     error = ?error,
-                    content = ?entry,
+                    content = ?claim,
                     "scrub probe failed; loss unknown, skipping"
                 );
                 failures += 1;
@@ -246,9 +260,11 @@ where
 ///    for already-absent claims, so a repeated report commits
 ///    nothing) and subtract their manifest-recorded sizes from the
 ///    retained accountant. The intact residency policy reconciles
-///    each cleared identity back to pending on the same pass, and
-///    the background plan re-drives the fetch with no waiter
-///    synthesized.
+///    each cleared identity back to pending — on the same pass
+///    for read-found losses (the drain runs ahead of admission),
+///    on the next pass for walk-found ones (the walk submits
+///    after admission) — and the background plan re-drives the
+///    fetch with no waiter synthesized.
 ///
 /// A poisoned store lock aborts the drain with the remaining items
 /// still queued.
@@ -277,31 +293,40 @@ where
     if pending.is_empty() {
         // The idle path costs nothing: no rebuild, no commit, no
         // store lock. A pass with no observed loss must not pay
-        // for the repair machinery (the walk above already paid
-        // its bounded stats; the drain adds nothing).
+        // for the repair machinery (the walk below pays its own
+        // bounded stats; the drain adds nothing).
         return Ok(report);
     }
-    let mut missing = Vec::new();
-    for observation in &pending {
+    // One read acquisition around the re-verify: nothing here
+    // mutates the store, so a single guard is both cheaper and
+    // steadier than per-item locking. Scoped past the commit
+    // below: the fact-log fsync must never run under the
+    // object-store lock, or a pass that both unclaims and lands
+    // bytes would serialize the two on one guard.
+    let missing = {
         let guard = store.read().map_err(|_| LiveError::Lock)?;
-        match guard.has(&observation.content()) {
-            Ok(true) => {
-                tracing::debug!(
-                    content = ?observation.content(),
-                    "scrub found healed bytes; claim stands"
-                );
-            }
-            Ok(false) => missing.push(observation.content()),
-            Err(error) => {
-                tracing::error!(
-                    error = ?error,
-                    content = ?observation.content(),
-                    "scrub re-verify failed; claim kept, loss unconfirmed"
-                );
-                report.failures += 1;
+        let mut missing = Vec::new();
+        for observation in &pending {
+            match guard.has(&observation.content()) {
+                Ok(true) => {
+                    tracing::debug!(
+                        content = ?observation.content(),
+                        "scrub found healed bytes; claim stands"
+                    );
+                }
+                Ok(false) => missing.push(observation.content()),
+                Err(error) => {
+                    tracing::error!(
+                        error = ?error,
+                        content = ?observation.content(),
+                        "scrub re-verify failed; claim kept, loss unconfirmed"
+                    );
+                    report.failures += 1;
+                }
             }
         }
-    }
+        missing
+    };
     if missing.is_empty() {
         return Ok(report);
     }
@@ -540,19 +565,22 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Entries without a claim cost no stats: never-fetched
-    /// content must not construct loss observations, and the
-    /// cursor still advances past it so coverage never stalls on
-    /// remote-only stretches.
+    /// Entries without a claim never enter the walk: the sweep
+    /// iterates claims, not manifest history, so never-fetched
+    /// content costs no stat and constructs no loss observation —
+    /// while the claimed half still sweeps normally.
     #[test]
     fn probe_skips_unclaimed_entries() {
         let (mut engine, dir) = test_engine("skip");
         let mut store = FsObjectStore::open(dir.join("objects-store")).unwrap();
-        let chunk = author_claimed_chunk(&mut engine, &mut store, b"unwanted");
-        // Unclaim without touching the policy: a `Cached` identity
-        // with no claim and no bytes is demand, not loss.
-        engine.record_object_removed(chunk).unwrap();
-        assert!(!engine.runtime_state().unwrap().is_local(&chunk));
+        let kept = author_claimed_chunk(&mut engine, &mut store, b"kept");
+        let dropped = author_claimed_chunk(&mut engine, &mut store, b"dropped");
+        // Unclaim without touching the policy or the bytes: a
+        // `Cached` identity with no claim and present bytes is
+        // demand, not loss — and the walk must not stat it.
+        engine.record_object_removed(dropped).unwrap();
+        assert!(!engine.runtime_state().unwrap().is_local(&dropped));
+        std::fs::remove_file(live_name(&dir, &dropped)).unwrap();
         let snapshot = engine.runtime_state().unwrap();
         let store = RwLock::new(store);
         let mut cursor = None;
@@ -560,7 +588,11 @@ mod tests {
         let (observations, failures) = probe_presence(&snapshot, &store, &mut cursor, 64).unwrap();
         assert!(observations.is_empty());
         assert_eq!(failures, 0);
+        // The sweep ran (cursor moved past the claimed half);
+        // the unclaimed half was never statted — its deleted
+        // file would otherwise have observed.
         assert!(cursor.is_some());
+        assert!(engine.runtime_state().unwrap().is_local(&kept));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -581,6 +613,58 @@ mod tests {
 
         assert_eq!(report, ScrubReport::default());
         assert!(emitted.is_empty());
+        assert_eq!(engine.current(), committed);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A store that cannot answer presence keeps its claims: the
+    /// re-verify fails closed (loss unconfirmed, never cleared),
+    /// counts the failure, and commits nothing — while the
+    /// diagnostic was already emitted, so the observation is
+    /// never silently lost.
+    #[test]
+    fn reverify_failure_keeps_claim_and_counts() {
+        struct UnreadableStore;
+        #[derive(Debug)]
+        struct UnreadableError;
+        impl wyrd_format::StoreError for UnreadableError {}
+        impl ObjectStore for UnreadableStore {
+            type Error = UnreadableError;
+            fn insert(&mut self, _kind: ObjectKind, data: &[u8]) -> Result<ContentId, Self::Error> {
+                Ok(ContentId::derive(ObjectKind::Chunk, data))
+            }
+            fn insert_verified(
+                &mut self,
+                _kind: ObjectKind,
+                _expected: &ContentId,
+                _data: &[u8],
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn get(&self, _id: &ContentId) -> Result<Option<Vec<u8>>, Self::Error> {
+                Err(UnreadableError)
+            }
+            fn has(&self, _id: &ContentId) -> Result<bool, Self::Error> {
+                Err(UnreadableError)
+            }
+        }
+
+        let (mut engine, dir) = test_engine("unreadable");
+        let content = ContentId::derive(ObjectKind::Chunk, b"unknown");
+        let committed = engine.current();
+        let queue = ScrubQueue::default();
+        queue.submit(ScrubObservation::missing(content, ObjectKind::Chunk));
+        let store = RwLock::new(UnreadableStore);
+        let mut emitted = Vec::new();
+        let report = drain_scrub(&queue, &store, None, &mut engine, 64, &mut |observation| {
+            emitted.push(observation)
+        })
+        .unwrap();
+
+        assert_eq!(emitted.len(), 1, "diagnostic precedes the failed check");
+        assert_eq!(report.observed, 1);
+        assert_eq!(report.claims_cleared, 0);
+        assert_eq!(report.failures, 1);
         assert_eq!(engine.current(), committed);
         std::fs::remove_dir_all(dir).unwrap();
     }

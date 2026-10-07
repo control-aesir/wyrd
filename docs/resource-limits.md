@@ -49,6 +49,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 | Want registry identities (pending + admitted) | `max_pending_wants` (4096) | registration fails; `EIO` at the POSIX boundary, never a silent drop |
 | Want admission per sync pass | `max_admit_per_pass` (1024) | remainder stays pending for the next pass — paced, never dropped |
 | Quarantine repairs per sync pass | `max_quarantine_per_pass` (64) | remainder stays queued for the next pass — paced, never dropped |
+| Scrub probes plus scrub repairs per sync pass | `max_scrub_per_pass` (64) | the walk stats at most this many claims from its rotating cursor (O(claims) scan, one log replay only when admission took no snapshot) and the drain repairs at most this many losses — remainder waits for the next pass, never dropped |
 | Mutation queue (admitted-but-incomplete) | `max_pending_mutations` (4096) | submission fails `Saturated`; `EAGAIN` |
 | Parent create tokens (distinct retained paths) | `max_parent_tokens` (4096) | new parent capture fails closed; `ESTALE` at the FUSE boundary |
 | Write buffer per dirty handle | `write_per_handle_bytes` (64 MiB) | reservation refused; `ENOSPC`, handle unchanged |

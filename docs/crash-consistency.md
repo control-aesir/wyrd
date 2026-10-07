@@ -388,7 +388,12 @@ freshness, is what a restart loses). Pinned by
 manifest-sized subtract), `healed_bytes_keep_their_claim`
 (re-verify before clear), and
 `probe_covers_entries_in_bounded_slices` (bounded slices plus
-wrap) (`wyrd-core/src/scrub.rs`).
+wrap) (`wyrd-core/src/scrub.rs`). The scrub commits through the
+same `DurableStore::commit` path and fact kind
+(`ObjectRemoved`) the quarantine matrix
+(`crash_matrix_never_hybrid`) already covers, so no second crash
+matrix is kept: the windows above name the scrub-specific order
+(the re-verify), and the shared commit path carries the rest.
 
 ## Unmount teardown
 

@@ -340,11 +340,18 @@ MutationRequest {
    returns. There is no path where `fsync` fails and the mutation
    nevertheless applies later.
 4. **Held for authoring prerequisites, with a deadline.** A mutation
-   whose base closure references remote-only content cannot author:
+   whose base closure    references remote-only content cannot author:
    the resolver (`ChunkUnavailable`) names the missing chunk, the loop
    registers it as an ordinary fetch want, and the mutation waits —
    pinned to the single head its first evaluation used, so the retry
-   can never silently rebase onto newer state. A changed, emptied, or
+   can never silently rebase onto newer state. Content lost
+   out of band fails the first attempt fast (the stale claim is
+   still intact when it evaluates, so the want admits nothing
+   and the commit fails closed `EIO`): the background scrub
+   unclaims the loss on its own passes, and a retry then behaves
+   like an append over never-fetched content — waits bounded for
+   a peer, `ETIMEDOUT` with none. Fail fast first, heal behind,
+   retry with parity. A changed, emptied, or
    multiplied head set fails the retry `Stale`, exactly like a raced
    handle commit. The wait is bounded by `max_mutation_wait` (default
    30s, wall-clock from admission — the caller has been blocked since

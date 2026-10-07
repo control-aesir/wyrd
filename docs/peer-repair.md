@@ -137,10 +137,47 @@ Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
   invalid may be deleted, through a narrowly named discard — never
   a general `ObjectStore::remove`. The implementation distinguishes
   the bad physical bytes, the durable possession claim (cleared via
-  the sole `ObjectRemoved` writer), and the demand state, so no
+  an `ObjectRemoved` commit), and the demand state, so no
   stale claim pretends deleted bytes still exist. Claim-clear
   precedes unlink, so a crash converges either way
   (`docs/crash-consistency.md`, quarantine repair).
+
+Decided for child 13 (OD-13-1 walk-every-pass, OD-13-2
+memory-only cursor, OD-13-3 clear-with-size-zero):
+
+- **Walk every pass, capped** (OD-13-1): out-of-band loss has no
+  trigger signal, so the presence walk runs on every pass —
+  bounded by `max_scrub_per_pass` stats over locally claimed
+  identities (O(claims), never O(history)), reusing admission's
+  snapshot when it took one. A walk-found loss heals one pass
+  later than a read-found one; beside a full sweep's rotation
+  that latency is immaterial.
+- **Memory-only cursor** (OD-13-2): the sweep position resets on
+  restart like the strike ledgers. A restart re-sweeps from the
+  beginning, deterministically ordered — coverage, never
+  freshness, is what a restart loses.
+- **Claim with no manifest entry still clears, with size zero**
+  (OD-13-3): the projection must stop lying even when the
+  accountant has nothing to subtract, and the reopen walk
+  re-seeds the count from the store.
+- **Placement: drain ahead of admission, walk after it.** The
+  drain clears read-found losses on the same pass they are
+  reported, so the waiter's want drives a fresh fetch without
+  waiting another pass; the walk submits for the next pass's
+  drain. Recorded here because the issue left the placement open.
+- **The install gate's tree/chunk asymmetry bounds what the
+  placement buys.** `verify_head_closure` reads every tree
+  through the store (a lost tree fails the install as
+  `TreeUnavailable`) but checks chunks for entry/mapping
+  consistency only — so the scrub heals lost chunks behind an
+  installed head rather than holding the install. Moving chunk
+  presence into the gate is a separate change, deliberately not
+  taken here: it would turn every install into a full-store stat
+  pass.
+- **No second discard path.** The scrub never unlinks: bytes
+  already gone need no removal, so there is no narrow-discard
+  analogue and no new store operation. The accountant subtract
+  is the only state the scrub mutates besides the claim.
 
 ## Part 2 — replication serving (after measurement; v0.7 home)
 

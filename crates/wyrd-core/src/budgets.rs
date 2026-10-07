@@ -17,7 +17,9 @@
 //! verify-read and store write lock) — all sized
 //! generously (see each default). `max_scrub_per_pass` joins the
 //! intentional family: the presence walk's bounded stats plus the
-//! scrub drain's batched claim-clear per pass. The `wyrd` binary itself takes no tuning flags
+//! scrub drain's batched claim-clear per pass.
+//!
+//! The `wyrd` binary itself takes no tuning flags
 //! today and runs defaults; these are library-level settings until a
 //! configuration surface lands. The sync-engine bounds
 //! (`MAX_PENDING_MESSAGES`, fetch backoff) stay constants: they are

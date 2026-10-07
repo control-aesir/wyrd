@@ -1851,14 +1851,26 @@ impl Engine {
             return Ok((0, 0));
         }
         let mut bytes = 0u64;
+        // One pass over the manifests for the whole batch: first
+        // entry naming an identity wins, and the walk stops early
+        // once every cleared identity has its size.
+        let wanted: BTreeSet<&ContentId> = ids.iter().collect();
+        let mut sizes: BTreeMap<ContentId, u64> = BTreeMap::new();
+        for record in runtime.manifests.values() {
+            for entry in record.manifest.entries() {
+                if wanted.contains(&entry.content_id) && !sizes.contains_key(&entry.content_id) {
+                    sizes.insert(entry.content_id, entry.size);
+                    if sizes.len() == ids.len() {
+                        break;
+                    }
+                }
+            }
+            if sizes.len() == ids.len() {
+                break;
+            }
+        }
         for id in &ids {
-            bytes += runtime
-                .manifests
-                .values()
-                .flat_map(|record| record.manifest.entries())
-                .find(|entry| entry.content_id == *id)
-                .map(|entry| entry.size)
-                .unwrap_or(0);
+            bytes += sizes.get(id).copied().unwrap_or(0);
         }
         let cleared = ids.len();
         let facts: Vec<Fact> = ids.into_iter().map(Fact::ObjectRemoved).collect();

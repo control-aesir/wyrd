@@ -248,8 +248,8 @@ version say exactly what changed.
   failing open (comment only).
 - Refresh two stale control-plane wiring comments
   (`crates/wyrd-sync/src/control/mod.rs`, `message.rs`): relay delivery
-  via `wyrd-core`'s `LiveMailbox` has landed, so they no longer read as
-  a later issue (comment only).
+  via `wyrd-core`'s `LiveMailbox` has landed, so they no longer read
+  as pending work (comment only).
 
 ## [0.2.0-alpha]
 

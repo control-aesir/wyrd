@@ -1032,6 +1032,9 @@ fn mount(
     // drains, and the session teardown lands at the earliest point
     // the queue state allows — destroy can only preserve handles
     // while the queue is live and drained.
+    // Stage latencies below are measured from here, so a slow
+    // shutdown names its stage instead of just its total.
+    let teardown_start = std::time::Instant::now();
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
@@ -1067,7 +1070,11 @@ fn mount(
     // close must not skip the remaining shutdowns, and the combined
     // status reports the first failure.
     supervisor.close_admission();
-    tracing::info!(stage = "teardown", "admission closed");
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "admission closed"
+    );
     let returned = match drive.join() {
         Ok(returned) => returned,
         Err(_) => {
@@ -1089,7 +1096,11 @@ fn mount(
     // Dropped at scope end, after transport teardown — the same
     // effective lifetime the node always had.
     let _live = returned.live;
-    tracing::info!(stage = "teardown", "loop thread joined");
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "loop thread joined"
+    );
     let loop_result = match returned.result {
         Ok(summary) => Ok(summary),
         Err(LoopError::Live(error)) => Err(CliError::Live(error)),
@@ -1112,14 +1123,22 @@ fn mount(
     // drop, and a shutdown could wait on a relay outage that never
     // clears.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
-    tracing::info!(stage = "teardown", "mailbox stopped");
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "mailbox stopped"
+    );
     let bulk_status = bulk
         .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
         .map_err(CliError::Bulk);
     if let Err(error) = &bulk_status {
-        tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
+        tracing::warn!(stage = "bulk", elapsed_ms = teardown_start.elapsed().as_millis(), error = %error, "bulk shutdown failed");
     } else {
-        tracing::info!(stage = "teardown", "bulk source stopped");
+        tracing::info!(
+            stage = "teardown",
+            elapsed_ms = teardown_start.elapsed().as_millis(),
+            "bulk source stopped"
+        );
     }
     // Release the bulk endpoint (and its runtime) before stopping
     // serving: a timed-out close must not linger with live peer
@@ -1129,9 +1148,13 @@ fn mount(
         .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
         .map_err(CliError::Serving);
     if let Err(error) = &serving_status {
-        tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
+        tracing::warn!(stage = "serving", elapsed_ms = teardown_start.elapsed().as_millis(), error = %error, "serving shutdown failed");
     } else {
-        tracing::info!(stage = "teardown", "serving stopped");
+        tracing::info!(
+            stage = "teardown",
+            elapsed_ms = teardown_start.elapsed().as_millis(),
+            "serving stopped"
+        );
     }
     combine_status(TeardownStatus {
         loop_result: loop_result.map(|_| ()),

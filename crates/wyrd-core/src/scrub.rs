@@ -169,10 +169,9 @@ pub struct ScrubReport {
 /// probe-budget break rather than by a separate wrap mechanism —
 /// so every pass makes coverage progress and a full sweep
 /// completes no matter how many identities the drive holds.
-/// `cursor` is memory-only
-/// (strike-ledger precedent): a restart restarts the sweep,
-/// deterministically ordered, so no loss is ever skipped — only
-/// re-statted.
+/// `cursor` is memory-only (strike-ledger precedent): a restart
+/// restarts the sweep, deterministically ordered, so no loss is
+/// ever skipped — only re-statted.
 ///
 /// The store read lock is acquired once around the walk: the walk
 /// never mutates the store, so one acquisition is both cheaper

@@ -367,8 +367,12 @@ fn fetch_member(
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let store = FsObjectStore::open(dir.join("objects")).unwrap();
+    // The live name comes from the store itself, never
+    // reconstructed: a layout change updates one place.
+    let live_name = store.live_path(ObjectKind::Chunk, &chunk);
     let node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
-        WyrdNode::new(engine, FsObjectStore::open(dir.join("objects")).unwrap()).unwrap();
+        WyrdNode::new(engine, store).unwrap();
     let (mut live, parts) = node
         .into_live(Duration::from_secs(30), &LiveConfig::default())
         .unwrap();
@@ -386,13 +390,6 @@ fn fetch_member(
         }
     }
     assert!(available, "the member fetched the chunk verified");
-    let hex = chunk.to_string();
-    let live_name = dir
-        .join("objects")
-        .join("objects")
-        .join(format!("{:02x}", ObjectKind::Chunk.byte()))
-        .join(&hex[..2])
-        .join(&hex[2..]);
     (loaded, live, parts, chunk, dir, live_name)
 }
 
@@ -571,9 +568,9 @@ fn scrubbed_chunk_heals_from_a_live_peer_without_a_waiter() {
 /// the peer-served half of the write-path loss claim. The member
 /// holds a verified chunk under a durable claim; host-side surgery
 /// deletes the live file; an appending writer then commits while
-/// the loop runs against the live peer. The first evaluation finds
-/// the base gone, the scrub unclaims it on the same pass, the
-/// refetch heals, and the commit lands — extended content served
+/// the loop runs against the live peer. The commit is deferred
+/// while the base is gone, the scrub unclaims it, the refetch
+/// heals, and the commit lands — extended content served
 /// through the same mount, no remount, no restart.
 #[test]
 fn scrubbed_append_heals_from_a_live_peer_without_remount() {
@@ -644,8 +641,8 @@ fn scrubbed_append_heals_from_a_live_peer_without_remount() {
         "the append healed through the scrub drain, not around it"
     );
     assert!(
-        commit_started.elapsed() < Duration::from_secs(120),
-        "the writer finished inside the deadline"
+        commit_started.elapsed() < Duration::from_secs(60),
+        "the writer finished on its own deadline, not the loop's 120s bound"
     );
 
     // Serving continues on the extended bytes: a fresh open reads

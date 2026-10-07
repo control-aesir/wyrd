@@ -165,8 +165,9 @@
 //! 27. `upgrade_derived_state_rebuilds_from_facts` — a fresh engine
 //!     recovers committed coverage by replay, stably across restarts
 //!     (`docs/upgrade-contract.md`, invariant 4).
-//! 28. `upgrade_mixed_versions_fail_named` — a forged envelope version
-//!     fails open with `ControlError::UnknownVersion`
+//! 28. `upgrade_mixed_versions_fail_named` — a sealed control message
+//!     with a forged version fails closed with
+//!     `ControlError::UnknownVersion`
 //!     (`docs/upgrade-contract.md`, invariant 5, gate half).
 //! 29. `upgrade_reads_never_mint_authority` — open, load, and
 //!     projection write no history and mint no transitions

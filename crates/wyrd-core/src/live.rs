@@ -38,6 +38,7 @@ use crate::mutation::{
 };
 use crate::projection::{Projection, SharedProjection};
 use crate::quarantine::{drain_quarantine, QuarantineQueue, QuarantineReport};
+use crate::scrub::{drain_scrub, probe_presence, ScrubQueue, ScrubReport};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
 use crate::want::WantRegistry;
@@ -172,6 +173,10 @@ pub struct SyncReport {
     /// Rejected-representation repair: diagnostics emitted, claims
     /// cleared, bytes unlinked. Zero on passes with nothing queued.
     pub quarantined: QuarantineReport,
+    /// Out-of-band loss repair: diagnostics emitted, stale claims
+    /// cleared, accounted bytes corrected. Zero on passes with no
+    /// observed loss.
+    pub scrubbed: ScrubReport,
     /// Whether the pass published a new projection generation.
     pub published: bool,
     /// Outbound sends the pass's publication committed (announcements
@@ -525,6 +530,18 @@ pub struct LiveNode<V: NamespaceView> {
     /// bytes and clears the claim. Shared with the backend like the
     /// want registry; the loop alone drains.
     pub(super) quarantine: Arc<QuarantineQueue>,
+    /// Out-of-band losses detectors observed: readers report
+    /// claimed-but-absent identities here, the presence walk
+    /// submits its misses here, and the loop's drain clears the
+    /// stale claims. Shared with the backend like the quarantine
+    /// queue; the loop alone drains.
+    pub(super) scrub: Arc<ScrubQueue>,
+    /// Where the presence walk resumes its next sweep: the last
+    /// manifest entry considered, so each pass stats a bounded
+    /// slice and coverage rotates. Memory-only (strike-ledger
+    /// precedent): a restart restarts the sweep from the
+    /// beginning, deterministically ordered.
+    pub(super) scrub_cursor: Option<ContentId>,
     /// Mounted mutations: the backend submits and blocks, the loop
     /// drains and applies them serially each pass (the total order).
     /// Its lock is its own; submitting also wakes the loop's idle wait.
@@ -870,6 +887,7 @@ where
             budgets.max_parent_tokens,
         ));
         let quarantine = Arc::new(QuarantineQueue::default());
+        let scrub = Arc::new(ScrubQueue::default());
         // One pacing signal for the whole live session: created here,
         // attached to the queue now, and shared with the backend's
         // callers (mailbox intake) so every producer wakes the loop.
@@ -901,6 +919,8 @@ where
                 projection,
                 wants,
                 quarantine,
+                scrub,
+                scrub_cursor: None,
                 mutations,
                 retained_bytes: config.retained_bytes.clone(),
                 published_revision: revision,
@@ -954,6 +974,14 @@ where
     /// loop's drain.
     pub fn quarantine_queue(&self) -> &Arc<QuarantineQueue> {
         &self.quarantine
+    }
+
+    /// The scrub channel detectors submit observed losses to: the
+    /// composer hands it to the backend alongside the quarantine
+    /// queue, so claimed-but-absent bytes are unclaimed by the
+    /// loop's drain.
+    pub fn scrub_queue(&self) -> &Arc<ScrubQueue> {
+        &self.scrub
     }
 
     /// Install the serving-mirror readiness barrier for announcement
@@ -1312,6 +1340,61 @@ where
             self.engine
                 .set_materialization_from(snapshot, want, MaterializationState::Cached)
         })?;
+        // Local scrub, walk half (child 13): re-stat locally
+        // claimed identities against the store from the rotating
+        // cursor, submitting misses for the drain below. The
+        // snapshot is admission's when it took one (passes with
+        // pending wants pay no second rebuild); otherwise one
+        // rebuild serves the walk. Either way the scan is
+        // O(claims), never O(history) — and the walk runs even
+        // when the queue is empty, because out-of-band loss has
+        // no other signal. Slightly stale either way (commits
+        // landed since): the drain re-verifies before clearing,
+        // so staleness only re-stats, never wrongly unclaims.
+        // Coupling note: the reused snapshot is the one
+        // `admit_wants` just mutated in place through
+        // `set_materialization_from` — safe because admission
+        // commits only `Fact::Materialization`, which never
+        // moves a local claim. If admission ever commits a
+        // claim-moving fact, the walk needs its own snapshot.
+        let walk_snapshot = match admission {
+            Some(snapshot) => snapshot,
+            None => self.engine.runtime_state()?,
+        };
+        let (losses, probe_failures) = probe_presence(
+            &walk_snapshot,
+            &self.store,
+            &mut self.scrub_cursor,
+            self.budgets.max_scrub_per_pass,
+        )?;
+        for loss in losses {
+            self.scrub.submit(loss);
+        }
+        // Local scrub, drain half (child 13): clear the claims
+        // the walk and the readers found missing — after the
+        // walk, so walk-found losses clear on the same pass they
+        // are observed, and ahead of fetching, so the same pass
+        // reconciles each cleared claim back to pending and the
+        // plan re-drives the fetch without waiting another pass.
+        // The residency policy is untouched, no waiter is
+        // synthesized, and no bytes are unlinked: loss is
+        // unclaimed, never deleted. Capped like quarantine:
+        // leftovers wait for the next pass.
+        let mut scrubbed = drain_scrub(
+            &self.scrub,
+            &self.store,
+            self.retained_bytes.as_deref(),
+            &mut self.engine,
+            self.budgets.max_scrub_per_pass,
+            &mut |loss| {
+                tracing::warn!(
+                    content = ?loss.content(),
+                    kind = ?loss.kind(),
+                    "claimed bytes absent from the store: unclaiming and re-demanding"
+                );
+            },
+        )?;
+        scrubbed.failures += probe_failures;
         let phase = std::time::Instant::now();
         let fetched = match bulk {
             Some(bulk) => {
@@ -1471,6 +1554,7 @@ where
                 drained,
                 fetched,
                 quarantined,
+                scrubbed,
                 published: false,
                 sent: 0,
                 generation,
@@ -1518,6 +1602,7 @@ where
                 drained,
                 fetched,
                 quarantined,
+                scrubbed,
                 published: false,
                 sent,
                 generation,
@@ -1596,6 +1681,7 @@ where
             drained,
             fetched,
             quarantined,
+            scrubbed,
             published: true,
             sent,
             generation: generation + 1,

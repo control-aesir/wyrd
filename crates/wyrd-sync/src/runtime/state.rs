@@ -254,6 +254,32 @@ impl RuntimeState {
         summary
     }
 
+    /// Every locally claimed content identity, in identity order.
+    /// The presence walk (local scrub) stats exactly this set
+    /// against the store: a claimed identity whose bytes are gone
+    /// is out-of-band loss. Sorted by construction (`BTreeSet`
+    /// iteration), so a rotating cursor over the list covers every
+    /// claim exactly once per sweep. Proportional to holdings,
+    /// never to manifest history: a mostly-remote drive walks
+    /// almost nothing. A pure query — the walk stats through its
+    /// own store handle, never through this state.
+    pub fn local_claims(&self) -> Vec<ContentId> {
+        self.local_objects.iter().copied().collect()
+    }
+
+    /// The first manifest entry kind naming one identity, for the
+    /// loss diagnostic. Miss-path only: the walk stats claims
+    /// without touching manifests, and resolves the kind solely
+    /// for identities the store just reported absent — so the
+    /// O(history) scan runs per actual loss, never per pass.
+    pub fn content_kind(&self, id: &ContentId) -> Option<ObjectKind> {
+        self.manifests
+            .values()
+            .flat_map(|record| record.manifest.entries())
+            .find(|entry| entry.content_id == *id)
+            .map(|entry| entry.kind)
+    }
+
     /// The durable materialization state projected into the view boundary.
     pub fn status(&self, id: &ContentId) -> FetchStatus {
         if self.is_local(id) {

@@ -1267,6 +1267,43 @@ fn retry_after_timeout_admits_without_a_new_fact() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Drain-before-fetch placement: one pass over a store that lost
+/// a claimed chunk both clears the stale claim (the report) and
+/// plans the refetch (the empty bulk attempts it as missing). If
+/// the drain drifted below the fetch phase, the plan would see
+/// the intact claim and attempt nothing — the clear would still
+/// report, but the refetch would wait another pass.
+#[test]
+fn walk_found_loss_clears_and_plans_in_one_pass() {
+    let (mut engine, dir, mut store, chunk, root, head) = scratch_file_drive("scrub-placement");
+    // Drop the chunk but keep the tree: the file resolves while
+    // its bytes are out-of-band loss under an intact claim.
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    // Cached policy so the cleared claim reconciles to pending
+    // (a RemoteOnly identity would never plan).
+    engine
+        .set_materialization(chunk, MaterializationState::Cached)
+        .unwrap();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let mut bulk = wyrd_sync::bulk::MemoryBulkSource::default();
+    let report = node.sync_once(&mut NoopMailbox, Some(&mut bulk)).unwrap();
+
+    assert_eq!(
+        report.scrubbed.claims_cleared, 1,
+        "the walk-found loss clears on the pass that observes it"
+    );
+    assert_eq!(
+        report.fetched.missing, 1,
+        "the same pass plans the cleared identity against the empty bulk"
+    );
+    assert_eq!(report.fetched.objects, 0, "no peer serves it");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Local content keeps its mappings: a served prefix reads, a
 /// missing path is `NotFound`, and a missing lookup is absence —
 /// the demand mapping changes nothing for held bytes.

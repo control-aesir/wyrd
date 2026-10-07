@@ -219,6 +219,17 @@ impl FsObjectStore {
             .join(&hex[2..])
     }
 
+    /// The live filesystem name for one identity under one kind:
+    /// where host-side surgery finds the bytes the store serves.
+    /// Public so the contract harness names the same file the
+    /// store reads instead of reconstructing the layout beside
+    /// it — a layout change then updates one place, and a wrong
+    /// kind simply names an absent file rather than failing
+    /// opaquely.
+    pub fn live_path(&self, kind: ObjectKind, id: &ContentId) -> PathBuf {
+        self.path_for(kind, id)
+    }
+
     /// The kind directory holding `id`, if any. See [`ALL_KINDS`].
     fn find(&self, id: &ContentId) -> Option<(ObjectKind, PathBuf)> {
         ALL_KINDS

@@ -33,11 +33,28 @@ version say exactly what changed.
   the diagnostic, discards the bytes (new narrow
   `DiscardRejectedRepresentation` operation — verify-then-unlink,
   never a general store `remove`), clears the possession claim via
-  the sole `ObjectRemoved` writer, and leaves the `Cached` policy
+  an `ObjectRemoved` commit, and leaves the `Cached` policy
   and the waiting reader to re-demand a fresh generation. New
   `ViewError::RejectedRepresentation` verdict (identity + kind);
   structural corruption keeps its unrepairable shape. No durable
   quarantine state; the vault is untouched.
+- Local scrub for out-of-band loss (peer-repair Part 1, third
+  child): claimed-but-absent bytes are observed at read time (new
+  `ViewError::LostRepresentation` verdict, identity + kind — a
+  stale `Available` no longer reads as an unreachable peer) and by
+  a bounded per-pass presence walk over locally claimed
+  identities from a rotating in-memory cursor. The loop's drain
+  emits the diagnostic, re-verifies presence (a concurrent heal
+  keeps its claim with no redundant fetch), clears the stale
+  claim via the second `ObjectRemoved` writer
+  (`Engine::record_missing_objects`, resolving each cleared
+  identity's retained size from its manifest entry in one batch
+  pass), and leaves the intact `Cached` policy for the background
+  plan to refetch with no waiter synthesized. The walk runs after
+  admission (reusing its snapshot) and the drain clears ahead of
+  fetching, so walk-found losses clear on the same pass they are
+  observed. No bytes are unlinked, no protocol change, no new
+  durable-fact kind; the vault is untouched.
 
 ### Added
 

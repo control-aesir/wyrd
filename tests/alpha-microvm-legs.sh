@@ -356,6 +356,28 @@ leg_fetch_member() {
   [[ "$(cat "$E2E_ROOT/cold-2-healed.got")" == "cold-bytes" ]] \
     || die "healed read returned wrong bytes"
   pass "quarantined chunk heals from the returned owner without remount"
+  # Out-of-band loss with a live claim (scrub leg, peer-repair
+  # child 13): cold-2.txt is verified local on the member again —
+  # the heal above served its bytes — so deleting its chunk file
+  # outright models post-install loss (a vanished file, never a
+  # verification failure) against a held claim. The owner is back,
+  # so unlike the bitrot block this read must heal instead of
+  # failing: the first read names the lost representation for the
+  # scrub drain, waits out the unclaim-and-refetch, and serves the
+  # refetched bytes in the same read. No remount, no restart.
+  cold_chunk=$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | head -n 1)
+  [[ -n "$cold_chunk" ]] || die "member store holds no cold-bytes chunk to delete"
+  [[ "$(grep -ral "cold-bytes" "$d/objects" 2>/dev/null | wc -l)" == 1 ]] \
+    || die "cold-bytes is not unique in the member store after the quarantine heal"
+  rm "$cold_chunk" \
+    || die "host-side chunk deletion failed"
+  timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2-relost.got" \
+    || die "post-loss read failed: scrub never healed"
+  [[ "$(cat "$E2E_ROOT/cold-2-relost.got")" == "cold-bytes" ]] \
+    || die "healed-after-loss read returned wrong bytes"
+  grep -q "unclaiming and re-demanding" "$LOGDIR/mount-xmember-f.err" \
+    || die "mount log never named the lost representation for scrub"
+  pass "lost chunk heals from the returned owner without remount"
   # Scratch write against the live route: creating a file forces
   # the current head's tree object to materialize (reads never
   # fetch tree objects, only manifests and chunks), and the delete

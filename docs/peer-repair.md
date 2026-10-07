@@ -137,10 +137,55 @@ Decided for child 12 (OD-12-1 A, OD-12-2 A, SD-1 A):
   invalid may be deleted, through a narrowly named discard — never
   a general `ObjectStore::remove`. The implementation distinguishes
   the bad physical bytes, the durable possession claim (cleared via
-  the sole `ObjectRemoved` writer), and the demand state, so no
+  an `ObjectRemoved` commit), and the demand state, so no
   stale claim pretends deleted bytes still exist. Claim-clear
   precedes unlink, so a crash converges either way
   (`docs/crash-consistency.md`, quarantine repair).
+
+Decided for child 13 (OD-13-1 walk-every-pass, OD-13-2
+memory-only cursor, OD-13-3 clear-with-size-zero):
+
+- **Walk every pass, capped** (OD-13-1): out-of-band loss has no
+  trigger signal, so the presence walk runs on every pass —
+  bounded by `max_scrub_per_pass` stats over locally claimed
+  identities (O(claims), never O(history)), reusing admission's
+  snapshot when it took one.
+- **Memory-only cursor** (OD-13-2): the sweep position resets on
+  restart like the strike ledgers. A restart re-sweeps from the
+  beginning, deterministically ordered — coverage, never
+  freshness, is what a restart loses.
+- **Claim with no manifest entry still clears, with size zero**
+  (OD-13-3): the projection must stop lying even when the
+  accountant has nothing to subtract, and the reopen walk
+  re-seeds the count from the store.
+- **Placement: admission, then walk, then drain, all ahead of
+  fetch.** The walk reuses admission's snapshot when it took one
+  (no second rebuild on active passes); the drain clears
+  walk-found and read-found losses on the same pass they are
+  observed, so the fetch plan reconciles each cleared claim back
+  to pending without waiting another pass. The quarantine drain
+  deliberately stays ahead of admission (its cleared claim must
+  reconcile before the waiter's want admits) while the scrub
+  drain sits after the walk: the asymmetry is load-bearing, not
+  a tidy-up candidate. The walk reads the
+  snapshot `admit_wants` just mutated in place — safe because
+  admission commits only `Fact::Materialization`, which never
+  moves a local claim; if admission ever commits a claim-moving
+  fact, the walk needs its own snapshot. Recorded here because
+  the issue left the placement open.
+- **The install gate's tree/chunk asymmetry bounds what the
+  placement buys.** `verify_head_closure` reads every tree
+  through the store (a lost tree fails the install as
+  `TreeUnavailable`) but checks chunks for entry/mapping
+  consistency only — so the scrub heals lost chunks behind an
+  installed head rather than holding the install. Moving chunk
+  presence into the gate is a separate change, deliberately not
+  taken here: it would turn every install into a full-store stat
+  pass.
+- **No second discard path.** The scrub never unlinks: bytes
+  already gone need no removal, so there is no narrow-discard
+  analogue and no new store operation. The accountant subtract
+  is the only state the scrub mutates besides the claim.
 
 ## Part 2 — replication serving (after measurement; v0.7 home)
 

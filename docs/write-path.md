@@ -344,7 +344,13 @@ MutationRequest {
    the resolver (`ChunkUnavailable`) names the missing chunk, the loop
    registers it as an ordinary fetch want, and the mutation waits —
    pinned to the single head its first evaluation used, so the retry
-   can never silently rebase onto newer state. A changed, emptied, or
+   can never silently rebase onto newer state. Content lost
+   out of band waits the same wait (the scrub unclaims the stale
+   locality on the same pass it observes it, so the append is
+   indistinguishable from an append over never-fetched content —
+   never-fetched parity): with a peer serving the bytes the
+   commit lands once the refetch heals, with no peer it runs out
+   the same deadline below. A changed, emptied, or
    multiplied head set fails the retry `Stale`, exactly like a raced
    handle commit. The wait is bounded by `max_mutation_wait` (default
    30s, wall-clock from admission — the caller has been blocked since

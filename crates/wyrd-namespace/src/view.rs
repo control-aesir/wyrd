@@ -247,10 +247,12 @@ pub enum ViewError {
     /// can register exactly that want and retry.
     NotMaterialized { content: ContentId },
     #[error("content unavailable: no peer reachable and nothing cached")]
-    /// A settled terminal verdict (or a stale available claim) for
-    /// content the store does not hold. Like `NotMaterialized`, the
-    /// identity rides the error so a demand-driven backend can note
-    /// reopen demand for exactly that identity.
+    /// A settled terminal verdict for content the store does not
+    /// hold. Like `NotMaterialized`, the identity rides the error
+    /// so a demand-driven backend can note reopen demand for
+    /// exactly that identity. A stale available claim surfaces as
+    /// [`ViewError::LostRepresentation`] instead, so this variant
+    /// never names out-of-band loss.
     Unavailable { content: ContentId },
     #[error("content failed verification; scrub and repair before surfacing")]
     Corrupt,
@@ -265,6 +267,25 @@ pub enum ViewError {
     /// may produce this variant; every other failure class keeps its
     /// own shape, so deletions are never named by resource errors.
     RejectedRepresentation {
+        content: ContentId,
+        kind: ObjectKind,
+    },
+    #[error(
+        "a claimed representation is absent from the store; unclaim and re-demand before surfacing"
+    )]
+    /// Durable facts claim locally verified bytes, but the store
+    /// does not hold them: out-of-band loss (a vanished file, never
+    /// a verification failure — absent bytes hash nothing). Unlike
+    /// [`ViewError::Unavailable`] — no peer reachable, or a settled
+    /// terminal verdict — the bytes *should* be here, so a
+    /// demand-driven backend reports the identity to the scrub
+    /// drain (which clears the stale claim) and re-demands it. The
+    /// identity *and* the representation kind ride the error, like
+    /// [`ViewError::RejectedRepresentation`]. Only a claimed-but-absent
+    /// read may produce this variant; never-fetched content keeps
+    /// the `NotMaterialized` / `Unavailable` shapes, so the loss
+    /// diagnostic never fires for content that simply never landed.
+    LostRepresentation {
         content: ContentId,
         kind: ObjectKind,
     },

@@ -884,6 +884,7 @@ fn mount(
         &parts.budgets,
     );
     backend.set_quarantine(std::sync::Arc::clone(live.quarantine_queue()));
+    backend.set_scrub(std::sync::Arc::clone(live.scrub_queue()));
 
     // The mailbox signs with the local identity key: open and signer
     // are the same key by construction, which is exactly the identity
@@ -1599,6 +1600,14 @@ struct SyncRunReport {
     quarantine_claims_cleared: usize,
     quarantine_bytes_discarded: usize,
     quarantine_failures: usize,
+    /// Out-of-band loss repair, accumulated like the rest and
+    /// stored under the same rule: `14-fetch-failure-diagnostics`
+    /// owns the class renderer, so this report must not print
+    /// them either.
+    scrubbed_observed: usize,
+    scrub_claims_cleared: usize,
+    scrub_bytes_subtracted: usize,
+    scrub_failures: usize,
     /// Outbound sends committed by per-pass publication.
     sent: usize,
     /// Distinct senders named by intake envelopes this run (OD-17-4
@@ -1670,6 +1679,10 @@ impl SyncRunReport {
         self.quarantine_claims_cleared += pass.quarantined.claims_cleared as usize;
         self.quarantine_bytes_discarded += pass.quarantined.bytes_discarded as usize;
         self.quarantine_failures += pass.quarantined.failures as usize;
+        self.scrubbed_observed += pass.scrubbed.observed as usize;
+        self.scrub_claims_cleared += pass.scrubbed.claims_cleared as usize;
+        self.scrub_bytes_subtracted += pass.scrubbed.bytes_subtracted as usize;
+        self.scrub_failures += pass.scrubbed.failures as usize;
         self.sent += pass.sent;
         self.unfetchable_heads = pass.pending_heads;
         // Union, not append: the same peer heard on twelve passes is
@@ -1783,6 +1796,10 @@ where
         quarantine_claims_cleared: 0,
         quarantine_bytes_discarded: 0,
         quarantine_failures: 0,
+        scrubbed_observed: 0,
+        scrub_claims_cleared: 0,
+        scrub_bytes_subtracted: 0,
+        scrub_failures: 0,
         sent: 0,
         outcome: RunOutcome::Quiet,
         pending: 0,

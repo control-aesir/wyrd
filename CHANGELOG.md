@@ -41,6 +41,12 @@ version say exactly what changed.
 
 ### Added
 
+- Lima harness guards the guest share: `lima/run-alpha.sh` verifies the
+  guest serves this checkout before building (the instance yaml's
+  recorded path, plus a guest mount check — no guest toolchain needed)
+  and refuses on a stale share instead of silently testing the wrong
+  code; `--re-share` re-points the instance at the current checkout
+  and restarts it.
 - Explicit convergence-over-delivery invariants (docs only, no behavior
   change): `docs/architecture.md` gains transport-is-never-evidence
   and identity-layering invariants pointing at the DG-3 forget

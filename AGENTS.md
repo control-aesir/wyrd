@@ -72,7 +72,7 @@ devenv shell                # enter the dev environment (rust, git-hooks)
 
 ## Running the Lima e2e suite
 
-`./lima/run-alpha.sh [--keep] [--step N[,N...]]` is long (minutes) and lives in a
+`./lima/run-alpha.sh [--keep] [--re-share] [--step N[,N...]]` is long (minutes) and lives in a
 guest. Operate it, never babysit it blind. (The hardened gate is the
 microVM suite instead: `nix/microvm/run-microvm.sh --fresh [--keep]`
 on a Linux KVM host (`--teardown` stops a kept run), same contract helpers, two peers plus a relay
@@ -86,6 +86,10 @@ Lima for macOS dev iteration and as the refactor guard.)
 - `--step` takes a comma list and runs the prefix closure (steps build on
   each other): `--step 4` runs steps 1–4, `--step 4,6` runs 1–6. An empty
   entry or a non-step is refused; an empty value means all steps.
+- The wrapper verifies the guest share serves this checkout before building
+  (host-side: the instance yaml's recorded path, plus a guest mount check)
+  and refuses on a stale share (worktree switches orphan it). Rerun with
+  `--re-share` to re-point the instance at the current checkout instead.
 - **A repeated `FAIL:` line is a stop, not patience.** The harness exits on
   the first failed check, so two identical polls mean the run is over —
   read the log, pull the failing mount's stderr out of the guest

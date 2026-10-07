@@ -539,7 +539,7 @@ Both are read and hardened by wyrd code, never by clap:
   keys. (`member list`, `member log`, and `snapshot list` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
-   them.)
+  them.)
 - `sync now` reports fetch-attempt diagnostics beside the
   unfulfilled total: one line per fired class
   (`transport_errors`, `missing`, `invalid`, `unavailable_keys`,
@@ -550,7 +550,15 @@ Both are read and hardened by wyrd code, never by clap:
   generation), with `quarantine` / `scrub` lines when the run did
   repair work. The class counters are diagnostic counts of observed
   failure classes; they are not a decomposition of `unfulfilled`,
-  and no rendered line reads as arithmetic on it. This fetch
+  and no rendered line reads as arithmetic on it. A non-zero
+  `unfulfilled` with no class line means the backlog was never
+  attempted this run — representations skipped in cooldown or
+  items the pass wall-clock budget never reached — not the absence
+  of failure. `deadlines` is a lower bound on budget pressure, not
+  a total (zero grants count as pressure too). `terminal` counts
+  identities holding a completed terminal generation right now —
+  generation-scoped, cleared by a new waiter or a restart, never a
+  property of the identity. This fetch
   surface is client-position: counts by reason, never identities —
   see `docs/trust.md:880-957`, with the observation ×
   trust-position matrix itself owned by `17-observability`.

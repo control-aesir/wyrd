@@ -177,6 +177,9 @@ check_no_leaks() {
 # this helper targets rendered command output only.
 check_no_content_ids() {
   local log="$1"
+  # Fail closed: an unreadable target must never report clean — a
+  # privacy assertion that fails open is the wrong default.
+  [[ -r "$log" ]] || die "check_no_content_ids: $log unreadable"
   grep -v "^  sender " "$log" | grep -qE "[0-9a-f]{64}" \
     && die "content-id-shaped token in $log"
   pass "no content-id-shaped tokens in $(basename "$log")"

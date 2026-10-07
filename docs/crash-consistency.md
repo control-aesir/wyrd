@@ -362,8 +362,9 @@ converges — a read re-observes the rejection and re-submits, and
 `insert` heals a present-but-unverifiable name). Bytes gone under a
 live claim cannot happen: the unlink never runs before the commit.
 Two bounds, both by process lifetime: the in-memory queue loses a
-diagnostic emitted microseconds before the crash (child 14's
-persistence will close this), and the retained-bytes counter keeps
+  diagnostic emitted microseconds before the crash (diagnostic
+  persistence belongs to `17-observability` — child 14 delivered
+  counts-only run diagnostics), and the retained-bytes counter keeps
 charging the claimed-cleared-but-still-present bytes until
 `FsObjectStore::open` re-seeds from disk. Pinned by `record_objects_removed_batches_many_identities`
 (one batch, duplicates collapse) and the drain's phase order

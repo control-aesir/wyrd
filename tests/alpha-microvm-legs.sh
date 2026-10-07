@@ -242,6 +242,10 @@ leg_fetch_member() {
   touch "$E2E_ROOT/member-listed-done"
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
+  # Window start for the class assertion below: only passes logged
+  # after the owner stopped can be about the dead-route probes — a
+  # whole-log grep would also match pre-window passes.
+  probed_from=$(wc -l < "$LOGDIR/mount-xmember-f.err")
   # Dead route, held manifest, nothing authored yet: the bytes are
   # announced but unfetchable, and no local write has had a chance
   # to demand them first. Each read must fail closed and bounded.
@@ -296,7 +300,8 @@ leg_fetch_member() {
   # transport failure non-zero — "peer gone" distinguished from
   # "budget exhausted" in the member's own log. Needs
   # wyrd_core=debug, the suite default like Lima.
-  grep "sync pass published" "$LOGDIR/mount-xmember-f.err" \
+  tail -n +"$((probed_from + 1))" "$LOGDIR/mount-xmember-f.err" \
+    | grep "sync pass published" \
     | grep -qE "missing=[1-9]|transport_errors=[1-9]" \
     || die "member log never named a fetch-failure class for the dead-route probes"
   pass "dead-route probes surface peer absence in the pass log"

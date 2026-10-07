@@ -15,7 +15,10 @@
 //!   at observation and travels the queue, so emission precedes
 //!   deletion structurally: the drain cannot name content it has not
 //!   already reported (OD-12-1's diagnostic-before-delete contract,
-//!   owned in full by `14-fetch-failure-diagnostics`).
+//!   owned in full by `14-fetch-failure-diagnostics` — delivered as
+//!   counts by reason on the run surface per OD-14-3 A; the
+//!   per-representation identity record and its persistence belong
+//!   to `17-observability`).
 //! - Nothing here is durable quarantine state: after the drain there
 //!   is no record that blocks a later waiter from starting generation
 //!   N+1. Terminology is rejected representation / repair-on-demand.
@@ -37,9 +40,10 @@ use wyrd_sync::runtime::Engine;
 
 use super::live::LiveError;
 
-/// Why locally held bytes were rejected. One variant today;
-/// `14-fetch-failure-diagnostics` owns the extension (import
-/// refusals, manifest mismatches) and the persistence.
+/// Why locally held bytes were rejected. One variant today; the
+/// extension (import refusals, manifest mismatches) and the
+/// persistence belong to `17-observability` — `14-fetch-failure-
+/// diagnostics` delivered the counts-only run surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationCause {
     /// Stored bytes no longer hash back to their address: bitrot

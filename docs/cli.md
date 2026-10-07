@@ -38,6 +38,9 @@ SIGINT/SIGTERM, which tears down in order: unmount and session join
 first (`destroy` commits still-dirty handles against the still-open
 mutation queue), then admission close and the loop join, then
 transport (mailbox, bulk source, serving) under bounded deadlines.
+Bulk closes graceful-or-abort (always success; a wedged drain warns
+and aborts), so only loop, session, and serving outcomes fold into
+the exit status.
 A process holding a file open on the mount delays the session join
 until it closes — unmount refuses a busy mount — so SIGINT waits
 for the last descriptor; the stop budgets bind the unmount itself,
@@ -547,7 +550,6 @@ Both are read and hardened by wyrd code, never by clap:
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)
-  are failures too, not help text. A transport teardown failure also
-  fails the mount: a bulk close that times out exits as a bulk error,
-  a serving shutdown failure as a serving error — after the
-  mountpoint is already unmounted.
+  are failures too, not help text. A serving shutdown failure also
+  fails the mount (as a serving error, after the mountpoint is
+  already unmounted); bulk closes graceful-or-abort and cannot fail.

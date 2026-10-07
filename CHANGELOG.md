@@ -255,6 +255,15 @@ version say exactly what changed.
 
 ### Fixed
 
+- Bulk transport shutdown is graceful-or-abort instead of fail-on-wedge:
+  the endpoint close gets a short bounded graceful attempt (5s,
+  `wyrd_sync::GRACEFUL_CLOSE_DEADLINE`); on expiry the endpoint
+  is aborted, a warning names the graceful-close timeout, and shutdown
+  still exits 0. Shutdown success means Wyrd stopped its own work and
+  released its resources — it no longer requires relay infrastructure
+  to acknowledge graceful closure, which intermittently held TERM
+  shutdown past the 60s bound (Lima step 6) with live relay connections
+  that had no reason to drain.
 - Drive custody files are created with explicit restrictive modes on
   Unix, independent of the process umask: `store-key.wrap`, `keystore`,
   `pairing.secret`, and `LOCK` at `0o600`, the drive directory (and

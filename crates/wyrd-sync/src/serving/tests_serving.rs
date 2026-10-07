@@ -97,7 +97,7 @@ fn serving_endpoint_serves_vault_roots_over_iroh() {
             .unwrap(),
         None
     );
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -130,7 +130,7 @@ fn serving_endpoint_bounds_live_fetches_by_the_request_ceiling() {
     );
     // ... while the same bytes verify under a fitting ceiling.
     assert_eq!(source.fetch_transport(&root, 512).unwrap(), Some(sealed));
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -165,7 +165,7 @@ fn serving_endpoint_bounds_live_manifest_fetches_by_the_request_ceiling() {
             max: 16
         })
     );
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -264,7 +264,7 @@ fn serving_mount_refuses_push_and_leaves_the_mirror_unchanged() {
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     assert!(
         landed.is_none(),
         "a push into the serving mirror must not land"
@@ -307,7 +307,7 @@ fn serving_reopen_rebuilds_the_mirror_from_the_vault() {
         source.fetch_transport(&root, usize::MAX).unwrap(),
         Some(sealed)
     );
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     reopened
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -431,7 +431,7 @@ fn fetch_from(serving: &ServingEndpoint, root: &BaoRoot) -> Option<Vec<u8>> {
         hash: *root.as_bytes(),
     });
     let fetched = source.fetch_transport(root, usize::MAX).ok().flatten();
-    source.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    source.shutdown(std::time::Duration::from_secs(10));
     fetched
 }
 

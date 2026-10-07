@@ -104,13 +104,13 @@ else:
     lines[i] = indent + "- location: " + json.dumps(os.environ["WYRD_ROOT"], ensure_ascii=False)
     # Unlink first: a previous read-only backup must not block this one;
     # unlinking needs directory permission, which the operator has.
-    for stale in (path + ".bak", tmp):
+    for stale in (path + ".bak", path + ".tmp"):
         if os.path.exists(stale):
             os.unlink(stale)
     shutil.copyfile(path, path + ".bak")
-    open(tmp, "w", encoding="utf-8").write("\n".join(lines))
-    shutil.copymode(path, tmp)
-    os.replace(tmp, path)
+    open(path + ".tmp", "w", encoding="utf-8").write("\n".join(lines))
+    shutil.copymode(path, path + ".tmp")
+    os.replace(path + ".tmp", path)
 EOF
 }
 # A sentry file, not git: the guest must show a mounted checkout, and the

@@ -16,7 +16,8 @@
 
 pub mod authorization;
 pub mod bulk;
-pub(crate) mod close;
+mod close;
+pub use close::GRACEFUL_CLOSE_DEADLINE;
 pub mod closure;
 pub mod control;
 pub mod durable;

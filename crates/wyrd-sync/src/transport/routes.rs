@@ -185,7 +185,7 @@ mod tests {
                 "each storage id addresses its own representation's bytes"
             );
         }
-        bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        bulk.shutdown(std::time::Duration::from_secs(10));
     }
 
     /// An announcement with an undecodable route publishes nothing and
@@ -225,6 +225,6 @@ mod tests {
         let report = publish_recorded_routes(&state, &mut bulk);
         assert_eq!(report.published, 0, "no route, no publications");
         assert_eq!(report.undecodable, 1, "the skip is counted, not silent");
-        bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+        bulk.shutdown(std::time::Duration::from_secs(10));
     }
 }

@@ -260,13 +260,16 @@ tears down session before transport on SIGINT/SIGTERM: unmount
 and session join first (`destroy` commits still-dirty handles against
 the still-open mutation queue, executed by the loop's post-return
 drain), then admission close, the loop join, and the mailbox, bulk
-source, and serving endpoint under bounded deadlines, with every
-outcome folded into the exit status. `open`/`read` on non-local
-content registers a want and blocks bounded (`docs/fetch-on-open.md`);
-the loop runs with a real iroh bulk source and publishes recorded routes
-each pass, and the mount opens the drive's serving endpoint, so a peer
-with a live announcement fetches over transport, while unavailable
-demand still surfaces `EIO` on its deadline. Relays arrive as repeatable
+source, and serving endpoint under bounded deadlines, with the
+fallible outcomes folded into the exit status. Bulk is
+graceful-or-abort (a wedged drain warns and aborts; it cannot fail
+the shutdown), so only loop, session, and serving outcomes can fail
+the exit. `open`/`read` on non-local content registers a want and
+blocks bounded (`docs/fetch-on-open.md`); the loop runs with a real
+iroh bulk source and publishes recorded routes each pass, and the
+mount opens the drive's serving endpoint, so a peer with a live
+announcement fetches over transport, while unavailable demand still
+surfaces `EIO` on its deadline. Relays arrive as repeatable
 `--relay` flags; parsing is clap-derive. Credential
 files are supported on Unix, must be regular files owned by the current
 user with private permissions, and are bounded and zeroized at the CLI

@@ -1,8 +1,42 @@
-//! Shared teardown primitive: bound a graceful transport stop by a
-//! deadline. A stalled peer must turn into a reported `TimedOut`
-//! instead of an unbounded wait. One home for both transport
-//! shutdowns (bulk source, serving endpoint) so the bound cannot
-//! drift between them.
+//! Shared teardown primitives: bound a transport stop by a
+//! deadline, and bound the graceful half of an endpoint close
+//! separately from failure. A stalled graceful close must turn into
+//! an abort (drop the endpoint and its runtime) instead of an
+//! unbounded wait or a failed shutdown: shutdown success means Wyrd
+//! stopped its own work and released its resources, not that relay
+//! infrastructure acknowledged graceful closure. One home for the
+//! teardown bounds (bulk graceful-or-abort, serving fail-on-wedge)
+//! so they cannot drift silently: serving keeps fail-on-wedge
+//! because its stop folds a router shutdown whose failure is a
+//! product signal (a panicked accept task names a real defect),
+//! while a bulk graceful drain waits only on drain-acks from relay
+//! connections that carry no product signal at all.
+
+/// Bound on the graceful half of transport shutdown: long enough
+/// for ordinary local/loopback close completion (clean closes land
+/// in milliseconds; loopback close-acks under throttle in well under
+/// a second), short enough that a wedged drain cannot hold process
+/// teardown hostage. Graceful endpoint shutdown is best-effort: the
+/// close waits on drain acknowledgements from relay infrastructure
+/// that is not part of daemon shutdown correctness, so expiry falls
+/// back to abort (dropping the endpoint and its runtime) rather than
+/// failing the shutdown. Shutdown success means Wyrd stopped its own
+/// work and released its resources; it does not require third-party
+/// relay connections to acknowledge graceful transport closure.
+pub const GRACEFUL_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a graceful transport stop, returning whether it finished
+/// inside `deadline`. A `false` return means the caller must abort
+/// (drop the endpoint and its runtime) and report success-with-abort,
+/// never failure: the graceful attempt is best-effort (see
+/// [`GRACEFUL_CLOSE_DEADLINE`]), and the timeout future is dropped,
+/// so no close work outlives the return either way.
+pub async fn graceful_or_abort(
+    stop: impl std::future::Future<Output = ()>,
+    deadline: std::time::Duration,
+) -> bool {
+    tokio::time::timeout(deadline, stop).await.is_ok()
+}
 
 /// Bound `stop` by `deadline`, reporting `message` on timeout.
 /// Factored out so the bound itself is unit-pinned (with a
@@ -42,6 +76,43 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[test]
+    fn graceful_close_inside_the_deadline_reports_finished() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A close that completes reports finished: the abort path
+        // stays out of the way on every clean shutdown.
+        let finished = runtime.block_on(graceful_or_abort(
+            async {},
+            std::time::Duration::from_secs(10),
+        ));
+        assert!(finished, "a completed close reports finished");
+    }
+
+    #[test]
+    fn stalled_close_reports_unfinished_inside_a_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A close that never resolves reports unfinished instead of
+        // waiting forever: the caller aborts and succeeds. The bound
+        // is the assertion — a 100ms deadline must return in well
+        // under a second, pinning that expiry is prompt, not eventual.
+        let started = std::time::Instant::now();
+        let finished = runtime.block_on(graceful_or_abort(
+            std::future::pending::<()>(),
+            std::time::Duration::from_millis(100),
+        ));
+        assert!(!finished, "a stalled close reports unfinished");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "expiry must be prompt, not eventual"
+        );
+    }
 
     #[test]
     fn close_deadline_reports_a_stalled_close() {

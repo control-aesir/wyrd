@@ -481,10 +481,11 @@ EOF
   # 90s, like the owner stop above: the member holds the same 56MiB
   # closure (head installed, chunks partly remote-only) behind a dead
   # route, and its TERM exit persists the serving store then closes
-  # both transports inside the 60s per-endpoint bound
-  # (TRANSPORT_SHUTDOWN_DEADLINE) — bounded, but far past the 15s
-  # small-vault budget. The budget binds the clean-but-slow path; a
-  # wedged close still fails the step via stop_mount's exit verdict.
+  # serving inside the 60s bound (TRANSPORT_SHUTDOWN_DEADLINE) while
+  # bulk closes graceful-or-abort. The stop is bounded, but far past
+  # the 15s small-vault budget: the budget binds the clean-but-slow
+  # path; a wedged serving close still fails the step via stop_mount's
+  # exit verdict.
   stop_mount member-relay TERM 90
   pass "peer-down pair stopped"
 

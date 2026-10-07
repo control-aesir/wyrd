@@ -92,7 +92,7 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
             "every sealed object landed over live transport"
         );
     }
-    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    bulk.shutdown(std::time::Duration::from_secs(10));
     restarted
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -248,7 +248,7 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
             "every sealed object landed over live transport"
         );
     }
-    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    bulk.shutdown(std::time::Duration::from_secs(10));
     restarted
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();
@@ -376,7 +376,7 @@ fn full_share_sliced_attempts_strike_like_master() {
             "every sealed object landed over live transport"
         );
     }
-    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    bulk.shutdown(std::time::Duration::from_secs(10));
     restarted
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();

@@ -428,19 +428,26 @@ impl IrohBulkSource {
         self.sealed.get(storage).map(Vec::as_slice)
     }
 
-    /// Close the owned endpoint, waiting at most `deadline` for
-    /// in-flight transfers to finish: teardown joins must stay bounded
-    /// even when a peer stalls mid-transfer. A timeout abandons the
-    /// graceful close and reports it — the endpoint is then aborted
-    /// (iroh logs it), so the peer sees a hard connection failure
-    /// rather than a clean close. The caller still drops the source,
-    /// so no transfer outlives the shutdown either way.
-    pub fn shutdown(&self, deadline: std::time::Duration) -> std::io::Result<()> {
-        self.runtime.block_on(super::close::with_deadline(
+    /// Close the owned endpoint under the graceful-close policy
+    /// ([`crate::GRACEFUL_CLOSE_DEADLINE`]): a clean drain reports
+    /// success; an expiry warns and the endpoint (with its runtime)
+    /// is dropped by the caller — the abort. Draining waits on
+    /// acknowledgements from relay infrastructure that is not part
+    /// of daemon shutdown correctness, so a wedged drain must not
+    /// fail a shutdown whose application work already stopped. The
+    /// only observable difference between the paths is the warning.
+    pub fn shutdown(&self, deadline: std::time::Duration) {
+        let finished = self.runtime.block_on(super::close::graceful_or_abort(
             self.endpoint.close(),
             deadline,
-            "endpoint close timed out with transfers in flight",
-        ))
+        ));
+        if !finished {
+            tracing::warn!(
+                stage = "bulk",
+                graceful_deadline_ms = deadline.as_millis(),
+                "bulk endpoint close exceeded the graceful deadline; aborting the endpoint"
+            );
+        }
     }
 
     /// Fetch a representation by trying each recorded provider in

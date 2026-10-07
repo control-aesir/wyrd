@@ -722,19 +722,22 @@ pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// that never clears.
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long teardown waits for each transport endpoint's graceful
+/// How long teardown waits for the serving endpoint's graceful
 /// close: much longer than the task-cancel bound above, because the
 /// close drains in-flight transfers over the same degraded links the
 /// drive syncs over — a throttled loopback legitimately needs tens of
 /// seconds, and mistaking a slow close for a wedged one turns clean
 /// shutdowns into mount failures. Still bounded, so a peer that
 /// never answers cannot hang teardown forever; a timeout still fails
-/// the mount. This is a per-endpoint wedge bound, not a share of a
-/// total: back-to-back wedge timeouts can exceed the e2e stop budgets,
-/// but any timeout already fails the step — the 90s budget binds the
-/// clean-but-slow path on the big-vault step: 10-14s for the owner
-/// stop under throttle, 44s for the member dead-route TERM stop after
-/// the throttle is removed.
+/// the mount. (Bulk no longer uses this bound: it closes under the
+/// graceful-or-abort policy in `wyrd_sync` (`GRACEFUL_CLOSE_DEADLINE`),
+/// which succeeds on expiry instead of failing.) This is a
+/// per-endpoint wedge bound, not a share of a total: back-to-back
+/// wedge timeouts can exceed the e2e stop budgets, but any timeout
+/// already fails the step — the 90s budget binds the clean-but-slow
+/// path on the big-vault step: 10-14s for the owner stop under
+/// throttle, 44s for the member dead-route TERM stop after the
+/// throttle is removed.
 const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Arm SIGINT/SIGTERM to trip [`SHUTDOWN`]. Best-effort: if the
@@ -1032,6 +1035,9 @@ fn mount(
     // drains, and the session teardown lands at the earliest point
     // the queue state allows — destroy can only preserve handles
     // while the queue is live and drained.
+    // Stage latencies below are measured from here, so a slow
+    // shutdown names its stage instead of just its total.
+    let teardown_start = std::time::Instant::now();
     if let Err(error) = unmounter.unmount() {
         eprintln!("warning: unmount failed: {error}");
         tracing::warn!(stage = "session", error = %error, "unmount failed");
@@ -1063,11 +1069,15 @@ fn mount(
     // drain exits on the close after one final sweep. Closing before
     // the join would strand destroy's submits; closing after the loop
     // join would leave the drain parked. Every teardown outcome is
-    // collected, not short-circuited: a failed loop, bulk, or serving
+    // collected, not short-circuited: a failed loop or serving
     // close must not skip the remaining shutdowns, and the combined
     // status reports the first failure.
     supervisor.close_admission();
-    tracing::info!(stage = "teardown", "admission closed");
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "admission closed"
+    );
     let returned = match drive.join() {
         Ok(returned) => returned,
         Err(_) => {
@@ -1089,7 +1099,11 @@ fn mount(
     // Dropped at scope end, after transport teardown — the same
     // effective lifetime the node always had.
     let _live = returned.live;
-    tracing::info!(stage = "teardown", "loop thread joined");
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "loop thread joined"
+    );
     let loop_result = match returned.result {
         Ok(summary) => Ok(summary),
         Err(LoopError::Live(error)) => Err(CliError::Live(error)),
@@ -1112,31 +1126,47 @@ fn mount(
     // drop, and a shutdown could wait on a relay outage that never
     // clears.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
-    tracing::info!(stage = "teardown", "mailbox stopped");
-    let bulk_status = bulk
-        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
-        .map_err(CliError::Bulk);
-    if let Err(error) = &bulk_status {
-        tracing::warn!(stage = "bulk", error = %error, "bulk shutdown failed");
-    } else {
-        tracing::info!(stage = "teardown", "bulk source stopped");
-    }
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "mailbox stopped"
+    );
+    // Graceful-or-abort: the bulk close warns inside on expiry and
+    // always reports success (the endpoint is dropped below — the
+    // abort), so teardown proceeds to serving unconditionally. A
+    // wedged drain must not fail a shutdown whose application work
+    // already stopped; see GRACEFUL_CLOSE_DEADLINE.
+    bulk.shutdown(wyrd_sync::GRACEFUL_CLOSE_DEADLINE);
+    tracing::info!(
+        stage = "teardown",
+        elapsed_ms = teardown_start.elapsed().as_millis(),
+        "bulk source stopped"
+    );
     // Release the bulk endpoint (and its runtime) before stopping
-    // serving: a timed-out close must not linger with live peer
-    // connections while the rest of teardown runs.
+    // serving: the abort half of graceful-or-abort. Dropping here —
+    // never earlier — bounds every close path even if the graceful
+    // attempt above ever regresses past its deadline.
     drop(bulk);
     let serving_status = serving
         .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
         .map_err(CliError::Serving);
     if let Err(error) = &serving_status {
-        tracing::warn!(stage = "serving", error = %error, "serving shutdown failed");
+        tracing::warn!(
+            stage = "serving",
+            elapsed_ms = teardown_start.elapsed().as_millis(),
+            error = %error,
+            "serving shutdown failed"
+        );
     } else {
-        tracing::info!(stage = "teardown", "serving stopped");
+        tracing::info!(
+            stage = "teardown",
+            elapsed_ms = teardown_start.elapsed().as_millis(),
+            "serving stopped"
+        );
     }
     combine_status(TeardownStatus {
         loop_result: loop_result.map(|_| ()),
         session_result,
-        bulk_result: bulk_status,
         serving_result: serving_status,
     })
 }
@@ -2426,14 +2456,13 @@ fn sync_now(
     let health = mailbox.health();
     print!("{}", mailbox_line(&health));
     // Teardown mirrors mount's transport shutdown in miniature: stop
-    // the mailbox tasks under a bounded deadline, then close bulk.
+    // the mailbox tasks under a bounded deadline, then close bulk
+    // graceful-or-abort (always success; a wedged drain warns inside).
     // A sync failure still tears transport down before returning it.
     mailbox.shutdown(SHUTDOWN_DEADLINE);
-    let bulk_status = bulk
-        .take()
-        .map(|bulk| bulk.shutdown(TRANSPORT_SHUTDOWN_DEADLINE))
-        .unwrap_or(Ok(()))
-        .map_err(CliError::Bulk);
+    if let Some(bulk) = bulk.take() {
+        bulk.shutdown(wyrd_sync::GRACEFUL_CLOSE_DEADLINE);
+    }
     drop(bulk);
     drop(live);
     let mut report = report?;
@@ -2443,7 +2472,6 @@ fn sync_now(
     combine_status(TeardownStatus {
         loop_result: outcome,
         session_result: Ok(()),
-        bulk_result: bulk_status,
         serving_result: Ok(()),
     })
 }

@@ -371,7 +371,7 @@ fn disconnected_peer_acquires_missed_history_over_real_relay() {
             "tree blob fetched alongside its chunk"
         );
     }
-    bulk.shutdown(std::time::Duration::from_secs(10)).unwrap();
+    bulk.shutdown(std::time::Duration::from_secs(10));
 
     // State convergence, asserted separately from acquisition: with
     // the bodies fetched, the reconnected peer's live heads match the

@@ -207,9 +207,10 @@ fn combine_status_fails_dead_sessions() {
 }
 
 /// Transport shutdown failures fail the mount instead of vanishing:
-/// a bulk close that timed out and a serving shutdown that errored
-/// are both operational causes the exit status must name, under
-/// their own variants.
+/// a serving shutdown that errored is an operational cause the exit
+/// status must name. (Bulk is graceful-or-abort and infallible by
+/// construction, so only serving can fail here; the fold still maps
+/// a bulk Err to Bulk for shape stability.)
 #[test]
 fn combine_status_reports_transport_shutdown_failures() {
     let clean = || TeardownStatus {
@@ -218,19 +219,6 @@ fn combine_status_reports_transport_shutdown_failures() {
         bulk_result: Ok(()),
         serving_result: Ok(()),
     };
-    assert!(
-        matches!(
-            combine_status(TeardownStatus {
-                bulk_result: Err(CliError::Bulk(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "bulk endpoint close timed out"
-                ))),
-                ..clean()
-            }),
-            Err(CliError::Bulk(_))
-        ),
-        "a timed-out bulk close fails the mount as a bulk error"
-    );
     assert!(
         matches!(
             combine_status(TeardownStatus {

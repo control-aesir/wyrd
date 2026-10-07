@@ -1301,6 +1301,6 @@ fn sliced_run_attempts_live_candidates_behind_a_dead_one() {
         elapsed >= Duration::from_secs(2),
         "the dead candidate demonstrably stalled (a fast refusal would finish in ms): {elapsed:?}"
     );
-    bulk.shutdown(Duration::from_secs(10)).unwrap();
+    bulk.shutdown(Duration::from_secs(10));
     live_serving.shutdown(Duration::from_secs(10)).unwrap();
 }

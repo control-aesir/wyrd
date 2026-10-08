@@ -63,7 +63,7 @@ fn mount_events_reach_the_configured_log_file() {
 
     let temp = TempDir::new();
     let log = temp.0.join("mount.log");
-    let subscriber = build_mount_subscriber(fs::File::create(&log).unwrap(), false);
+    let subscriber = build_mount_subscriber(Some(fs::File::create(&log).unwrap()), false);
     tracing::subscriber::with_default(subscriber, || {
         tracing::info!(stage = "test", "visible at info");
         tracing::debug!(opcode = "lookup", latency_us = 7, "hidden without verbose");
@@ -79,7 +79,7 @@ fn mount_events_reach_the_configured_log_file() {
     );
 
     let verbose_log = temp.0.join("verbose.log");
-    let subscriber = build_mount_subscriber(fs::File::create(&verbose_log).unwrap(), true);
+    let subscriber = build_mount_subscriber(Some(fs::File::create(&verbose_log).unwrap()), true);
     tracing::subscriber::with_default(subscriber, || {
         tracing::debug!(opcode = "lookup", latency_us = 7, "visible with verbose");
     });
@@ -109,12 +109,12 @@ fn relay_teardown_noise_gated_on_shutdown_latch() {
     let temp = TempDir::new();
     SHUTDOWN.store(true, Ordering::Relaxed);
     let quiet_log = temp.0.join("quiet.log");
-    let subscriber = build_mount_subscriber(fs::File::create(&quiet_log).unwrap(), false);
+    let subscriber = build_mount_subscriber(Some(fs::File::create(&quiet_log).unwrap()), false);
     tracing::subscriber::with_default(subscriber, emit_noise);
 
     SHUTDOWN.store(false, Ordering::Relaxed);
     let loud_log = temp.0.join("loud.log");
-    let subscriber = build_mount_subscriber(fs::File::create(&loud_log).unwrap(), false);
+    let subscriber = build_mount_subscriber(Some(fs::File::create(&loud_log).unwrap()), false);
     tracing::subscriber::with_default(subscriber, emit_noise);
 
     SHUTDOWN.store(was, Ordering::Relaxed);
@@ -139,8 +139,8 @@ fn mount_subscribers_route_to_their_own_files() {
     let temp = TempDir::new();
     let first = temp.0.join("first.log");
     let second = temp.0.join("second.log");
-    let first_subscriber = build_mount_subscriber(fs::File::create(&first).unwrap(), false);
-    let second_subscriber = build_mount_subscriber(fs::File::create(&second).unwrap(), false);
+    let first_subscriber = build_mount_subscriber(Some(fs::File::create(&first).unwrap()), false);
+    let second_subscriber = build_mount_subscriber(Some(fs::File::create(&second).unwrap()), false);
     tracing::subscriber::with_default(first_subscriber, || {
         tracing::info!("event for the first log");
     });

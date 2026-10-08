@@ -60,7 +60,10 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for SharedWriter {
 /// post-loop shutdown sequence does for both endpoints. The gate
 /// swallows only that one event, and only once [`SHUTDOWN`] is
 /// tripped, so a mid-operation relay death still fails visibly.
-pub(crate) fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl tracing::Subscriber {
+pub(crate) fn build_mount_subscriber(
+    file: Option<fs::File>,
+    verbose: bool,
+) -> impl tracing::Subscriber {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // Both crates: the binary (`wyrd`, this file) and the library
         // (`wyrd_daemon`, the FUSE backend) emit request and stage
@@ -74,15 +77,21 @@ pub(crate) fn build_mount_subscriber(file: fs::File, verbose: bool) -> impl trac
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(false);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(SharedWriter::new(file))
-        .with_ansi(false);
+    // No file layer without a file: the vault's supervisor captures
+    // stderr, and only `--log-file` adds the second stream. `None`
+    // layers are no-ops, so the registry shape stays one copy.
+    let file_layer = file.map(|file| {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(SharedWriter::new(file))
+            .with_ansi(false);
+        ShutdownNoiseGate { inner: layer }
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(ShutdownNoiseGate {
             inner: stderr_layer,
         })
-        .with(ShutdownNoiseGate { inner: file_layer })
+        .with(file_layer)
 }
 
 /// Suppression wrapper for one output layer: forwards every span and
@@ -242,11 +251,48 @@ pub(crate) fn init_mount_diagnostics(drive_dir: &Path, verbose: bool) -> Result<
     // crate; without this bridge those records vanish because no
     // logger is ever initialized.
     let _ = tracing_log::LogTracer::init();
-    let subscriber = build_mount_subscriber(file, verbose);
+    let subscriber = build_mount_subscriber(Some(file), verbose);
     if tracing_subscriber::util::SubscriberInitExt::try_init(subscriber).is_err() {
         tracing::warn!(
             stage = "start",
             log = %log_path.display(),
+            "diagnostics already initialized; reusing the installed subscriber",
+        );
+    }
+    Ok(log_path)
+}
+
+/// Vault diagnostics: structured events to stderr always, plus an
+/// appended operator-chosen file when `--log-file` is given (OD-22-D
+/// option A+C). Never a drive-resident default, and never truncated:
+/// a vault runs for months under a supervisor that already captures
+/// stderr, and a restart must not destroy the previous run's record.
+/// Logs never contain secret bytes (same rule as CLI errors).
+///
+/// Call first in [`vault`](crate::vault), before the serving endpoint
+/// or the loop thread exists. Same first-install-wins rule as the
+/// mount: one vault per process by construction.
+pub(crate) fn init_vault_diagnostics(log_file: Option<&Path>) -> Result<Option<PathBuf>, CliError> {
+    let file = match log_file {
+        Some(path) => Some(
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|source| CliError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?,
+        ),
+        None => None,
+    };
+    let log_path = log_file.map(Path::to_path_buf);
+    let _ = tracing_log::LogTracer::init();
+    let subscriber = build_mount_subscriber(file, false);
+    if tracing_subscriber::util::SubscriberInitExt::try_init(subscriber).is_err() {
+        tracing::warn!(
+            stage = "start",
+            log = ?log_path.as_ref().map(|path| path.display().to_string()),
             "diagnostics already initialized; reusing the installed subscriber",
         );
     }

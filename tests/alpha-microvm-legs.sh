@@ -808,11 +808,10 @@ leg_headless_setup() {
 }
 
 # leg_headless_serve <drive> <creds> <relay>: the serving half of
-# the two-headless-peers exchange (issue 23-headless-serving). Runs
-# `sync now --serve` in the background, waits for the park line
-# (drain verdict printed, endpoint serving the converged snapshot),
-# then drives the kill/restart/TERM sequence the fetch legs
-# rendezvous on:
+# the two-headless-peers exchange (issue 22a: the vault process).
+# Runs `wyrd vault` in the background, waits for the ready line
+# (first routed pass complete, endpoint serving), then drives the
+# kill/restart/TERM sequence the fetch legs rendezvous on:
 #   serve#1 → C fetches → KILL (mid-flight) → serve#2 (mirror
 #   rebuilt from the vault) → TERM → host admits D → serve#3 → D
 #   fetches pre-kill content → TERM, clean exit 0.
@@ -829,17 +828,17 @@ leg_headless_serve() {
     "$E2E_ROOT/headless-serve-stopped" "$E2E_ROOT/headless-d-invited" \
     "$E2E_ROOT/headless-serve3-ready" "$E2E_ROOT/headless-fetch-d-done"
   mkdir -p "$PIDDIR"
-  # serve#1: the drain announces C's catch-up with the serve route,
-  # then parks. The park line proves the verdict printed first, so
-  # a fetcher starting now races nothing.
-  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+  # serve#1: the vault announces with its serve route, then keeps
+  # syncing. The ready line proves the first routed pass completed,
+  # so a fetcher starting now races nothing.
+  with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-1.out" 2>"$LOGDIR/headless-serve-1.err" &
   echo $! > "$PIDDIR/headless-serve.pid"
-  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-1.err" \
-    || die "serve#1 never reached its serve phase (see headless-serve-1.err)"
+  poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-1.err" \
+    || die "serve#1 never reported ready (see headless-serve-1.err)"
   grep -q "serving over iroh" "$LOGDIR/headless-serve-1.err" \
     || die "serve#1 never bound its endpoint"
-  pass "serve#1 drains, announces its route, and parks"
+  pass "serve#1 reports ready with its route and keeps syncing"
   touch "$E2E_ROOT/headless-serve-ready"
   # C fetches the whole drive headless; only then is the kill
   # mid-flight (residency, not startup).
@@ -854,16 +853,16 @@ leg_headless_serve() {
   kill -0 "$pid" 2>/dev/null && die "serve#1 pid survived KILL"
   rm -f "$PIDDIR/headless-serve.pid"
   pass "serve#1 dies on KILL"
-  # serve#2: restart over the same drive — the mirror rebuilds from
-  # the vault by replay, never by re-deriving bytes. Nothing new to
-  # announce (C discharged, D not yet admitted); the park line
-  # proves the endpoint is back up.
-  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+  # serve#2: restart the vault over the same drive — the mirror
+  # rebuilds from the vault by replay, never by re-deriving bytes.
+  # Nothing new to announce (C discharged, D not yet admitted); the
+  # ready line proves the endpoint is back up and re-announced.
+  with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-2.out" 2>"$LOGDIR/headless-serve-2.err" &
   echo $! > "$PIDDIR/headless-serve.pid"
-  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-2.err" \
-    || die "serve#2 never re-parked after KILL (see headless-serve-2.err)"
-  pass "serve#2 re-parks after KILL: the mirror rebuilt from the vault"
+  poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-2.err" \
+    || die "serve#2 never reported ready after KILL (see headless-serve-2.err)"
+  pass "serve#2 reports ready after KILL: the mirror rebuilt from the vault"
   # TERM while parked: the ordered teardown (mailbox, bulk, serving
   # under the transport bound) must exit 0, proving the shutdown
   # half of the residency contract.
@@ -885,12 +884,12 @@ leg_headless_serve() {
   # D's fresh obligations with its own route.
   poll_until 300 test -f "$E2E_ROOT/headless-d-invited" \
     || die "host never admitted D"
-  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+  with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-3.out" 2>"$LOGDIR/headless-serve-3.err" &
   echo $! > "$PIDDIR/headless-serve.pid"
-  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-3.err" \
-    || die "serve#3 never parked (see headless-serve-3.err)"
-  pass "serve#3 parks with D's obligations announced"
+  poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-3.err" \
+    || die "serve#3 never reported ready (see headless-serve-3.err)"
+  pass "serve#3 reports ready with D's obligations announced"
   touch "$E2E_ROOT/headless-serve3-ready"
   # D fetches content announced before the kill, served after it:
   # the vault-persisted representations outlive the endpoint.

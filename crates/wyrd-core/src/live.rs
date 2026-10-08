@@ -202,6 +202,15 @@ pub struct LiveSummary {
     pub errors_retried: u64,
 }
 
+/// What the supervised loop reports on a completed pass, for
+/// composers that outlive any single drain: the cumulative pass
+/// count plus the pass's own report, so a long-running process can
+/// log readiness and posture from evidence instead of inferring
+/// liveness. Installed per composition ([`LiveNode::set_pass_hook`]);
+/// unset by default, in which case completed passes report nothing.
+/// Failures keep flowing through the loop's error closure unchanged.
+pub type PassHook = dyn FnMut(u64, &SyncReport) + Send;
+
 /// Still-undischarged outbox obligations, itemized per class: queued
 /// pairs minus delivered ones, in deterministic order. The status
 /// half of the outbox picture; [`OutboxTotals`] carries the
@@ -611,6 +620,14 @@ pub struct LiveNode<V: NamespaceView> {
     /// loop's first pass is itself a fresh opportunity to discover
     /// gaps. Compared by movement, never by value.
     pub(super) last_mailbox_reconnects: Option<u64>,
+    /// Completed-pass hook, installed by the composer alongside the
+    /// route and barrier: the loop calls it with the cumulative pass
+    /// count and the pass's report after every successful pass. `None`
+    /// (tests, compositions that end at the summary) reports nothing.
+    /// Like the barrier and address, this is composer-installed node
+    /// state — the loop owns the passes, the composer owns what they
+    /// mean to the operator.
+    pub(super) pass_hook: Option<Box<PassHook>>,
 }
 
 /// The live half of a split node: everything a presentation
@@ -936,6 +953,7 @@ where
                 serving_flush_budget: config.serving_flush_budget,
                 fetch_pass_budget: config.fetch_pass_budget,
                 last_mailbox_reconnects: None,
+                pass_hook: None,
             },
             parts,
         ))
@@ -991,6 +1009,15 @@ where
     /// a peer acting on an announcement never races the write-through.
     pub fn set_serving_barrier(&mut self, barrier: Arc<dyn ServingBarrier>) {
         self.serving_barrier = Some(barrier);
+    }
+
+    /// Install the completed-pass hook: the loop calls it with the
+    /// cumulative pass count and the pass's report after every
+    /// successful pass. The vault composer installs its readiness and
+    /// posture observer here; compositions that end at the summary
+    /// leave it unset.
+    pub fn set_pass_hook(&mut self, hook: impl FnMut(u64, &SyncReport) + Send + 'static) {
+        self.pass_hook = Some(Box::new(hook));
     }
 
     /// Send every undischarged outbound obligation: transitions and
@@ -3076,10 +3103,13 @@ where
         while !stop.load(Ordering::Relaxed) {
             let bulk_ref = bulk.as_deref_mut();
             match self.sync_once(mailbox, bulk_ref) {
-                Ok(_) => {
+                Ok(report) => {
                     consecutive = [0; 3];
                     delay = [config.error_base_delay; 3];
                     summary.passes += 1;
+                    if let Some(hook) = &mut self.pass_hook {
+                        hook(summary.passes, &report);
+                    }
                     if waker.wait(stop, config.interval) == Wake::Stop {
                         break;
                     }

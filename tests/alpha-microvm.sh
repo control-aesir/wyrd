@@ -408,8 +408,8 @@ fi # want_phase 11
 # --- phase: microvm 12 (headless serving) --------------------------------
 if want_phase 12; then
 # Two headless peers exchange content with neither mounting
-# (issue 23-headless-serving): the owner drive serves via
-# `sync now --serve` while fresh devices join and converge with
+# (issue 22a: the vault process): the owner drive serves via
+# `wyrd vault` while fresh devices join and converge with
 # plain `sync now`, then read the bytes through a mount (headless
 # reconciliation leaves file chunks RemoteOnly by policy, so the
 # read faults them in over the serve route — the feature under

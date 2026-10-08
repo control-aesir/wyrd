@@ -2097,23 +2097,24 @@ fn sync_now_output_contains_no_secret_bytes() {
 }
 
 /// The trust-position statement ships with the surfaces: the docs
-/// the operator reads state that no vault-position surface exists,
-/// so nobody reads a client surface as a vault one. A grep over
-/// the changed doc file — fails if the statement is ever dropped.
-/// The never-print list is pinned as one whitespace-normalized
-/// sentence, head and tail anchored, not per-phrase `contains`
-/// checks: phrase checks stay green when the guarded words drift
-/// elsewhere in the file (which is exactly what happened to two
-/// entries), while the sentence check fails whenever the list changes
-/// shape in either direction.
+/// the operator reads state that client surfaces speak for clients
+/// while the vault's own surface is self-reported, so nobody reads
+/// a client surface as a vault one. A grep over the changed doc
+/// file — fails if the statement is ever dropped. The never-print
+/// list is pinned as one whitespace-normalized sentence, head and
+/// tail anchored, not per-phrase `contains` checks: phrase checks
+/// stay green when the guarded words drift elsewhere in the file
+/// (which is exactly what happened to two entries), while the
+/// sentence check fails whenever the list changes shape in either
+/// direction.
 #[test]
-fn vault_trust_position_is_documented_as_unimplemented() {
+fn vault_trust_position_names_the_self_reported_surface() {
     let reference =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli.md"))
             .expect("the CLI reference reads");
     assert!(
-        reference.contains("No vault-position diagnostics surface exists"),
-        "the statement pins the missing vault surface"
+        reference.contains("The vault's own surface is self-reported"),
+        "the statement pins the vault surface instead of its absence"
     );
     let flat = reference.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(

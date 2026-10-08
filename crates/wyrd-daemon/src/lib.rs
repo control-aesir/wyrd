@@ -15,9 +15,14 @@
 pub mod core;
 pub mod fuse;
 pub mod lifecycle;
+pub mod vault;
 
 pub use core::{
     FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, NodeError,
     PendingObligations, ResourceBudgets, RuntimeMaterialization, SyncReport, WyrdNode,
 };
 pub use lifecycle::{LoopError, LoopReturn, Supervisor, Wake, WakeSignal};
+pub use vault::{
+    install_serving, run_vault, shutdown_transport, ServeSurface, TransportDeadlines,
+    TransportShutdown, VaultEvent, VaultLoopEnd, VaultObserver, VaultOutcome, VaultRun,
+};

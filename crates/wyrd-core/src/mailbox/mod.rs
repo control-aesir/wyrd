@@ -1804,4 +1804,11 @@ where
             .load(Ordering::Relaxed)
             .saturating_add(self.health.stream_recovery_attempts.load(Ordering::Relaxed))
     }
+
+    /// The trait's bounded backstop, wired to the inherent task
+    /// shutdown: the generic composer tears transport down through
+    /// this, never around it.
+    fn shutdown(&mut self, deadline: Duration) {
+        LiveMailbox::shutdown(self, deadline)
+    }
 }

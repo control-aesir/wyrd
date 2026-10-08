@@ -18,6 +18,7 @@ wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir
 wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
 wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd sync [--relay <url>...] --identity-file <path> --passphrase-file <path> <drive_dir> (status | now)
+wyrd vault --relay <url>... [--log-file <path>] --identity-file <path> --passphrase-file <path> <drive_dir>
 wyrd pin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
 wyrd unpin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
 wyrd evict --identity-file <path> --passphrase-file <path> <drive_dir> <path>
@@ -466,9 +467,49 @@ tears down immediately with its own error instead of serving
 half-fetched state. `--serve` cannot be combined with `--offline`:
 with no relay nothing publishes the route, so the endpoint would
 serve content nothing can discover. The persistent lifecycle is
-`wyrd vault` (a separate issue); `--serve` is the bridge until it
-exists, and it performs no further intake or fetch passes while
-parked.
+`wyrd vault` (below); `--serve` is the bridge, and it performs no
+further intake or fetch passes while parked.
+
+### `vault` — a headless vault process, no mount
+
+The mount's live loop and serving surface with no presentation
+session: the persistent process. `sync now` stays the bounded
+one-shot drain; `vault` never stops syncing until SIGINT/SIGTERM.
+Needs at least one `--relay` — a relay-less vault serves routes
+nothing can discover and never converges, so the command refuses
+rather than idle forever (there is no `--offline`: an offline
+vault is a process that idles, not a run with a verdict).
+
+```text
+vault
+    = the mount's composition minus the session: open the serving
+      endpoint, flush, announce the route, gate every pass on
+      mirror readiness, run the live loop under the same budgets
+    = reports readiness once, after the first routed pass, as
+      `vault ready: serving <id>` on stderr — the first line is a
+      true one: not before the flush, not before the address
+    = periodic `vault posture` lines while it runs (passes, errors
+      retried, sends, uptime): proof of life, never a health claim
+    = failures with the mount's reporting shape
+    = SIGTERM exits 0 when the loop stopped clean and every
+      transport closed; a transport close that times out exits
+      non-zero, after everything else still shut down. Exit 0 is
+      durable-outbox-first, not outbox-empty: pending obligations
+      (a relay down at TERM time) stay recorded and resume on the
+      next run — TERM never loses one, but it does not wait for one.
+```
+
+What the vault states is what the device is *doing* — residency
+policy, quota, effective budgets, all already readable — never what
+it *guarantees*: retention promises wait for the DG-4 decision, and
+the help text makes no retention claim. No liveness handle, no
+status surface, no daemonization: supervision owns the pid
+(`systemd`/`launchd` track and restart it), the store lock stays
+exclusive (a second `wyrd` invocation against the running drive
+fails closed with the lock error, `sync status` included), and
+shutdown is SIGTERM plus the documented teardown order. Operator
+lifecycle (`start`/`stop`/`status`) and queryable health are separate
+follow-ons; this command is the foreground process they supervise.
 
 ### `pin` / `unpin` / `evict` / `cache` — local materialization policy
 
@@ -569,15 +610,20 @@ Both are read and hardened by wyrd code, never by clap:
 - `mount` initializes structured diagnostics first: events to stderr
   plus `drive_dir/mount.log`, truncated per mount (one mount, one
   log — no rotation code). Init, export, member, and device log nothing to disk.
+  `vault` logs to stderr always, plus an appended operator-chosen
+  file under `--log-file` — never a drive-resident default, never
+  truncated: a restart must not destroy the previous run's record.
   Every dispatch line carries the opcode, its reply errno, its
   latency, and the mutation-queue backlog observed at dispatch
   entry — queue pressure per dispatch, no metrics pipeline.
 - Trust position of these surfaces: `sync status`, `sync now`, and
   `mount.log` speak for a client holding its own keys, never for a
-  vault. No vault-position diagnostics surface exists: the matrix
+  vault. The vault's own surface is self-reported — one ready line,
+  periodic posture counts, failures with the mount's shape, on
+  stderr plus an optional `--log-file` — and the matrix
   and enforcement that generalize this statement land separately,
   sequenced after `wyrd vault`, because a boundary needs a vault
-  process to be meaningful and none exists. What these surfaces
+  process to be meaningful. What these surfaces
   print is counts, latencies, class breakdowns,
   and pressure against the bounds in `resource-limits.md`. What
   they never print is ContentIds, filesystem paths, file bytes,

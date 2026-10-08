@@ -687,6 +687,78 @@ fn capability_refusal_warns_once_with_the_capability_kind() {
     );
 }
 
+/// An announcement refusal warns with the announcement kind: the
+/// third production call site's wiring, pinned the same way — the
+/// set is now complete, every `send_sealed_to` caller names its
+/// kind through its own path.
+#[test]
+fn announcement_refusal_warns_once_with_the_announcement_kind() {
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let genesis_id = fx
+        .engine
+        .log
+        .transition(&child_id)
+        .and_then(|t| t.prev)
+        .expect("genesis linked");
+    let (author_sk, _) = identity(0x22);
+    // One known snapshot under the held epoch-1 key: takes the
+    // re-announce path and reaches the send.
+    let snap = wyrd_format::SnapshotId::from_bytes([0xA1; 32]);
+    let Message::SnapshotAnnouncement(known) = announcement_msg(&author_sk, snap, 1, genesis_id)
+    else {
+        panic!("announcement_msg builds announcements");
+    };
+    let recipient = identity(0x05).1;
+    fx.engine
+        .commit_facts(&[
+            Fact::Announcement(known),
+            Fact::AnnouncementQueued(snap, recipient),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut refusing = RefusingMailbox {
+            inner: MemoryMailbox {
+                relay: &mut fx.relay,
+                owner: fx.recipient,
+            },
+        };
+        assert_eq!(
+            fx.engine.announce_pending(&mut refusing, None).unwrap(),
+            0,
+            "a refused announcement send counts nothing"
+        );
+    });
+    let warns: Vec<Vec<(String, String)>> = logs
+        .snapshot()
+        .into_iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, fields)| fields)
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn for the refused pair");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("announcement"),
+        "the warn names the attempted kind: {kind}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.announcement_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.announcement_queued,
+        vec![(snap, recipient)],
+        "the obligation stays pending"
+    );
+}
+
 /// An announcement obligation without a sealing key stays pending
 /// instead of failing the pass: the snapshot under the held key
 /// still sends, and the keyless one remains observable via the

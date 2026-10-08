@@ -551,14 +551,5 @@ for f in "$RUN"/logs/*; do
   fi
 done
 pass "no secrets in host logs"
-    grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
-  done
-  if want_phase 6; then
-    for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")"; do
-      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
-    done
-  fi
-done
-pass "no secrets in host logs"
 
 echo "microvm: $PASS host checks passed (guest legs report their own totals above)"

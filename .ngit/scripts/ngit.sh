@@ -38,15 +38,16 @@ REPO_NADDR="naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97n
 : "${NGIT_CACHE_DIR:=$HOME/.ngit-event-cache}"
 
 # Bound every ngit call: a hung relay must fail fast and loud, never
-# stall the job into its timeout. The bound covers a full cold sync
-# (minutes on a fresh checkout); steady-state warm calls finish in
-# seconds. Kills are safe on the read path (list/view/status are
-# side-effect free); on the publish path a kill risks a half-done
-# report, which still beats a hung job. `timeout` may be absent on
-# some runners; degrade to a direct call.
+# stall the job into its timeout. The default bound covers a full cold
+# sync (minutes on a fresh checkout); steady-state warm calls finish in
+# seconds. Callers under a deadline override per call with
+# NGIT_CALL_TIMEOUT_SECS (see bounded_scan below). Kills are safe on
+# the read path (list/view/status are side-effect free); on the publish
+# path a kill risks a half-done report, which still beats a hung job.
+# `timeout` may be absent on some runners; degrade to a direct call.
 bounded_ngit() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout 300 ngit "$@"
+    timeout "${NGIT_CALL_TIMEOUT_SECS:-300}" ngit "$@"
   else
     ngit "$@"
   fi
@@ -74,11 +75,12 @@ resolve_pr() {
   local PR_ID=""
 
   # One knob bounds the whole scan below: every ngit call syncs repo
-  # state and each hangs up to the per-call bound, so per-call
-  # timeouts alone still allow multi-minute stacking. Expire the scan
-  # loudly instead of stalling into the job timeout. Overridable for
-  # tests; the production default covers a cold seed (minutes) while
-  # warm runs finish in seconds, far from pathology.
+  # state, and each call is capped at the time left on the deadline
+  # (bounded_scan), so the scan can never outlive the deadline no
+  # matter how slowly a single call syncs. Expire the scan loudly
+  # instead of stalling into the job timeout. Overridable for tests;
+  # the production default covers a cold seed (minutes) while warm runs
+  # finish in seconds, far from pathology.
   local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-480}))
   check_deadline() {
     if [ "$SECONDS" -ge "$deadline" ]; then
@@ -87,12 +89,26 @@ resolve_pr() {
     fi
   }
 
+  # Scan-path ngit call: like bounded_ngit, but the per-call timeout
+  # is the smaller of the default bound and the time left on the scan
+  # deadline, so an in-flight call can never push the scan past the
+  # deadline and into the job timeout (which would also skip the cache
+  # save that depends on the scan finishing).
+  bounded_scan() {
+    check_deadline
+    local remaining=$((deadline - SECONDS))
+    if [ "$remaining" -gt 300 ]; then
+      remaining=300
+    fi
+    NGIT_CALL_TIMEOUT_SECS="$remaining" bounded_ngit "$@"
+  }
+
   # Fastest exact path first: coordinators that export the trigger event
   # let ngit map a 1618 proposal or a 1619 revision to its PR directly.
   if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
     check_deadline
     PR_ID="$(
-      bounded_ngit --repo "$REPO_NADDR" \
+      bounded_scan --repo "$REPO_NADDR" \
         ci status "$NGIT_CI_TRIGGER_EVENT" --json |
         jq -r '.target.pr // empty' || true
     )"
@@ -108,7 +124,7 @@ resolve_pr() {
     check_deadline
     local matches
     matches="$(
-      bounded_ngit --repo "$REPO_NADDR" pr list --json |
+      bounded_scan --repo "$REPO_NADDR" pr list --json |
         jq -r --arg branch "$PR_BRANCH" '
           .[] |
           select(.branch == $branch or
@@ -138,12 +154,12 @@ resolve_pr() {
     local sha_matches=()
     local candidates candidate
     candidates="$(
-      bounded_ngit --repo "$REPO_NADDR" pr list --json --status open,draft |
+      bounded_scan --repo "$REPO_NADDR" pr list --json --status open,draft |
         jq -r '.[].id' || true
     )"
     for candidate in $candidates; do
       check_deadline
-      if bounded_ngit --repo "$REPO_NADDR" pr view "$candidate" --json |
+      if bounded_scan --repo "$REPO_NADDR" pr view "$candidate" --json |
         jq -e --arg sha "$GITHUB_SHA" '
           ([(.ci.runs // [] | .[].commit),
             (.ci.outdated // [] | .[].commit)]

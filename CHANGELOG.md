@@ -133,8 +133,11 @@ version say exactly what changed.
   the global cache: fresh checkouts discarded the bulk of relay sync
   state every run, so auto-draft cold-synced past the resolution
   deadline on every new PR. Resolution deadline 180s to 480s and the
-  per-call bound 120s to 300s as cold-seed cover; warm runs finish in
-  seconds.
+  per-call bound 120s to 300s as cold-seed cover; each scan call is
+  additionally capped at the time left on the deadline, so the scan
+  can never outlive it into the job timeout and skip the cache save.
+  The reporter save step runs unconditionally like the draft one.
+  Warm runs finish in seconds.
 
 ### Added
 

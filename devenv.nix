@@ -76,7 +76,7 @@ in
       enable = true;
       name = "review helper tests";
       entry = "bash .ngit/scripts/tests/test-review.sh";
-      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/test-review\\.sh)$";
+      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/test-(review|ngit-bounds)\\.sh)$";
       pass_filenames = false;
     };
   };

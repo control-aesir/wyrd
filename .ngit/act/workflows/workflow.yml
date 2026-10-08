@@ -401,6 +401,7 @@ jobs:
       # Saves whatever the reporter synced (even on resolution failure:
       # partial warmth still helps the next run).
       - name: Save ngit event cache
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: |

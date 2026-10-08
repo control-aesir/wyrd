@@ -23,6 +23,11 @@ version say exactly what changed.
 
 ### Added
 
+- MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
+  run the prefix closure over suite phases 1-11 (1-5 shared core,
+  6-11 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
+  entry or a non-step is refused; an empty value means all phases.
+
 - Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):
   republish stranded bytes as a recovery-flagged snapshot parented
   onto the current eligible heads, without adopting the dead fork's

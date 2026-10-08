@@ -6,12 +6,17 @@
 # a host bridge). One command end to end:
 #
 #   sudo ./nix/microvm/run-microvm.sh [--state-dir DIR] [--fresh] [--keep]
+#   sudo ./nix/microvm/run-microvm.sh [--state-dir DIR] [--step N[,N...]]
 #   sudo ./nix/microvm/run-microvm.sh --teardown
 #
 #   --state-dir DIR  host state root (default /var/lib/wyrd-microvm/state)
 #   --fresh          wipe $STATE_DIR/run before booting (default: keep,
 #                    so a failed run's drives survive for forensics)
 #   --keep           leave VMs and network up afterwards for debugging
+#   --step           run suite phases 1..N (comma lists allowed; the run
+#                    is the prefix closure, since phases build on each
+#                    other: 1-5 are the shared-core Lima steps on peer-o,
+#                    6-11 the microvm phases in tests/alpha-microvm.sh)
 #   --teardown       stop a kept run (daemons, taps, bridge) and exit;
 #                    takes the run lock, so it refuses while a suite
 #                    is active. State dirs and logs are retained.
@@ -36,15 +41,46 @@ STATE_DIR="/var/lib/wyrd-microvm/state"
 FRESH=0
 KEEP=0
 TEARDOWN=0
+ONLY_STEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --fresh) FRESH=1; shift ;;
     --keep) KEEP=1; shift ;;
+    --step)
+      # An explicit but empty value is a mistake, not "all phases".
+      [[ -n "${2:-}" ]] || { echo "error: --step needs at least one step" >&2; exit 2; }
+      ONLY_STEP="$2"
+      shift 2
+      ;;
     --teardown) TEARDOWN=1; shift ;;
     *) echo "error: unknown flag $1 (see header)" >&2; exit 2 ;;
   esac
 done
+
+# Validate --step now, not after the multi-minute build and boot: a
+# typo must fail here. The orchestrator re-checks (same grammar), so
+# a direct tests/alpha-microvm.sh invocation fails the same way.
+if [[ -n "$ONLY_STEP" ]]; then
+  # The grammar is a comma list; whitespace is not a separator.
+  [[ "$ONLY_STEP" != *[[:space:]]* ]] \
+    || { echo "error: --step: '$ONLY_STEP' is not a comma list (got whitespace)" >&2; exit 2; }
+  # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
+  # without this it would run zero checks and pass.
+  [[ ",$ONLY_STEP," != *,,* ]] \
+    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-11 entries)" >&2; exit 2; }
+  # Split on commas into a quoted array: an unquoted expansion would
+  # glob each entry against the working directory first, so `--step
+  # '*'` could pathname-expand into a digit-named file and slip past
+  # the grammar.
+  _step_entries=()
+  IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
+  for _e in "${_step_entries[@]}"; do
+    [[ "$_e" =~ ^([1-9]|1[01])$ ]] \
+      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-11)" >&2; exit 2; }
+  done
+  unset _step_entries _e
+fi
 
 [[ "$EUID" == 0 ]] || { echo "error: run as root (taps, bridge, virtiofsd need it)" >&2; exit 2; }
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
@@ -260,6 +296,7 @@ set +e
 timeout 5400 env \
   "STATE_DIR=$STATE_DIR" \
   "SSH_KEY=$SSH_KEY" \
+  "MICROVM_ONLY_STEP=$ONLY_STEP" \
   "WYRD_BIN=$WYRD_BIN" \
   "NAK_BIN=$NAK_BIN" \
   "RELAY_URL=ws://$NET.10:18761" \

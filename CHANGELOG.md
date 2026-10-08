@@ -137,6 +137,18 @@ version say exactly what changed.
   fetching, so walk-found losses clear on the same pass they are
   observed. No bytes are unlinked, no protocol change, no new
   durable-fact kind; the vault is untouched.
+- CI draft and reporter jobs persist the per-repo ngit event cache
+  (`.git/nostr-cache.lmdb`) through the actions/cache steps alongside
+  the global cache: fresh checkouts discarded the bulk of relay sync
+  state every run, so auto-draft cold-synced past the resolution
+  deadline on every new PR. Resolution deadline 180s to 480s and the
+  per-call bound 120s to 300s as cold-seed cover; scan and publish
+  calls are each capped at the time left on a shared per-step budget
+  (60s under the 10-minute job ceiling), so a slow run can never
+  stall into cancellation and skip the cache save. The reporter save
+  step runs unconditionally like the draft one. A hermetic shell-test
+  job (`bash .ngit/scripts/tests/run-all.sh`) pins the bound
+  arithmetic. Warm runs finish in seconds.
 
 ### Fixed
 

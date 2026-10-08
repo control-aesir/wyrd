@@ -1127,7 +1127,14 @@ leg_steady_member() {
 leg_crash_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection member leg"
+  # Debug for this mount only, Lima step-6 style (see leg_fetch_member):
+  # the scratch commit below is under investigation — if it outwaits
+  # its deadline again, the daemon log must show what the commit
+  # waited on. Scoped save/restore so later mounts keep info level.
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xcrash-m "$c" "$d" "$MNTS/xcrash-m" --relay "$relay"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   poll_until 120 bash -c "ls '$MNTS/xcrash-m' | grep -qx 'cold-u.txt'" \
     || die "member never listed the cold file"
   touch "$E2E_ROOT/crash-m-listed"

@@ -2478,6 +2478,8 @@ mod tests_properties;
 #[cfg(test)]
 mod tests_reconciliation;
 #[cfg(test)]
+mod tests_reopen_agreement;
+#[cfg(test)]
 mod tests_response;
 #[cfg(test)]
 mod tests_restart_equivalence;

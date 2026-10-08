@@ -31,6 +31,17 @@ version say exactly what changed.
   stdin, posts exactly once as Wyrd AI Review, and verifies. Review
   agents call these instead of re-deriving ngit ceremony.
 
+- Crash-consistency window pins (G4, tests only — no behavior
+  change): cross-subsystem reopen agreement (one test per crash
+  stage where the object store, vault, and fact log can disagree,
+  plus the vault/object-store pair under a post-rename fsync
+  failure and the poisoned-lock stays-failed consequence),
+  post-corruption projection (a damaged head fails the pass with
+  the previous generation still serving; normative rule stays in
+  `docs/epochs.md`), and mirror-queue diagnostics (depth travels
+  with the not-ready report; a rejecting queue warns at the
+  default level). Inventory in `docs/crash-consistency.md`.
+
 - Device-local durability levels (DG-2, normative in
   `docs/write-path.md`): a completed write reports which of Working,
   Committed, or Published it reached, indexed by the DG-1

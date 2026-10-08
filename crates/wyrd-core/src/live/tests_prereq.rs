@@ -13,14 +13,22 @@ use wyrd_sync::keys::DeviceIdentitySecret;
 /// heads) alone, so `open_shared` needs no out-of-band config:
 /// which prerequisite the mapping sees is a function of which
 /// objects the store holds. `pub(super)` for the trigger tests,
-/// which compose nodes over the same fake view.
-pub(super) struct FileView {
-    store: Arc<RwLock<MemoryObjectStore>>,
+/// which compose nodes over the same fake view. Generic over the
+/// object store so corruption tests can run the same fake over a
+/// tampering wrapper: the view only ever reads through the
+/// [`ObjectStore`](wyrd_format::ObjectStore) trait. The default
+/// keeps every existing `LiveNode<FileView>` annotation working.
+pub(super) struct FileView<S = MemoryObjectStore> {
+    store: Arc<RwLock<S>>,
     materialization: RuntimeMaterialization,
     heads: Vec<Head>,
 }
 
-impl FileView {
+impl<S> FileView<S>
+where
+    S: wyrd_format::ObjectStore,
+    S::Error: std::fmt::Debug,
+{
     fn file_entry(&self) -> Result<(String, u64, bool, Vec<ContentId>), ViewError> {
         let [head] = self.heads.as_slice() else {
             return Err(ViewError::NotFound);
@@ -61,8 +69,12 @@ impl FileView {
     }
 }
 
-impl NamespaceView for FileView {
-    type Store = MemoryObjectStore;
+impl<S> NamespaceView for FileView<S>
+where
+    S: wyrd_format::ObjectStore,
+    S::Error: std::fmt::Debug,
+{
+    type Store = S;
     type Materialization = RuntimeMaterialization;
 
     fn open(

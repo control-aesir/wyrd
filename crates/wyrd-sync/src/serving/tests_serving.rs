@@ -1,7 +1,7 @@
 use super::*;
 use crate::keys::EpochSecret;
 use crate::seal::seal_manifest;
-use wyrd_format::{DriveId, Manifest, SnapshotId};
+use wyrd_format::{DriveId, FsObjectStore, Manifest, ObjectKind, ObjectStore, SnapshotId};
 
 fn drive() -> DriveId {
     DriveId::from_bytes([0xEE; 32])
@@ -917,12 +917,89 @@ fn failed_publication_surfaces_an_error_and_leaves_no_temp() {
     }
 }
 
-/// Directory-sync calls made by the injection test below; the first
-/// fails, the rest use the real implementation.
-static DIR_SYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The object-store/vault publication pair under a post-rename
+/// directory-sync failure (G4 window (a)): the sealed envelope is
+/// installed in the vault but not known durable, while the plaintext
+/// sits in the object store. The two sides must agree through the
+/// failure — the vault serves the installed bytes under their name
+/// and the object store holds the plaintext — and a retry plus a
+/// reopen must agree the same way. A vault record must never name a
+/// representation the object store does not hold, on the failure
+/// path any more than the happy one.
+#[test]
+fn object_store_and_vault_agree_after_post_rename_fsync_failure() {
+    let dir = serve_dir();
+    let objects_dir = dir.join("objects");
+    let mut objects = FsObjectStore::open(objects_dir.clone()).unwrap();
+    let plaintext = b"publication pair payload".to_vec();
+    let content = objects.insert(ObjectKind::Chunk, &plaintext).unwrap();
+    let sealed = b"sealed representation bytes".to_vec();
+    let root = blob_root(&sealed);
+    let mut vault = Vault::open(&dir).unwrap();
+    reset_dir_sync_calls();
+    vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
+
+    // The rename installs the file, then the injected directory
+    // fsync fails: the durability error surfaces, but both halves of
+    // the pair are already in place.
+    let error = vault.import(&sealed).unwrap_err();
+    assert!(
+        error.to_string().contains("injected"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        objects.get(&content).unwrap(),
+        Some(plaintext.clone()),
+        "the object store holds the plaintext through the failure"
+    );
+    assert_eq!(
+        vault.sealed(&root).unwrap(),
+        Some(sealed.clone()),
+        "the installed envelope verifies under its name through the failure"
+    );
+
+    // A retry takes the held-root path and reconciles; both sides
+    // still agree afterwards and across a reopen.
+    assert_eq!(vault.import(&sealed).unwrap(), root);
+    assert_eq!(vault.roots().unwrap(), vec![root]);
+    drop(vault);
+    drop(objects);
+    let vault = Vault::open(&dir).unwrap();
+    let objects = FsObjectStore::open(objects_dir).unwrap();
+    assert_eq!(vault.roots().unwrap(), vec![root]);
+    assert_eq!(
+        vault.sealed(&root).unwrap(),
+        Some(sealed),
+        "reopen serves the reconciled envelope"
+    );
+    assert_eq!(
+        objects.get(&content).unwrap(),
+        Some(plaintext),
+        "reopen holds the plaintext the vault record names"
+    );
+}
+
+// Directory-sync calls seen by the injection tests below; the
+// first fails, the rest use the real implementation. Thread-local:
+// the suite runs tests concurrently in one binary, and a shared
+// counter let one test's reset steal another test's injected
+// failure. A thread runs one test at a time, so resetting at the
+// test's start is race-free.
+thread_local! {
+    static DIR_SYNC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn reset_dir_sync_calls() {
+    DIR_SYNC_CALLS.with(|calls| calls.set(0));
+}
 
 fn fail_first_dir_sync(dir: &Path) -> std::io::Result<()> {
-    if DIR_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+    let call = DIR_SYNC_CALLS.with(|calls| {
+        let call = calls.get();
+        calls.set(call + 1);
+        call
+    });
+    if call == 0 {
         return Err(std::io::Error::other("injected directory fsync failure"));
     }
     durable::fsync_dir(dir)
@@ -961,7 +1038,7 @@ fn post_rename_directory_sync_failure_is_reconciled_on_retry() {
     let dir = serve_dir();
     let mut vault = Vault::open(&dir).unwrap();
     let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-    DIR_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    reset_dir_sync_calls();
     vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
 
     let sealed = b"durability failure reconciled".to_vec();

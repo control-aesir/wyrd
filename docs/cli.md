@@ -491,8 +491,12 @@ vault
     = periodic `vault posture` lines while it runs (passes, errors
       retried, sends, uptime): proof of life, never a health claim
     = failures with the mount's reporting shape
-    = SIGTERM exits 0 with the outbox empty; a transport close that
-      times out exits non-zero, after everything else still shut down
+    = SIGTERM exits 0 when the loop stopped clean and every
+      transport closed; a transport close that times out exits
+      non-zero, after everything else still shut down. Exit 0 is
+      durable-outbox-first, not outbox-empty: pending obligations
+      (a relay down at TERM time) stay recorded and resume on the
+      next run — TERM never loses one, but it does not wait for one.
 ```
 
 What the vault states is what the device is *doing* — residency
@@ -614,10 +618,12 @@ Both are read and hardened by wyrd code, never by clap:
   entry — queue pressure per dispatch, no metrics pipeline.
 - Trust position of these surfaces: `sync status`, `sync now`, and
   `mount.log` speak for a client holding its own keys, never for a
-  vault. No vault-position diagnostics surface exists: the matrix
+  vault. The vault's own surface is self-reported — one ready line,
+  periodic posture counts, failures with the mount's shape, on
+  stderr plus an optional `--log-file` — and the matrix
   and enforcement that generalize this statement land separately,
   sequenced after `wyrd vault`, because a boundary needs a vault
-  process to be meaningful and none exists. What these surfaces
+  process to be meaningful. What these surfaces
   print is counts, latencies, class breakdowns,
   and pressure against the bounds in `resource-limits.md`. What
   they never print is ContentIds, filesystem paths, file bytes,

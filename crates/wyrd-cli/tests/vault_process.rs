@@ -1,6 +1,7 @@
 //! The vault process (issue `22a`): a foreground `wyrd vault`
 //! against a real in-process relay reports ready once, serves until
-//! SIGINT/SIGTERM, and exits 0 with the outbox empty. Process-level
+//! SIGINT/SIGTERM, and exits 0 on a clean stop — with the empty
+//! fixture's outbox still empty after. Process-level
 //! on purpose: readiness, signal handling, and the exit code live in
 //! the binary composer, not the library.
 //!
@@ -115,38 +116,63 @@ impl Fixture {
 
     /// Spawn the vault against `relay`, returning the child once its
     /// stderr carries the ready line: TERM lands on a converged
-    /// vault, never on startup.
-    fn spawn_until_ready(&self, relay: &TestRelay) -> Child {
+    /// vault, never on startup. The stderr drain thread stays alive
+    /// until the child exits: later observer writes (posture,
+    /// transient failures) must never hit a closed pipe, which
+    /// `eprintln!` would turn into a loop-thread panic and a
+    /// flaky non-zero exit.
+    fn spawn_until_ready(
+        &self,
+        relay: &TestRelay,
+        log_file: Option<&std::path::Path>,
+    ) -> VaultChild {
+        let mut argv = vec![
+            "vault",
+            self.drive.to_str().unwrap(),
+            "--relay",
+            &relay.url,
+            "--identity-file",
+            self.identity.to_str().unwrap(),
+            "--passphrase-file",
+            self.passphrase.to_str().unwrap(),
+        ];
+        let log_path;
+        if let Some(path) = log_file {
+            log_path = path.to_str().unwrap().to_string();
+            argv.push("--log-file");
+            argv.push(&log_path);
+        }
         let mut child = self
-            .wyrd(&[
-                "vault",
-                self.drive.to_str().unwrap(),
-                "--relay",
-                &relay.url,
-                "--identity-file",
-                self.identity.to_str().unwrap(),
-                "--passphrase-file",
-                self.passphrase.to_str().unwrap(),
-            ])
+            .wyrd(&argv)
             .stderr(Stdio::piped())
             .spawn()
             .expect("wyrd vault spawns");
-        let lines = await_stderr_line(&mut child, "vault ready: serving ", Duration::from_secs(90));
+        let (lines, drain) =
+            await_stderr_line(&mut child, "vault ready: serving ", Duration::from_secs(90));
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains("serving over iroh: ")),
             "the bind line precedes readiness, got: {lines:?}"
         );
+        let bind = lines
+            .iter()
+            .find(|line| line.contains("serving over iroh: "))
+            .unwrap();
         let ready = lines
             .iter()
             .find(|line| line.contains("vault ready: serving "))
             .unwrap();
-        assert!(
-            ready.len() > "vault ready: serving ".len(),
-            "the ready line carries the serving id, got {ready:?}"
+        let bind_id = bind.rsplit(' ').next().unwrap();
+        let ready_id = ready.rsplit(' ').next().unwrap();
+        assert_eq!(
+            bind_id, ready_id,
+            "the ready line names the bound endpoint, bind={bind_id} ready={ready_id}"
         );
-        child
+        VaultChild {
+            child,
+            drain: Some(drain),
+        }
     }
 }
 
@@ -160,8 +186,14 @@ impl Drop for Fixture {
 /// timeout): faster and less flaky than a fixed sleep, and it fails
 /// the test instead of hanging the suite. An early EOF fails
 /// immediately with what the process said instead of spinning to the
-/// deadline.
-fn await_stderr_line(child: &mut Child, needle: &str, timeout: Duration) -> Vec<String> {
+/// deadline. Returns the lines so far plus a drain thread that owns
+/// the pipe until EOF: the caller keeps it alive until `wait`, so no
+/// later child write ever hits a closed pipe.
+fn await_stderr_line(
+    child: &mut Child,
+    needle: &str,
+    timeout: Duration,
+) -> (Vec<String>, std::thread::JoinHandle<()>) {
     let stderr = child.stderr.take().expect("stderr piped");
     let mut lines = Vec::new();
     let deadline = Instant::now() + timeout;
@@ -184,10 +216,44 @@ fn await_stderr_line(child: &mut Child, needle: &str, timeout: Duration) -> Vec<
         }
         lines.push(trimmed);
     }
-    lines
+    let drain = std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (lines, drain)
 }
 
-fn sigterm(child: &Child) {
+/// A vault child past readiness: the drain thread outlives every
+/// observer write, and `wait` reaps both.
+struct VaultChild {
+    child: Child,
+    drain: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VaultChild {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait(mut self) -> ExitStatus {
+        let status = self.child.wait().expect("vault reaps");
+        // EOF follows the exit, so the join reaps the drain without
+        // hanging; a join failure cannot change the exit verdict.
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+        status
+    }
+}
+
+fn sigterm(child: &VaultChild) {
     // No libc in test scope (the workspace denies unsafe code): the
     // platform `kill` delivers the same SIGTERM the supervisor sends.
     let status = Command::new("kill")
@@ -204,9 +270,9 @@ fn vault_sigterm_after_ready_exits_zero() {
     let fixture = Fixture::new("term");
     fixture.init();
     let relay = TestRelay::spawn();
-    let mut child = fixture.spawn_until_ready(&relay);
+    let child = fixture.spawn_until_ready(&relay, None);
     sigterm(&child);
-    let status: ExitStatus = child.wait().expect("vault reaps");
+    let status: ExitStatus = child.wait();
     relay.shutdown();
     assert!(
         status.success(),
@@ -224,9 +290,9 @@ fn vault_outbox_empty_after_clean_stop() {
     let fixture = Fixture::new("outbox");
     fixture.init();
     let relay = TestRelay::spawn();
-    let mut child = fixture.spawn_until_ready(&relay);
+    let child = fixture.spawn_until_ready(&relay, None);
     sigterm(&child);
-    assert!(child.wait().expect("vault reaps").success());
+    assert!(child.wait().success());
     relay.shutdown();
     let output = fixture
         .wyrd(&[
@@ -248,4 +314,56 @@ fn vault_outbox_empty_after_clean_stop() {
             "no {class} left pending after a clean stop, got:\n{report}"
         );
     }
+}
+
+/// A relay-less vault is refused before touching the drive: the
+/// refusal precedes the keystore open, so even an uninitialized
+/// drive reports the usage error rather than a store error.
+#[test]
+fn vault_without_relay_is_refused() {
+    let fixture = Fixture::new("norelay");
+    let output = fixture
+        .wyrd(&[
+            "vault",
+            fixture.drive.to_str().unwrap(),
+            "--identity-file",
+            fixture.identity.to_str().unwrap(),
+            "--passphrase-file",
+            fixture.passphrase.to_str().unwrap(),
+        ])
+        .output()
+        .expect("wyrd vault runs");
+    assert!(
+        !output.status.success(),
+        "a relay-less vault must not start"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr renders text");
+    assert!(
+        stderr.contains("needs at least one --relay"),
+        "the refusal names the missing relay, got: {stderr:?}"
+    );
+}
+
+/// `--log-file` appends across restarts: the second run's ready line
+/// lands beside the first run's record instead of truncating it. A
+/// restart must not destroy the previous run's evidence.
+#[test]
+fn vault_log_file_appends_across_restarts() {
+    let fixture = Fixture::new("logfile");
+    fixture.init();
+    let relay = TestRelay::spawn();
+    let log = fixture.dir.join("vault.log");
+    let first = fixture.spawn_until_ready(&relay, Some(&log));
+    sigterm(&first);
+    assert!(first.wait().success());
+    let second = fixture.spawn_until_ready(&relay, Some(&log));
+    sigterm(&second);
+    assert!(second.wait().success());
+    relay.shutdown();
+    let body = std::fs::read_to_string(&log).expect("log file reads");
+    assert_eq!(
+        body.matches("vault ready").count(),
+        2,
+        "both runs recorded readiness in one appended file, got:\n{body}"
+    );
 }

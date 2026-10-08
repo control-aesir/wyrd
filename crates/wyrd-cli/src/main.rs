@@ -26,7 +26,8 @@ use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{
-    run_vault, shutdown_transport, TransportDeadlines, VaultEvent, VaultLoopEnd, VaultRun,
+    install_serving, run_vault, shutdown_transport, TransportDeadlines, VaultEvent, VaultLoopEnd,
+    VaultRun,
 };
 use wyrd_daemon::{
     FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor,
@@ -955,15 +956,14 @@ fn mount(
     // Flush the serving endpoint before announcing its address, so the
     // first seal carries a route peers can already dial. The loop owns
     // sends from here: every pass publishes undischarged announcement,
-    // transition, and capability obligations to the relay.
-    serving.flush().map_err(CliError::Serving)?;
-    live.set_node_addr(Some(serving.node_addr_bytes()));
-    // Gate every publish pass's announcement discharge on mirror
-    // readiness: a peer acting on an announcement must find every
-    // announced representation importable, not just the first seal's.
+    // transition, and capability obligations to the relay. The install
+    // itself is the shared composer step (`install_serving`): flush,
+    // route, then the discharge barrier — one copy for every live
+    // composer, so the order cannot drift between mount, headless
+    // sync, and vault.
+    install_serving(&mut live, &serving).map_err(CliError::Serving)?;
     // Endpoint ownership (and shutdown below) stays here; the loop
-    // holds only the cloneable readiness handle.
-    live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
+    // holds only the cloneable readiness handle the install took.
     // The composer builds its presentation backend from the node's
     // live parts; the node itself never names the backend type.
     // The quarantine channel rides along: readers submit observed
@@ -2728,14 +2728,12 @@ fn sync_now(
     };
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
     if let Some(serving) = &serving {
-        // Mount order: flush before announcing the address, so the
-        // first seal carries a route peers can already dial; then
-        // publish the route and gate every pass's discharge on mirror
-        // readiness. A backed-up mirror leaves the obligation
-        // recorded, never discharged.
-        serving.flush().map_err(CliError::Serving)?;
-        live.set_node_addr(Some(serving.node_addr_bytes()));
-        live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
+        // Mount order, through the shared install step: flush before
+        // announcing the address, so the first seal carries a route
+        // peers can already dial; then publish the route and gate
+        // every pass's discharge on mirror readiness. A backed-up
+        // mirror leaves the obligation recorded, never discharged.
+        install_serving(&mut live, serving).map_err(CliError::Serving)?;
     }
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but
@@ -2997,7 +2995,7 @@ fn vault(
     // Fold like the mount — loop first, then serving — with no
     // session in between. SIGTERM exits 0 here exactly when the loop
     // stopped clean and every transport closed: the mount's rule at
-    // `docs/cli.md:440-443` applies to the vault too.
+    // `docs/cli.md:669-673` applies to the vault too.
     let loop_result = match outcome.loop_end {
         VaultLoopEnd::Returned(result) => result.map(|_| ()).map_err(|error| match error {
             LoopError::Live(error) => CliError::Live(error),

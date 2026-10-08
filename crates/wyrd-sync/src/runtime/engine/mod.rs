@@ -790,6 +790,17 @@ pub struct Engine {
     /// purity for the corrupt verdict, so the set is consulted when an
     /// invalid strike trips a cooldown.
     pub(super) fetch_transport_seen: BTreeSet<FetchKey>,
+    /// Obligations whose all-relay refusal already warned once, as
+    /// (kind, obligation, recipient) triples: the first refusal of an
+    /// obligation logs at warn so a never-flipping policy refusal is
+    /// operator-visible under the default filter; repeats stay at
+    /// debug. In-memory only — a restart re-warns once, which is the
+    /// honest behavior for a new operator-visible session — and
+    /// entries are dropped when the obligation discharges, so the set
+    /// never outgrows the pending outbox. Never logged: the key may
+    /// name identities the warn line must not carry (trust.md
+    /// OD-17-6).
+    pub(super) refusal_warned: HashSet<(&'static str, String, DeviceId)>,
     /// Test-only crash injection: the next durable commit stops after
     /// the named stage, simulating power loss (see
     /// `DurableStore::commit_until`). Production always runs to
@@ -878,6 +889,7 @@ impl Engine {
             fetch_invalid_cooled: BTreeSet::new(),
             fetch_budget_cooled: BTreeSet::new(),
             fetch_transport_seen: BTreeSet::new(),
+            refusal_warned: HashSet::new(),
             #[cfg(test)]
             crash_stage: None,
             reconnect_latched: false,

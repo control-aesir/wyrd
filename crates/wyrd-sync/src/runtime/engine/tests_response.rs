@@ -20,6 +20,7 @@ use crate::durable::{
 };
 use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
+use crate::runtime::author::{capability_obligation, transition_obligation};
 use crate::runtime::respond::{AnswerReport, MAX_RESPONSE_SENDS_PER_STATEMENT};
 use crate::runtime::test_util::{
     control_key, deliver, deliver_from, drain, fixture, identity, queue, reopen,
@@ -286,8 +287,20 @@ fn duplicate_reconciliation_is_idempotent() {
         .unwrap();
     let evidence = keyed_evidence(r, &[child_id]);
     state(&mut fx, r, evidence.clone());
+    // The warn-once marker for the covered pair: retirement must
+    // prune it with the obligation, or refused-then-reconciled pairs
+    // leak entries past the pending outbox the set bounds.
+    fx.engine
+        .refusal_warned
+        .insert(("transition", transition_obligation(&child_id), r));
     let first = answer(&mut fx);
     assert_eq!(first.retired, 1);
+    assert!(
+        !fx.engine
+            .refusal_warned
+            .contains(&("transition", transition_obligation(&child_id), r)),
+        "retirement prunes the warn-once marker with the obligation"
+    );
     let second = answer(&mut fx);
     assert_eq!(second.retired, 0, "re-answer retires nothing new");
     assert_eq!(second.sent, 0, "and sends nothing further");
@@ -384,8 +397,20 @@ fn capability_retires_on_exact_install_match() {
     // The install arrives in the next statement: retires, sends nothing.
     let evidence = keyed_evidence(r, &[]);
     state(&mut fx, r, evidence.clone());
+    // Same marker-pruning rule as the transition path: the
+    // retirement discharges the obligation, so the warn-once entry
+    // goes with it.
+    fx.engine
+        .refusal_warned
+        .insert(("capability", capability_obligation(2, &r), r));
     let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
     assert_eq!(report.retired, 1);
+    assert!(
+        !fx.engine
+            .refusal_warned
+            .contains(&("capability", capability_obligation(2, &r), r)),
+        "retirement prunes the warn-once marker with the obligation"
+    );
     assert_eq!(report.sent, 0, "covered needs no send");
     let loaded = fx.engine.store.load().unwrap();
     assert_eq!(

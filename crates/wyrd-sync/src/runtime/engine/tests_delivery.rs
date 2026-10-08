@@ -12,7 +12,7 @@ use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     admit_engine, announcement_for, announcement_msg, control_key, deliver, drain, encryption_key,
-    fixture, identity, queue, transition_message, TestDir,
+    fixture, identity, queue, transition_message, CapturedLogs, TestDir,
 };
 use crate::transport::mailbox::{
     open_from_sender, seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox,
@@ -183,6 +183,121 @@ fn delivery_retains_obligation_when_no_relay_accepts() {
         loaded.transition_delivered,
         vec![(child_id, recipient)],
         "the Delivered fact lands only on acceptance"
+    );
+}
+
+/// A refusal the relays will never flip must be operator-visible:
+/// the first refusal of an obligation warns once under the default
+/// filter; repeats stay at debug. The obligation itself is
+/// untouched — still pending, still undelivered — and the warn names
+/// the kind only, never identities (trust.md OD-17-6).
+#[test]
+fn a_repeated_refusal_warns_once_per_obligation() {
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let sealed = seal(
+        &control_key(2),
+        &member_drive(),
+        2,
+        &transition_message(&child),
+    )
+    .unwrap()
+    .encode();
+    let recipient = identity(0x03).1;
+    fx.engine
+        .commit_facts(&[
+            Fact::TransitionSealed(child_id, sealed),
+            Fact::TransitionQueued(child_id, recipient),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        for pass in 1..=2 {
+            let mut refusing = RefusingMailbox {
+                inner: MemoryMailbox {
+                    relay: &mut fx.relay,
+                    owner: fx.recipient,
+                },
+            };
+            assert_eq!(
+                fx.engine.deliver_pending(&mut refusing).unwrap(),
+                0,
+                "refused pass {pass} counts nothing"
+            );
+        }
+    });
+    let events = logs.snapshot();
+    let is_refusal = |(level, fields): &(tracing::Level, Vec<(String, String)>)| {
+        *level == tracing::Level::WARN
+            && fields
+                .iter()
+                .any(|(name, value)| name == "message" && value.contains("refused"))
+    };
+    let warns: Vec<&Vec<(String, String)>> = events
+        .iter()
+        .filter(|event| is_refusal(event))
+        .map(|(_, fields)| fields)
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "exactly one warn across both refused passes, got {warns:?}"
+    );
+    // The whole field set, not just the message: an identity
+    // smuggled in as a tracing field would bypass a message-only
+    // assertion, so the warn must carry exactly kind and message.
+    let mut names: Vec<&str> = warns[0].iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["kind", "message"],
+        "the warn carries no identity field: {names:?}"
+    );
+    let message = warns[0]
+        .iter()
+        .find(|(name, _)| name == "message")
+        .map(|(_, value)| value)
+        .expect("message field present");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("transition"),
+        "the warn names the attempted kind: {kind}"
+    );
+    assert!(
+        !message.contains(&recipient.to_string()),
+        "the warn names no recipient identity: {message}"
+    );
+    assert!(
+        !message.contains(&child_id.to_string()),
+        "the warn names no transition identity: {message}"
+    );
+    let debugs = events
+        .iter()
+        .filter(|(level, fields)| {
+            *level == tracing::Level::DEBUG
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "message" && value.contains("refused"))
+        })
+        .count();
+    assert!(
+        debugs >= 1,
+        "the repeat refusal stays at debug, keeping the stall greppable"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.transition_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.transition_queued,
+        vec![(child_id, recipient)],
+        "the obligation stays pending"
     );
 }
 
@@ -465,6 +580,183 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     let inner = open_from_sender(&identity_secret(&owner_sk), member, delivery.envelope()).unwrap();
     let resent = SealedRotation::decode(&inner).expect("rotation framed");
     assert_eq!(resent.encode(), sealed, "retries resend identical bytes");
+}
+
+/// A capability refusal warns with the capability kind: the
+/// production call site's wiring is pinned end to end, not just the
+/// shared send path — a `kind` drift at the call site would name the
+/// wrong obligation class here.
+#[test]
+fn capability_refusal_warns_once_with_the_capability_kind() {
+    use crate::control::seal_rotation;
+    use crate::keys::capability::Capability;
+    use crate::keys::owner_proof::OwnerProof;
+    use crate::runtime::test_util::{identity_secret, owner};
+
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let (owner_sk, member) = owner();
+    let state = fx.engine.log.state_of(&child_id).expect("child is valid");
+    let registration = state
+        .encryption_key_of(&member)
+        .copied()
+        .expect("member has a registered key");
+    // A pre-sealed rotation delivery to the world member, exactly as
+    // the seal-commit test stages it: reuse header-correlates, so the
+    // wrap carries placeholder secrets.
+    let wrap = Capability::mint(
+        member_drive(),
+        member,
+        &state,
+        &child,
+        vec![secret(0xAA), secret(0xBB)],
+    )
+    .expect("member is a member")
+    .wrap()
+    .expect("wraps")
+    .as_bytes()
+    .to_vec();
+    let owner_identity = identity_secret(&owner_sk);
+    let proof = OwnerProof::sign(
+        &owner_identity,
+        &member_drive(),
+        &member,
+        &child_id,
+        2,
+        &[secret(0xAA), secret(0xBB)],
+    )
+    .expect("local signer authorizes the owner-proof domain")
+    .encode();
+    let sealed = seal_rotation(
+        &member_drive(),
+        member,
+        &registration,
+        2,
+        &child.canonical_bytes(),
+        &wrap,
+        &proof,
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilitySealed(2, member, sealed),
+            Fact::CapabilityQueued(2, member),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut refusing = RefusingMailbox {
+            inner: MemoryMailbox {
+                relay: &mut fx.relay,
+                owner: fx.recipient,
+            },
+        };
+        assert_eq!(
+            fx.engine.deliver_pending(&mut refusing).unwrap(),
+            0,
+            "a refused capability send counts nothing"
+        );
+    });
+    let warns: Vec<Vec<(String, String)>> = logs
+        .snapshot()
+        .into_iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, fields)| fields)
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn for the refused pair");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("capability"),
+        "the warn names the attempted kind: {kind}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.capability_queued,
+        vec![(2, member)],
+        "the obligation stays pending"
+    );
+}
+
+/// An announcement refusal warns with the announcement kind: the
+/// third production call site's wiring, pinned the same way — the
+/// set is now complete, every `send_sealed_to` caller names its
+/// kind through its own path.
+#[test]
+fn announcement_refusal_warns_once_with_the_announcement_kind() {
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let genesis_id = fx
+        .engine
+        .log
+        .transition(&child_id)
+        .and_then(|t| t.prev)
+        .expect("genesis linked");
+    let (author_sk, _) = identity(0x22);
+    // One known snapshot under the held epoch-1 key: takes the
+    // re-announce path and reaches the send.
+    let snap = wyrd_format::SnapshotId::from_bytes([0xA1; 32]);
+    let Message::SnapshotAnnouncement(known) = announcement_msg(&author_sk, snap, 1, genesis_id)
+    else {
+        panic!("announcement_msg builds announcements");
+    };
+    let recipient = identity(0x05).1;
+    fx.engine
+        .commit_facts(&[
+            Fact::Announcement(known),
+            Fact::AnnouncementQueued(snap, recipient),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut refusing = RefusingMailbox {
+            inner: MemoryMailbox {
+                relay: &mut fx.relay,
+                owner: fx.recipient,
+            },
+        };
+        assert_eq!(
+            fx.engine.announce_pending(&mut refusing, None).unwrap(),
+            0,
+            "a refused announcement send counts nothing"
+        );
+    });
+    let warns: Vec<Vec<(String, String)>> = logs
+        .snapshot()
+        .into_iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, fields)| fields)
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn for the refused pair");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("announcement"),
+        "the warn names the attempted kind: {kind}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.announcement_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.announcement_queued,
+        vec![(snap, recipient)],
+        "the obligation stays pending"
+    );
 }
 
 /// An announcement obligation without a sealing key stays pending

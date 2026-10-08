@@ -203,6 +203,28 @@ pub(super) fn seal_fresh_for(
     Ok(Some(bytes))
 }
 
+/// The warn-once marker's obligation half, one constructor per
+/// kind: the reuse verifications, the send path, and reconciliation
+/// retirement all key the same string, so the three can never
+/// disagree on it. In-memory keys only — never logged (trust.md
+/// OD-17-6).
+pub(crate) fn transition_obligation(id: &TransitionId) -> String {
+    format!("transition {id:?}")
+}
+
+/// See [`transition_obligation`]: one descriptor per (epoch,
+/// recipient) capability pair.
+pub(crate) fn capability_obligation(epoch: u64, recipient: &DeviceId) -> String {
+    format!("capability epoch {epoch} for {recipient}")
+}
+
+/// See [`transition_obligation`]: one descriptor per snapshot's
+/// fan-out; the marker still tracks each recipient pair
+/// independently.
+pub(crate) fn announcement_obligation(snapshot: &wyrd_format::SnapshotId) -> String {
+    format!("announcement {snapshot:?}")
+}
+
 /// Send verified sealed bytes to each recipient under the mailbox's
 /// outer recipient seal, committing one delivered marker per
 /// relay-accepted send. A send no relay accepts commits nothing —
@@ -210,10 +232,18 @@ pub(super) fn seal_fresh_for(
 /// leaves the obligation pending for a later pass instead of
 /// recording a fact no acceptance supports. A send failure returns
 /// immediately with the rest still pending.
+///
+/// The first refusal of an obligation warns once: a policy refusal
+/// that can never flip would otherwise retry silently forever under
+/// the default filter. Repeats stay at debug, and the warn names the
+/// kind only — never the recipient or the obligation's identities
+/// (trust.md OD-17-6). Discharge clears the marker, so a re-queued
+/// obligation warns again.
 pub(super) fn send_sealed_to(
     engine: &mut Engine,
     mailbox: &mut impl Mailbox,
     kind: &'static str,
+    obligation: &str,
     sealed_bytes: &[u8],
     recipients: impl IntoIterator<Item = DeviceId>,
     delivered: impl Fn(DeviceId) -> Fact,
@@ -222,14 +252,26 @@ pub(super) fn send_sealed_to(
     for recipient in recipients {
         let envelope = seal_for_recipient(&engine.identity_secret, recipient, sealed_bytes)?;
         let report = mailbox.send(envelope)?;
+        // The per-pair key: the same envelope fans out over many
+        // recipients and each pair discharges independently, so the
+        // warn-once marker tracks pairs, not envelopes.
+        let warned_key = (kind, obligation.to_owned(), recipient);
         if report.accepted == 0 {
             // The bytes reached no relay: retiring the obligation
             // here would lose the sender's recovery path while the
             // recipient never saw the event. Stay pending; the next
             // pass retries the identical bytes.
-            tracing::debug!(kind, recipient = ?recipient, "outbox send refused; obligation stays pending");
+            if engine.refusal_warned.insert(warned_key) {
+                tracing::warn!(
+                    kind,
+                    "outbox send refused by every relay; obligation stays pending"
+                );
+            } else {
+                tracing::debug!(kind, recipient = ?recipient, "outbox send refused; obligation stays pending");
+            }
             continue;
         }
+        engine.refusal_warned.remove(&warned_key);
         // Per-send forensics, mirroring the intake verdict lines: with
         // relay ids on one side and control kinds on the other, a
         // stuck peer's whole outbox can be reconstructed envelope by
@@ -301,6 +343,10 @@ fn deliver_transitions(
             }
             continue;
         };
+        // The obligation descriptor names the send below as well as
+        // the reuse verification: one string per transition, so the
+        // warn-once marker keys the pair the send actually attempts.
+        let obligation = transition_obligation(&id);
         let sealed_bytes = if let Some(bytes) = sealed_overlay.get(&id).cloned().or_else(|| {
             rebuilt
                 .runtime
@@ -311,7 +357,6 @@ fn deliver_transitions(
             // before use: the fact's key must name the transition the
             // bytes actually carry, or the send would discharge one
             // obligation while delivering another.
-            let obligation = format!("transition {id:?}");
             let Some(bytes) = verify_reused_sealed(
                 engine,
                 &rebuilt.keyring,
@@ -393,6 +438,7 @@ fn deliver_transitions(
             engine,
             mailbox,
             "transition",
+            &obligation,
             &sealed_bytes,
             recipients,
             |recipient| Fact::TransitionDelivered(id, recipient),
@@ -467,6 +513,10 @@ fn deliver_capabilities(
         let Some(transition_id) = chain.get(&epoch).copied() else {
             continue;
         };
+        // One descriptor per obligation: this loop visits each pair
+        // once, so it names the reuse verification below and the
+        // send's warn-once marker alike.
+        let obligation = capability_obligation(epoch, &recipient);
         // No pass-local overlay here, unlike transitions: pending pairs
         // are unique per pass (a set, visited once), so a first seal
         // can never be re-read in the same pass — the committed fact
@@ -486,7 +536,6 @@ fn deliver_capabilities(
             // correlation below is the whole check, exactly as the
             // envelope-epoch correlation is for epoch-sealed reuse.
             Some(bytes) if bytes.first() == Some(&ROTATION_VERSION) => {
-                let obligation = format!("capability epoch {epoch} for {recipient}");
                 match verify_reused_rotation(
                     engine,
                     &bytes,
@@ -547,7 +596,6 @@ fn deliver_capabilities(
             }
             Some(bytes) => {
                 if SealedControl::decode(&bytes).is_err() {
-                    let obligation = format!("capability epoch {epoch} for {recipient}");
                     return Err(EngineError::SealedOutboxMismatch(format!(
                         "{obligation}: sealed bytes do not decode"
                     )));
@@ -593,6 +641,7 @@ fn deliver_capabilities(
             engine,
             mailbox,
             "capability",
+            &obligation,
             &sealed_bytes,
             [recipient],
             |delivered| Fact::CapabilityDelivered(epoch, delivered),

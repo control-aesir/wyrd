@@ -1,4 +1,4 @@
-use super::tests_harness::{drain_side, restart, scenario, secret};
+use super::tests_harness::{drain_side, local_tree, restart, scenario, secret};
 use super::*;
 
 use crate::seal::EncryptedObject;
@@ -567,14 +567,35 @@ fn a_torn_authoring_commit_leaves_no_half_advertised_state() {
 /// and not by storage id. The serving maps build over recorded
 /// snapshots and their manifest records alone, so anything without
 /// a committed snapshot behind it is unreachable by construction.
+/// The positive control first: a committed snapshot's recorded ids
+/// do serve, so the negatives below cannot pass vacuously on empty
+/// maps.
 #[test]
 fn device_local_state_is_never_servable() {
     let (mut pair, _, _) = scenario();
     assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
     assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let committed = authored.snapshot().snapshot_id();
     let state = pair.a.engine.runtime_state().unwrap();
     let mut source =
         crate::serving::VaultSource::from_state(&state, pair.a.engine.vault()).unwrap();
+    assert!(
+        source
+            .fetch_root_manifest(&committed, usize::MAX)
+            .unwrap()
+            .is_some(),
+        "a committed snapshot serves by reference"
+    );
+    assert!(
+        source
+            .fetch_snapshot(&committed, usize::MAX)
+            .unwrap()
+            .is_some(),
+        "a committed body serves by reference"
+    );
     // No snapshot was ever recorded under this id, and no manifest
     // record names this storage id.
     let unknown = SnapshotId::from_bytes([0xF1; 32]);

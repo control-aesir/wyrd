@@ -195,9 +195,11 @@ pub struct SyncStatus {
     pub materialization: MaterializationSummary,
     /// The durability level the drive's newest committed snapshot
     /// reached (DG-2, normative in `docs/write-path.md`): Working
-    /// before the first snapshot, Committed while an announcement
-    /// obligation is queued, Published once the outbox is quiet.
-    /// Committed facts only, like every other row.
+    /// with no recorded snapshot body, Committed while an
+    /// announcement obligation is queued, Published once the outbox
+    /// is quiet. Committed facts only, like every other row — and
+    /// read off the already-rebuilt state, so status adds no store
+    /// rebuild for it.
     pub durability: DurabilityLevel,
 }
 
@@ -338,7 +340,9 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
     };
     let materialization = state.materialization_summary();
     let reconciliation = engine.reconciliation_counters()?;
-    let durability = engine.durability_level()?;
+    // The level reads off the already-rebuilt state: no third store
+    // rebuild for the status path.
+    let durability = state.durability_level();
     Ok(SyncStatus {
         tip,
         held_epochs,

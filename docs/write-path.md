@@ -249,8 +249,8 @@ Rules:
    handle — the plain debounce-save loop — commits one snapshot
    before and after, so the headline workload is unchanged until the
    implementation batches across saves; likewise open/write/close
-churn still commits per cycle because `release` forces. The
-observability baseline must measure these shapes separately.
+   churn still commits per cycle because `release` forces. The
+   observability baseline must measure these shapes separately.
 
 ## Durability levels (DG-2, normative)
 
@@ -272,24 +272,28 @@ and derives from committed facts only — so it is identical before
 and after a restart over the same state, and `sync status` can
 report it offline:
 
-- no recorded snapshot → **Working** (a genesis-only drive holds
-  nothing durable beyond membership);
-- at least one recorded snapshot and a non-empty announcement
+- no recorded snapshot body → **Working** (a genesis-only drive
+  holds nothing durable beyond membership; announcement-only
+  records do not count — a device that has observed a peer's
+  announcement but holds no body has nothing durable of its own,
+  owes nothing from it, and serves nothing from it);
+- at least one recorded snapshot body and a non-empty announcement
   outbox → **Committed** (durable here, not yet conveyed);
-- at least one recorded snapshot and an empty announcement
+- at least one recorded snapshot body and an empty announcement
   outbox → **Published** (conveyed or conveyable-to-nobody: a lone
   participant announces to nobody, so a solo author lands here).
 
 `servable` means the projection is published and serving residency
 flushed for the snapshot (re-established after every reopen before
-anything is served); `announceable` means no undischarged
-announcement obligation remains for it. Both read yes only at
-Published.
+anything is served) — not before step 5, and yes once serving
+readiness succeeds, which precedes discharge; `announceable` means
+no undischarged announcement obligation remains for it, which reads
+yes only at Published.
 
 | DG-1 event class | Level yielded | What survives a crash | What a reopen reports | Servable? | Announceable? |
 |---|---|---|---|---|---|
 | Non-forcing: buffered `write` / handle `truncate` / `set-exec`, `flush` or `release` on a clean or read handle, no-op submission, refused pre-submit forcer, elapsed time alone | Unchanged (the new bytes are Working: volatile, memory-only) | Only the pre-existing durable state; the new bytes are gone — that loss is the contract | The prior level; no new head, no new obligation | New bytes: never | New bytes: never |
-| Forcing, fold commits, announcement obligation still queued | Committed | The whole snapshot: object store, vault, and fact log become durable together at step 3 | New head, obligation pending, `durability: committed` | No — a crash here replays the outbox and re-establishes the projection before serving | No — the send has not happened |
+| Forcing, fold commits, announcement obligation still queued | Committed | The whole snapshot: object store, vault, and fact log become durable together at step 3 | New head, obligation pending, `durability: committed` | Not before step 5 — a crash here replays the outbox and re-establishes the projection before serving; yes once serving readiness succeeds | No — the send has not happened |
 | Forcing, fold commits, obligation discharged (relay acceptance, or a lone participant with nobody to announce to) | Published | The whole snapshot | New head, outbox quiet, `durability: published` | Yes | Yes |
 | Forcing, fold commits nothing (rule 6: no surviving member) | Unchanged | Nothing new — no empty snapshot, no dangling obligation | The prior level | — | — |
 

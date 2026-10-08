@@ -95,8 +95,10 @@ pub use super::bootstrap::PairingRequest;
 /// propagation is never part of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityLevel {
-    /// No recorded snapshot: everything unwritten or pending is
-    /// volatile memory, deterministically discarded on crash.
+    /// No recorded snapshot body: everything unwritten or pending
+    /// is volatile memory, deterministically discarded on crash.
+    /// Announcement-only records do not count — observing a peer's
+    /// announcement holds nothing durable of this drive's own.
     Working,
     /// At least one committed snapshot, and the announcement outbox
     /// is non-empty: durable here, not yet conveyed.
@@ -1830,20 +1832,15 @@ impl Engine {
     }
 
     /// The durability level the drive's newest committed snapshot
-    /// reached (DG-2): Working with no recorded snapshot, Committed
-    /// while the announcement outbox is non-empty, Published once it
-    /// is quiet. Rebuilds from the store, so the report is committed
-    /// facts only — restart-equivalent by construction.
+    /// reached (DG-2): Working with no recorded snapshot body,
+    /// Committed while the announcement outbox is non-empty,
+    /// Published once it is quiet. Rebuilds from the store, so the
+    /// report is committed facts only — restart-equivalent by
+    /// construction. The predicate itself lives on
+    /// [`RuntimeState`](super::RuntimeState) so holders of an
+    /// already-rebuilt state do not rebuild again.
     pub fn durability_level(&self) -> Result<DurabilityLevel, EngineError> {
-        let rebuilt = self.store.rebuild(self.device)?;
-        if rebuilt.runtime.recorded_snapshots().next().is_none() {
-            return Ok(DurabilityLevel::Working);
-        }
-        if rebuilt.runtime.pending_announcements().is_empty() {
-            Ok(DurabilityLevel::Published)
-        } else {
-            Ok(DurabilityLevel::Committed)
-        }
+        Ok(self.store.rebuild(self.device)?.runtime.durability_level())
     }
 
     /// Whether any outbound obligation awaits a send — announcements,

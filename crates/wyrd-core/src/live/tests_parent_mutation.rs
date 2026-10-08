@@ -530,30 +530,63 @@ fn a_crash_with_a_pending_window_leaves_no_head_or_obligation() {
 }
 
 /// DG-2: the bounded-window property that makes discarding correct.
-/// A pending mutation resolves through the single applying call —
-/// no operator flush, no timer wait, no follow-up action: the
-/// returned success means the new state is committed and served.
+/// A pending set folds with its forcing event and commits in the one
+/// call — no operator flush, no timer wait, no follow-up action: the
+/// returned success means the new state is committed and served. The
+/// fold carries two members and advances the sequence by exactly one
+/// snapshot holding both.
 #[test]
 fn a_pending_window_commits_without_operator_action() {
     let (engine, dir, store, _root, head) = scratch_fixed_drive("bounded-window");
     let old_head = head.snapshot().snapshot_id();
     let mut live = live_over_tree(engine, store, &[head]);
+    let current = live.engine.current();
     let outcome = live
         .apply_mutation(
-            &MutationKind::Mkdir {
-                path: "parent/newdir".to_string(),
+            &MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::Mkdir {
+                            path: "parent/a".to_string(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir {
+                            path: "parent/b".to_string(),
+                        },
+                        forcer: true,
+                    },
+                ],
             },
             None,
         )
-        .expect("a committable mutation applies in the one call");
+        .expect("a forcing fold commits in the one call");
     assert!(
-        matches!(outcome, MutationOutcome::Done),
-        "the call committed, not merely queued: {outcome:?}"
+        matches!(outcome, MutationOutcome::Fold { .. }),
+        "the call folded and committed, not merely queued: {outcome:?}"
     );
-    let new_head = live.live_heads_traced().unwrap()[0]
-        .snapshot()
-        .snapshot_id();
-    assert_ne!(new_head, old_head, "the one call advanced the head");
+    assert_eq!(
+        live.engine.current(),
+        current + 1,
+        "the pending set plus its forcer commit as exactly one snapshot"
+    );
+    let heads = live.live_heads_traced().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_ne!(
+        heads[0].snapshot().snapshot_id(),
+        old_head,
+        "the one call advanced the head"
+    );
+    for path in ["parent/a", "parent/b"] {
+        assert!(
+            matches!(
+                live.current_node(&heads, path).unwrap(),
+                Some(Node::Dir { .. })
+            ),
+            "both folded members are served from the one snapshot"
+        );
+    }
     assert!(
         live.engine.pending_announcements().unwrap().is_empty(),
         "a lone participant announces to nobody"
@@ -566,9 +599,11 @@ fn a_pending_window_commits_without_operator_action() {
 }
 
 /// DG-2 hard criterion: device-local state creates no announcement
-/// obligation and appears in no manifest. The held create touches
-/// neither the outbox nor the manifest records — only a committed
-/// snapshot crosses those boundaries.
+/// obligation and appears in no manifest. Two shapes: a held mutation
+/// attempt (volatile intent), and bytes staged in the store the way a
+/// pre-commit write stages them — present but referenced by nothing.
+/// Neither crosses a boundary: only a committed snapshot queues
+/// obligations and records manifests.
 #[test]
 fn device_local_state_creates_no_announcement_obligation() {
     let (engine, dir, source_store, root, head) = scratch_fixed_drive("no-obligation");
@@ -583,21 +618,36 @@ fn device_local_state_creates_no_announcement_obligation() {
         .unwrap()
         .insert_into(&mut serving_store)
         .unwrap();
-    let mut live = live_over_tree(engine, serving_store, &[head]);
+    let mut live = live_over_tree(engine, serving_store, std::slice::from_ref(&head));
+    let old_head = head.snapshot().snapshot_id();
     let manifests_before = live
         .engine
         .runtime_state()
         .unwrap()
         .manifest_records()
         .count();
+    // Shape one: the held create.
     let deferred = deferred_create(&mut live);
     assert!(
         matches!(deferred, MutationError::NeedContent { .. }),
         "the create holds for content: {deferred:?}"
     );
+    // Shape two: staged bytes, present in the store and referenced
+    // by no snapshot — what a pre-commit write looks like before
+    // its snapshot commits.
+    let staged = live
+        .store
+        .write()
+        .unwrap()
+        .insert(wyrd_format::ObjectKind::Chunk, b"staged-never-committed")
+        .unwrap();
+    assert!(
+        live.store.read().unwrap().get(&staged).unwrap().is_some(),
+        "the staged bytes are really there, uncommitted"
+    );
     assert!(
         live.engine.pending_announcements().unwrap().is_empty(),
-        "held state queues no announcement"
+        "held state and staged bytes queue no announcement"
     );
     assert_eq!(
         live.engine
@@ -606,7 +656,14 @@ fn device_local_state_creates_no_announcement_obligation() {
             .manifest_records()
             .count(),
         manifests_before,
-        "held state records no manifest"
+        "held state and staged bytes record no manifest"
+    );
+    assert_eq!(
+        live.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id(),
+        old_head,
+        "held state and staged bytes install no head"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

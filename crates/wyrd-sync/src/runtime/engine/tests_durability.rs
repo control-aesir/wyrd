@@ -87,6 +87,36 @@ fn durability_level_reported_per_commit_boundary() {
     );
 }
 
+/// DG-2: announcement-only records do not count toward the level.
+/// A device that has observed its peer's announcements but holds no
+/// snapshot body reports Working — it has nothing durable of its
+/// own, owes nothing from those records, and serves nothing from
+/// them.
+#[test]
+fn announcement_only_records_report_working() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let state = pair.b.engine.runtime_state().unwrap();
+    let recorded: Vec<_> = state.recorded_snapshots().collect();
+    assert!(!recorded.is_empty(), "B observed its peer's announcements");
+    for id in &recorded {
+        assert!(
+            state.snapshot_body(id).is_none(),
+            "B holds no snapshot body behind the observed records"
+        );
+    }
+    let pending = pair.b.engine.pending_announcements().unwrap();
+    assert!(
+        pending.is_empty(),
+        "B owes nothing from observed records: {pending:?}"
+    );
+    assert_eq!(
+        pair.b.engine.durability_level().unwrap(),
+        DurabilityLevel::Working
+    );
+}
+
 /// DG-2 level assertions over the crash-injection stages: a torn
 /// authoring commit is invisible before CURRENT advances (the level
 /// stays Published, the sequence stays put) and becomes a Committed

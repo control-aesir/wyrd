@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use wyrd_format::{ContentId, Entry, EntryContent, ObjectKind, ObjectStore, SnapshotId, Tree};
 
 use super::merge::{check_local, load_root};
-use super::snapshot::author_recovery;
+use super::snapshot::{author_recovery, check_recovery_owner};
 use crate::authorization::SnapshotDag;
 use crate::durable::{AuthorizedSnapshot, Rebuilt};
 use crate::runtime::engine::{Engine, EngineError};
@@ -148,6 +148,10 @@ where
         return Err(EngineError::RecoveryEmptySelection);
     }
     let rebuilt = engine.store.rebuild(engine.device)?;
+    // Same ownership projection `author_recovery` enforces, checked
+    // before the graft-tree insert: a non-owner call must write
+    // nothing at all, not even an orphaned tree object.
+    check_recovery_owner(&rebuilt, &engine.device)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;
     }
@@ -198,7 +202,7 @@ where
 /// and holds the vault copy of), reported as status instead of an
 /// error. Missing dominates undecryptable across a subtree walk,
 /// so the operator sees the harder problem first.
-fn probe_entry<S: ObjectStore>(
+pub(super) fn probe_entry<S: ObjectStore>(
     engine: &Engine,
     objects: &S,
     rebuilt: &Rebuilt,
@@ -220,10 +224,17 @@ where
         if !seen.insert(subtree) {
             continue;
         }
-        let bytes = objects
+        // An absent subtree is missing bytes, not a plan-wide
+        // failure: the dry run reports the row instead of aborting
+        // every other row. A present-but-wrong subtree stays an
+        // error — corruption fails closed, never mislabels.
+        let bytes = match objects
             .get(&subtree)
             .map_err(|error| EngineError::ObjectStore(format!("{error:?}")))?
-            .ok_or(EngineError::TreeUnavailable(subtree))?;
+        {
+            Some(bytes) => bytes,
+            None => return Ok(RecoveryStatus::Missing),
+        };
         if ContentId::derive(ObjectKind::Tree, &bytes) != subtree {
             return Err(EngineError::TreeMismatch(subtree));
         }
@@ -266,9 +277,10 @@ where
 
 /// Classify one chunk through the locality gate's two doors:
 /// byte-local wins; a recorded mapping the device holds the epoch
-/// capability for and holds the vault copy of is covered; a
-/// mapping that fails the capability half is undecryptable; no
-/// mapping at all is missing.
+/// capability for and holds the vault copy of is covered; a held
+/// capability without the bytes is missing; mappings from epochs
+/// the device holds nothing for are undecryptable; no mapping at
+/// all is missing.
 fn probe_chunk<S: ObjectStore>(
     engine: &Engine,
     objects: &S,
@@ -284,8 +296,10 @@ where
     {
         return Ok(RecoveryStatus::Ready);
     }
-    let mut capability_gap = false;
+    let mut held_any = false;
+    let mut mapped_any = false;
     for mapping in rebuilt.runtime.recorded_mappings(&chunk) {
+        mapped_any = true;
         let held = rebuilt.keyring.secret(mapping.encryption_epoch).is_some();
         let served = engine
             .vault
@@ -295,14 +309,17 @@ where
         if held && served {
             return Ok(RecoveryStatus::Ready);
         }
-        if !held {
-            capability_gap = true;
+        if held {
+            held_any = true;
         }
     }
-    if capability_gap {
-        return Ok(RecoveryStatus::Undecryptable);
+    // A held-but-unserved mapping means the device has the
+    // capability and lacks the bytes: missing, not undecryptable.
+    // Undecryptable is only the no-held-capability case.
+    if held_any || !mapped_any {
+        return Ok(RecoveryStatus::Missing);
     }
-    Ok(RecoveryStatus::Missing)
+    Ok(RecoveryStatus::Undecryptable)
 }
 
 /// The harder of two statuses: missing dominates undecryptable

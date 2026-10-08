@@ -87,7 +87,56 @@ fn recovery_plan_reports_row_statuses() {
     );
 }
 
-/// Planning over an id with no local body fails closed naming the id.
+/// The plan descends into grafted subtrees: a nested directory
+/// whose bytes are all local reads ready through the public plan.
+#[test]
+fn recovery_plan_walks_directories() {
+    let (_dir, mut engine, _) = owner_engine("recover-dirs");
+    let mut objects = MemoryObjectStore::default();
+    let inner = {
+        let chunk = objects.insert(ObjectKind::Chunk, b"nested").unwrap();
+        let entry = Entry::file("nested.txt", 6, false, vec![chunk]).unwrap();
+        Tree::from_entries(vec![entry])
+            .unwrap()
+            .insert_into(&mut objects)
+            .unwrap()
+    };
+    let base = Tree::from_entries(vec![Entry::dir("sub", inner).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let base_id = engine
+        .author_snapshot(&objects, base)
+        .unwrap()
+        .snapshot()
+        .snapshot_id();
+    let child = tree(&mut objects, &[("c.txt", b"c")]);
+    author_with_parents(&mut engine, &objects, child, vec![base_id]).unwrap();
+    assert_eq!(
+        status_of(&engine, &objects, base_id, "sub"),
+        RecoveryStatus::Ready,
+        "a fully local subtree walks ready"
+    );
+}
+
+/// A directory whose subtree object is absent reads missing — the
+/// row reports, the plan does not abort. Probed directly: no
+/// authoring path commits a dangling subtree, so the plan is the
+/// only surface that meets one.
+#[test]
+fn recovery_plan_reports_an_absent_subtree_as_missing() {
+    use super::recover::probe_entry;
+
+    let (_dir, engine, _) = owner_engine("recover-absent-subtree");
+    let objects = MemoryObjectStore::default();
+    let rebuilt = engine.store.rebuild(engine.device()).unwrap();
+    let dangling = Entry::dir("sub", ContentId::from_bytes([0x99; 32])).unwrap();
+    assert_eq!(
+        probe_entry(&engine, &objects, &rebuilt, &dangling).unwrap(),
+        RecoveryStatus::Missing,
+        "absent subtree bytes are missing, not a plan failure"
+    );
+}
 #[test]
 fn recovery_plan_refuses_an_unknown_source() {
     let (_dir, engine, _) = owner_engine("recover-plan-unknown");
@@ -151,5 +200,44 @@ fn recover_refuses_bad_selections() {
         engine.live_heads().unwrap().len(),
         heads_before,
         "refusals commit nothing"
+    );
+}
+
+/// A non-owner selection writes nothing at all: the ownership gate
+/// runs before the graft-tree insert, so the refused call leaves no
+/// orphaned tree object. The expected graft id is recomputed from
+/// the plan row — deterministic trees make the absence check exact.
+#[test]
+fn recover_writes_nothing_for_a_non_owner() {
+    use crate::membership::test_util::key;
+
+    let (_dir, mut engine, _) = owner_engine("recover-no-orphan");
+    let mut objects = MemoryObjectStore::default();
+    let (base_id, _) = base_and_child(&mut engine, &mut objects);
+    let entry = engine
+        .recovery_plan(&objects, base_id)
+        .unwrap()
+        .paths
+        .into_iter()
+        .find(|row| row.path == "a.txt")
+        .expect("source holds the row")
+        .entry;
+    let grafted = Tree::from_entries(vec![entry]).unwrap();
+    let graft_id = ContentId::derive(ObjectKind::Tree, &grafted.encode());
+    assert!(
+        !objects.has(&graft_id).unwrap(),
+        "the graft tree starts absent"
+    );
+    engine.device = key(20).1;
+    assert!(
+        matches!(
+            engine.recover(&mut objects, base_id, &["a.txt".to_owned()], false, &[]),
+            Err(EngineError::RecoveryNotOwner)
+        ),
+        "non-owner refused"
+    );
+    assert!(
+        !objects.has(&graft_id).unwrap(),
+        "no orphaned graft tree is inserted"
     );
 }

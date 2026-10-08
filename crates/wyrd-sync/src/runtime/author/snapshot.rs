@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{
-    snapshot::RECOVERY_FLAG, ChildManifest, ContentId, Entry, Manifest, ManifestEntry, ObjectKind,
-    ObjectStore, Snapshot, SnapshotId, Tree,
+    snapshot::RECOVERY_FLAG, ChildManifest, ContentId, DeviceId, Entry, Manifest, ManifestEntry,
+    ObjectKind, ObjectStore, Snapshot, SnapshotId, Tree,
 };
 
 use crate::authorization::SnapshotDag;
@@ -75,6 +75,24 @@ where
     author_over(engine, objects, tree, parents, rebuilt, 0)
 }
 
+/// The recovery author must be the current canonical owner — not
+/// merely a member of the bound epoch. Shared by [`author_recovery`]
+/// and the recovery selection path, so both enforce the same
+/// projection and a non-owner writes nothing anywhere: checked
+/// before any store insert, re-checked at authoring.
+pub(super) fn check_recovery_owner(
+    rebuilt: &Rebuilt,
+    device: &DeviceId,
+) -> Result<(), EngineError> {
+    let known = rebuilt
+        .log
+        .known_state()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    match rebuilt.log.owners_of(&known.transition_id) {
+        Some(owners) if owners.len() == 1 && owners.contains(device) => Ok(()),
+        _ => Err(EngineError::RecoveryNotOwner),
+    }
+}
 /// Author a recovery snapshot over `tree` on behalf of this engine's
 /// device. The tree is explicitly selected historical content — the
 /// caller passes a recorded ContentId, never live-derived lineage —
@@ -94,19 +112,11 @@ where
     S::Error: std::fmt::Debug,
 {
     let rebuilt = engine.store.rebuild(engine.device)?;
-    let known = rebuilt
-        .log
-        .known_state()
-        .ok_or(EngineError::NoCanonicalMembership)?;
-    // The recovery author must be the current canonical owner — not
-    // merely a member of the bound epoch. The classifier enforces
-    // the same rule on intake (`RecoveryNotOwner`); authoring
-    // refuses up front so a misconfigured member fails loudly
-    // instead of authoring snapshots every peer rejects.
-    match rebuilt.log.owners_of(&known.transition_id) {
-        Some(owners) if owners.len() == 1 && owners.contains(&engine.device) => {}
-        _ => return Err(EngineError::RecoveryNotOwner),
-    }
+    // The classifier enforces the same rule on intake
+    // (`RecoveryNotOwner`); authoring refuses up front so a
+    // misconfigured member fails loudly instead of authoring
+    // snapshots every peer rejects.
+    check_recovery_owner(&rebuilt, &engine.device)?;
     let mut dag = SnapshotDag::new(engine.drive);
     for body in rebuilt.runtime.snapshot_bodies.values() {
         dag.observe(body.clone());

@@ -163,7 +163,9 @@ fn snapshot_list_marks_recovery_heads() {
 }
 
 /// The marker is also on the heads tip row: the two renderers
-/// mark independently, so a tip that is not live still audits.
+/// mark independently. Heads lists tips only, so the marker audits
+/// a recovery while it is listed — once history moves past it the
+/// snapshot leaves both views (see `docs/cli.md`).
 #[test]
 fn snapshot_heads_marks_recovery_tips() {
     let fixture = Fixture::new();
@@ -501,6 +503,82 @@ fn recover_run_grafts_the_take() {
         grafted.snapshot().parents,
         vec![second],
         "parents are the current eligible heads"
+    );
+}
+
+/// `--all` grafts the whole source tree in one run.
+#[test]
+fn recover_run_all_grafts_the_whole_tree() {
+    let fixture = Fixture::new();
+    let first = write_file(&fixture, "old.txt", b"old");
+    write_file(&fixture, "new.txt", b"new");
+    command(fixture.args(vec![
+        "recover".into(),
+        "run".into(),
+        "--from".into(),
+        first.to_string(),
+        "--all".into(),
+    ]))
+    .unwrap();
+
+    let engine = fixture.open();
+    let grafted = engine
+        .live_heads()
+        .unwrap()
+        .into_iter()
+        .find(|head| head.snapshot().flags() & wyrd_format::RECOVERY_FLAG != 0)
+        .expect("a recovery head is live");
+    let store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+    let bytes = store.get(&grafted.snapshot().tree).unwrap().unwrap();
+    let names: Vec<_> = Tree::decode(&bytes)
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|entry| entry.name.as_str().to_owned())
+        .collect();
+    assert_eq!(names, vec!["old.txt"], "the whole source tree grafts");
+}
+
+/// `--content` grafts explicitly named bytes under their hex name,
+/// for content whose path the operator no longer knows.
+#[test]
+fn recover_run_content_grafts_under_its_hex_name() {
+    let fixture = Fixture::new();
+    let first = write_file(&fixture, "old.txt", b"old");
+    write_file(&fixture, "new.txt", b"new");
+    let loose = {
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        store.insert(ObjectKind::Chunk, b"loose").unwrap()
+    };
+    command(fixture.args(vec![
+        "recover".into(),
+        "run".into(),
+        "--from".into(),
+        first.to_string(),
+        "--content".into(),
+        loose.to_string(),
+    ]))
+    .unwrap();
+
+    let engine = fixture.open();
+    let grafted = engine
+        .live_heads()
+        .unwrap()
+        .into_iter()
+        .find(|head| head.snapshot().flags() & wyrd_format::RECOVERY_FLAG != 0)
+        .expect("a recovery head is live");
+    let store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+    let bytes = store.get(&grafted.snapshot().tree).unwrap().unwrap();
+    let names: Vec<_> = Tree::decode(&bytes)
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|entry| entry.name.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec![loose.to_string()],
+        "the content grafts under its hex name"
     );
 }
 

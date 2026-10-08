@@ -93,6 +93,7 @@ pub(super) fn check_recovery_owner(
         _ => Err(EngineError::RecoveryNotOwner),
     }
 }
+
 /// Author a recovery snapshot over `tree` on behalf of this engine's
 /// device. The tree is explicitly selected historical content — the
 /// caller passes a recorded ContentId, never live-derived lineage —

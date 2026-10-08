@@ -137,6 +137,75 @@ fn recovery_plan_reports_an_absent_subtree_as_missing() {
         "absent subtree bytes are missing, not a plan failure"
     );
 }
+/// probe_chunk through recorded mappings: an epoch the keyring
+/// does not hold reads undecryptable, a held-but-unserved mapping
+/// reads missing. The rows ride one fabricated manifest whose id
+/// derives from its own bytes — the recorded-mapping door is about
+/// the mapping rows, not the envelope, so synthesis is the honest
+/// fixture.
+#[test]
+fn probe_chunk_classifies_recorded_mappings() {
+    use super::recover::probe_entry;
+    use crate::runtime::ManifestRecord;
+    use std::collections::BTreeMap;
+    use wyrd_format::{BaoRoot, Manifest, ManifestEntry, StorageId};
+
+    let (_dir, engine, _) = owner_engine("recover-mappings");
+    let objects = MemoryObjectStore::default();
+    let mut rebuilt = engine.store.rebuild(engine.device()).unwrap();
+    let held_epoch = (1..=8)
+        .find(|epoch| rebuilt.keyring.secret(*epoch).is_some())
+        .expect("the harness holds an epoch secret");
+    let unheld_epoch = 999_999u64;
+    assert!(rebuilt.keyring.secret(unheld_epoch).is_none());
+    let chunk_unheld = ContentId::from_bytes([0xC1; 32]);
+    let chunk_unserved = ContentId::from_bytes([0xC2; 32]);
+    let entry_for = |chunk: ContentId, epoch: u64| ManifestEntry {
+        content_id: chunk,
+        kind: ObjectKind::Chunk,
+        version: 1,
+        storage_id: StorageId::from_bytes([0xD0; 32]),
+        encryption_epoch: epoch,
+        size: 5,
+        transport: BaoRoot::from_bytes([0xE0; 32]),
+    };
+    let manifest = Manifest::new(
+        SnapshotId::from_bytes([0xF0; 32]),
+        vec![
+            entry_for(chunk_unheld, unheld_epoch),
+            entry_for(chunk_unserved, held_epoch),
+        ],
+        vec![],
+    )
+    .unwrap();
+    let manifest_id = ContentId::derive(ObjectKind::Manifest, &manifest.canonical_bytes());
+    rebuilt.runtime.manifests.insert(
+        manifest_id,
+        ManifestRecord {
+            is_root: false,
+            manifest_id,
+            representations: BTreeMap::new(),
+            transport: BaoRoot::from_bytes([0xE1; 32]),
+            manifest,
+        },
+    );
+    let status = |chunk: ContentId| {
+        let entry = Entry::file("f", 5, false, vec![chunk]).unwrap();
+        probe_entry(&engine, &objects, &rebuilt, &entry).unwrap()
+    };
+    assert_eq!(
+        status(chunk_unheld),
+        RecoveryStatus::Undecryptable,
+        "no held epoch decrypts the row"
+    );
+    assert_eq!(
+        status(chunk_unserved),
+        RecoveryStatus::Missing,
+        "a held capability without the bytes is missing, not undecryptable"
+    );
+}
+
+/// Planning over an id with no local body fails closed naming the id.
 #[test]
 fn recovery_plan_refuses_an_unknown_source() {
     let (_dir, engine, _) = owner_engine("recover-plan-unknown");

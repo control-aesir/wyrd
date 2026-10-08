@@ -259,6 +259,15 @@ fn a_repeated_refusal_warns_once_per_obligation() {
         .find(|(name, _)| name == "message")
         .map(|(_, value)| value)
         .expect("message field present");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("transition"),
+        "the warn names the attempted kind: {kind}"
+    );
     assert!(
         !message.contains(&recipient.to_string()),
         "the warn names no recipient identity: {message}"
@@ -571,6 +580,111 @@ fn delivery_skips_capability_without_a_sealing_key_and_sends_the_rest() {
     let inner = open_from_sender(&identity_secret(&owner_sk), member, delivery.envelope()).unwrap();
     let resent = SealedRotation::decode(&inner).expect("rotation framed");
     assert_eq!(resent.encode(), sealed, "retries resend identical bytes");
+}
+
+/// A capability refusal warns with the capability kind: the
+/// production call site's wiring is pinned end to end, not just the
+/// shared send path — a `kind` drift at the call site would name the
+/// wrong obligation class here.
+#[test]
+fn capability_refusal_warns_once_with_the_capability_kind() {
+    use crate::control::seal_rotation;
+    use crate::keys::capability::Capability;
+    use crate::keys::owner_proof::OwnerProof;
+    use crate::runtime::test_util::{identity_secret, owner};
+
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let (owner_sk, member) = owner();
+    let state = fx.engine.log.state_of(&child_id).expect("child is valid");
+    let registration = state
+        .encryption_key_of(&member)
+        .copied()
+        .expect("member has a registered key");
+    // A pre-sealed rotation delivery to the world member, exactly as
+    // the seal-commit test stages it: reuse header-correlates, so the
+    // wrap carries placeholder secrets.
+    let wrap = Capability::mint(
+        member_drive(),
+        member,
+        &state,
+        &child,
+        vec![secret(0xAA), secret(0xBB)],
+    )
+    .expect("member is a member")
+    .wrap()
+    .expect("wraps")
+    .as_bytes()
+    .to_vec();
+    let owner_identity = identity_secret(&owner_sk);
+    let proof = OwnerProof::sign(
+        &owner_identity,
+        &member_drive(),
+        &member,
+        &child_id,
+        2,
+        &[secret(0xAA), secret(0xBB)],
+    )
+    .expect("local signer authorizes the owner-proof domain")
+    .encode();
+    let sealed = seal_rotation(
+        &member_drive(),
+        member,
+        &registration,
+        2,
+        &child.canonical_bytes(),
+        &wrap,
+        &proof,
+    )
+    .expect("seals")
+    .encode();
+    fx.engine
+        .commit_facts(&[
+            Fact::CapabilitySealed(2, member, sealed),
+            Fact::CapabilityQueued(2, member),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut refusing = RefusingMailbox {
+            inner: MemoryMailbox {
+                relay: &mut fx.relay,
+                owner: fx.recipient,
+            },
+        };
+        assert_eq!(
+            fx.engine.deliver_pending(&mut refusing).unwrap(),
+            0,
+            "a refused capability send counts nothing"
+        );
+    });
+    let warns: Vec<Vec<(String, String)>> = logs
+        .snapshot()
+        .into_iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, fields)| fields)
+        .collect();
+    assert_eq!(warns.len(), 1, "one warn for the refused pair");
+    let kind = warns[0]
+        .iter()
+        .find(|(name, _)| name == "kind")
+        .map(|(_, value)| value)
+        .expect("kind field present");
+    assert!(
+        kind.contains("capability"),
+        "the warn names the attempted kind: {kind}"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.capability_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.capability_queued,
+        vec![(2, member)],
+        "the obligation stays pending"
+    );
 }
 
 /// An announcement obligation without a sealing key stays pending

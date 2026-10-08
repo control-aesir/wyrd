@@ -16,6 +16,7 @@ on:
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
+      - ".ngit/scripts/review.sh"
   pull_request:
     types: [opened, ready_for_review]
     paths:
@@ -31,6 +32,7 @@ on:
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
+      - ".ngit/scripts/review.sh"
 
 jobs:
   draft:

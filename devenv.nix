@@ -68,6 +68,17 @@ in
       files = "^(page/|docs/|README\\.md)";
       pass_filenames = false;
     };
+
+    # Review helper tests: the stub suite runs when the helper, its
+    # library, or the suite itself changes, so broken resolve/post
+    # semantics never ship green.
+    review-tests = {
+      enable = true;
+      name = "review helper tests";
+      entry = "bash .ngit/scripts/tests/test-review.sh";
+      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/test-review\\.sh)$";
+      pass_filenames = false;
+    };
   };
 
   # Release tooling: `build` wraps `.ngit/scripts/build.sh`,
@@ -76,4 +87,13 @@ in
   # detection). Input is pinned to the release tag in a detached
   # worktree, never the working copy.
   scripts.build.exec = "${./.ngit/scripts/build.sh} \"$@\"";
+
+  # Review tooling: `review` wraps `.ngit/scripts/review.sh`, the
+  # tested resolve/context/post helpers local PR reviews call instead
+  # of re-deriving ngit ceremony. The store-installed script loses its
+  # sibling ngit.sh, so REVIEW_LIB_DIR points it back at the stored
+  # scripts directory. The stub-based suite runs from the checkout, not
+  # exposed as a `scripts.*` command: its fixtures resolve
+  # source-relative paths.
+  scripts.review.exec = "REVIEW_LIB_DIR=${./.ngit/scripts} ${./.ngit/scripts/review.sh} \"$@\"";
 }

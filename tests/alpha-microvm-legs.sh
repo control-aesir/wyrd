@@ -1115,9 +1115,12 @@ leg_steady_member() {
 # state and serve.
 # Fence record (OD-06-A): the kill lands after the obligation write
 # is acknowledged and while the relay partition makes drain
-# impossible — the pending-outbox window. Single-writer discipline
-# holds throughout: the witness authors nothing while partitioned,
-# so no fork can mask a lost obligation.
+# impossible — the pending-outbox window. The drive joined fresh
+# (manifest-only), so a scratch commit over the live relay localizes
+# the head tree first: without it the obligation write would wait on
+# remote base-closure content and fail TimedOut instead of pending.
+# Single-writer discipline holds throughout: the witness authors
+# nothing while partitioned, so no fork can mask a lost obligation.
 # Bounded-failure assertions: cold serve bounded (300s), witness
 # convergence bounded host-side. Wall-clock envelope: worst case
 # under 10 minutes with the partition waits; typical 3-4 minutes.
@@ -1128,6 +1131,19 @@ leg_crash_member() {
   poll_until 120 bash -c "ls '$MNTS/xcrash-m' | grep -qx 'cold-u.txt'" \
     || die "member never listed the cold file"
   touch "$E2E_ROOT/crash-m-listed"
+  # Tree localization BEFORE the partition: this drive joined fresh
+  # and is manifest-only, and a mutation held waiting on remote
+  # base-closure content fails TimedOut (ETIMEDOUT) by design
+  # (max_mutation_wait) — it never becomes the pending obligation
+  # this leg needs. Committing a scratch file over the live relay
+  # forces the head tree local (completion is the signal — success
+  # means the trees are local), so the obligation write below is
+  # local-first and succeeds while undrainable.
+  echo "scratch-m" > "$MNTS/xcrash-m/scratch-m.txt"
+  [[ "$(cat "$MNTS/xcrash-m/scratch-m.txt")" == "scratch-m" ]] \
+    || die "scratch write never committed"
+  pass "scratch commit localizes the head tree over the live relay"
+  touch "$E2E_ROOT/crash-m-ready"
   poll_until 180 test -f "$E2E_ROOT/crash-m-partitioned" \
     || die "host never partitioned the relay"
   conflict_assert_partitioned "$relay"

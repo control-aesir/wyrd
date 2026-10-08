@@ -630,7 +630,7 @@ pass "owner KILL mid-burst reopens clean and converges"
 # 13b: member KILL with a pending obligation under partition. Host
 # drives the partition like phase 10 (same tap, same EXIT-trap
 # discipline): the member authors alone while down.
-rm -f "$RUN"/crash-m-listed "$RUN"/crash-m-partitioned "$RUN"/crash-m-killed \
+rm -f "$RUN"/crash-m-listed "$RUN"/crash-m-ready "$RUN"/crash-m-partitioned "$RUN"/crash-m-killed \
   "$RUN"/crash-m-healed "$RUN"/crash-m-done "$RUN"/crash-m-witness-done
 on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-owner $GCOD $GCO $RELAY_URL" \
   >"$RUN/logs/leg-steady-owner.out" 2>&1 &
@@ -638,8 +638,8 @@ LEG_O=$!
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-member $GCND $GCN $RELAY_URL" \
   >"$RUN/logs/leg-crash-member.out" 2>&1 &
 LEG_N=$!
-wait_conflict_file 300 "$RUN/crash-m-listed" \
-  "member never listed the cold file (see logs/leg-crash-member.out)" "$LEG_N"
+wait_conflict_file 300 "$RUN/crash-m-ready" \
+  "member never localized its tree for the obligation (see logs/leg-crash-member.out)" "$LEG_N"
 heal_tap() { ip link set tap-r up 2>/dev/null || true; }
 trap heal_tap EXIT
 ip link set tap-r down || die "host could not partition tap-r"

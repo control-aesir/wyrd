@@ -72,6 +72,15 @@ version say exactly what changed.
   copy shared by mount, `sync now --serve`, and vault (route-plus-
   barrier wiring pinned by a test a hand-wired barrier cannot
   satisfy; flush-before-route is the shared code order).
+- MicroVM degraded-path legs (G5, tests only — no behavior change):
+  crash injection (owner SIGKILL mid-burst reopens clean with
+  byte-complete survivors; member SIGKILL with a pending obligation
+  under partition replays and re-serves), resource exhaustion
+  (filled filesystem fails closed ENOSPC, drive stays readable and
+  recovers, offline export holds only byte-complete fills), and
+  unknown parent (withheld body leaves the child ENOENT bounded with
+  an EIO control, then heals). New suite phases 13-15; the whole-run
+  cap moves 90 to 120 minutes with the legs' stated budgets.
 
 - Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
   in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):

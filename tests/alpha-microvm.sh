@@ -28,12 +28,18 @@
 #      versions identical on both sides
 #   microvm 11. offline reopen of both drives on the host (exports
 #      now assert the conflict siblings too)
+#   microvm 12. headless serving pair (serve/fetch without mounts,
+#      KILL mid-residency with mirror rebuild, TERM shutdowns)
+#   microvm 13. crash injection on a fresh pair: owner KILL mid-burst,
+#      member KILL with a pending obligation under partition
+#   microvm 14. resource exhaustion: filled filesystem, ENOSPC fail-closed
+#   microvm 15. unknown parent: withheld body, ENOENT child, heal
 #
 # Step selection (runner --step -> MICROVM_ONLY_STEP): phases build on
 # each other, so the run set is the prefix closure of the selection —
 # selecting phase N runs 1..N, never a lone dependent phase on stale
 # state. Entries 1-5 are the shared-core Lima steps (phase 1 runs the
-# 1..N prefix of those); 6-12 are the microvm phases below. Absent
+# 1..N prefix of those); 6-15 are the microvm phases below. Absent
 # means all phases (the runner refuses an explicit empty value, so
 # empty arriving here also means all).
 #
@@ -80,7 +86,7 @@ if [[ -n "$ONLY_STEP" ]]; then
   # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
   # without this it would run zero checks and pass.
   [[ ",$ONLY_STEP," != *,,* ]] \
-    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-12 entries)"
+    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-15 entries)"
   # Split on commas into a quoted array: an unquoted expansion would
   # glob each entry against the working directory first, so `--step
   # '*'` could pathname-expand into a digit-named file and slip past
@@ -88,12 +94,12 @@ if [[ -n "$ONLY_STEP" ]]; then
   _step_entries=()
   IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
   for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[012])$ ]] \
-      || die "--step: '$_e' is not a step (expected a comma list of 1-12)"
+    [[ "$_e" =~ ^([1-9]|1[0-5])$ ]] \
+      || die "--step: '$_e' is not a step (expected a comma list of 1-15)"
     if (( _e > MAX_STEP )); then MAX_STEP="$_e"; fi
   done
   unset _step_entries _e
-  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-12)"
+  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-15)"
 fi
 want_phase() { [[ -z "$ONLY_STEP" ]] || (( $1 <= MAX_STEP )); }
 # Shared-core steps selected: the 1..N prefix truncated to the core
@@ -116,6 +122,24 @@ as_guest() { setpriv --reuid 1000 --regid 1000 --clear-groups -- "$@"; }
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
 on_o() { $SSH "$PEER_O" "$@"; }
 on_n() { $SSH "$PEER_N" "$@"; }
+
+# wait_conflict_file <seconds> <file> <what> <leg-pid>: shared
+# rendezvous waiter for host-driven fault blocks (partition, kill):
+# fail fast when the awaited leg exits early instead of burning the
+# whole budget on a corpse.
+wait_conflict_file() { # <seconds> <file> <what> <leg-pid>
+  local budget="$1" f="$2" what="$3" leg="$4" i
+  for ((i = 0; i < budget * 2; i++)); do
+    [[ -f "$f" ]] && return 0
+    # A dead leg never touches its file: fail fast instead of burning
+    # the whole budget on a corpse. The pid is per-file (the sibling
+    # leg may already have finished fine); $what names the awaited
+    # rendezvous and its leg log.
+    kill -0 "$leg" 2>/dev/null || die "$what (leg exited early)"
+    sleep 0.5
+  done
+  die "$what"
+}
 
 # --- phase 1: shared core on peer-o ------------------------------------
 # Always runs: every prefix starts at 1. The selection only truncates
@@ -309,19 +333,6 @@ rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
   "$RUN/logs"/conflict-reread-owner-2.stderr \
   "$RUN/logs"/conflict-reread-member-1.stderr \
   "$RUN/logs"/conflict-reread-member-2.stderr
-wait_conflict_file() { # <seconds> <file> <what> <leg-pid>
-  local budget="$1" f="$2" what="$3" leg="$4" i
-  for ((i = 0; i < budget * 2; i++)); do
-    [[ -f "$f" ]] && return 0
-    # A dead leg never touches its file: fail fast instead of burning
-    # the whole budget on a corpse. The pid is per-file (the sibling
-    # leg may already have finished fine); $what names the awaited
-    # rendezvous and its leg log.
-    kill -0 "$leg" 2>/dev/null || die "$what (leg exited early)"
-    sleep 0.5
-  done
-  die "$what"
-}
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh conflict-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-conflict-member.out" 2>&1 &
 LEG_N=$!
@@ -560,6 +571,163 @@ wait "$LEG_HS" || die "headless serve leg failed (see logs/leg-headless-serve.ou
 pass "three headless peers exchange content with neither mounting"
 fi # want_phase 12
 
+# --- phase: microvm 13 (crash injection) ---------------------------------
+# Two SIGKILL legs against a fresh drive pair (the phase-10 pair is
+# conflicted — writes fail EIO there by design — so crashing on it
+# would prove nothing about the commit path). 13a kills the owner
+# mid-burst after 40 acknowledged writes; 13b kills the member with
+# a pending obligation under a host-driven relay partition (tap-r
+# surgery, same shape as phase 10). Every kill targets the shipped
+# binary's real process death — no test-only hooks (OD-06-A) — and
+# each leg records the fence its kill represents. Worst case ~12
+# minutes for the pair; typical 6-8.
+if want_phase 13; then
+echo "=== microvm 13: crash injection ==="
+CO="$RUN/creds/crash-o"
+COD="$RUN/drives/crash-o"
+CN="$RUN/creds/crash-n"
+CND="$RUN/drives/crash-n"
+GCO="$GUEST_RUN/creds/crash-o"
+GCOD="$GUEST_RUN/drives/crash-o"
+GCN="$GUEST_RUN/creds/crash-n"
+GCND="$GUEST_RUN/drives/crash-n"
+mkdir -p "$CO" "$COD" "$CN" "$CND"
+for _cdir in "$CO" "$CN"; do
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_cdir/identity"
+  printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$_cdir/passphrase"
+  chmod 600 "$_cdir/identity" "$_cdir/passphrase"
+done
+unset _cdir
+chown -R 1000:1000 "$CO" "$COD" "$CN" "$CND"
+as_guest "$WYRD_BIN" init --identity-file "$CO/identity" --passphrase-file "$CO/passphrase" \
+  "$COD" >"$RUN/logs/init-crash.out" 2>"$RUN/logs/init-crash.stderr" \
+  || die "crash pair drive init failed"
+as_guest "$WYRD_BIN" device --identity-file "$CN/identity" --passphrase-file "$CN/passphrase" \
+  "$CND" pairing-request "$RUN/pairing-crash.txt" >"$RUN/logs/pairing-crash.out" 2>"$RUN/logs/pairing-crash.stderr" \
+  || die "crash-n pairing-request failed"
+DEV_CRASH="$(grep '^device ' "$RUN/pairing-crash.txt" | cut -d' ' -f2)"
+KEY_CRASH="$(grep '^encryption-key ' "$RUN/pairing-crash.txt" | cut -d' ' -f2)"
+[[ "${#DEV_CRASH}" == 64 && "${#KEY_CRASH}" == 64 ]] || die "crash-n pairing material malformed"
+as_guest "$WYRD_BIN" member --identity-file "$CO/identity" \
+  --passphrase-file "$CO/passphrase" "$COD" \
+  invite "$DEV_CRASH" "$KEY_CRASH" "$RUN/invitation-crash" >"$RUN/logs/invite-crash.out" 2>"$RUN/logs/invite-crash.stderr" \
+  || die "crash owner invite of crash-n failed"
+as_guest "$WYRD_BIN" device --identity-file "$CN/identity" --passphrase-file "$CN/passphrase" \
+  "$CND" join "$RUN/invitation-crash" >"$RUN/logs/join-crash.out" 2>"$RUN/logs/join-crash.stderr" \
+  || die "crash-n join failed"
+pass "crash pair joins on a fresh drive"
+# 13a: owner burst + KILL, witness holds convergence across the death.
+rm -f "$RUN"/crash-o-steady-ready "$RUN"/crash-o-back "$RUN"/crash-o-member-done
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-member $GCND $GCN $RELAY_URL" \
+  >"$RUN/logs/leg-steady-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-owner $GCOD $GCO $RELAY_URL" \
+  >"$RUN/logs/leg-crash-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "crash witness member leg failed (see logs/leg-steady-member.out)"
+wait "$LEG_O" || die "crash owner leg failed (see logs/leg-crash-owner.out)"
+pass "owner KILL mid-burst reopens clean and converges"
+# 13b: member KILL with a pending obligation under partition. Host
+# drives the partition like phase 10 (same tap, same EXIT-trap
+# discipline): the member authors alone while down.
+rm -f "$RUN"/crash-m-listed "$RUN"/crash-m-partitioned "$RUN"/crash-m-killed \
+  "$RUN"/crash-m-healed "$RUN"/crash-m-done "$RUN"/crash-m-witness-done
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-owner $GCOD $GCO $RELAY_URL" \
+  >"$RUN/logs/leg-steady-owner.out" 2>&1 &
+LEG_O=$!
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-member $GCND $GCN $RELAY_URL" \
+  >"$RUN/logs/leg-crash-member.out" 2>&1 &
+LEG_N=$!
+wait_conflict_file 300 "$RUN/crash-m-listed" \
+  "member never listed the cold file (see logs/leg-crash-member.out)" "$LEG_N"
+heal_tap() { ip link set tap-r up 2>/dev/null || true; }
+trap heal_tap EXIT
+ip link set tap-r down || die "host could not partition tap-r"
+touch "$RUN/crash-m-partitioned"
+wait_conflict_file 300 "$RUN/crash-m-killed" \
+  "member never died on KILL under partition (see logs/leg-crash-member.out)" "$LEG_N"
+pass "member KILL lands with the obligation pending"
+ip link set tap-r up || die "host could not heal tap-r"
+trap - EXIT
+touch "$RUN/crash-m-healed"
+wait "$LEG_N" || die "crash member leg failed (see logs/leg-crash-member.out)"
+wait "$LEG_O" || die "crash witness owner leg failed (see logs/leg-steady-owner.out)"
+pass "member KILL under partition replays the obligation and re-serves"
+fi # want_phase 13
+
+# --- phase: microvm 14 (resource exhaustion) -----------------------------
+# Fill the exhaustion drive's filesystem to 256 MiB headroom, then
+# write through an offline mount until ENOSPC. Offline on purpose:
+# exhaustion is a storage-stack property, not a sync one, and a
+# relay would only add failure modes to the wrong leg. The host
+# exports the drive offline afterwards and asserts the fail-closed
+# half: every fill file present is exactly 32 MiB (byte-complete)
+# or absent — never torn — plus the pre-fill and recovery anchors.
+# Worst case ~8 minutes; typical 3-4.
+if want_phase 14; then
+echo "=== microvm 14: resource exhaustion ==="
+rm -f "$RUN"/fill-*.stderr
+EC="$RUN/creds/exh"
+ED="$RUN/drives/exh"
+GEC="$GUEST_RUN/creds/exh"
+GED="$GUEST_RUN/drives/exh"
+mkdir -p "$EC" "$ED"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$EC/identity"
+printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$EC/passphrase"
+chmod 600 "$EC/identity" "$EC/passphrase"
+chown -R 1000:1000 "$EC" "$ED"
+as_guest "$WYRD_BIN" init --identity-file "$EC/identity" --passphrase-file "$EC/passphrase" \
+  "$ED" >"$RUN/logs/init-exh.out" 2>"$RUN/logs/init-exh.stderr" \
+  || die "exhaustion drive init failed"
+pass "exhaustion drive initialized"
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh exhaustion $GED $GEC" \
+  >"$RUN/logs/leg-exhaustion.out" 2>&1 || die "exhaustion leg failed (see logs/leg-exhaustion.out)"
+pass "writes fail closed ENOSPC and the drive recovers"
+rm -rf "$RUN/export-exh"
+as_guest "$WYRD_BIN" export \
+  --identity-file "$EC/identity" \
+  --passphrase-file "$EC/passphrase" \
+  "$ED" "$RUN/export-exh" >"$RUN/logs/export-exh.out" 2>&1 \
+  || die "exhaustion drive does not export after reopen"
+[[ "$(cat "$RUN/export-exh/small.txt")" == "pre-fill" ]] \
+  || die "exhaustion export lost the pre-fill anchor"
+[[ "$(cat "$RUN/export-exh/recovery.txt")" == "recovered" ]] \
+  || die "exhaustion export lost the recovery anchor"
+# Fill-file inventory: present means byte-complete (exactly 32 MiB),
+# absent means never committed — torn is the partial-accept this
+# phase exists to forbid.
+for (( _x = 1; _x <= 24; _x++ )); do
+  _f="$RUN/export-exh/fill-$_x.bin"
+  [[ -e "$_f" ]] || continue
+  [[ "$(stat -c %s "$_f")" == "33554432" ]] \
+    || die "exhaustion export holds torn fill-$_x.bin ($(stat -c %s "$_f") bytes)"
+done
+unset _x _f
+pass "exhaustion export holds only byte-complete fills plus both anchors"
+fi # want_phase 14
+
+# --- phase: microvm 15 (unknown parent) -----------------------------------
+# Reuses the healthy post-crash pair: owner publishes two chained
+# snapshots and stops before the member fetches any body; the member
+# proves the UnknownParent case split (child ENOENT, parent EIO,
+# both bounded), then heals once the owner returns. No third VM, no
+# proxy (OD-06-C). Worst case ~10 minutes; typical 3-4.
+if want_phase 15; then
+echo "=== microvm 15: unknown parent ==="
+rm -f "$RUN"/uparent-owner-gone "$RUN"/uparent-member-probed \
+  "$RUN"/uparent-owner-back "$RUN"/uparent-member-healed \
+  "$RUN"/up-2.err "$RUN"/up-1.err
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GCND $GCN $RELAY_URL" \
+  >"$RUN/logs/leg-uparent-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-owner $GCOD $GCO $RELAY_URL" \
+  >"$RUN/logs/leg-uparent-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "unknown-parent member leg failed (see logs/leg-uparent-member.out)"
+wait "$LEG_O" || die "unknown-parent owner leg failed (see logs/leg-uparent-owner.out)"
+pass "unknown-parent fails ENOENT bounded and heals"
+fi # want_phase 15
+
 # Host-side leak check over every log the host wrote (guest logs
 # are checked in-guest by each leg). Owner secrets always exist past
 # phase 1; member-n credentials exist only once phase 6 stages them,
@@ -581,6 +749,17 @@ for f in "$RUN"/logs/*; do
              "$(cat "$HC/identity")" "$(cat "$HC/passphrase")" \
              "$(cat "$HE/identity")" "$(cat "$HE/passphrase")" \
              "$(cat "$HDD/identity")" "$(cat "$HDD/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
+  if want_phase 13; then
+    for s in "$(cat "$CO/identity")" "$(cat "$CO/passphrase")" \
+             "$(cat "$CN/identity")" "$(cat "$CN/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
+  if want_phase 14; then
+    for s in "$(cat "$EC/identity")" "$(cat "$EC/passphrase")"; do
       grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
     done
   fi

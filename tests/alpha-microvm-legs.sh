@@ -1013,6 +1013,346 @@ leg_headless_fetch() {
   check_no_leaks "$LOGDIR/mount-xheadless-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_crash_owner <drive> <creds> <relay>: mount, converge an anchor
+# write with the witness, then take 40 acknowledged burst writes and
+# SIGKILL the mount's own process mid-stream — no graceful shutdown,
+# no reopen before the kill. Remount fresh and prove the drive
+# reopened clean: the anchor survives byte-identical, every burst
+# file present is byte-complete (never torn), and a post-crash write
+# converges to the witness.
+# Fence record (OD-06-A): the kill lands after the 40th burst write
+# is acknowledged (read back through the mount) and before any
+# reopen or export can report the commit — the rename/CURRENT
+# window (AfterRenameCommit / AfterFsyncCommitDir /
+# AfterRenameCurrent). The fence cannot name the exact stage; the
+# leg pins the crash-model window, not the stage.
+# Bounded-failure assertions: anchor read bounded (120s), post-crash
+# convergence bounded (300s member-side via the witness done-file).
+# Wall-clock envelope: ~40 local commits plus two converges, worst
+# case under 8 minutes; typical green run 2-3 minutes.
+leg_crash_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 13 "crash-injection owner leg"
+  start_mount xcrash-o "$c" "$d" "$MNTS/xcrash-o" --relay "$relay"
+  echo "anchor-v1" > "$MNTS/xcrash-o/anchor.txt"
+  poll_until 120 test -f "$E2E_ROOT/crash-o-steady-ready" \
+    || die "witness never converged the anchor write"
+  pass "anchor converged before the burst"
+  local i=1
+  while (( i <= 40 )); do
+    echo "burst-$i" > "$MNTS/xcrash-o/burst-$i.txt"
+    [[ "$(cat "$MNTS/xcrash-o/burst-$i.txt")" == "burst-$i" ]] \
+      || die "burst write $i never acknowledged"
+    i=$((i + 1))
+  done
+  pass "40 burst writes acknowledged (fence: post-ack, pre-reopen — the rename/CURRENT window)"
+  local pid kstatus=0
+  pid="$(cat "$PIDDIR/mount-xcrash-o.pid")"
+  kill -KILL "$pid" 2>/dev/null || die "owner mount pid already gone before KILL"
+  set +e; wait "$pid"; kstatus=$?; set -e
+  [[ "$kstatus" == "137" ]] || die "owner KILL exit $kstatus, want 137"
+  kill -0 "$pid" 2>/dev/null && die "owner mount pid survived KILL"
+  rm -f "$PIDDIR/mount-xcrash-o.pid"
+  fusermount3 -uz "$MNTS/xcrash-o" 2>/dev/null || true
+  pass "owner mount died on KILL"
+  start_mount xcrash-o2 "$c" "$d" "$MNTS/xcrash-o2" --relay "$relay"
+  [[ "$(timeout 120 cat "$MNTS/xcrash-o2/anchor.txt")" == "anchor-v1" ]] \
+    || die "anchor lost across the KILL"
+  pass "anchor survives the KILL byte-identical"
+  # Fail-closed burst inventory: every burst file the reopen shows
+  # must carry its full acknowledged bytes — a torn survivor is the
+  # partial-accept this leg exists to forbid. Absent is fine (never
+  # committed); partial is not.
+  local f torn=0 n=0 i
+  for (( i = 1; i <= 40; i++ )); do
+    f="$MNTS/xcrash-o2/burst-$i.txt"
+    [[ -e "$f" ]] || continue
+    n=$((n + 1))
+    [[ "$(cat "$f")" == "burst-$i" ]] || torn=$((torn + 1))
+  done
+  [[ "$torn" == 0 ]] || die "$torn burst survivors are torn after the KILL"
+  pass "burst survivors ($n files) are byte-complete, never torn"
+  echo "after-crash" > "$MNTS/xcrash-o2/after-crash.txt"
+  touch "$E2E_ROOT/crash-o-back"
+  poll_until 300 test -f "$E2E_ROOT/crash-o-member-done" \
+    || die "witness never converged the post-crash head"
+  stop_mount xcrash-o2 INT
+  check_no_leaks "$LOGDIR/mount-xcrash-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-xcrash-o2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_steady_member <drive> <creds> <relay>: the witness half of the
+# owner crash: converge the anchor (proving pre-crash convergence),
+# then converge the post-crash head after the owner returns — both
+# bounded, so a stuck recovery dies loudly instead of hanging the
+# phase. Holds its mount across the owner's death: no remount, no
+# repair on this side.
+leg_steady_member() {
+  local d="$1" c="$2" relay="$3"
+  step 13 "crash witness member leg"
+  start_mount xsteady-m "$c" "$d" "$MNTS/xsteady-m" --relay "$relay"
+  poll_until 180 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
+    || die "witness never converged the anchor write"
+  pass "witness converges the anchor before the crash"
+  touch "$E2E_ROOT/crash-o-steady-ready"
+  poll_until 120 test -f "$E2E_ROOT/crash-o-back" \
+    || die "owner never came back after the KILL"
+  poll_until 300 converged "$MNTS/xsteady-m/after-crash.txt" "after-crash" \
+    || die "witness never converged the post-crash head"
+  pass "post-crash head converges without remount"
+  touch "$E2E_ROOT/crash-o-member-done"
+  stop_mount xsteady-m TERM
+  check_no_leaks "$LOGDIR/mount-xsteady-m.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_crash_member <drive> <creds> <relay>: mount, take the cold
+# announcement in hand WITHOUT fetching its body (the want is
+# admitted but unfetched — durable state, not memory), then write an
+# obligation the partitioned relay cannot drain and SIGKILL the
+# mount's own process. After the host heals, remount fresh: the
+# obligation must still converge to the witness (never lost with
+# the dead process) and the cold want must re-demand from durable
+# state and serve.
+# Fence record (OD-06-A): the kill lands after the obligation write
+# is acknowledged and while the relay partition makes drain
+# impossible — the pending-outbox window. Single-writer discipline
+# holds throughout: the witness authors nothing while partitioned,
+# so no fork can mask a lost obligation.
+# Bounded-failure assertions: cold serve bounded (300s), witness
+# convergence bounded host-side. Wall-clock envelope: worst case
+# under 10 minutes with the partition waits; typical 3-4 minutes.
+leg_crash_member() {
+  local d="$1" c="$2" relay="$3"
+  step 13 "crash-injection member leg"
+  start_mount xcrash-m "$c" "$d" "$MNTS/xcrash-m" --relay "$relay"
+  poll_until 120 bash -c "ls '$MNTS/xcrash-m' | grep -qx 'cold-u.txt'" \
+    || die "member never listed the cold file"
+  touch "$E2E_ROOT/crash-m-listed"
+  poll_until 180 test -f "$E2E_ROOT/crash-m-partitioned" \
+    || die "host never partitioned the relay"
+  conflict_assert_partitioned "$relay"
+  echo "obligation-v1" > "$MNTS/xcrash-m/obligation.txt"
+  [[ "$(cat "$MNTS/xcrash-m/obligation.txt")" == "obligation-v1" ]] \
+    || die "obligation write never acknowledged"
+  pass "obligation acknowledged while the relay is down (fence: pending-outbox window)"
+  local pid kstatus=0
+  pid="$(cat "$PIDDIR/mount-xcrash-m.pid")"
+  kill -KILL "$pid" 2>/dev/null || die "member mount pid already gone before KILL"
+  set +e; wait "$pid"; kstatus=$?; set -e
+  [[ "$kstatus" == "137" ]] || die "member KILL exit $kstatus, want 137"
+  kill -0 "$pid" 2>/dev/null && die "member mount pid survived KILL"
+  rm -f "$PIDDIR/mount-xcrash-m.pid"
+  fusermount3 -uz "$MNTS/xcrash-m" 2>/dev/null || true
+  touch "$E2E_ROOT/crash-m-killed"
+  pass "member mount died on KILL with the obligation pending"
+  poll_until 180 test -f "$E2E_ROOT/crash-m-healed" \
+    || die "host never healed the relay"
+  start_mount xcrash-m2 "$c" "$d" "$MNTS/xcrash-m2" --relay "$relay"
+  # The want re-demands from durable state: the pre-kill listing
+  # admitted it, the kill took only the process, and the post-heal
+  # read serves the bytes over the live route with no remount dance
+  # beyond the fresh mount itself.
+  poll_until 300 converged "$MNTS/xcrash-m2/cold-u.txt" "cold-bytes-u" \
+    || die "cold want never re-demanded after the KILL"
+  pass "admitted want survives the KILL and serves after heal"
+  touch "$E2E_ROOT/crash-m-done"
+  poll_until 300 test -f "$E2E_ROOT/crash-m-witness-done" \
+    || die "witness never converged the obligation"
+  stop_mount xcrash-m2 TERM
+  check_no_leaks "$LOGDIR/mount-xcrash-m.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-xcrash-m2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_steady_owner <drive> <creds> <relay>: the witness half of the
+# member crash: publish the cold file, then stay read-only while the
+# relay is partitioned (single-writer discipline — any owner write
+# under partition would fork the drive and mask the assertion).
+# After heal, converge the member's obligation bytes bounded: the
+# replay arriving here is the proof the KILL lost nothing.
+leg_steady_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 13 "crash witness owner leg"
+  start_mount xsteady-o "$c" "$d" "$MNTS/xsteady-o" --relay "$relay"
+  echo "cold-bytes-u" > "$MNTS/xsteady-o/cold-u.txt"
+  poll_until 120 test -f "$E2E_ROOT/crash-m-listed" \
+    || die "member never listed the cold file"
+  pass "cold announcement published before the partition"
+  poll_until 300 converged "$MNTS/xsteady-o/obligation.txt" "obligation-v1" \
+    || die "member obligation never replayed after the KILL"
+  pass "killed member's obligation replays after heal"
+  touch "$E2E_ROOT/crash-m-witness-done"
+  poll_until 120 test -f "$E2E_ROOT/crash-m-done" \
+    || die "member leg never finished"
+  stop_mount xsteady-o INT
+  check_no_leaks "$LOGDIR/mount-xsteady-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_exhaustion <drive> <creds>: fill the drive's filesystem with
+# a filler file (leaving 256 MiB headroom — never the whole disk),
+# then write 32 MiB random files through an OFFLINE mount until one
+# fails. The failing write must fail closed with ENOSPC (rc 1,
+# "No space left on device"): the store maps a full disk to
+# StoreFailure::StorageFull, which reaches the mount as ENOSPC
+# (wyrd-format fs_store, wyrd-daemon fuse backend). Each file stays
+# under the 64 MiB per-handle write budget, so the ENOSPC is the
+# disk's, not the budget's; random bytes defeat chunk sharing, so
+# every file really consumes its 32 MiB.
+# Bounded-failure assertions: the failing write is wrapped in
+# `timeout` (a hang is the bug, not a slow pass); the pre-fill file
+# stays readable under exhaustion; the drive accepts writes again
+# once the filler is gone. The host exports the drive offline and
+# asserts every fill file present is exactly 32 MiB (byte-complete)
+# or absent — never torn.
+# Wall-clock envelope: up to 24 x 32 MiB commits worst case
+# (~768 MiB of churn), under 8 minutes; typical 3-4 minutes.
+leg_exhaustion() {
+  local d="$1" c="$2"
+  step 14 "resource-exhaustion leg"
+  command -v fallocate >/dev/null \
+    || die "fallocate missing in the guest: the filler needs block preallocation"
+  local avail_kb filler_bytes
+  avail_kb="$(df -k --output=avail "$d" | tail -n 1 | tr -d ' ')"
+  [[ "$avail_kb" -ge 2097152 ]] \
+    || die "only ${avail_kb} KiB free under $d: the exhaustion leg needs 2 GiB headroom to fail loudly, not vacuously"
+  # Leave 256 MiB breathing room for the guest itself (logs, mounts):
+  # the filler takes the rest, and the drive's own writes eat the
+  # remainder until the disk refuses.
+  filler_bytes=$(( (avail_kb - 262144) * 1024 ))
+  rm -f "$d/../exhaustion-filler.bin"
+  fallocate -l "$filler_bytes" "$d/../exhaustion-filler.bin" \
+    || die "filler preallocation failed"
+  pass "filesystem filled, 256 MiB headroom left"
+  start_mount xexh "$c" "$d" "$MNTS/xexh"
+  echo "pre-fill" > "$MNTS/xexh/small.txt"
+  [[ "$(cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \
+    || die "pre-fill anchor never committed"
+  pass "pre-fill anchor committed before exhaustion"
+  local i=0 rc=0 failed=0
+  while (( i < 24 )); do
+    i=$((i + 1))
+    rc=0
+    timeout 300 bash -c "head -c 33554432 /dev/urandom > '$MNTS/xexh/fill-$i.bin'" \
+      2>"$E2E_ROOT/fill-$i.stderr" || rc=$?
+    if (( rc != 0 )); then
+      [[ "$rc" == 1 ]] || die "fill-$i exited $rc, want ENOSPC (1)"
+      grep -q "No space left on device" "$E2E_ROOT/fill-$i.stderr" \
+        || die "fill-$i was not ENOSPC: $(cat "$E2E_ROOT/fill-$i.stderr")"
+      failed=1
+      break
+    fi
+  done
+  [[ "$failed" == 1 ]] \
+    || die "24 x 32 MiB fills never exhausted the disk: the leg would pass without ever seeing ENOSPC"
+  pass "write fails closed with ENOSPC after $i fills"
+  # Readable under exhaustion: the failure must not take the drive's
+  # read path down with it.
+  [[ "$(timeout 60 cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \
+    || die "pre-fill anchor unreadable under exhaustion"
+  pass "drive stays readable while full"
+  rm -f "$d/../exhaustion-filler.bin" \
+    || die "filler removal failed"
+  echo "recovered" > "$MNTS/xexh/recovery.txt"
+  [[ "$(cat "$MNTS/xexh/recovery.txt")" == "recovered" ]] \
+    || die "drive never accepted writes after the filler was removed"
+  pass "drive accepts writes again once space returns"
+  stop_mount xexh INT
+  check_no_leaks "$LOGDIR/mount-xexh.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_uparent_owner <drive> <creds> <relay>: publish two chained
+# snapshots (up-1, then up-2 strictly on top — the read-back between
+# them proves S1 committed before S2 authors, so S2's parent IS S1)
+# and stop gracefully while the member still lacks both bodies. The
+# graceful stop is the point: no crash is needed, only an
+# announcement whose body never arrives. Remount after the member's
+# probes and publish a heal-signal write; the member converging it
+# proves the stall healed.
+leg_uparent_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 15 "unknown-parent owner leg"
+  start_mount xup-o "$c" "$d" "$MNTS/xup-o" --relay "$relay"
+  echo "up-1-bytes" > "$MNTS/xup-o/up-1.txt"
+  [[ "$(cat "$MNTS/xup-o/up-1.txt")" == "up-1-bytes" ]] \
+    || die "up-1 never committed"
+  echo "up-2-bytes" > "$MNTS/xup-o/up-2.txt"
+  [[ "$(cat "$MNTS/xup-o/up-2.txt")" == "up-2-bytes" ]] \
+    || die "up-2 never committed on top of up-1"
+  pass "chained snapshots published (up-2 strictly on up-1)"
+  stop_mount xup-o INT
+  check_no_leaks "$LOGDIR/mount-xup-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  touch "$E2E_ROOT/uparent-owner-gone"
+  poll_until 300 test -f "$E2E_ROOT/uparent-member-probed" \
+    || die "member never finished the unknown-parent probes"
+  start_mount xup-o2 "$c" "$d" "$MNTS/xup-o2" --relay "$relay"
+  echo "up-3-bytes" > "$MNTS/xup-o2/up-3.txt"
+  touch "$E2E_ROOT/uparent-owner-back"
+  poll_until 300 test -f "$E2E_ROOT/uparent-member-healed" \
+    || die "member never healed after the bodies arrived"
+  stop_mount xup-o2 INT
+  check_no_leaks "$LOGDIR/mount-xup-o2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_uparent_member <drive> <creds> <relay>: with the owner down,
+# list both announcements off the relay (manifests need no bodies),
+# then prove the case split from fetch-on-open.md: the child's paths
+# are ENOENT — the unadopted snapshot never enters the projected
+# namespace — while the parent's own read fails EIO
+# (announced-but-unfetchable, the manifest-chain case). Both bounded
+# well under the 30s open deadline, so either hanging reads as rc
+# 124 instead of passing. The EIO half is the positive control: it
+# proves bodies were really withheld, so the ENOENT is the
+# UnknownParent verdict and not a dead mount. After the owner
+# returns, all three files serve: the stall heals.
+# Wall-clock envelope: worst case under 10 minutes with the heal
+# converges; typical 3-4 minutes.
+leg_uparent_member() {
+  local d="$1" c="$2" relay="$3"
+  local rc=0
+  step 15 "unknown-parent member leg"
+  start_mount xup-m "$c" "$d" "$MNTS/xup-m" --relay "$relay"
+  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
+    || die "member never listed up-1"
+  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
+    || die "member never listed up-2"
+  pass "both announcements listed with the owner down"
+  poll_until 180 test -f "$E2E_ROOT/uparent-owner-gone" \
+    || die "owner never stopped before the probes"
+  # The child first, on pristine state: up-2's snapshot has an
+  # unrecorded parent (up-1's body never arrived), so it classifies
+  # UnknownParent, never becomes a live head, and its paths are
+  # ENOENT — never a hang. The 10s budget (well under the 30s open
+  # deadline) is what makes "never" real.
+  rc=0
+  timeout 10 cat "$MNTS/xup-m/up-2.txt" >/dev/null 2>"$E2E_ROOT/up-2.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "unadopted-child open returned rc $rc, want ENOENT (1)"
+  grep -q "No such file or directory" "$E2E_ROOT/up-2.err" \
+    || die "unadopted-child open was not ENOENT: $(cat "$E2E_ROOT/up-2.err")"
+  pass "unadopted snapshot's paths are ENOENT, never a hang"
+  # Positive control: the parent IS announced and only its body is
+  # missing, so its read fails EIO bounded — bodies were really
+  # withheld, the mount is alive, the ENOENT above is the verdict.
+  rc=0
+  timeout 60 cat "$MNTS/xup-m/up-1.txt" >/dev/null 2>"$E2E_ROOT/up-1.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "withheld-body read returned rc $rc, want EIO (1)"
+  grep -q "Input/output error" "$E2E_ROOT/up-1.err" \
+    || die "withheld-body read was not EIO: $(cat "$E2E_ROOT/up-1.err")"
+  pass "withheld parent body fails EIO bounded (control)"
+  touch "$E2E_ROOT/uparent-member-probed"
+  poll_until 300 test -f "$E2E_ROOT/uparent-owner-back" \
+    || die "owner never returned after the probes"
+  poll_until 300 converged "$MNTS/xup-m/up-1.txt" "up-1-bytes" \
+    || die "up-1 never healed once the body arrived"
+  poll_until 300 converged "$MNTS/xup-m/up-2.txt" "up-2-bytes" \
+    || die "up-2 never healed once the body arrived"
+  pass "withheld bodies heal without remount"
+  poll_until 300 converged "$MNTS/xup-m/up-3.txt" "up-3-bytes" \
+    || die "member never converged the post-return write"
+  pass "post-return head converges"
+  touch "$E2E_ROOT/uparent-member-healed"
+  stop_mount xup-m TERM
+  check_no_leaks "$LOGDIR/mount-xup-m.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
@@ -1022,10 +1362,17 @@ case "${1:-}" in
   fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
   conflict-owner) leg_conflict_owner "$2" "$3" "$4" ;;
   conflict-member) leg_conflict_member "$2" "$3" "$4" ;;
+  crash-owner) leg_crash_owner "$2" "$3" "$4" ;;
+  steady-member) leg_steady_member "$2" "$3" "$4" ;;
+  crash-member) leg_crash_member "$2" "$3" "$4" ;;
+  steady-owner) leg_steady_owner "$2" "$3" "$4" ;;
+  exhaustion) leg_exhaustion "$2" "$3" ;;
+  uparent-owner) leg_uparent_owner "$2" "$3" "$4" ;;
+  uparent-member) leg_uparent_member "$2" "$3" "$4" ;;
   headless-serve) leg_headless_serve "$2" "$3" "$4" ;;
   headless-fetch) leg_headless_fetch "$2" "$3" "$4" "$5" "$6" "$7" ;;
   headless-setup) leg_headless_setup "$2" "$3" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|crash-owner|steady-member|crash-member|steady-owner|exhaustion|uparent-owner|uparent-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
 e2e_timing_report
 echo "legs: $PASS_COUNT checks passed"

@@ -26,13 +26,15 @@
 # (own cwd each: qemu uses relative socket paths) -> wait for ssh ->
 # wait for the relay control plane -> tests/alpha-microvm.sh ->
 # report -> teardown (unless --keep).
-# The whole suite runs under `timeout` (90 min): a hung guest must
-# fail the run, never the evening. Legs carry their own shorter
-# polls; this bound is whole-run pathology cover. Raised from 60
-# when the relay-partition conflict phase landed: phases 9 and 10
-# each document ~11 and ~20-25 minute nominal worst cases, and an
-# opaque SIGKILL at the cap must never be the way a slow conflict
-# phase reports.
+# The whole suite runs under `timeout` (120 min): a hung guest must
+# never wedge the host. Raised from 90 when the crash/exhaustion/
+# unknown-parent phases landed: phases 13-15 document ~12, ~8, and
+# ~10 minute nominal worst cases on top of the earlier ~11 and
+# ~20-25 minute conflict phases, and an opaque SIGKILL at the cap
+# must never be the way a slow phase reports. Each new phase states
+# its own worst-case duration in tests/alpha-microvm.sh, and the cap
+# moves only with that statement attached. Legs carry their own
+# shorter polls; this bound is whole-run pathology cover.
 set -euo pipefail
 
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
@@ -293,7 +295,7 @@ echo "    relay control plane reachable"
 
 echo "==> running the suite"
 set +e
-timeout 5400 env \
+timeout 7200 env \
   "STATE_DIR=$STATE_DIR" \
   "SSH_KEY=$SSH_KEY" \
   "MICROVM_ONLY_STEP=$ONLY_STEP" \

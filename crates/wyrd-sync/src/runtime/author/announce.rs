@@ -1,5 +1,6 @@
 use super::deliver::{
-    control_key_for, open_reused_sealed, seal_fresh_for, send_sealed_to, verify_reused_sealed,
+    announcement_obligation, control_key_for, open_reused_sealed, seal_fresh_for, send_sealed_to,
+    verify_reused_sealed,
 };
 use crate::control::{seal as seal_control, Message, SnapshotAnnouncement};
 use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact, Rebuilt};
@@ -476,7 +477,7 @@ fn send_pending_for(
         .collect();
     // Names the send's warn-once marker: one snapshot's fan-out, so
     // the marker still tracks each recipient pair independently.
-    let obligation = format!("announcement {snapshot:?}");
+    let obligation = announcement_obligation(&snapshot);
     send_sealed_to(
         engine,
         mailbox,

@@ -203,6 +203,28 @@ pub(super) fn seal_fresh_for(
     Ok(Some(bytes))
 }
 
+/// The warn-once marker's obligation half, one constructor per
+/// kind: the reuse verifications, the send path, and reconciliation
+/// retirement all key the same string, so the three can never
+/// disagree on it. In-memory keys only — never logged (trust.md
+/// OD-17-6).
+pub(crate) fn transition_obligation(id: &TransitionId) -> String {
+    format!("transition {id:?}")
+}
+
+/// See [`transition_obligation`]: one descriptor per (epoch,
+/// recipient) capability pair.
+pub(crate) fn capability_obligation(epoch: u64, recipient: &DeviceId) -> String {
+    format!("capability epoch {epoch} for {recipient}")
+}
+
+/// See [`transition_obligation`]: one descriptor per snapshot's
+/// fan-out; the marker still tracks each recipient pair
+/// independently.
+pub(crate) fn announcement_obligation(snapshot: &wyrd_format::SnapshotId) -> String {
+    format!("announcement {snapshot:?}")
+}
+
 /// Send verified sealed bytes to each recipient under the mailbox's
 /// outer recipient seal, committing one delivered marker per
 /// relay-accepted send. A send no relay accepts commits nothing —
@@ -324,7 +346,7 @@ fn deliver_transitions(
         // The obligation descriptor names the send below as well as
         // the reuse verification: one string per transition, so the
         // warn-once marker keys the pair the send actually attempts.
-        let obligation = format!("transition {id:?}");
+        let obligation = transition_obligation(&id);
         let sealed_bytes = if let Some(bytes) = sealed_overlay.get(&id).cloned().or_else(|| {
             rebuilt
                 .runtime
@@ -494,7 +516,7 @@ fn deliver_capabilities(
         // One descriptor per obligation: this loop visits each pair
         // once, so it names the reuse verification below and the
         // send's warn-once marker alike.
-        let obligation = format!("capability epoch {epoch} for {recipient}");
+        let obligation = capability_obligation(epoch, &recipient);
         // No pass-local overlay here, unlike transitions: pending pairs
         // are unique per pass (a set, visited once), so a first seal
         // can never be re-read in the same pass — the committed fact

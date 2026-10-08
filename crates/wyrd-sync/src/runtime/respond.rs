@@ -62,6 +62,7 @@ use std::collections::BTreeSet;
 
 use wyrd_format::{DeviceId, TransitionId};
 
+use super::author::{capability_obligation, transition_obligation};
 use super::engine::{Engine, EngineError};
 use super::state::RuntimeState;
 use crate::durable::{reconciliation_statement_digest, Fact, ReconciliationEvidence};
@@ -242,9 +243,20 @@ impl Engine {
         let mut facts = Vec::with_capacity(covered_t.len() + covered_c.len());
         for id in covered_t {
             facts.push(Fact::TransitionReconciled(id, *requester, *digest));
+            // Retirement discharges the obligation exactly like relay
+            // acceptance, so the warn-once marker goes with it: a
+            // refused-then-reconciled pair must not linger in the set
+            // past the pending outbox it bounds.
+            self.refusal_warned
+                .remove(&("transition", transition_obligation(&id), *requester));
         }
         for epoch in covered_c {
             facts.push(Fact::CapabilityReconciled(epoch, *requester, *digest));
+            self.refusal_warned.remove(&(
+                "capability",
+                capability_obligation(epoch, requester),
+                *requester,
+            ));
         }
         let mut retired = 0usize;
         for chunk in facts.chunks(RETIRE_COMMIT_BATCH) {

@@ -60,6 +60,7 @@ pub use admission::AdmitOutcome;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;
 pub(super) use deliver::deliver_scoped;
+pub(super) use deliver::{capability_obligation, transition_obligation};
 pub(super) use merge::merge;
 pub(super) use merge::plan as plan_merge;
 pub use merge::{MergePath, MergePlan, MergeSelection};

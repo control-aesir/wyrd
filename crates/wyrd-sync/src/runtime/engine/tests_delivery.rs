@@ -12,7 +12,7 @@ use crate::keys::DeviceEncryptionSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     admit_engine, announcement_for, announcement_msg, control_key, deliver, drain, encryption_key,
-    fixture, identity, queue, transition_message, TestDir,
+    fixture, identity, queue, transition_message, CapturedLogs, TestDir,
 };
 use crate::transport::mailbox::{
     open_from_sender, seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox,
@@ -186,50 +186,6 @@ fn delivery_retains_obligation_when_no_relay_accepts() {
     );
 }
 
-/// A minimal capturing subscriber: records (level, message) per
-/// event so the warn-once test can count refusal lines with no new
-/// dependency (tracing core only). Scoped with `with_default`, so
-/// parallel tests keep their own capture.
-#[derive(Clone, Default)]
-struct CapturedLogs {
-    events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
-}
-
-struct MessageCapture(Option<String>);
-
-impl tracing::field::Visit for MessageCapture {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0 = Some(format!("{value:?}"));
-        }
-    }
-}
-
-impl tracing::Subscriber for CapturedLogs {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut capture = MessageCapture(None);
-        event.record(&mut capture);
-        self.events
-            .lock()
-            .expect("capture lock held")
-            .push((*event.metadata().level(), capture.0.unwrap_or_default()));
-    }
-
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
 /// A refusal the relays will never flip must be operator-visible:
 /// the first refusal of an obligation warns once under the default
 /// filter; repeats stay at debug. The obligation itself is
@@ -271,30 +227,54 @@ fn a_repeated_refusal_warns_once_per_obligation() {
             );
         }
     });
-    let events = logs.events.lock().expect("capture lock held");
-    let warns: Vec<&String> = events
+    let events = logs.snapshot();
+    let is_refusal = |(level, fields): &(tracing::Level, Vec<(String, String)>)| {
+        *level == tracing::Level::WARN
+            && fields
+                .iter()
+                .any(|(name, value)| name == "message" && value.contains("refused"))
+    };
+    let warns: Vec<&Vec<(String, String)>> = events
         .iter()
-        .filter(|(level, message)| *level == tracing::Level::WARN && message.contains("refused"))
-        .map(|(_, message)| message)
+        .filter(|event| is_refusal(event))
+        .map(|(_, fields)| fields)
         .collect();
     assert_eq!(
         warns.len(),
         1,
         "exactly one warn across both refused passes, got {warns:?}"
     );
+    // The whole field set, not just the message: an identity
+    // smuggled in as a tracing field would bypass a message-only
+    // assertion, so the warn must carry exactly kind and message.
+    let mut names: Vec<&str> = warns[0].iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["kind", "message"],
+        "the warn carries no identity field: {names:?}"
+    );
+    let message = warns[0]
+        .iter()
+        .find(|(name, _)| name == "message")
+        .map(|(_, value)| value)
+        .expect("message field present");
     assert!(
-        !warns[0].contains(&recipient.to_string()),
-        "the warn names no recipient identity: {}",
-        warns[0]
+        !message.contains(&recipient.to_string()),
+        "the warn names no recipient identity: {message}"
     );
     assert!(
-        !warns[0].contains(&child_id.to_string()),
-        "the warn names no transition identity: {}",
-        warns[0]
+        !message.contains(&child_id.to_string()),
+        "the warn names no transition identity: {message}"
     );
     let debugs = events
         .iter()
-        .filter(|(level, message)| *level == tracing::Level::DEBUG && message.contains("refused"))
+        .filter(|(level, fields)| {
+            *level == tracing::Level::DEBUG
+                && fields
+                    .iter()
+                    .any(|(name, value)| name == "message" && value.contains("refused"))
+        })
         .count();
     assert!(
         debugs >= 1,

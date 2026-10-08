@@ -936,7 +936,7 @@ fn object_store_and_vault_agree_after_post_rename_fsync_failure() {
     let sealed = b"sealed representation bytes".to_vec();
     let root = blob_root(&sealed);
     let mut vault = Vault::open(&dir).unwrap();
-    DIR_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    reset_dir_sync_calls();
     vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
 
     // The rename installs the file, then the injected directory
@@ -979,12 +979,27 @@ fn object_store_and_vault_agree_after_post_rename_fsync_failure() {
     );
 }
 
-/// Directory-sync calls made by the injection test below; the first
-/// fails, the rest use the real implementation.
-static DIR_SYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Directory-sync calls seen by the injection tests below; the
+// first fails, the rest use the real implementation. Thread-local:
+// the suite runs tests concurrently in one binary, and a shared
+// counter let one test's reset steal another test's injected
+// failure. A thread runs one test at a time, so resetting at the
+// test's start is race-free.
+thread_local! {
+    static DIR_SYNC_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn reset_dir_sync_calls() {
+    DIR_SYNC_CALLS.with(|calls| calls.set(0));
+}
 
 fn fail_first_dir_sync(dir: &Path) -> std::io::Result<()> {
-    if DIR_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+    let call = DIR_SYNC_CALLS.with(|calls| {
+        let call = calls.get();
+        calls.set(call + 1);
+        call
+    });
+    if call == 0 {
         return Err(std::io::Error::other("injected directory fsync failure"));
     }
     durable::fsync_dir(dir)
@@ -1023,7 +1038,7 @@ fn post_rename_directory_sync_failure_is_reconciled_on_retry() {
     let dir = serve_dir();
     let mut vault = Vault::open(&dir).unwrap();
     let serving = ServingEndpoint::open_loopback(&vault, &dir).unwrap();
-    DIR_SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    reset_dir_sync_calls();
     vault.durability = durable::Durability::with_sync(fail_first_dir_sync);
 
     let sealed = b"durability failure reconciled".to_vec();

@@ -151,10 +151,15 @@ fn rejecting_mirror_queue_warns_at_the_default_log_level() {
     );
 
     // Rejecting, failed barrier: the Err arm warns the same way.
+    // A failed-import count trips the warn by itself, pinning the
+    // second warn condition beside the rejection count above.
     node.set_serving_barrier(Arc::new(StubBarrier {
         ready: false,
         fail: true,
-        stats: Some(rejecting_stats()),
+        stats: Some(MirrorStats {
+            failed_imports: 1,
+            ..rejecting_stats()
+        }),
     }) as Arc<dyn ServingBarrier>);
     let (ready, logged) = with_capture(tracing::Level::INFO, || node.flush_serving_barrier());
     let ready = ready.expect("a failed barrier degrades to not-ready");

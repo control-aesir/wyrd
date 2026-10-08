@@ -1,8 +1,9 @@
 //! Window (a): cross-subsystem reopen agreement (G4, OD-05-A option B).
 //!
 //! The object store, the vault, and the fact log become durable together
-//! at the authoring boundary (`docs/write-path.md:325-327`): vault
-//! imports land before the facts that name them, and body + manifests +
+//! at the authoring boundary (the Committed row of the DG-2 table in
+//! `docs/write-path.md`: "the whole snapshot ... become durable
+//! together at step 3"): vault imports land before the facts that name
 //! queued announcements commit in one batch. A crash inside the commit
 //! must leave all three agreeing on reopen — the visible log names no
 //! sealed representation the vault does not hold and no plaintext the
@@ -12,6 +13,7 @@
 //! before-XOR-full property; these tests own the joint agreement, one
 //! per stage where the three stores can actually disagree.
 
+use super::tests_harness::{drain_side, restart, scenario};
 use super::*;
 use std::collections::BTreeSet;
 
@@ -188,31 +190,6 @@ fn assert_torn_batch_invisible(
     assert_subsystems_agree(engine, objects);
 }
 
-/// After the CURRENT rename the batch is durable: both snapshots are
-/// visible, the torn head serves, and every named representation
-/// resolves in the vault and the object store.
-fn assert_torn_batch_visible(
-    engine: &Engine,
-    objects: &FsObjectStore,
-    baseline: SnapshotId,
-    torn: SnapshotId,
-) {
-    let loaded = engine.store.load().expect("reopen loads the log");
-    let mut bodies: Vec<_> = loaded
-        .snapshot_bodies
-        .iter()
-        .map(Snapshot::snapshot_id)
-        .collect();
-    bodies.sort();
-    let mut expected = vec![baseline, torn];
-    expected.sort();
-    assert_eq!(
-        bodies, expected,
-        "the CURRENT-advanced batch must replay whole"
-    );
-    assert_subsystems_agree(engine, objects);
-}
-
 /// The commit file is renamed but CURRENT still points at the
 /// baseline: reopen sees the before-state and the three subsystems
 /// agree on it.
@@ -247,10 +224,52 @@ fn subsystems_agree_after_crash_at_current_temp_write() {
 /// CURRENT advanced past the batch: the authoring is fully visible
 /// and every representation it names resolves in the vault and the
 /// object store. Only the directory fsync is missing, which no
-/// reopen can observe.
+/// reopen can observe. The torn head serves, and its announcement
+/// obligation is queued, not discharged — a lone author would owe
+/// nobody, so this stage runs on the two-device scenario where the
+/// obligation is real.
 #[test]
 fn subsystems_agree_after_crash_at_rename_current() {
-    let (engine_dir, objects_dir, baseline, torn) = crash_author_at(CrashStage::AfterRenameCurrent);
-    let (engine, objects) = reopen(&engine_dir, &objects_dir);
-    assert_torn_batch_visible(&engine, &objects, baseline, torn);
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let objects_dir = TestDir::new("reopen-agreement-peer-objects");
+    let mut objects = FsObjectStore::open(objects_dir.path.clone()).unwrap();
+    let tree = disk_tree(&mut objects);
+    pair.a.engine.crash_after(CrashStage::AfterRenameCurrent);
+    let torn = pair
+        .a
+        .engine
+        .author_snapshot(&objects, tree)
+        .unwrap()
+        .snapshot()
+        .snapshot_id();
+    restart(&mut pair.a, &controls);
+    let engine = &pair.a.engine;
+    let loaded = engine.store.load().expect("reopen loads the log");
+    let bodies: BTreeSet<_> = loaded
+        .snapshot_bodies
+        .iter()
+        .map(Snapshot::snapshot_id)
+        .collect();
+    assert!(
+        bodies.contains(&torn),
+        "the CURRENT-advanced batch must replay whole"
+    );
+    let heads: Vec<_> = engine
+        .live_heads()
+        .expect("heads classify")
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+    assert!(
+        heads.contains(&torn),
+        "the torn batch's head serves after reopen: {heads:?}"
+    );
+    let pending = engine.pending_announcements().unwrap();
+    assert!(
+        pending.iter().any(|(id, _)| *id == torn),
+        "the torn batch's announcement is queued, not discharged: {pending:?}"
+    );
+    assert_subsystems_agree(engine, &objects);
 }

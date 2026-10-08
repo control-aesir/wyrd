@@ -364,7 +364,10 @@ degraded-but-Ok report), and
 reclassifies nothing, the failed pass manufactures no durable
 facts, and healing converges without rescue)
 (`core/live/tests_post_corruption.rs`, over a bitrotted tree served
-through the same fake view the pass verifies against).
+through the same fake view the pass verifies against — the
+object-store vector; the damaged-log and damaged-vault arms carry
+the same preserve/surface semantics by the same code path, and take
+no separate pin).
 
 ## Mailbox ack and intake
 

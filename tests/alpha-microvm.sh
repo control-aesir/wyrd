@@ -405,6 +405,93 @@ done
 pass "conflict versions export as name@N siblings on both drives"
 fi # want_phase 11
 
+# --- phase: microvm 12 (headless serving) --------------------------------
+# Two headless peers exchange content with neither mounting
+# (issue 23-headless-serving): the owner drive serves via
+# `sync now --serve` while fresh devices join and converge with
+# plain `sync now`, then read the bytes through offline `export`.
+# C proves the positive case; a KILL mid-residency plus restart
+# proves the mirror rebuilds from the vault; D — admitted after
+# the restart so its obligations are fresh for serve#3's route
+# (re-announcement reseals pending obligations, never resurrects
+# discharged ones) — proves pre-kill content still serves; both
+# TERM stops prove the shutdown half. Drives are unmounted since
+# phase 11, so the keystore is free for the offline invites.
+echo "=== microvm 12: headless serving ==="
+rm -f "$RUN/headless-serve-ready" "$RUN/headless-fetch-c-done" \
+  "$RUN/headless-serve-stopped" "$RUN/headless-d-invited" \
+  "$RUN/headless-serve3-ready" "$RUN/headless-fetch-d-done"
+HC="$RUN/creds/headless-c"
+HD="$RUN/drives/headless-c"
+GHC="$GUEST_RUN/creds/headless-c"
+GHD="$GUEST_RUN/drives/headless-c"
+mkdir -p "$HC" "$HD"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$HC/identity"
+printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$HC/passphrase"
+chmod 600 "$HC/identity" "$HC/passphrase"
+chown -R 1000:1000 "$HC" "$HD"
+as_guest "$WYRD_BIN" device --identity-file "$HC/identity" --passphrase-file "$HC/passphrase" \
+  "$HD" pairing-request "$RUN/pairing-hc.txt" >"$RUN/logs/pairing-hc.out" 2>"$RUN/logs/pairing-hc.stderr" \
+  || die "headless-c pairing-request failed"
+DEV_C="$(grep '^device ' "$RUN/pairing-hc.txt" | cut -d' ' -f2)"
+KEY_C="$(grep '^encryption-key ' "$RUN/pairing-hc.txt" | cut -d' ' -f2)"
+[[ "${#DEV_C}" == 64 && "${#KEY_C}" == 64 ]] || die "headless-c pairing material malformed"
+as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
+  --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
+  invite "$DEV_C" "$KEY_C" "$RUN/invitation-hc" >"$RUN/logs/invite-hc.out" 2>"$RUN/logs/invite-hc.stderr" \
+  || die "owner invite of headless-c failed"
+as_guest "$WYRD_BIN" device --identity-file "$HC/identity" --passphrase-file "$HC/passphrase" \
+  "$HD" join "$RUN/invitation-hc" >"$RUN/logs/join-hc.out" 2>"$RUN/logs/join-hc.stderr" \
+  || die "headless-c join failed"
+pass "headless-c joins from the owner invitation"
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-serve $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-headless-serve.out" 2>&1 &
+LEG_HS=$!
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-fetch $GHD $GHC $RELAY_URL c headless-serve-ready headless-fetch-c-done" \
+  >"$RUN/logs/leg-headless-fetch-c.out" 2>&1 &
+LEG_HC=$!
+# D is admitted mid-leg, after serve#2 stops and frees the owner
+# drive: its obligations must be fresh for serve#3's route. The
+# invite runs on the host (offline keystore op); the leg waits on
+# headless-d-invited before starting serve#3.
+for ((i = 0; i < 600 * 2; i++)); do
+  [[ -f "$RUN/headless-serve-stopped" ]] && break
+  kill -0 "$LEG_HS" 2>/dev/null || die "serve leg exited before stopping serve#2 (see logs/leg-headless-serve.out)"
+  sleep 0.5
+done
+[[ -f "$RUN/headless-serve-stopped" ]] || die "serve leg never stopped serve#2"
+HDD="$RUN/creds/headless-d"
+HDDD="$RUN/drives/headless-d"
+GHDD="$GUEST_RUN/creds/headless-d"
+GHDDD="$GUEST_RUN/drives/headless-d"
+mkdir -p "$HDD" "$HDDD"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$HDD/identity"
+printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$HDD/passphrase"
+chmod 600 "$HDD/identity" "$HDD/passphrase"
+chown -R 1000:1000 "$HDD" "$HDDD"
+as_guest "$WYRD_BIN" device --identity-file "$HDD/identity" --passphrase-file "$HDD/passphrase" \
+  "$HDDD" pairing-request "$RUN/pairing-hd.txt" >"$RUN/logs/pairing-hd.out" 2>"$RUN/logs/pairing-hd.stderr" \
+  || die "headless-d pairing-request failed"
+DEV_D="$(grep '^device ' "$RUN/pairing-hd.txt" | cut -d' ' -f2)"
+KEY_D="$(grep '^encryption-key ' "$RUN/pairing-hd.txt" | cut -d' ' -f2)"
+[[ "${#DEV_D}" == 64 && "${#KEY_D}" == 64 ]] || die "headless-d pairing material malformed"
+as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
+  --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
+  invite "$DEV_D" "$KEY_D" "$RUN/invitation-hd" >"$RUN/logs/invite-hd.out" 2>"$RUN/logs/invite-hd.stderr" \
+  || die "owner invite of headless-d failed"
+as_guest "$WYRD_BIN" device --identity-file "$HDD/identity" --passphrase-file "$HDD/passphrase" \
+  "$HDDD" join "$RUN/invitation-hd" >"$RUN/logs/join-hd.out" 2>"$RUN/logs/join-hd.stderr" \
+  || die "headless-d join failed"
+touch "$RUN/headless-d-invited"
+pass "headless-d joins after the serve restart"
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-fetch $GHDDD $GHDD $RELAY_URL d headless-serve3-ready headless-fetch-d-done" \
+  >"$RUN/logs/leg-headless-fetch-d.out" 2>&1 &
+LEG_HD=$!
+wait "$LEG_HC" || die "headless fetch-c leg failed (see logs/leg-headless-fetch-c.out)"
+wait "$LEG_HD" || die "headless fetch-d leg failed (see logs/leg-headless-fetch-d.out)"
+wait "$LEG_HS" || die "headless serve leg failed (see logs/leg-headless-serve.out)"
+pass "two headless peers exchange content with neither mounting"
+
 # Host-side leak check over every log the host wrote (guest logs
 # are checked in-guest by each leg). Owner secrets always exist past
 # phase 1; member-n credentials exist only once phase 6 stages them,

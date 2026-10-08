@@ -23,6 +23,17 @@ version say exactly what changed.
 
 ### Added
 
+- Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):
+  republish stranded bytes as a recovery-flagged snapshot parented
+  onto the current eligible heads, without adopting the dead fork's
+  lineage. Plan first (one row per source root path: ready,
+  already-live, undecryptable, missing, each with its reason), then
+  run with `--take`, `--all`, or `--content`. Owner-only with an
+  up-front CLI pre-check; the engine re-enforces ownership at
+  authoring. `snapshot list` and `snapshot heads` mark
+  recovery-flagged tips. Selection is root-entry granularity over a
+  single source body addressed by id — no historical browsing.
+
 - Warn-once control-plane refusal: the first all-relay refusal of an
   outbox obligation logs at warn (kind only, never identities) so a
   never-flipping policy refusal is operator-visible under the default

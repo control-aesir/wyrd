@@ -24,6 +24,7 @@ mod announce;
 mod common;
 mod deliver;
 mod merge;
+mod recover;
 mod remove_device;
 mod resolve_conflict;
 mod rotate_epoch;
@@ -42,6 +43,8 @@ mod tests_lifecycle;
 mod tests_merge;
 #[cfg(test)]
 mod tests_reader;
+#[cfg(test)]
+mod tests_recover;
 #[cfg(test)]
 mod tests_removal;
 #[cfg(test)]
@@ -64,6 +67,9 @@ pub(super) use deliver::{capability_obligation, transition_obligation};
 pub(super) use merge::merge;
 pub(super) use merge::plan as plan_merge;
 pub use merge::{MergePath, MergePlan, MergeSelection};
+pub(super) use recover::plan as plan_recovery;
+pub(super) use recover::recover;
+pub use recover::{RecoveryPath, RecoveryPlan, RecoveryStatus};
 pub(super) use remove_device::remove_device;
 pub(super) use resolve_conflict::resolve_conflict;
 pub(super) use rotate_epoch::rotate_epoch;

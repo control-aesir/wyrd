@@ -32,6 +32,7 @@ use wyrd_daemon::{
 use wyrd_format::FsObjectStore;
 use wyrd_format::{
     DeviceEncryptionKey, DeviceId, MembershipTransition, ObjectStore, SnapshotId, TransitionId,
+    RECOVERY_FLAG,
 };
 use wyrd_sync::control::SealedBootstrap;
 use wyrd_sync::keys::DeviceIdentitySecret;
@@ -347,6 +348,51 @@ enum SnapshotAction {
         /// Repeatable.
         #[arg(long = "drop")]
         drops: Vec<String>,
+    },
+    /// Recover stranded bytes into a recovery-flagged snapshot:
+    /// republish selected content from a dead fork under the
+    /// current epoch without adopting its lineage. Plan first,
+    /// then run — like `merge`, the dry run shows every row
+    /// before anything commits.
+    Recover {
+        #[command(subcommand)]
+        action: RecoverAction,
+    },
+}
+
+/// One owner-recovery step: preview the graft, or author it.
+#[derive(Debug, Subcommand)]
+enum RecoverAction {
+    /// Preview a recovery without authoring: one row per source
+    /// root path with its status, so the operator sees what is
+    /// graftable, what is already live, and what is gone before
+    /// selecting.
+    Plan {
+        /// Source snapshot, 64 hex characters: the stranded fork
+        /// whose bytes are grafted.
+        #[arg(long = "from")]
+        from: String,
+    },
+    /// Graft selected source rows into a recovery snapshot
+    /// parented onto the current eligible heads. Owner-only: a
+    /// non-owner fails closed with the engine's refusal before
+    /// anything commits.
+    Run {
+        /// Source snapshot, 64 hex characters.
+        #[arg(long = "from")]
+        from: String,
+        /// Source root path to graft. Repeatable, one path per
+        /// line; root-entry granularity like merge.
+        #[arg(long = "take")]
+        takes: Vec<String>,
+        /// Graft the whole source tree instead of `--take` lines.
+        #[arg(long = "all")]
+        all: bool,
+        /// Explicit content id to graft under its hex name, for
+        /// content whose path the operator no longer knows.
+        /// Repeatable.
+        #[arg(long = "content")]
+        contents: Vec<String>,
     },
 }
 
@@ -2852,6 +2898,54 @@ fn snapshot(
             );
             Ok(())
         }
+        SnapshotAction::Recover { action } => match action {
+            RecoverAction::Plan { from } => {
+                let from = parse_snapshot_id(&from)?;
+                let store = FsObjectStore::open(drive_dir.to_path_buf())
+                    .map_err(|error| CliError::Store(error.to_string()))?;
+                let plan = engine.recovery_plan(&store, from)?;
+                print!("{}", recovery_plan_report(&plan));
+                Ok(())
+            }
+            RecoverAction::Run {
+                from,
+                takes,
+                all,
+                contents,
+            } => {
+                check_recovery_owner(&engine)?;
+                if all && !takes.is_empty() {
+                    return Err(CliError::Usage(
+                        "--all grafts the whole source tree: drop the --take lines".into(),
+                    ));
+                }
+                let from = parse_snapshot_id(&from)?;
+                let mut checked = Vec::with_capacity(takes.len());
+                for take in &takes {
+                    checked.push(check_recover_path(take)?);
+                }
+                let mut ids = Vec::with_capacity(contents.len());
+                for content in &contents {
+                    ids.push(parse_content_id(content)?);
+                }
+                let mut store = FsObjectStore::open(drive_dir.to_path_buf())
+                    .map_err(|error| CliError::Store(error.to_string()))?;
+                let grafted = engine.recover(&mut store, from, &checked, all, &ids)?;
+                let parents = grafted
+                    .snapshot()
+                    .parents
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "recovered {} at epoch {} (parents {parents})",
+                    grafted.snapshot().snapshot_id(),
+                    grafted.snapshot().epoch,
+                );
+                Ok(())
+            }
+        },
     }
 }
 
@@ -2894,6 +2988,22 @@ fn map_merge_error(error: EngineError) -> CliError {
     }
 }
 
+/// The OD-15-5 presentation check: refuse before the operator
+/// composes a selection when this device is not the current
+/// canonical owner. Reads the same membership projection the
+/// engine enforces, and the engine still wins any race — a pass
+/// here never authorizes anything.
+fn check_recovery_owner(engine: &Engine) -> Result<(), CliError> {
+    let log = engine.membership_log();
+    let known = log
+        .known_state()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    match log.owners_of(&known.transition_id) {
+        Some(owners) if owners.len() == 1 && owners.contains(&engine.device()) => Ok(()),
+        _ => Err(CliError::Engine(EngineError::RecoveryNotOwner)),
+    }
+}
+
 /// One merge-spec path: a root entry name. v0 merges at root-entry
 /// granularity (a conflicting subtree is taken or dropped whole),
 /// so anything deeper is refused at the argument boundary.
@@ -2901,6 +3011,17 @@ fn check_merge_path(path: &str) -> Result<String, CliError> {
     if path.is_empty() || path.contains('/') {
         return Err(CliError::Usage(format!(
             "merge paths are root entries, got {path:?}"
+        )));
+    }
+    Ok(path.to_owned())
+}
+
+/// One recovery-selection path: the same root-entry granularity
+/// as the merge spec, so a grafted subtree travels whole.
+fn check_recover_path(path: &str) -> Result<String, CliError> {
+    if path.is_empty() || path.contains('/') {
+        return Err(CliError::Usage(format!(
+            "recover paths are root entries, got {path:?}"
         )));
     }
     Ok(path.to_owned())
@@ -3107,6 +3228,18 @@ fn parse_snapshot_id(hex: &str) -> Result<SnapshotId, CliError> {
     Ok(SnapshotId::from_bytes(bytes))
 }
 
+/// Parse a content id from 64 hex characters (the `--content`
+/// escape hatch for grafting bytes whose path is unknown).
+fn parse_content_id(hex: &str) -> Result<wyrd_format::ContentId, CliError> {
+    let bytes = hex::decode(hex.trim())
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            CliError::Usage("content must be 64 hex characters naming a content id".into())
+        })?;
+    Ok(wyrd_format::ContentId::from_bytes(bytes))
+}
+
 /// Parse a membership transition id from 64 hex characters (the
 /// winner and voided siblings named by `member resolve`).
 fn parse_transition_id(hex: &str) -> Result<TransitionId, CliError> {
@@ -3272,13 +3405,14 @@ fn snapshot_list_report(engine: &Engine) -> Result<String, CliError> {
     for (number, head) in heads.iter().enumerate() {
         let snapshot = head.snapshot();
         out.push_str(&format!(
-            "@{} {} epoch {} author {} tree {} parents {}\n",
+            "@{} {} epoch {} author {} tree {} parents {}{}\n",
             number + 1,
             snapshot.snapshot_id(),
             snapshot.epoch,
             snapshot.author,
             snapshot.tree,
             snapshot.parents.len(),
+            recovery_marker(snapshot.flags()),
         ));
     }
     Ok(out)
@@ -3311,11 +3445,12 @@ fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
             .map(|number| format!(" @{}", number + 1))
             .unwrap_or_default();
         out.push_str(&format!(
-            "{}{} {} epoch {}\n",
+            "{}{} {} epoch {}{}\n",
             head.id,
             number,
             render_classification(&head.classification),
             head.epoch,
+            recovery_marker(head.flags),
         ));
     }
     Ok(out)
@@ -3353,6 +3488,41 @@ fn snapshot_plan_report(plan: &wyrd_sync::runtime::MergePlan) -> String {
             path.path,
             versions.join(" ")
         ));
+    }
+    out
+}
+
+/// The recovery audit marker: a recovery-flagged snapshot names
+/// itself in both head views, so grafts stay visible as long as the
+/// snapshot is listed at all.
+fn recovery_marker(flags: u8) -> &'static str {
+    if flags & RECOVERY_FLAG != 0 {
+        " recovery"
+    } else {
+        ""
+    }
+}
+
+/// Preview a recovery without authoring: one row per source root
+/// path with its status, so the operator sees what is graftable,
+/// what is already live, and what is gone. Built as a string so
+/// tests assert the rendering without capturing stdout.
+fn recovery_plan_report(plan: &wyrd_sync::runtime::RecoveryPlan) -> String {
+    use wyrd_sync::runtime::RecoveryStatus;
+    let mut out = format!("recovery plan (from {}):\n", plan.from);
+    for row in &plan.paths {
+        let status = match row.status {
+            RecoveryStatus::Ready => "ready".to_owned(),
+            RecoveryStatus::AlreadyLive => {
+                "already-live: a current head holds this path — recovery is the wrong verb"
+                    .to_owned()
+            }
+            RecoveryStatus::Undecryptable => {
+                "undecryptable: no held epoch decrypts these bytes".to_owned()
+            }
+            RecoveryStatus::Missing => "missing: bytes are not local".to_owned(),
+        };
+        out.push_str(&format!("{}: {status}\n", row.path));
     }
     out
 }

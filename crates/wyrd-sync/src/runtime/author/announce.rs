@@ -474,10 +474,14 @@ fn send_pending_for(
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)
         .collect();
+    // Names the send's warn-once marker: one snapshot's fan-out, so
+    // the marker still tracks each recipient pair independently.
+    let obligation = format!("announcement {snapshot:?}");
     send_sealed_to(
         engine,
         mailbox,
         "announcement",
+        &obligation,
         sealed_bytes,
         recipients,
         |recipient| Fact::AnnouncementDelivered(snapshot, recipient),

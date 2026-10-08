@@ -23,6 +23,12 @@ version say exactly what changed.
 
 ### Added
 
+- Warn-once control-plane refusal: the first all-relay refusal of an
+  outbox obligation logs at warn (kind only, never identities) so a
+  never-flipping policy refusal is operator-visible under the default
+  filter; repeats stay at debug. Logging only — obligations still
+  pend and no Delivered fact commits on refusal.
+
 - Shed-wait attribution on `sync now` (`17-observability`, OD-17-2
   extension): pending-bound sheds carry their already-classified wait
   into `deferred_shed_unseen` / `deferred_shed_status_blocked`, and

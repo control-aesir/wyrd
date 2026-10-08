@@ -186,6 +186,132 @@ fn delivery_retains_obligation_when_no_relay_accepts() {
     );
 }
 
+/// A minimal capturing subscriber: records (level, message) per
+/// event so the warn-once test can count refusal lines with no new
+/// dependency (tracing core only). Scoped with `with_default`, so
+/// parallel tests keep their own capture.
+#[derive(Clone, Default)]
+struct CapturedLogs {
+    events: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+}
+
+struct MessageCapture(Option<String>);
+
+impl tracing::field::Visit for MessageCapture {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturedLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut capture = MessageCapture(None);
+        event.record(&mut capture);
+        self.events
+            .lock()
+            .expect("capture lock held")
+            .push((*event.metadata().level(), capture.0.unwrap_or_default()));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A refusal the relays will never flip must be operator-visible:
+/// the first refusal of an obligation warns once under the default
+/// filter; repeats stay at debug. The obligation itself is
+/// untouched — still pending, still undelivered — and the warn names
+/// the kind only, never identities (trust.md OD-17-6).
+#[test]
+fn a_repeated_refusal_warns_once_per_obligation() {
+    let (mut fx, child) = two_transition_world();
+    let child_id = child.transition_id();
+    let sealed = seal(
+        &control_key(2),
+        &member_drive(),
+        2,
+        &transition_message(&child),
+    )
+    .unwrap()
+    .encode();
+    let recipient = identity(0x03).1;
+    fx.engine
+        .commit_facts(&[
+            Fact::TransitionSealed(child_id, sealed),
+            Fact::TransitionQueued(child_id, recipient),
+        ])
+        .unwrap();
+    let logs = CapturedLogs::default();
+    let dispatch = tracing::Dispatch::new(logs.clone());
+    tracing::dispatcher::with_default(&dispatch, || {
+        for pass in 1..=2 {
+            let mut refusing = RefusingMailbox {
+                inner: MemoryMailbox {
+                    relay: &mut fx.relay,
+                    owner: fx.recipient,
+                },
+            };
+            assert_eq!(
+                fx.engine.deliver_pending(&mut refusing).unwrap(),
+                0,
+                "refused pass {pass} counts nothing"
+            );
+        }
+    });
+    let events = logs.events.lock().expect("capture lock held");
+    let warns: Vec<&String> = events
+        .iter()
+        .filter(|(level, message)| *level == tracing::Level::WARN && message.contains("refused"))
+        .map(|(_, message)| message)
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "exactly one warn across both refused passes, got {warns:?}"
+    );
+    assert!(
+        !warns[0].contains(&recipient.to_string()),
+        "the warn names no recipient identity: {}",
+        warns[0]
+    );
+    assert!(
+        !warns[0].contains(&child_id.to_string()),
+        "the warn names no transition identity: {}",
+        warns[0]
+    );
+    let debugs = events
+        .iter()
+        .filter(|(level, message)| *level == tracing::Level::DEBUG && message.contains("refused"))
+        .count();
+    assert!(
+        debugs >= 1,
+        "the repeat refusal stays at debug, keeping the stall greppable"
+    );
+    let loaded = fx.engine.store.load().unwrap();
+    assert!(
+        loaded.transition_delivered.is_empty(),
+        "warn-once changes logging only: refusal still commits no Delivered fact"
+    );
+    assert_eq!(
+        loaded.transition_queued,
+        vec![(child_id, recipient)],
+        "the obligation stays pending"
+    );
+}
+
 /// A transition sealed under a foreign epoch key fails closed even
 /// when the payload is correct: the envelope epoch must be the
 /// transition's own epoch, or recipients without that key would

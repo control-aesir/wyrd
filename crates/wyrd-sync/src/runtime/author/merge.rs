@@ -312,7 +312,7 @@ fn validate_spec(
 /// The root tree one source head commits, address- and limit-checked
 /// exactly like the authoring walk checks every node it reads: a
 /// faulty store cannot launder a wrong address into the merge.
-fn load_root<S: ObjectStore>(objects: &S, tree: ContentId) -> Result<Tree, EngineError>
+pub(crate) fn load_root<S: ObjectStore>(objects: &S, tree: ContentId) -> Result<Tree, EngineError>
 where
     S::Error: std::fmt::Debug,
 {
@@ -339,7 +339,7 @@ where
 /// Symlinks name no content. Read-only (`get`/`has`, never insert)
 /// over a visited set, so a faulty store claiming a reference cycle
 /// terminates instead of looping.
-fn check_local<S: ObjectStore>(
+pub(crate) fn check_local<S: ObjectStore>(
     engine: &Engine,
     objects: &S,
     rebuilt: &Rebuilt,

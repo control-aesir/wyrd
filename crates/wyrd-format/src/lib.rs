@@ -38,7 +38,7 @@ pub use membership::{Change, MembershipError, MembershipTransition};
 pub use mutation::{
     mkdir, put, put_strict, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH,
 };
-pub use snapshot::{Snapshot, SnapshotError};
+pub use snapshot::{Snapshot, SnapshotError, RECOVERY_FLAG};
 pub use store::{
     DiscardOutcome, DiscardRejectedRepresentation, FetchStatus, MemoryObjectStore,
     MemoryStoreError, ObjectStore, RetainedBytes, SharedStore, SharedStoreError, StoreError,

@@ -80,7 +80,9 @@ use crate::membership::TransitionStatus;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
-pub use super::author::{MergePath, MergePlan, MergeSelection};
+pub use super::author::{
+    MergePath, MergePlan, MergeSelection, RecoveryPath, RecoveryPlan, RecoveryStatus,
+};
 pub use super::bootstrap::PairingRequest;
 
 /// Engine failures: durable-commit, runtime-record, and mailbox-
@@ -149,6 +151,16 @@ pub enum EngineError {
     UnresolvedMergePath(String),
     #[error("merged tree failed construction: {0}")]
     MergeTreeInvalid(String),
+    #[error("no snapshot {0} in the local DAG to recover from")]
+    UnknownRecoverySource(SnapshotId),
+    #[error("recovery selection names {0:?}, which the source snapshot does not contain")]
+    UnknownRecoveryPath(String),
+    #[error("recovery selects nothing: pass --take, --all, or --content")]
+    RecoveryEmptySelection,
+    #[error("recovery content {0} is not in the local object store")]
+    UnknownRecoveryContent(ContentId),
+    #[error("recovery tree failed construction: {0}")]
+    RecoveryTreeInvalid(String),
     #[error("device identity was previously removed and cannot be re-admitted; use a new device identity")]
     RetiredDevice,
     #[error("no held epoch secret for epoch {0}")]
@@ -638,6 +650,9 @@ pub struct SnapshotHead {
     pub id: SnapshotId,
     pub classification: crate::authorization::Classification,
     pub epoch: u64,
+    /// The body flag bits, so renderers mark recovery snapshots
+    /// without a second lookup: audit stays with the row.
+    pub flags: u8,
 }
 
 /// The intake driver for one device on one drive.
@@ -1138,6 +1153,46 @@ impl Engine {
         super::author::plan_merge(self, objects, heads)
     }
 
+    /// Plan a recovery over one source snapshot without authoring
+    /// anything: the per-path status a dry run shows before the
+    /// operator selects. Read-only; shares the classification
+    /// [`recover`] validates against. See
+    /// [`super::author::recover`].
+    ///
+    /// [`recover`]: Engine::recover
+    pub fn recovery_plan<S: ObjectStore>(
+        &self,
+        objects: &S,
+        from: SnapshotId,
+    ) -> Result<super::author::RecoveryPlan, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::plan_recovery(self, objects, from)
+    }
+
+    /// Recover selected source rows into a recovery-flagged
+    /// snapshot: the deterministic graft tree over the selection,
+    /// parented onto the current eligible heads by the current
+    /// canonical owner. Takes name source root paths (root-entry
+    /// granularity, like the merge spec), `all` takes the whole
+    /// source tree, and `contents` grafts explicitly named content
+    /// ids the operator no longer knows a path for. See
+    /// [`super::author::recover`].
+    pub fn recover<S: ObjectStore>(
+        &mut self,
+        objects: &mut S,
+        from: SnapshotId,
+        takes: &[String],
+        all: bool,
+        contents: &[ContentId],
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        super::author::recover(self, objects, from, takes, all, contents)
+    }
+
     /// Send every undischarged transition- and capability-delivery
     /// obligation, returning the number of relay-accepted sends this call.
     /// Transitions go before capabilities; a mid-loop transport
@@ -1498,11 +1553,12 @@ impl Engine {
             .into_iter()
             .filter(|(id, _)| live.contains(id))
             .filter_map(|(id, classification)| {
-                let epoch = rebuilt.runtime.snapshot_bodies.get(&id)?.epoch;
+                let body = rebuilt.runtime.snapshot_bodies.get(&id)?;
                 Some(SnapshotHead {
                     id,
                     classification,
-                    epoch,
+                    epoch: body.epoch,
+                    flags: body.flags(),
                 })
             })
             .collect();

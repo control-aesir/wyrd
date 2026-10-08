@@ -26,7 +26,8 @@ pub(crate) mod test_util;
 
 pub use engine::{
     AdmitOutcome, DrainReport, Engine, EngineError, ExecuteReport, MergePath, MergePlan,
-    MergeSelection, PairingRequest, SnapshotHead, TerminalState, MAX_PENDING_MESSAGES,
+    MergeSelection, PairingRequest, RecoveryPath, RecoveryPlan, RecoveryStatus, SnapshotHead,
+    TerminalState, MAX_PENDING_MESSAGES,
 };
 
 /// What one route-publication pass did. `published` counts the address

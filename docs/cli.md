@@ -192,12 +192,16 @@ not the full live-head set: re-check the numbers before copying them
 from `snapshot list` into a narrowed merge.
 
 - `list`: the live heads with their `@N` numbers, epochs, authors,
-  trees, and parent counts.
+  trees, and parent counts. Recovery-flagged heads carry a
+  `recovery` marker.
 - `heads`: every DAG head with its authorization classification
   (`eligible`, `canonical-history`, `superseded`, `stranded`,
   `voided`, `pending:<reason>`, `rejected:<reason>`) and epoch.
   Eligible heads carry their `@N` merge numbers; every other class
-  is retained history with its reason attached.
+  is retained history with its reason attached. Recovery-flagged
+  tips carry the same `recovery` marker as `list`: the marker
+  audits a snapshot while it is listed, not after history moves
+  past it.
 - `merge [--head <id>...] [--default @N] [--take path=@N]...
   [--drop path]...`: merge source heads — all live heads by
   default, or an explicit subset of at least two — into one
@@ -223,6 +227,25 @@ from `snapshot list` into a narrowed merge.
   which need a `--take` line before merging. Refused with a pointer
   to `member resolve` where a short selection meets no eligible
   heads on a membership-frozen drive.
+- `recover plan --from <id>`: preview a recovery without
+  authoring — one row per source root path with its status, so the
+  operator sees what is graftable (`ready`), what is already live
+  under the current heads (`already-live`, with the reason),
+  what no held epoch decrypts (`undecryptable`), and what is gone
+  (`missing`).
+- `recover run --from <id> [--take path]... [--all]
+  [--content <id>]...`: graft the selection into a
+  recovery-flagged snapshot parented onto the current eligible
+  heads at the current epoch. Paths are root entries, like the
+  merge spec; `--all` takes the whole source tree instead of
+  `--take` lines, and `--content` grafts explicitly named content
+  ids the operator no longer knows a path for. An empty
+  selection, an unknown path, or bytes the device cannot produce
+  all fail closed with nothing committed. Owner-only: anyone else
+  is refused up front with the engine's `RecoveryNotOwner`, and
+  the engine re-enforces it at authoring. No membership change,
+  no epoch change; the grafted bytes ride the usual announcement
+  outbox.
 
 ### `device` — pair this device with a drive
 

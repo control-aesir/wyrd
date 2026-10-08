@@ -351,11 +351,11 @@ jobs:
 
   reporter:
     if: failure() && github.event_name == 'pull_request'
-    # Gated on both jobs completing: since rust and nix run parallel,
-    # a fast rust failure still waits out the slow nix job before the
-    # report lands. Accepted — parallel wall time is worth slower
-    # failure feedback.
-    needs: [rust, nix]
+    # Gated on all three jobs completing: since rust, nix, and
+    # shell-tests run parallel, a fast failure still waits out the
+    # slowest job before the report lands. Accepted — parallel wall
+    # time is worth slower failure feedback.
+    needs: [rust, nix, shell-tests]
     runs-on: ubuntu-latest
     # Same pathology cover as the draft job: healthy runs finish fast.
     timeout-minutes: 10

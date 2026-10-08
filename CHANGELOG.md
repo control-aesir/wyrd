@@ -43,8 +43,8 @@ version say exactly what changed.
   and never readable as a head.
 
 - MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
-  run the prefix closure over suite phases 1-11 (1-5 shared core,
-  6-11 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
+  run the prefix closure over suite phases 1-12 (1-5 shared core,
+  6-12 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
   entry or a non-step is refused; omitting the flag means all phases.
 
 - Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):
@@ -64,6 +64,15 @@ version say exactly what changed.
   filter; repeats stay at debug. Logging only — obligations still
   pend and no Delivered fact commits on refusal.
 
+- Headless serving composition (`sync now --serve`, OD-23-V/W/X):
+  the bounded headless drain optionally binds the mount's serving
+  surface (open, bulk, flush, route, barrier) so its announcements
+  carry a dialable route and discharge waits on mirror readiness;
+  after the drain's own verdict the endpoint serves the converged
+  snapshot until SIGINT/SIGTERM and shuts down in mount order. No
+  barrier without serving (route-less authoring unchanged);
+  `--serve` refuses `--offline`; `docs/trust.md` names both
+  shipped member-hosted shapes. Bridge until `wyrd vault` exists.
 - Shed-wait attribution on `sync now` (`17-observability`, OD-17-2
   extension): pending-bound sheds carry their already-classified wait
   into `deferred_shed_unseen` / `deferred_shed_status_blocked`, and
@@ -128,6 +137,23 @@ version say exactly what changed.
   fetching, so walk-found losses clear on the same pass they are
   observed. No bytes are unlinked, no protocol change, no new
   durable-fact kind; the vault is untouched.
+
+### Fixed
+
+- `sync now` mailbox verdict requires observation-validity: a
+  zero-connected sample with zero supervisor ticks no longer fails
+  the run (that is the mailbox's initial state, not a measurement),
+  and relay communication in either direction with no observed
+  attachment exempts an "unreachable relay" diagnosis — delivered
+  intake or relay-accepted sends both prove the relay talked to
+  this run, so a stale zero-connected sample cannot convict.
+  Attached-then-lost still fails, so a genuinely dead relay keeps
+  its verdict — with one residual window: the attachment latch flips
+  only on a supervisor-tick observation, so an attachment and loss
+  both landing between ticks reads as never-attached. Fixes quiet headless restarts (e.g. `sync now
+  --serve` re-park) exiting degraded within a second of startup,
+  including runs that attached and delivered mid-run before any
+  supervisor tick observed the attachment.
 
 ### Added
 

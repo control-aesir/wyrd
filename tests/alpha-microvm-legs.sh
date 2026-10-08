@@ -786,6 +786,175 @@ conflict_assert_converged() {
   pass "conflicted drive fails writes EIO and still serves reads"
 }
 
+# leg_headless_setup <drive> <creds>: mount the fresh single-author
+# drive, write the target files, stop. Phase 12 intentionally uses
+# a fresh single-author dataset: v0 serving is author-bound and
+# does not replicate serving authority for historical snapshots,
+# so a deep multi-author closure is only convergent when every
+# author has a live route (replication serving is deferred to
+# v0.7). Do not "improve" this leg by reusing an existing deep
+# drive: every announcement C needs must carry A's live endpoint,
+# which holds exactly when A is the sole author.
+leg_headless_setup() {
+  local d="$1" c="$2"
+  step 12 "headless dataset setup"
+  start_mount xhfresh "$c" "$d" "$MNTS/xhfresh"
+  echo "serve-target-1" > "$MNTS/xhfresh/target-1.txt"
+  echo "serve-target-2" > "$MNTS/xhfresh/target-2.txt"
+  stop_mount xhfresh INT
+  check_no_leaks "$LOGDIR/mount-xhfresh.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  pass "single-author dataset written and unmounted"
+  touch "$E2E_ROOT/headless-setup-done"
+}
+
+# leg_headless_serve <drive> <creds> <relay>: the serving half of
+# the two-headless-peers exchange (issue 23-headless-serving). Runs
+# `sync now --serve` in the background, waits for the park line
+# (drain verdict printed, endpoint serving the converged snapshot),
+# then drives the kill/restart/TERM sequence the fetch legs
+# rendezvous on:
+#   serve#1 → C fetches → KILL (mid-flight) → serve#2 (mirror
+#   rebuilt from the vault) → TERM → host admits D → serve#3 → D
+#   fetches pre-kill content → TERM, clean exit 0.
+# D is admitted between serve#2 and serve#3 on purpose: the
+# re-announcement path reseals pending obligations with the live
+# route but never resurrects discharged ones, so D's obligations
+# must be fresh for serve#3's route. C proves the positive case, D
+# proves previously announced representations still serve after a
+# kill -9 and mirror rebuild.
+leg_headless_serve() {
+  local d="$1" c="$2" relay="$3"
+  step 12 "headless serving leg"
+  rm -f "$E2E_ROOT/headless-serve-ready" "$E2E_ROOT/headless-fetch-c-done" \
+    "$E2E_ROOT/headless-serve-stopped" "$E2E_ROOT/headless-d-invited" \
+    "$E2E_ROOT/headless-serve3-ready" "$E2E_ROOT/headless-fetch-d-done"
+  mkdir -p "$PIDDIR"
+  # serve#1: the drain announces C's catch-up with the serve route,
+  # then parks. The park line proves the verdict printed first, so
+  # a fetcher starting now races nothing.
+  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+    >"$LOGDIR/headless-serve-1.out" 2>"$LOGDIR/headless-serve-1.err" &
+  echo $! > "$PIDDIR/headless-serve.pid"
+  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-1.err" \
+    || die "serve#1 never reached its serve phase (see headless-serve-1.err)"
+  grep -q "serving over iroh" "$LOGDIR/headless-serve-1.err" \
+    || die "serve#1 never bound its endpoint"
+  pass "serve#1 drains, announces its route, and parks"
+  touch "$E2E_ROOT/headless-serve-ready"
+  # C fetches the whole drive headless; only then is the kill
+  # mid-flight (residency, not startup).
+  poll_until 300 test -f "$E2E_ROOT/headless-fetch-c-done" \
+    || die "fetch-c never finished against serve#1"
+  pass "fetch-c converged against the serving headless peer"
+  local pid
+  pid="$(cat "$PIDDIR/headless-serve.pid")"
+  kill -KILL "$pid" 2>/dev/null || die "serve#1 pid already gone before KILL"
+  set +e; wait "$pid"; local kstatus=$?; set -e
+  [[ "$kstatus" == "137" ]] || die "serve#1 KILL exit $kstatus, want 137"
+  kill -0 "$pid" 2>/dev/null && die "serve#1 pid survived KILL"
+  rm -f "$PIDDIR/headless-serve.pid"
+  pass "serve#1 dies on KILL"
+  # serve#2: restart over the same drive — the mirror rebuilds from
+  # the vault by replay, never by re-deriving bytes. Nothing new to
+  # announce (C discharged, D not yet admitted); the park line
+  # proves the endpoint is back up.
+  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+    >"$LOGDIR/headless-serve-2.out" 2>"$LOGDIR/headless-serve-2.err" &
+  echo $! > "$PIDDIR/headless-serve.pid"
+  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-2.err" \
+    || die "serve#2 never re-parked after KILL (see headless-serve-2.err)"
+  pass "serve#2 re-parks after KILL: the mirror rebuilt from the vault"
+  # TERM while parked: the ordered teardown (mailbox, bulk, serving
+  # under the transport bound) must exit 0, proving the shutdown
+  # half of the residency contract.
+  pid="$(cat "$PIDDIR/headless-serve.pid")"
+  kill -TERM "$pid"
+  local i status="timeout"
+  for ((i = 0; i < 60 * 5; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      set +e; wait "$pid"; status=$?; set -e
+      break
+    fi
+    sleep 0.2
+  done
+  [[ "$status" == "0" ]] || die "serve#2 TERM shutdown exit $status, want clean 0"
+  rm -f "$PIDDIR/headless-serve.pid"
+  pass "serve#2 shuts down clean on TERM"
+  touch "$E2E_ROOT/headless-serve-stopped"
+  # The host admits D while the drive is free; serve#3 announces
+  # D's fresh obligations with its own route.
+  poll_until 300 test -f "$E2E_ROOT/headless-d-invited" \
+    || die "host never admitted D"
+  with_creds "$c" sync "$d" --relay "$relay" now --serve \
+    >"$LOGDIR/headless-serve-3.out" 2>"$LOGDIR/headless-serve-3.err" &
+  echo $! > "$PIDDIR/headless-serve.pid"
+  poll_until 300 grep -q "serving converged snapshot until shutdown" "$LOGDIR/headless-serve-3.err" \
+    || die "serve#3 never parked (see headless-serve-3.err)"
+  pass "serve#3 parks with D's obligations announced"
+  touch "$E2E_ROOT/headless-serve3-ready"
+  # D fetches content announced before the kill, served after it:
+  # the vault-persisted representations outlive the endpoint.
+  poll_until 300 test -f "$E2E_ROOT/headless-fetch-d-done" \
+    || die "fetch-d never finished against serve#3"
+  pass "fetch-d converged on pre-kill content after the restart"
+  pid="$(cat "$PIDDIR/headless-serve.pid")"
+  kill -TERM "$pid"
+  status="timeout"
+  for ((i = 0; i < 60 * 5; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      set +e; wait "$pid"; status=$?; set -e
+      break
+    fi
+    sleep 0.2
+  done
+  [[ "$status" == "0" ]] || die "serve#3 TERM shutdown exit $status, want clean 0"
+  rm -f "$PIDDIR/headless-serve.pid"
+  pass "serve#3 shuts down clean on TERM"
+  check_no_leaks "$LOGDIR/headless-serve-1.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-serve-2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-serve-3.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_headless_fetch <drive> <creds> <relay> <tag> <ready-file> <done-file>:
+# the fetching half: an ordinary headless `sync now` (never --serve)
+# against a parked serving peer, then a mount read proves the bytes.
+# The device starts empty, so a nonzero object count is bulk transfer
+# from the serving peer — the advertised address is the one that
+# answers, proved by dialability rather than asserted from logs.
+# File content is deliberately NOT asserted via headless export:
+# headless reconciliation leaves file chunks `RemoteOnly` by policy
+# (structural closure only — trees, manifests, bodies), and v0
+# promises no headless materialization. The byte-exact proof comes
+# from mounting the fetcher and reading through the projection:
+# the read faults the remote-only chunks in over the serving peer's
+# announced route, which is the feature under review end to end
+# (serve -> route -> fault-in -> verify). This runs while the serve
+# side is still parked, before the done-file releases it for KILL.
+leg_headless_fetch() {
+  local d="$1" c="$2" relay="$3" tag="$4" ready="$5" done="$6"
+  step 12 "headless fetch leg ($tag)"
+  poll_until 300 test -f "$E2E_ROOT/$ready" \
+    || die "serve side never parked for $tag"
+  with_creds "$c" sync "$d" --relay "$relay" now \
+    >"$LOGDIR/headless-fetch-$tag.out" 2>"$LOGDIR/headless-fetch-$tag.err" \
+    || die "headless fetch ($tag) exited non-zero"
+  grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/headless-fetch-$tag.out" \
+    || die "headless fetch ($tag) fetched no objects (see headless-fetch-$tag.out)"
+  pass "headless fetch ($tag) pulls objects over the serve route"
+  start_mount "xheadless-$tag" "$c" "$d" "$MNTS/xheadless-$tag" --relay "$relay"
+  [[ "$(cat "$MNTS/xheadless-$tag/target-1.txt")" == "serve-target-1" ]] \
+    || die "headless mount ($tag) lost target-1.txt"
+  [[ "$(cat "$MNTS/xheadless-$tag/target-2.txt")" == "serve-target-2" ]] \
+    || die "headless mount ($tag) lost target-2.txt"
+  pass "headless mount ($tag) faults the served bytes in over the serve route"
+  stop_mount "xheadless-$tag" INT
+  touch "$E2E_ROOT/$done"
+  check_no_content_ids "$LOGDIR/headless-fetch-$tag.out"
+  check_no_leaks "$LOGDIR/headless-fetch-$tag.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-fetch-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-xheadless-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
@@ -795,6 +964,9 @@ case "${1:-}" in
   fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
   conflict-owner) leg_conflict_owner "$2" "$3" "$4" ;;
   conflict-member) leg_conflict_member "$2" "$3" "$4" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member <drive> <creds> <relay>" >&2; exit 2 ;;
+  headless-serve) leg_headless_serve "$2" "$3" "$4" ;;
+  headless-fetch) leg_headless_fetch "$2" "$3" "$4" "$5" "$6" "$7" ;;
+  headless-setup) leg_headless_setup "$2" "$3" ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
 echo "legs: $PASS_COUNT checks passed"

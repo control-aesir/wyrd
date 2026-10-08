@@ -3291,3 +3291,7 @@ mod terminal_tests;
 #[cfg(test)]
 #[path = "live/tests_trigger.rs"]
 mod trigger_tests;
+
+#[cfg(test)]
+#[path = "live/tests_serve_barrier.rs"]
+mod serve_barrier_tests;

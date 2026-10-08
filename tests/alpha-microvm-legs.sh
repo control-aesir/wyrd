@@ -1131,6 +1131,16 @@ leg_crash_member() {
   poll_until 120 bash -c "ls '$MNTS/xcrash-m' | grep -qx 'cold-u.txt'" \
     || die "member never listed the cold file"
   touch "$E2E_ROOT/crash-m-listed"
+  # Body-path gate BEFORE any authorship: a held mutation gets 30s
+  # (max_mutation_wait) before it fails TimedOut, and this drive
+  # joined fresh — its loop is still settling while the endpoint
+  # warms. Converging the cold bytes through patient read-side
+  # demand first proves the iroh body path is live and the loop is
+  # settled, so the scratch commit's tree fetch below races nothing
+  # cold. Without this the scratch itself outwaits the deadline.
+  poll_until 300 converged "$MNTS/xcrash-m/cold-u.txt" "cold-bytes-u" \
+    || die "member never converged the cold bytes before authoring"
+  pass "cold bytes flow before the member authors"
   # Tree localization BEFORE the partition: this drive joined fresh
   # and is manifest-only, and a mutation held waiting on remote
   # base-closure content fails TimedOut (ETIMEDOUT) by design

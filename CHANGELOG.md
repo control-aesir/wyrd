@@ -143,11 +143,15 @@ version say exactly what changed.
 - `sync now` mailbox verdict requires observation-validity: a
   zero-connected sample with zero supervisor ticks no longer fails
   the run (that is the mailbox's initial state, not a measurement),
-  and relay-delivered intake with no observed attachment exempts an
-  "unreachable relay" diagnosis. Attached-then-lost still fails, so
-  a genuinely dead relay keeps its verdict. Fixes quiet headless
-  restarts (e.g. `sync now --serve` re-park) exiting degraded within
-  a second of startup.
+  and relay communication in either direction with no observed
+  attachment exempts an "unreachable relay" diagnosis — delivered
+  intake or relay-accepted sends both prove the relay talked to
+  this run, so a stale zero-connected sample cannot convict.
+  Attached-then-lost still fails, so a genuinely dead relay keeps
+  its verdict. Fixes quiet headless restarts (e.g. `sync now
+  --serve` re-park) exiting degraded within a second of startup,
+  including runs that attached and delivered mid-run before any
+  supervisor tick observed the attachment.
 
 ### Added
 

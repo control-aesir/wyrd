@@ -1855,20 +1855,25 @@ fn mailbox_degraded(health: &MailboxHealth) -> bool {
 /// at zero per mailbox, and a run that exits before the first tick
 /// reads the initial zeros — that is unobserved, not degraded.
 ///
-/// B. Relay-delivered intake with no observed attachment proves
-/// relay communication for that run: envelopes arrived, so an
-/// "unreachable relay" diagnosis contradicts the run's own intake.
+/// B. Relay communication in either direction with no observed
+/// attachment proves the relay talked to this run: delivered intake
+/// or relay-accepted sends both contradict an "unreachable relay"
+/// diagnosis, so a stale zero-connected sample cannot convict.
 /// This is corroboration, not a health claim — a relay that
-/// delivered once and then died is still convictable, because the
-/// attachment latch below flips once any tick observes presence
-/// and never flips back. So intake exempts only the never-attached
-/// case; attached-then-lost still fails.
+/// communicated once and then died is still convictable, because
+/// the attachment latch below flips once any tick observes presence
+/// and never flips back. So communication exempts only the
+/// never-attached case; attached-then-lost still fails.
 ///
 /// Positive-evidence arms (a relay-closed subscription, a
 /// supervisor episode that ran) fail immediately under both rules:
 /// they are observed trouble, not absent observations, and the
 /// tick gate never applies to them.
-fn mailbox_verdict_failed(health: &MailboxHealth, intake_observed: bool) -> bool {
+fn mailbox_verdict_failed(
+    health: &MailboxHealth,
+    intake_observed: bool,
+    sent_accepted: usize,
+) -> bool {
     if health.total_relays == 0 {
         return false;
     }
@@ -1882,7 +1887,7 @@ fn mailbox_verdict_failed(health: &MailboxHealth, intake_observed: bool) -> bool
         if health.supervisor_ticks == 0 {
             return false;
         }
-        if intake_observed && !health.relay_attached {
+        if (intake_observed || sent_accepted > 0) && !health.relay_attached {
             return false;
         }
         return true;
@@ -2512,7 +2517,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         // operator tailing only the last line sees the scope.
         RunOutcome::Quiet => match report.mailbox {
             Some(health)
-                if !mailbox_verdict_failed(&health, report_intake_observed(report))
+                if !mailbox_verdict_failed(&health, report_intake_observed(report), report.sent)
                     && !reconciliation_open => {
                 out.push_str("completed: quiet");
                 if health.total_relays == 0 {
@@ -2527,7 +2532,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         },
         RunOutcome::RemoteStalled => match report.mailbox {
             Some(health)
-                if !mailbox_verdict_failed(&health, report_intake_observed(report))
+                if !mailbox_verdict_failed(&health, report_intake_observed(report), report.sent)
                     && !reconciliation_open => {
                 out.push_str(&format!(
                     "completed: quiet with {} unfetchable heads (known but not local)",
@@ -2553,7 +2558,7 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             // reaches quiet. Name it here, not just in the stderr
             // error, so the stdout forensics show the cause.
             if !matches!(report.mailbox, Some(health)
-                if !mailbox_verdict_failed(&health, report_intake_observed(report))) {
+                if !mailbox_verdict_failed(&health, report_intake_observed(report), report.sent)) {
                 out.push_str(&format!("; {}, convergence unverified", degraded_reason(report.mailbox)));
             }
             out.push('\n');
@@ -2578,7 +2583,7 @@ fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
         None => return Err(CliError::Unobserved),
         Some(health) => health,
     };
-    if mailbox_verdict_failed(&mailbox, report_intake_observed(report)) {
+    if mailbox_verdict_failed(&mailbox, report_intake_observed(report), report.sent) {
         return Err(CliError::Unverified {
             connected: mailbox.connected_relays,
             total: mailbox.total_relays,

@@ -910,6 +910,47 @@ fn intake_does_not_survive_observed_attachment_then_loss() {
     );
 }
 
+/// 5. Relay-accepted sends corroborate like intake: a quiet serve
+/// that delivered a dozen announcements but whose ticks never
+/// observed the attachment must park, not contradict its own
+/// transmissions. The send path absorbs transport failures as zero
+/// and zero-accepted keeps obligations pending, so a nonzero sent
+/// count with an empty outbox proves the relay talked to this run.
+#[test]
+fn accepted_sends_without_attachment_exempt_unreachable() {
+    let mut mailbox = blind_mailbox();
+    mailbox.supervisor_ticks = 2;
+    assert!(!mailbox.relay_attached);
+    let mut report = report_with(RunOutcome::Quiet, Some(mailbox));
+    report.sent = 12;
+    assert!(
+        run_outcome_error(&report).is_ok(),
+        "accepted sends without observed attachment prove communication"
+    );
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("completed: quiet"),
+        "the run completes instead of failing its own deliveries: {rendered}"
+    );
+}
+
+/// 6. Accepted sends are not a permanent health latch either:
+/// attached mid-run and then lost, with the loss observed, still
+/// fails. Like intake, sends exempt only the never-attached case.
+#[test]
+fn sends_do_not_survive_observed_attachment_then_loss() {
+    let mut mailbox = blind_mailbox();
+    mailbox.supervisor_ticks = 5;
+    mailbox.relay_attached = true;
+    let mut report = report_with(RunOutcome::Quiet, Some(mailbox));
+    report.sent = 12;
+    let error = run_outcome_error(&report).unwrap_err();
+    assert!(
+        matches!(error, CliError::Unverified { connected: 0, .. }),
+        "attached-then-lost fails despite earlier sends, got: {error}"
+    );
+}
+
 /// The mailbox line reads posture, never connection alone: an
 /// explicitly offline run is idle (neither live nor degraded), a
 /// connected run with no closures is live, and anything else names

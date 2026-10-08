@@ -249,8 +249,57 @@ Rules:
    handle — the plain debounce-save loop — commits one snapshot
    before and after, so the headline workload is unchanged until the
    implementation batches across saves; likewise open/write/close
-   churn still commits per cycle because `release` forces. The
-   observability baseline must measure these shapes separately.
+churn still commits per cycle because `release` forces. The
+observability baseline must measure these shapes separately.
+
+## Durability levels (DG-2, normative)
+
+Decision OD-03-A/B/C (records at the bottom of this document): the
+ladder is **Working → Committed → Published**, indexed by the DG-1
+boundary table above — one row per commit-forcing event class, never
+a free-standing ladder. There is no device-durable-but-not-a-snapshot
+level and no device-local journal in v0.3: steps 1-2 prepare, and
+preparation becomes durable only together with the snapshot at step 3.
+
+The four crash-consistency boundary kinds — durable, visible,
+servable, propagated (`docs/crash-consistency.md:15-20`) — are a
+separate axis: properties of a byte range at a point in the
+pipeline, not caller-visible levels. The two vocabularies must never
+be read as one ladder.
+
+The level is per drive, taken over the newest committed snapshot,
+and derives from committed facts only — so it is identical before
+and after a restart over the same state, and `sync status` can
+report it offline:
+
+- no recorded snapshot → **Working** (a genesis-only drive holds
+  nothing durable beyond membership);
+- at least one recorded snapshot and a non-empty announcement
+  outbox → **Committed** (durable here, not yet conveyed);
+- at least one recorded snapshot and an empty announcement
+  outbox → **Published** (conveyed or conveyable-to-nobody: a lone
+  participant announces to nobody, so a solo author lands here).
+
+`servable` means the projection is published and serving residency
+flushed for the snapshot (re-established after every reopen before
+anything is served); `announceable` means no undischarged
+announcement obligation remains for it. Both read yes only at
+Published.
+
+| DG-1 event class | Level yielded | What survives a crash | What a reopen reports | Servable? | Announceable? |
+|---|---|---|---|---|---|
+| Non-forcing: buffered `write` / handle `truncate` / `set-exec`, `flush` or `release` on a clean or read handle, no-op submission, refused pre-submit forcer, elapsed time alone | Unchanged (the new bytes are Working: volatile, memory-only) | Only the pre-existing durable state; the new bytes are gone — that loss is the contract | The prior level; no new head, no new obligation | New bytes: never | New bytes: never |
+| Forcing, fold commits, announcement obligation still queued | Committed | The whole snapshot: object store, vault, and fact log become durable together at step 3 | New head, obligation pending, `durability: committed` | No — a crash here replays the outbox and re-establishes the projection before serving | No — the send has not happened |
+| Forcing, fold commits, obligation discharged (relay acceptance, or a lone participant with nobody to announce to) | Published | The whole snapshot | New head, outbox quiet, `durability: published` | Yes | Yes |
+| Forcing, fold commits nothing (rule 6: no surviving member) | Unchanged | Nothing new — no empty snapshot, no dangling obligation | The prior level | — | — |
+
+The hard invariant, unchanged: device-local working state is never
+servable, never announceable, and never readable as a head. Only a
+committed snapshot crosses those boundaries — serving is keyed by
+recorded snapshot (`VaultSource` maps build over recorded snapshots
+and their manifest records alone), obligations are queued atomically
+with the snapshot body, and heads install only from committed
+snapshot bodies.
 
 ## Writable handles
 
@@ -1106,3 +1155,40 @@ resolve to no change submit and force nothing. Full options,
 reasoning, and decider in `nostr:nevent1qqsgsh7jz4em9k8mzu9v46dyrsgpcvqlrm4ematxz3lra4r8zuyenwspz9mhxue69uhkwunpwdczuap49eehgu8xt8t`
 (republish of
 `nostr:nevent1qqspp78nadn9vyghn7hak7guydzxwquvy4av83qxc6hha476ky2lhlgpz9mhxue69uhkwunpwdczuap49eehgkxrkd3`).
+
+## Decision record (OD-03 / DG-2)
+
+Decided by Zander, all three:
+
+- **OD-03-A = A, level-per-boundary mapping.** The DG-1 boundary
+  table is the index: each commit-forcing event class gets one row
+  stating the resulting level, what survives a crash, what a reopen
+  reports, and whether the state is servable and announceable. The
+  three levels are the resulting classification, and the four
+  crash-consistency boundary kinds stay orthogonal. Rejected: **B,
+  three level definitions plus a cross-reference table** — the mapping
+  would be the actual contract anyway, so it is the artefact.
+- **OD-03-B = A, no middle level and no journal in v0.3.** The
+  original three-level ladder (process-local → device-durable →
+  replicated) contradicted itself: it named a device-durable level
+  while recommending pending state need no journal, leaving a rung
+  with no persistence property behind it. "Replicated" is removed as
+  a durability level (propagation is never part of local filesystem
+  durability), and the middle rung is dropped rather than renamed:
+  Working means process-local pending state, deterministically
+  discarded on crash — the same contract POSIX gives `write()`. A
+  device-local journal would be a second persistence model whose
+  crash semantics no document specifies. The invariant that makes
+  discarding correct is DG-1's bounded window: if the coalescing
+  policy ever admits an unbounded idle window, discarding stops
+  being a durability statement and becomes data loss.
+- **OD-03-C = A, report through `SyncStatus`.** One field on the
+  existing offline-capable status, no new command and no per-write
+  surface. Rejected: **B, `wyrd sync now`'s run report** — a run
+  report describes an execution, while the level describes the
+  drive's durable state after the boundary — and **C, embedders-only
+  contract** — an unobservable durability contract makes the v0.3
+  single-machine claim weaker than it needs to be.
+
+Full options and reasoning in
+`nostr:nevent1qqs9mvafekvy740nzk2lywd9se0yuts9f3u0pqtmntmptlym92nf6egpz9mhxue69uhkwunpwdczuap49eehg33qp2w`.

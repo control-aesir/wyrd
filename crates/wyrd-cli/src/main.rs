@@ -2009,6 +2009,11 @@ fn sync_status_render(status: &SyncStatus) -> String {
         }
         None => out.push_str("membership: none observed\n"),
     }
+    // The drive's durability level (DG-2): what the newest committed
+    // snapshot reached — working before the first snapshot, committed
+    // while an announcement is queued, published once the outbox is
+    // quiet. Committed facts only, so it renders offline.
+    out.push_str(&format!("durability: {}\n", status.durability.as_str()));
     let totals = &status.totals;
     let pending = &status.obligations;
     out.push_str(&format!(

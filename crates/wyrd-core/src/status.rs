@@ -15,7 +15,10 @@ use wyrd_format::{DeviceId, SnapshotId};
 use wyrd_sync::{
     authorization::Classification,
     membership::KnownState,
-    runtime::{Engine, EngineError, MaterializationSummary, OutboxTotals, ReconciliationCounters},
+    runtime::{
+        DurabilityLevel, Engine, EngineError, MaterializationSummary, OutboxTotals,
+        ReconciliationCounters,
+    },
 };
 
 use crate::live::PendingObligations;
@@ -190,6 +193,12 @@ pub struct SyncStatus {
     /// Materialization as counts: explicit residency policies plus
     /// locally held objects.
     pub materialization: MaterializationSummary,
+    /// The durability level the drive's newest committed snapshot
+    /// reached (DG-2, normative in `docs/write-path.md`): Working
+    /// before the first snapshot, Committed while an announcement
+    /// obligation is queued, Published once the outbox is quiet.
+    /// Committed facts only, like every other row.
+    pub durability: DurabilityLevel,
 }
 
 impl SyncStatus {
@@ -329,6 +338,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
     };
     let materialization = state.materialization_summary();
     let reconciliation = engine.reconciliation_counters()?;
+    let durability = engine.durability_level()?;
     Ok(SyncStatus {
         tip,
         held_epochs,
@@ -343,6 +353,7 @@ pub fn observe(engine: &Engine, configured_relays: usize) -> Result<SyncStatus, 
         reconciliation,
         convergence,
         materialization,
+        durability,
     })
 }
 
@@ -351,6 +362,7 @@ mod tests {
     use super::*;
     use wyrd_format::{Entry, ObjectKind, ObjectStore, Tree};
     use wyrd_sync::keys::DeviceIdentitySecret;
+    use wyrd_sync::runtime::DurabilityLevel;
 
     /// Scratch-drive uniquifier: wall-clock nanos collide across
     /// parallel tests on coarse clocks, so every scratch dir takes
@@ -461,6 +473,58 @@ mod tests {
     fn observation_is_repeatable() {
         let (engine, dir) = scratch_authored();
         assert_eq!(observe(&engine, 0).unwrap(), observe(&engine, 0).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// DG-2 (OD-03-C): the status carries the drive's durability
+    /// level from committed facts — Working on a fresh drive,
+    /// Published for a lone participant's author, Committed while
+    /// the admission fixture's obligations are queued.
+    #[test]
+    fn durability_level_is_observed_from_durable_state() {
+        let dir = scratch_dir("level");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = DeviceIdentitySecret::from_bytes([0xD3; 32]).unwrap();
+        let mut engine = Engine::create(dir.clone(), "core-test-pass", identity).unwrap();
+        assert_eq!(
+            observe(&engine, 0).unwrap().durability,
+            DurabilityLevel::Working
+        );
+        // A lone participant's author announces to nobody.
+        let mut store = wyrd_format::FsObjectStore::open(dir.clone()).unwrap();
+        let chunk = store.insert(ObjectKind::Chunk, b"level-bytes").unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 11, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+        drop(store);
+        assert_eq!(
+            observe(&engine, 0).unwrap().durability,
+            DurabilityLevel::Published
+        );
+        drop(engine);
+        let reopened = Engine::open_keystore(
+            dir.clone(),
+            "core-test-pass",
+            DeviceIdentitySecret::from_bytes([0xD3; 32]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe(&reopened, 0).unwrap().durability,
+            DurabilityLevel::Published,
+            "the level derives from committed facts, never memory"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The admission fixture owes obligations, so its writes sit
+        // at Committed until the sends discharge them.
+        let (engine, dir) = scratch_authored();
+        assert_eq!(
+            observe(&engine, 0).unwrap().durability,
+            DurabilityLevel::Committed
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

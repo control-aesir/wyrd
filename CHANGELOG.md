@@ -23,6 +23,19 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd vault` foreground process (22a): the mount's live loop and
+  serving surface with no presentation session — the persistent
+  process that `sync now` (bounded one-shot, unchanged) is not.
+  One `vault ready: serving <id>` line after the first routed pass,
+  periodic `vault posture` proof-of-life, failures with the mount's
+  shape; stderr always plus an appended `--log-file`, never a
+  drive-resident default; SIGTERM exits 0 with the outbox empty. No
+  retention promise (waits for DG-4), no liveness handle, no
+  supervision — those are the 22b and packaging follow-ons. Loop
+  composition and the transport tail now live in `wyrd-daemon`'s
+  vault module as one copy shared with the mount (the install order
+  is pinned by a wiring test a hand-wired barrier cannot satisfy).
+
 - Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
   in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):
   `resolve-pr` maps the

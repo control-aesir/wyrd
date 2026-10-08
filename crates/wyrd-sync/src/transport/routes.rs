@@ -93,6 +93,13 @@ impl RoutePublishing for IrohBulkSource {
     fn publish_routes(&mut self, state: &RuntimeState) -> Result<RouteReport, EngineError> {
         Ok(publish_recorded_routes(state, self))
     }
+
+    /// The trait's graceful-or-abort close, wired to the inherent
+    /// endpoint shutdown: the generic composer tears transport down
+    /// through this, never around it.
+    fn shutdown(&mut self, deadline: std::time::Duration) {
+        IrohBulkSource::shutdown(self, deadline)
+    }
 }
 
 #[cfg(test)]

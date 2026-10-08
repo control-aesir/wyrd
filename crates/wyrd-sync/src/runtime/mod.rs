@@ -50,6 +50,15 @@ pub trait RoutePublishing: crate::bulk::BulkSource {
     /// Push every route the durable state records. Returns what the
     /// pass published and what it refused to decode.
     fn publish_routes(&mut self, state: &RuntimeState) -> Result<RouteReport, EngineError>;
+
+    /// Close the source's owned endpoint under `deadline`
+    /// (graceful-or-abort: a wedged drain warns inside and reports
+    /// success, so teardown proceeds). Defaults to a no-op — fakes
+    /// own no endpoint — so every real source MUST override this:
+    /// a silent default on a live endpoint would leak its runtime
+    /// past teardown. Always reports success; the abort half is the
+    /// caller dropping the source after this returns.
+    fn shutdown(&mut self, _deadline: std::time::Duration) {}
 }
 
 /// Local residency policy for one content object.

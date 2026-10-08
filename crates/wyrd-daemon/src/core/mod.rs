@@ -27,10 +27,12 @@ mod tests_run_loop;
 mod tests_sync;
 #[cfg(test)]
 mod tests_teardown;
+#[cfg(test)]
+mod tests_vault;
 
 pub use wyrd_core::budgets::ResourceBudgets;
 pub use wyrd_core::live::{
-    admit_wants, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary,
+    admit_wants, FailureClass, LiveConfig, LiveError, LiveNode, LiveParts, LiveSummary, PassHook,
     PendingObligations, ServingBarrier, SyncReport, MAILBOX_MAX_CONSECUTIVE_ERRORS,
     STORE_MAX_CONSECUTIVE_ERRORS,
 };

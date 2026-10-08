@@ -31,6 +31,10 @@ zeroize.workspace = true
 # Downstream tests build a real `Engine` per test; enabling the fast KDF
 # profile here keeps that affordable without touching production builds.
 wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+# In-process relay for the vault process test (test-only: rust-nostr's
+# real relay beside the binary under test; never a runtime dependency).
+nostr-sdk = { workspace = true, features = ["local-relay"] }
+tokio.workspace = true
 # The mount-path tests name the composed view type explicitly; the
 # binary itself only ever touches it through the daemon's surface.
 wyrd-fuse.workspace = true

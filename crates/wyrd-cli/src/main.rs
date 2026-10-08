@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::logging::init_mount_diagnostics;
+use crate::logging::{init_mount_diagnostics, init_vault_diagnostics};
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
@@ -25,6 +25,9 @@ use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
+use wyrd_daemon::{
+    run_vault, shutdown_transport, TransportDeadlines, VaultEvent, VaultLoopEnd, VaultRun,
+};
 use wyrd_daemon::{
     FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor,
     SyncReport, WyrdNode,
@@ -171,6 +174,25 @@ enum Command {
         relays: RelayArgs,
         #[command(subcommand)]
         action: SyncAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Run a headless vault: the mount's live loop and serving
+    /// surface with no presentation session. The persistent process
+    /// (OD-22-B option A) — `sync now` stays the bounded one-shot,
+    /// this never stops syncing until SIGINT/SIGTERM. Needs at least
+    /// one `--relay`; states what the device is doing, never what it
+    /// guarantees (OD-22-E: retention promises wait for DG-4).
+    Vault {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(flatten)]
+        relays: RelayArgs,
+        /// Optional log file, appended (never truncated): stderr
+        /// always carries the ready line and failures for the
+        /// supervisor to capture (OD-22-D option A+C).
+        #[arg(long, value_name = "PATH")]
+        log_file: Option<PathBuf>,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -609,6 +631,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
         Command::Device { credentials, .. } => read_credentials(credentials)?,
         Command::Sync { credentials, .. } => read_credentials(credentials)?,
+        Command::Vault { credentials, .. } => read_credentials(credentials)?,
         Command::Pin { credentials, .. } => read_credentials(credentials)?,
         Command::Unpin { credentials, .. } => read_credentials(credentials)?,
         Command::Evict { credentials, .. } => read_credentials(credentials)?,
@@ -652,6 +675,12 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             action,
             ..
         } => sync(drive_dir, relays.relay, action, &passphrase, identity),
+        Command::Vault {
+            drive_dir,
+            relays,
+            log_file,
+            ..
+        } => vault(drive_dir, relays.relay, log_file, &passphrase, identity),
         Command::Pin {
             drive_dir, path, ..
         } => pin(drive_dir, &path, &passphrase, identity),
@@ -1180,50 +1209,22 @@ fn mount(
             )))
         }
     };
-    // Cancel the mailbox tasks within a bounded deadline: the drainer
-    // and supervisor stop, and the runtime aborts whatever has not
-    // yielded by then. Without this the tasks would run until runtime
-    // drop, and a shutdown could wait on a relay outage that never
-    // clears.
-    mailbox.shutdown(SHUTDOWN_DEADLINE);
-    tracing::info!(
-        stage = "teardown",
-        elapsed_ms = teardown_start.elapsed().as_millis(),
-        "mailbox stopped"
+    // One transport tail for every loop composer (see the vault
+    // module): stop the mailbox tasks, close bulk graceful-or-abort,
+    // release bulk, close serving — every stage runs, and the serving
+    // outcome folds into the exit below. Stage latencies log from the
+    // shared tail's own start, seconds behind the teardown base above.
+    let transport = shutdown_transport(
+        &mut mailbox,
+        Some(bulk),
+        serving,
+        &TransportDeadlines {
+            mailbox: SHUTDOWN_DEADLINE,
+            bulk: wyrd_sync::GRACEFUL_CLOSE_DEADLINE,
+            serving: TRANSPORT_SHUTDOWN_DEADLINE,
+        },
     );
-    // Graceful-or-abort: the bulk close warns inside on expiry and
-    // always reports success (the endpoint is dropped below — the
-    // abort), so teardown proceeds to serving unconditionally. A
-    // wedged drain must not fail a shutdown whose application work
-    // already stopped; see GRACEFUL_CLOSE_DEADLINE.
-    bulk.shutdown(wyrd_sync::GRACEFUL_CLOSE_DEADLINE);
-    tracing::info!(
-        stage = "teardown",
-        elapsed_ms = teardown_start.elapsed().as_millis(),
-        "bulk source stopped"
-    );
-    // Release the bulk endpoint (and its runtime) before stopping
-    // serving: the abort half of graceful-or-abort. Dropping here —
-    // never earlier — bounds every close path even if the graceful
-    // attempt above ever regresses past its deadline.
-    drop(bulk);
-    let serving_status = serving
-        .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
-        .map_err(CliError::Serving);
-    if let Err(error) = &serving_status {
-        tracing::warn!(
-            stage = "serving",
-            elapsed_ms = teardown_start.elapsed().as_millis(),
-            error = %error,
-            "serving shutdown failed"
-        );
-    } else {
-        tracing::info!(
-            stage = "teardown",
-            elapsed_ms = teardown_start.elapsed().as_millis(),
-            "serving stopped"
-        );
-    }
+    let serving_status = transport.serving.map_err(CliError::Serving);
     combine_status(TeardownStatus {
         loop_result: loop_result.map(|_| ()),
         session_result,
@@ -2854,6 +2855,165 @@ fn shutdown_headless_serving(
             .map_err(CliError::Serving),
         None => Ok(()),
     }
+}
+
+/// A headless vault: the mount's live loop and serving surface with
+/// no presentation session. The persistent process (OD-22-B option
+/// A): `sync now` stays the bounded one-shot drain, this never stops
+/// syncing until SIGINT/SIGTERM. Composition runs through the
+/// daemon's vault runner, so the loop order and transport tail stay
+/// one copy with the mount — the vault is the second composer the
+/// lifecycle prose was written for.
+fn vault(
+    drive_dir: PathBuf,
+    relays: Vec<String>,
+    log_file: Option<PathBuf>,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    // A relay-less vault serves routes nothing can discover and never
+    // converges: refuse it the way `sync now` refuses a bare
+    // relay-less run. Unlike `sync now` there is no `--offline`
+    // escape — an offline vault is a process that idles forever, not
+    // a run with a verdict.
+    if relays.is_empty() {
+        return Err(CliError::Usage(
+            "vault needs at least one --relay: a relay-less vault serves nothing peers can discover"
+                .into(),
+        ));
+    }
+    // Diagnostics first: stderr always carries the ready line and the
+    // failures for the supervisor to capture, plus an appended
+    // operator-chosen file under `--log-file` — never a
+    // drive-resident default, never truncated (a restart must not
+    // destroy the previous run's record).
+    init_vault_diagnostics(log_file.as_deref())?;
+    let vault_span = tracing::info_span!("vault", drive = %drive_dir.display());
+    let _vault_guard = vault_span.enter();
+    tracing::info!(stage = "start", "vault diagnostics initialized");
+
+    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
+    // Same shared budgets as mount and headless sync, through
+    // `for_local_sync` (never `Default` directly): several are
+    // correctness boundaries, and a vault-only default must never
+    // silently diverge them.
+    let config = LiveConfig::for_local_sync();
+    let store = FsObjectStore::open(drive_dir.clone())
+        .map_err(|error| CliError::Store(error.to_string()))?;
+    check_startup_retention(&config, &store)?;
+    // The vault parks on this latch from its first pass to its last,
+    // so arm it before composition: a signal during startup still
+    // tears down instead of parking.
+    install_shutdown_handler()?;
+    let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, store)?;
+    daemon.refresh_live_heads()?;
+    // A real-iroh endpoint like the mount's (never loopback): the
+    // announced route must be one a peer on another machine can dial.
+    let serving = daemon
+        .open_serving(&drive_dir, false)
+        .map_err(CliError::Serving)?;
+    let serving_id = hex::encode(serving.addr().id.as_bytes());
+    eprintln!("serving over iroh: {serving_id}");
+    tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
+    let (live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    // The headless consumer has no presentation backend: the live
+    // parts (projection handle, wants, mutations) are owned but never
+    // served — the same shape the headless composition uses. The
+    // queue stays open but nobody submits, so passes only ever see
+    // intake and fetch work.
+    drop(parts);
+    // The mailbox signs with the local identity key: open and signer
+    // are the same key by construction (see the mount's inventory
+    // comment — the full process graph is unchanged here).
+    let signer_keys = identity.signer_keys();
+    let open_secret = signer_keys.secret_key().clone();
+    let seen_path = drive_dir.join("mailbox.seen");
+    let mailbox = LiveMailbox::connect(signer_keys, open_secret, relays.clone(), seen_path)?;
+    // Arrival short-circuits the loop's idle wait the way it does for
+    // the mount: without this, every park burns its full window even
+    // as mail lands.
+    mailbox.attach_waker(Arc::clone(live.waker()));
+    let bulk = bind_bulk_source()?;
+    // The observer's events are the operator surface (SD-2 option A):
+    // one ready line after the first routed pass, periodic posture
+    // while it runs, failures with the mount's reporting shape. All
+    // three go to stderr (the supervisor captures them) and the event
+    // stream the log file carries.
+    let emit: Arc<dyn Fn(VaultEvent) + Send + Sync> = Arc::new(move |event| match event {
+        VaultEvent::Ready { serving_id } => {
+            eprintln!("vault ready: serving {serving_id}");
+            tracing::info!(stage = "ready", iroh_id = %serving_id, "vault ready");
+        }
+        VaultEvent::Posture {
+            passes,
+            errors,
+            sent,
+            uptime_secs,
+        } => {
+            eprintln!(
+                "vault posture: {passes} passes, {errors} errors retried, {sent} sends, uptime {uptime_secs}s"
+            );
+            tracing::info!(
+                stage = "posture",
+                passes,
+                errors,
+                sent,
+                uptime_secs,
+                "vault posture"
+            );
+        }
+        VaultEvent::PassFailed {
+            class,
+            consecutive,
+            error,
+        } => {
+            eprintln!("live sync pass failed ({class} class, {consecutive} consecutive): {error}");
+            tracing::warn!(
+                stage = "sync",
+                class = %class,
+                consecutive,
+                error = %error,
+                "live sync pass failed"
+            );
+        }
+    });
+    let outcome = run_vault(VaultRun {
+        live,
+        mailbox,
+        bulk: Some(bulk),
+        serving,
+        serving_id,
+        config,
+        deadlines: TransportDeadlines {
+            mailbox: SHUTDOWN_DEADLINE,
+            bulk: wyrd_sync::GRACEFUL_CLOSE_DEADLINE,
+            serving: TRANSPORT_SHUTDOWN_DEADLINE,
+        },
+        stop: &SHUTDOWN,
+        emit,
+    })
+    .map_err(CliError::Serving)?;
+    // Fold like the mount — loop first, then serving — with no
+    // session in between. SIGTERM exits 0 here exactly when the loop
+    // stopped clean and every transport closed: the mount's rule at
+    // `docs/cli.md:440-443` applies to the vault too.
+    let loop_result = match outcome.loop_end {
+        VaultLoopEnd::Returned(result) => result.map(|_| ()).map_err(|error| match error {
+            LoopError::Live(error) => CliError::Live(error),
+            LoopError::Panicked => {
+                CliError::Mount(std::io::Error::other("live loop thread panicked"))
+            }
+        }),
+        VaultLoopEnd::SupervisionLost => Err(CliError::Mount(std::io::Error::other(
+            "supervised loop thread failed",
+        ))),
+    };
+    combine_status(TeardownStatus {
+        loop_result,
+        session_result: Ok(()),
+        serving_result: outcome.transport.serving.map_err(CliError::Serving),
+    })
 }
 
 /// Administer drive membership offline over the keystore: reads

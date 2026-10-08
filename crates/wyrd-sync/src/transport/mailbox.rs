@@ -296,6 +296,15 @@ pub trait Mailbox {
     fn reconnects(&self) -> u64 {
         0
     }
+
+    /// Stop the mailbox's background tasks within `deadline`,
+    /// aborting whatever has not yielded by then: the composer's
+    /// bounded backstop so shutdown never hangs on a relay outage
+    /// that never clears. Defaults to a no-op — in-memory fakes own
+    /// no tasks, and stay compiling without an opinion — so every
+    /// real transport MUST override this: a silent default on a live
+    /// mailbox would leak its tasks past teardown. Idempotent.
+    fn shutdown(&mut self, _deadline: std::time::Duration) {}
 }
 
 /// Mailbox-scoped identity for one handover: stable across re-offers

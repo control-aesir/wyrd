@@ -3273,8 +3273,16 @@ pub fn admit_wants<E>(
 mod backoff_tests;
 
 #[cfg(test)]
+#[path = "live/tests_post_corruption.rs"]
+mod post_corruption_tests;
+
+#[cfg(test)]
 #[path = "live/tests_prereq.rs"]
 mod prereq_tests;
+
+#[cfg(test)]
+#[path = "live/tests_mirror_diagnostics.rs"]
+mod mirror_diagnostics_tests;
 
 #[cfg(test)]
 #[path = "live/tests_parent_mutation.rs"]

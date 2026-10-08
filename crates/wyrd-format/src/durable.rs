@@ -555,6 +555,42 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_durability_lock_stays_failed_until_restart() {
+        // Both sets poisoned: every entry point fails, repeatedly, with
+        // the poison error — no call succeeds, no retry heals, and no
+        // directory is synced on the inconsistent bookkeeping. A Mutex
+        // cannot unpoison, so only a restart (fresh bookkeeping) clears
+        // this; the test pins the stay-failed half from inside the one
+        // process it can observe.
+        let dir = scratch_dir();
+        reset_sync_calls();
+        let durability = Durability::with_sync(count_sync);
+        poison_sets(&durability, true, true);
+        for _ in 0..3 {
+            let error = durability.reconcile().expect_err("reconcile must fail");
+            assert!(
+                error.to_string().contains("poisoned"),
+                "unexpected error: {error}"
+            );
+            let error = durability
+                .verify_dir(&dir)
+                .expect_err("verify_dir must fail");
+            assert!(
+                error.to_string().contains("poisoned"),
+                "unexpected error: {error}"
+            );
+            let temp = dir.join("leaf");
+            assert!(durability.write_temp(&temp, b"data").is_err());
+        }
+        assert_eq!(
+            sync_calls(),
+            0,
+            "no directory may be synced while the lock stays poisoned"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fsync_dir_reports_a_missing_directory() {
         let dir = scratch_dir();
         assert!(fsync_dir(&dir).is_ok());

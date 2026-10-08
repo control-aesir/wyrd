@@ -5,7 +5,18 @@ every subsystem that survives a restart, the order its writes land
 in, the crash windows between them, and the invariant plus the test
 that pins each window. A crash anywhere must leave before-XOR-full
 state per subsystem — torn writes are invisible, never half-applied —
-and the subsystems must agree with each other on reopen.
+and the subsystems must agree with each other on reopen. The joint
+claim is pinned per crash stage, not per pair: one reopen test per
+stage where the three durable stores (object store, vault, fact log)
+can actually disagree —
+`subsystems_agree_after_crash_at_rename_commit`,
+`subsystems_agree_after_crash_at_commit_dir_fsync`,
+`subsystems_agree_after_crash_at_current_temp_write`, and
+`subsystems_agree_after_crash_at_rename_current`
+(`engine/tests_reopen_agreement.rs`) — plus the vault/object-store
+publication pair under a post-rename fsync failure
+(`object_store_and_vault_agree_after_post_rename_fsync_failure`,
+`serving/tests_serving.rs`).
 
 This is an extensible inventory of current boundaries, not an
 exhaustive closed set: future durable recovery state (for example a
@@ -297,16 +308,63 @@ restart rebuilds the mirror from the vault. Queue depth travels
 with the not-ready report in the pass logs, and a queue that is
 actually rejecting warns at the default log level. Pinned by
 `a_full_mirror_queue_applies_backpressure_without_losing_the_vault`,
-`serving_reopen_rebuilds_the_mirror_from_the_vault`, and
-`reimport_reconciles_a_vault_file_the_mirror_never_saw`.
+`serving_reopen_rebuilds_the_mirror_from_the_vault`,
+`reimport_reconciles_a_vault_file_the_mirror_never_saw`, and the two
+diagnostics tests:
+`mirror_queue_depth_travels_with_the_not_ready_report` (depth against
+the bounds rides the not-ready report) and
+`rejecting_mirror_queue_warns_at_the_default_log_level` (a rejecting
+queue warns where the default filter sees it, both on the timed-out
+and the failed barrier arms, while a merely slow mirror stays debug;
+`core/live/tests_mirror_diagnostics.rs`). Where the lines get
+aggregated or exposed is the observability issue's half, not this
+document's.
 
 A poisoned durability-bookkeeping lock fails the operation, never the
 process: no directory is assumed durable or repaired on state a
 panicked holder may have left inconsistent, so the instance stays
 failed until restart. Pinned by
-`poisoned_pending_fails_reconcile_at_the_first_acquire` and
+`poisoned_pending_fails_reconcile_at_the_first_acquire`,
+`poisoned_verified_fails_reconcile_at_the_second_acquire`, and
 `poisoned_verified_fails_verify_dir_before_any_sync`
-(`wyrd-format/src/durable.rs`).
+(`wyrd-format/src/durable.rs`), and the stays-failed consequence by
+`poisoned_durability_lock_stays_failed_until_restart` (every entry
+point fails repeatedly with the poison error and no directory syncs
+until a restart supplies fresh bookkeeping).
+
+## Post-corruption projection
+
+Three crash windows share one rule: the fact log replays to a hash
+chain that does not verify, the object store serves bytes that no
+longer hash to their address (bitrot under a live name), or the
+vault holds an envelope whose bytes do not verify under the name the
+log record claims. In all three, replay or classification cannot
+produce a valid projection from the durable state — and the window
+is what the reopen does next, not the damage itself.
+
+The behavior is normative in `docs/epochs.md:557-568` and is not
+restated here: Wyrd preserves the last successfully installed heads
+and surfaces the projection error to the caller. The installed
+projection is not an endorsement of the newly replayed state, a
+failed projection never replaces trustworthy state with less
+trustworthy state, and v0 neither repairs, resynchronizes, nor
+clears — with no persistent daemon error-state model. This section
+records the window and its proof; `epochs.md` remains the sole
+authority for what must happen.
+
+Pinned by `failed_projection_preserves_the_last_installed_heads`
+(a damaged later head fails the pass with the previous generation
+still serving — the publication slot is not even swapped, and the
+generation count never moves),
+`failed_projection_surfaces_the_error_to_the_caller` (the damage
+reaches the caller as the pass's own closure error, never a
+degraded-but-Ok report), and
+`failed_projection_never_clears_or_resynchronizes_installed_heads`
+(the installed generation keeps serving its files, the engine
+reclassifies nothing, the failed pass manufactures no durable
+facts, and healing converges without rescue)
+(`core/live/tests_post_corruption.rs`, over a bitrotted tree served
+through the same fake view the pass verifies against).
 
 ## Mailbox ack and intake
 

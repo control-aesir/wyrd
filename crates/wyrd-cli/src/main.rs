@@ -2223,9 +2223,12 @@ const MAILBOX_IDLE_LINE: &str = "mailbox: idle (no --relay given)\n";
 /// relay-less run reads idle, never live: with no relays there is
 /// no attachment to be alive, and `is_live` over zero relays would
 /// claim otherwise. The verdict word is the run-level one from
-/// `mailbox_degraded`, so it always agrees with the exit status; a
-/// run that recovered mid-run reads degraded with the episodes
-/// named, never a bare live that the exit contradicts.
+/// `mailbox_degraded`, so it agrees with the exit status except for
+/// a never-observed sample: the line reports the zero honestly
+/// while the exit cannot convict on it (see
+/// `mailbox_verdict_failed`). A run that recovered mid-run reads
+/// degraded with the episodes named, never a bare live that the
+/// exit contradicts.
 fn mailbox_line(health: &MailboxHealth) -> String {
     if health.total_relays == 0 {
         return MAILBOX_IDLE_LINE.to_owned();

@@ -4,9 +4,11 @@
 //! budgets) with a never-ready barrier and a pending announcement
 //! must leave the obligation recorded after a pass; the same node
 //! with a ready barrier — or with no barrier, the non-serve
-//! composition — discharges it. A wiring omission that drops the
-//! barrier install would surface here as a discharged obligation
-//! where the never-ready case demands a pending one.
+//! composition — discharges it. This pins the gating semantics
+//! (a present-but-never-ready barrier holds the obligation), not
+//! the CLI wiring itself: removing the `set_serving_barrier` call
+//! in `sync_now` leaves this green, and phase 12 runs a healthy
+//! mirror, so the one-line install stays inspection-covered.
 
 use super::prereq_tests::{live_over_configured, scratch_file_drive};
 use super::*;

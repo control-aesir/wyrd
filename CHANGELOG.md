@@ -43,8 +43,8 @@ version say exactly what changed.
   and never readable as a head.
 
 - MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
-  run the prefix closure over suite phases 1-11 (1-5 shared core,
-  6-11 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
+  run the prefix closure over suite phases 1-12 (1-5 shared core,
+  6-12 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
   entry or a non-step is refused; omitting the flag means all phases.
 
 - Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):
@@ -148,7 +148,9 @@ version say exactly what changed.
   intake or relay-accepted sends both prove the relay talked to
   this run, so a stale zero-connected sample cannot convict.
   Attached-then-lost still fails, so a genuinely dead relay keeps
-  its verdict. Fixes quiet headless restarts (e.g. `sync now
+  its verdict — with one residual window: the attachment latch flips
+  only on a supervisor-tick observation, so an attachment and loss
+  both landing between ticks reads as never-attached. Fixes quiet headless restarts (e.g. `sync now
   --serve` re-park) exiting degraded within a second of startup,
   including runs that attached and delivered mid-run before any
   supervisor tick observed the attachment.

@@ -991,14 +991,16 @@ fn mailbox_line_reads_posture_not_connection() {
     );
 }
 
-/// The line and the exit agree on every posture: the word the
-/// operator reads and the code automation keys on never contradict
-/// each other — degraded word with a non-zero exit, live or idle
-/// word with zero. The healed case is pinned explicitly: attached
-/// now but blind mid-run still reads degraded, with the episodes
-/// named.
+/// The line and the exit agree on every posture except a
+/// never-observed sample: the word the operator reads and the code
+/// automation keys on never contradict each other — degraded word
+/// with a non-zero exit, live or idle word with zero — but an
+/// unticked zero sample reports degraded on the line while the exit
+/// cannot convict on it (see unverified_verdict_requires_observation).
+/// The healed case is pinned explicitly: attached now but blind
+/// mid-run still reads degraded, with the episodes named.
 #[test]
-fn mailbox_line_and_exit_agree_on_every_posture() {
+fn mailbox_line_and_exit_agree_except_unobserved_sample() {
     // Offline: the line reads idle, the exit succeeds.
     let offline = fixture_mailbox();
     assert!(mailbox_line(&offline).contains("idle"));

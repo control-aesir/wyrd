@@ -36,9 +36,9 @@ version say exactly what changed.
   supervision — those are the 22b and packaging follow-ons. Loop
   composition, the serving install step (flush, route, barrier), and
   the transport tail now live in `wyrd-daemon`'s vault module as one
-  copy shared by mount, `sync now --serve`, and vault (the install
-  order is pinned by a wiring test a hand-wired barrier cannot
-  satisfy).
+  copy shared by mount, `sync now --serve`, and vault (route-plus-
+  barrier wiring pinned by a test a hand-wired barrier cannot
+  satisfy; flush-before-route is the shared code order).
 
 - Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
   in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):

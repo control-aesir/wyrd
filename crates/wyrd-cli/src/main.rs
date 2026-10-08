@@ -2995,7 +2995,7 @@ fn vault(
     // Fold like the mount — loop first, then serving — with no
     // session in between. SIGTERM exits 0 here exactly when the loop
     // stopped clean and every transport closed: the mount's rule at
-    // `docs/cli.md:669-673` applies to the vault too.
+    // `docs/cli.md:675-679` applies to the vault too.
     let loop_result = match outcome.loop_end {
         VaultLoopEnd::Returned(result) => result.map(|_| ()).map_err(|error| match error {
             LoopError::Live(error) => CliError::Live(error),

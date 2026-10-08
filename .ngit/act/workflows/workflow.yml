@@ -56,10 +56,16 @@ jobs:
 
       # Warms the auto-draft scan: the first-ever cold scan takes
       # minutes (full-state relay sync per call), later runs reuse this.
+      # Both cache layers are restored: the global event cache plus the
+      # per-repo cache ngit keeps in the git common directory, which
+      # holds the bulk of sync state (caching the global dir alone
+      # leaves every run cold).
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ github.workspace }}/.ngit-event-cache
+          path: |
+            ${{ github.workspace }}/.ngit-event-cache
+            ${{ github.workspace }}/.git/nostr-cache.lmdb
           key: ngit-events-Linux-${{ github.run_id }}
           restore-keys: ngit-events-Linux-
 
@@ -90,7 +96,9 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: ${{ github.workspace }}/.ngit-event-cache
+          path: |
+            ${{ github.workspace }}/.ngit-event-cache
+            ${{ github.workspace }}/.git/nostr-cache.lmdb
           key: ngit-events-Linux-${{ github.run_id }}
 
   rust:
@@ -345,10 +353,14 @@ jobs:
 
       # Warms the reporter's event cache first: cold full-state relay
       # syncs cost minutes per ngit call, and the scan makes several.
+      # Restores both cache layers (global plus the per-repo cache in
+      # the git common directory); see the draft job.
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ github.workspace }}/.ngit-event-cache
+          path: |
+            ${{ github.workspace }}/.ngit-event-cache
+            ${{ github.workspace }}/.git/nostr-cache.lmdb
           key: ngit-events-Linux-${{ github.run_id }}
           restore-keys: ngit-events-Linux-
 
@@ -391,6 +403,8 @@ jobs:
       - name: Save ngit event cache
         uses: actions/cache/save@v4
         with:
-          path: ${{ github.workspace }}/.ngit-event-cache
+          path: |
+            ${{ github.workspace }}/.ngit-event-cache
+            ${{ github.workspace }}/.git/nostr-cache.lmdb
           key: ngit-events-Linux-${{ github.run_id }}
 

@@ -128,6 +128,13 @@ version say exactly what changed.
   fetching, so walk-found losses clear on the same pass they are
   observed. No bytes are unlinked, no protocol change, no new
   durable-fact kind; the vault is untouched.
+- CI draft and reporter jobs persist the per-repo ngit event cache
+  (`.git/nostr-cache.lmdb`) through the actions/cache steps alongside
+  the global cache: fresh checkouts discarded the bulk of relay sync
+  state every run, so auto-draft cold-synced past the resolution
+  deadline on every new PR. Resolution deadline 180s to 480s and the
+  per-call bound 120s to 300s as cold-seed cover; warm runs finish in
+  seconds.
 
 ### Added
 

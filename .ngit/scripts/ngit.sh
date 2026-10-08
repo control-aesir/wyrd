@@ -38,13 +38,15 @@ REPO_NADDR="naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97n
 : "${NGIT_CACHE_DIR:=$HOME/.ngit-event-cache}"
 
 # Bound every ngit call: a hung relay must fail fast and loud, never
-# stall the job into its timeout. Kills are safe on the read path
-# (list/view/status are side-effect free); on the publish path a kill
-# risks a half-done report, which still beats a hung job. `timeout` may
-# be absent on some runners; degrade to a direct call.
+# stall the job into its timeout. The bound covers a full cold sync
+# (minutes on a fresh checkout); steady-state warm calls finish in
+# seconds. Kills are safe on the read path (list/view/status are
+# side-effect free); on the publish path a kill risks a half-done
+# report, which still beats a hung job. `timeout` may be absent on
+# some runners; degrade to a direct call.
 bounded_ngit() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout 120 ngit "$@"
+    timeout 300 ngit "$@"
   else
     ngit "$@"
   fi
@@ -71,13 +73,13 @@ resolve_pr() {
 
   local PR_ID=""
 
-  # One knob bounds the whole scan below: every ngit call cold-syncs full
-  # repo state and each hangs up to the per-call bound, so per-call
-  # timeouts alone still allow multi-minute stacking (three hung calls
-  # burned six minutes on a fresh PR). Expire the scan loudly instead of
-  # stalling into the job timeout. Overridable for tests; production
-  # default keeps healthy runs (seconds) far from pathology.
-  local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-180}))
+  # One knob bounds the whole scan below: every ngit call syncs repo
+  # state and each hangs up to the per-call bound, so per-call
+  # timeouts alone still allow multi-minute stacking. Expire the scan
+  # loudly instead of stalling into the job timeout. Overridable for
+  # tests; the production default covers a cold seed (minutes) while
+  # warm runs finish in seconds, far from pathology.
+  local deadline=$((SECONDS + ${RESOLUTION_DEADLINE_SECS:-480}))
   check_deadline() {
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "PR resolution timed out" >&2

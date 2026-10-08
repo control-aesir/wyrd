@@ -41,10 +41,10 @@ pub enum RecoveryStatus {
     /// epoch capability that decrypts them: continuous membership
     /// never covered the content (`docs/epochs.md`, recovery).
     Undecryptable,
-    /// The bytes are not producible locally: no local plaintext,
-    /// no servable recorded mapping, or an absent subtree — whether
-    /// the device holds an epoch capability or not. Out-of-band
-    /// loss, which the scrub owns, not recovery.
+    /// No local plaintext with either no recorded mapping at all
+    /// or a held mapping whose vault copy is absent, plus an absent
+    /// subtree. An unheld mapping is `Undecryptable`, not missing.
+    /// Out-of-band loss, which the scrub owns, not recovery.
     Missing,
 }
 

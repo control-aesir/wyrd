@@ -10,6 +10,13 @@
 # paths. Exits nonzero on any failure.
 set -uo pipefail
 
+# Hook runners (prek via devenv git-hooks) export GIT_DIR into hook
+# processes; any git call then obeys it instead of its own path
+# argument (`git init <dir>` re-inits that repo, `git -C` stays put).
+# The scratch repo below must be immune, so drop repo discovery from
+# the environment before touching git.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REVIEW_SH="$SCRIPT_DIR/../review.sh"
 
@@ -21,7 +28,8 @@ fail=0
 ok() { pass=$((pass + 1)); echo "ok: $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL: $1"; }
 
-T="$(mktemp -d)"
+T="$(mktemp -d "${TMPDIR:-/tmp}/review-test.XXXXXXXX")"
+[ -d "$T" ] || { echo "FAIL: scratch dir setup failed" >&2; exit 1; }
 trap 'rm -rf "$T"' EXIT
 
 # Stub ngit: logs every invocation, then replays fixture files. Fails
@@ -33,7 +41,15 @@ echo "ngit $*" >> "$STUB_LOG"
 args="$*"
 case "$args" in
   *"pr list"*) cat "$STUB_LIST_JSON" ;;
-  *"pr view"*) cat "$STUB_VIEW_JSON" ;;
+  *"pr view"*)
+    # The first view call replays STUB_VIEW_FIRST when set (the
+    # pre-publish snapshot); later calls replay STUB_VIEW_JSON.
+    if [ -n "${STUB_VIEW_FIRST:-}" ] && [ "$(grep -c "pr view" "$STUB_LOG")" = "1" ]; then
+      cat "$STUB_VIEW_FIRST"
+    else
+      cat "$STUB_VIEW_JSON"
+    fi
+    ;;
   *"pr comment"*)
     if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
       echo "stub: publish failed" >&2
@@ -49,7 +65,12 @@ export PATH="$T/bin:$PATH"
 export STUB_LOG="$T/ngit.log"
 
 # Scratch repo on a pr/ branch for resolve-pr's branch detection.
+# Fail loud here: a bad scratch repo cascades into confusing
+# downstream failures (notably under hook runners, whose env differs
+# from an interactive shell).
 git init -q -b pr/test-helpers "$T/repo"
+[ "$(git -C "$T/repo" branch --show-current)" = "pr/test-helpers" ] ||
+  { echo "FAIL: scratch repo setup failed" >&2; exit 1; }
 
 LIST_ONE="$T/list-one.json"
 LIST_NONE="$T/list-none.json"
@@ -125,8 +146,9 @@ else
   bad "pr-context: out=[$out]"
 fi
 
-# 7. post-comment posts stdin once with the signer and verifies.
-export STUB_VIEW_JSON="$VIEW_WITH"
+# 7. post-comment posts stdin once with the signer and verifies a
+# NEW matching comment (pre-publish view is empty).
+export STUB_VIEW_FIRST="$VIEW_WITHOUT" STUB_VIEW_JSON="$VIEW_WITH"
 : > "$STUB_LOG"
 printf 'hello review' | "$REVIEW_SH" post-comment nevent1testpr1 >/dev/null 2>"$T/err"
 code=$?
@@ -138,6 +160,7 @@ if [ $code -eq 0 ] && [ "$comment_calls" = "1" ] &&
 else
   bad "post-comment happy path: code=$code calls=$comment_calls"
 fi
+unset STUB_VIEW_FIRST
 
 # 8. post-comment refuses an empty body before any ngit call.
 : > "$STUB_LOG"
@@ -183,6 +206,42 @@ if [ "$out" = "nevent1testpr1" ]; then
 else
   bad "REVIEW_LIB_DIR override: out=[$out]"
 fi
+
+# 12. post-comment rejects a stale duplicate: the identical body
+# pre-exists and nothing new arrived.
+export STUB_VIEW_FIRST="$VIEW_WITH" STUB_VIEW_JSON="$VIEW_WITH"
+: > "$STUB_LOG"
+printf 'hello review' | "$REVIEW_SH" post-comment nevent1testpr1 >/dev/null 2>"$T/err"
+code=$?
+if [ $code -ne 0 ] && grep -q "refusing to retry" "$T/err"; then
+  ok "post-comment refuses stale duplicate bodies"
+else
+  bad "post-comment stale duplicate: code=$code"
+fi
+unset STUB_VIEW_FIRST
+
+# 13. post-comment publishes online: no --offline on the publish call.
+export STUB_VIEW_FIRST="$VIEW_WITHOUT" STUB_VIEW_JSON="$VIEW_WITH"
+: > "$STUB_LOG"
+printf 'hello review' | "$REVIEW_SH" post-comment nevent1testpr1 >/dev/null 2>&1
+comment_calls="$(grep -c "pr comment" "$STUB_LOG")"
+if [ "$comment_calls" = "1" ] && ! grep "pr comment" "$STUB_LOG" | grep -q -- "--offline"; then
+  ok "post-comment publishes without --offline"
+else
+  bad "post-comment publish argv: calls=$comment_calls $(grep 'pr comment' "$STUB_LOG")"
+fi
+unset STUB_VIEW_FIRST
+
+# 14. Default signer is Wyrd AI Review when REVIEW_SIGNER is unset.
+export STUB_VIEW_FIRST="$VIEW_WITHOUT" STUB_VIEW_JSON="$VIEW_WITH"
+: > "$STUB_LOG"
+printf 'hello review' | env -u REVIEW_SIGNER "$REVIEW_SH" post-comment nevent1testpr1 >/dev/null 2>&1
+if grep -q -- '--signer Wyrd AI Review' "$STUB_LOG"; then
+  ok "post-comment defaults to the Wyrd AI Review signer"
+else
+  bad "post-comment default signer: $(cat "$STUB_LOG")"
+fi
+unset STUB_VIEW_FIRST
 
 echo "---"
 echo "$pass passed, $fail failed"

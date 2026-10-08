@@ -60,8 +60,11 @@ read_flags() {
 }
 
 # Resolve the current branch to its PR id and print only the id. Zero
-# or multiple matches fail loudly; never guess.
+# or multiple matches fail loudly; never guess. Starts from the
+# caller's checkout: hook runners export GIT_DIR into their hooks, so
+# repo discovery is reset to plain cwd lookup first.
 cmd_resolve_pr() {
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
   local online="${1:-}"
   [ "$online" = "--online" ] || [ -z "$online" ] || usage
 
@@ -111,8 +114,11 @@ cmd_pr_context() {
 }
 
 # Post stdin as a comment on the PR, exactly once, then verify the
-# comment landed. Any failure stops loudly: no retry (a retry risks a
-# double post) and no alternate publication method.
+# comment landed. Verification requires a matching comment that was
+# not present before publishing: threads can hold older identical
+# bodies, and those must never satisfy the check. Any failure stops
+# loudly: no retry (a retry risks a double post) and no alternate
+# publication method.
 cmd_post_comment() {
   local id="${1:-}"
   [ -n "$id" ] || usage
@@ -125,17 +131,22 @@ cmd_post_comment() {
     exit 1
   fi
 
+  local before
+  before="$(bounded_ngit --repo "$REPO_NADDR" pr view "$id" --json --offline --comments |
+    jq -r '(.comments // [])[].id')"
+
   bounded_ngit --signer "$REVIEW_SIGNER" --repo "$REPO_NADDR" \
     pr comment "$id" --body "$body" --json
 
   local view
   view="$(bounded_ngit --repo "$REPO_NADDR" pr view "$id" --json --offline --comments)"
   if printf '%s' "$view" |
-    jq -e --arg body "$body" \
-      '(.comments // []) | map(select(.body == $body)) | length > 0' >/dev/null; then
+    jq -e --arg body "$body" --arg before "$before" '
+      ((.comments // []) | map(select(.body == $body) | .id)
+        - ($before | split("\n"))) | length > 0' >/dev/null; then
     echo "post-comment: verified comment present on $id" >&2
   else
-    echo "post-comment: comment not found on $id after posting; refusing to retry" >&2
+    echo "post-comment: no new matching comment on $id after posting; refusing to retry" >&2
     exit 1
   fi
 }

@@ -29,6 +29,14 @@
 #   microvm 11. offline reopen of both drives on the host (exports
 #      now assert the conflict siblings too)
 #
+# Step selection (runner --step -> MICROVM_ONLY_STEP): phases build on
+# each other, so the run set is the prefix closure of the selection —
+# selecting phase N runs 1..N, never a lone dependent phase on stale
+# state. Entries 1-5 are the shared-core Lima steps (phase 1 runs the
+# 1..N prefix of those); 6-11 are the microvm phases below. Absent
+# means all phases (the runner refuses an explicit empty value, so
+# empty arriving here also means all).
+#
 # The relay is a VM service the host stops/starts per conflict leg
 # via its tap (tap-r down/up); see nix/microvm/run-microvm.sh.
 # Control-plane remainder closed here: NIP-44 wire interop is pinned
@@ -58,6 +66,45 @@ PASS=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 die() { echo "  FAIL: $1" >&2; exit 1; }
 
+ONLY_STEP="${MICROVM_ONLY_STEP:-}"
+# Comma list (`--step 6,10`): phases build on each other, so the run
+# set is the prefix closure of the selection — selecting phase N runs
+# 1..N, never a lone dependent phase on stale state. Every entry must
+# name a real phase, so `--step 99` fails instead of passing zero
+# checks, and the highest entry decides the prefix.
+MAX_STEP=0
+if [[ -n "$ONLY_STEP" ]]; then
+  # The grammar is a comma list; whitespace is not a separator.
+  [[ "$ONLY_STEP" != *[[:space:]]* ]] \
+    || die "--step: '$ONLY_STEP' is not a comma list (got whitespace)"
+  # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
+  # without this it would run zero checks and pass.
+  [[ ",$ONLY_STEP," != *,,* ]] \
+    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-11 entries)"
+  # Split on commas into a quoted array: an unquoted expansion would
+  # glob each entry against the working directory first, so `--step
+  # '*'` could pathname-expand into a digit-named file and slip past
+  # the grammar.
+  _step_entries=()
+  IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
+  for _e in "${_step_entries[@]}"; do
+    [[ "$_e" =~ ^([1-9]|1[01])$ ]] \
+      || die "--step: '$_e' is not a step (expected a comma list of 1-11)"
+    if (( _e > MAX_STEP )); then MAX_STEP="$_e"; fi
+  done
+  unset _step_entries _e
+  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-11)"
+fi
+want_phase() { [[ -z "$ONLY_STEP" ]] || (( $1 <= MAX_STEP )); }
+# Shared-core steps selected: the 1..N prefix truncated to the core
+# range, as the comma list the Lima script already accepts. An absent
+# selection means all five — identical to the previous hardcoded list.
+CORE_MAX=5
+if [[ -n "$ONLY_STEP" && "$MAX_STEP" -lt 5 ]]; then CORE_MAX="$MAX_STEP"; fi
+CORE_ONLY="1"
+for (( _c = 2; _c <= CORE_MAX; _c++ )); do CORE_ONLY="$CORE_ONLY,$_c"; done
+unset _c
+
 # The orchestrator runs as root (taps, VMs), but share files belong
 # to uid 1000 (guest e2e, the only normal user) — and the credential
 # hardening refuses cross-uid opens both directions. So every host
@@ -71,12 +118,15 @@ on_o() { $SSH "$PEER_O" "$@"; }
 on_n() { $SSH "$PEER_N" "$@"; }
 
 # --- phase 1: shared core on peer-o ------------------------------------
+# Always runs: every prefix starts at 1. The selection only truncates
+# the core depth (CORE_ONLY above).
 echo "=== microvm 1-5: shared core on peer-o ==="
-on_o "E2E_ENV_FILE=$GUEST_ENV E2E_ONLY_STEP=1,2,3,4,5 bash $GUEST_TESTS/alpha-lima.sh" \
-  || die "shared core steps 1-5 failed on peer-o"
-pass "shared core steps 1-5 green on peer-o"
+on_o "E2E_ENV_FILE=$GUEST_ENV E2E_ONLY_STEP=$CORE_ONLY bash $GUEST_TESTS/alpha-lima.sh" \
+  || die "shared core steps ($CORE_ONLY) failed on peer-o"
+pass "shared core steps ($CORE_ONLY) green on peer-o"
 
 # --- phase 2: second member natively on peer-n --------------------------
+if want_phase 6; then
 echo "=== microvm 6: member-n invite/join split ==="
 # Created here, not at the top: phase 1's guest pre-clean empties
 # the shared state root, so anything made earlier would be wiped
@@ -119,8 +169,10 @@ as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$M
   "$MD" join "$RUN/invitation-n" >"$RUN/logs/join-n.out" 2>"$RUN/logs/join-n.stderr" \
   || die "member-n join failed"
 pass "member-n joins"
+fi # want_phase 6
 
 # --- phase 3: cross-host convergence ------------------------------------
+if want_phase 7; then
 echo "=== microvm 7: cross-host convergence ==="
 rm -f "$RUN/owner-done"
 OD="$GUEST_RUN/drives/owner"
@@ -189,8 +241,10 @@ RUMORS="$( { printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" \
 [[ "$nak_status" != 124 ]] || die "9501 query timed out: leak check inconclusive (see logs/nak-9501.err)"
 [[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
+fi # want_phase 7
 
 # --- phase 4: serving restart -------------------------------------------
+if want_phase 8; then
 echo "=== microvm 8: serving restart ==="
 rm -f "$RUN/member-ready" "$RUN/member-done"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh restart-member $GMD $GMC $RELAY_URL" \
@@ -208,8 +262,10 @@ pass "route update rewires fetch across hosts"
 # the leg fails on it if the log is still empty at the end.
 wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
   || echo 0 > "$RUN/seen-after-restart"
+fi # want_phase 8
 
 # --- phase 5: fetch plane ---------------------------------------------
+if want_phase 9; then
 echo "=== microvm 9: fetch plane ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/member-scratch-done" "$RUN/owner-stopped" "$RUN/member-fetch-done" \
@@ -226,6 +282,7 @@ LEG_O=$!
 wait "$LEG_N" || die "fetch member leg failed (see logs/leg-fetch-member.out)"
 wait "$LEG_O" || die "fetch owner leg failed (see logs/leg-fetch-owner.out)"
 pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
+fi # want_phase 9
 
 # --- phase: microvm 10 (relay-partition conflict) ---------------------
 # Rename half runs pre-partition (it needs convergence); the host
@@ -240,6 +297,7 @@ pass "blocking open, bounded EIO, recovery, and dedupe hold across hosts"
 # legs already pin (and saturate at its query limit one day).
 # A host EXIT trap re-ups tap-r: any die between down and up must
 # not strand the relay unreachable in a --keep run.
+if want_phase 10; then
 echo "=== microvm 10: relay-partition conflict ==="
 rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
   "$RUN"/conflict-rename-member-done "$RUN"/conflict-partitioned \
@@ -290,13 +348,16 @@ touch "$RUN/conflict-healed"
 wait "$LEG_N" || die "conflict member leg failed (see logs/leg-conflict-member.out)"
 wait "$LEG_O" || die "conflict owner leg failed (see logs/leg-conflict-owner.out)"
 pass "conflict versions, EIO writes, and serving reads hold across hosts"
+fi # want_phase 10
 
 # --- phase: microvm 11 (offline reopen) ---------------------------------
 # Depends on phase 5's delete (fetch-member removes stale-1.txt once
 # the scratch write has localized the trees it needs): the export
 # below fails closed on remote-only content, so without that delete
 # this phase dies at the member export. Correct product behavior,
-# coupled phases.
+# coupled phases. (Prefix closure guarantees the dependency: phase 11
+# never runs without phase 9.)
+if want_phase 11; then
 echo "=== microvm 11: offline reopen ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
@@ -342,16 +403,22 @@ for side in owner member; do
     || die "$side export sibling set mismatch: [$got]"
 done
 pass "conflict versions export as name@N siblings on both drives"
+fi # want_phase 11
 
 # Host-side leak check over every log the host wrote (guest logs
-# are checked in-guest by each leg). All four credential secrets,
-# matching the Lima step's coverage.
+# are checked in-guest by each leg). Owner secrets always exist past
+# phase 1; member-n credentials exist only once phase 6 stages them,
+# so a prefix that stops earlier has nothing of theirs to check.
 for f in "$RUN"/logs/*; do
   [[ -f "$f" ]] || continue
-  for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")" \
-           "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
+  for s in "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
     grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
   done
+  if want_phase 6; then
+    for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
 done
 pass "no secrets in host logs"
 

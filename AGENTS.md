@@ -74,9 +74,9 @@ devenv shell                # enter the dev environment (rust, git-hooks)
 
 `./lima/run-alpha.sh [--keep] [--re-share] [--step N[,N...]]` is long (minutes) and lives in a
 guest. Operate it, never babysit it blind. (The hardened gate is the
-microVM suite instead: `nix/microvm/run-microvm.sh --fresh [--keep]`
+microVM suite instead: `nix/microvm/run-microvm.sh --fresh [--keep] [--step N[,N...]]`
 on a Linux KVM host (`--teardown` stops a kept run), same contract helpers, two peers plus a relay
-VM. Prefer it for topology, convergence, and restart evidence; use
+VM. `--step` runs the prefix closure over phases 1–11 (1–5 shared core, 6–11 microvm legs). Prefer it for topology, convergence, and restart evidence; use
 Lima for macOS dev iteration and as the refactor guard.)
 
 - **Never pipe it through `tail`.** A foreground pipe buffers everything, so

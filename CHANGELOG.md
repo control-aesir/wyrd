@@ -302,6 +302,14 @@ version say exactly what changed.
 
 ### Fixed
 
+- Bootstrap seal binds the envelope version and the ephemeral key into
+  the AEAD tag: the AAD is now `"wyrd bootstrap v1" ‖ version ‖ drive ‖
+  recipient ‖ encryption key ‖ inviter ‖ ephemeral pk` (mirroring the
+  rotation fix in 7060570), and the signed plaintext repeats the full
+  header instead of omitting the version and the ephemeral key.
+  Wire-affecting: bytes sealed by an older build no longer open, which
+  is the new construction refusing the old encoding by design
+  (nothing deployed, alpha).
 - Bulk transport shutdown is graceful-or-abort instead of fail-on-wedge:
   the endpoint close gets a short bounded graceful attempt (5s,
   `wyrd_sync::GRACEFUL_CLOSE_DEADLINE`); on expiry the endpoint

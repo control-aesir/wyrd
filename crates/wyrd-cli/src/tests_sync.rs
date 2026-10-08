@@ -833,7 +833,7 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
     );
 }
 
-/// 1. A quiet run that exits before the supervisor's first tick must
+/// A quiet run that exits before the supervisor's first tick must
 /// not fail as unverified: `connected_relays == 0` with zero ticks
 /// is the mailbox's initial state, not a health observation. This is
 /// the serve#2 restart shape — three sub-second passes, intake
@@ -855,7 +855,7 @@ fn unverified_verdict_requires_observation() {
     );
 }
 
-/// 2. An observed zero still fails: ticks ran, no relay attached,
+/// An observed zero still fails: ticks ran, no relay attached,
 /// nothing arrived. Observation-validity gates the verdict; it does
 /// not excuse a genuinely unreachable relay.
 #[test]
@@ -870,7 +870,7 @@ fn observed_zero_without_intake_still_fails() {
     );
 }
 
-/// 3. Relay-delivered intake with no observed attachment contradicts
+/// Relay-delivered intake with no observed attachment contradicts
 /// an "unreachable relay" diagnosis: envelopes arrived, so the path
 /// worked during this run, and the zero-connected sample is stale
 /// rather than true. Intake is corroboration, not a health claim —
@@ -893,7 +893,7 @@ fn relay_intake_without_attachment_exempts_unreachable() {
     );
 }
 
-/// 4. Intake is not a permanent health latch: attached mid-run and
+/// Intake is not a permanent health latch: attached mid-run and
 /// then lost, with the loss observed, still fails. The exemption
 /// covers "never attached", never "attached then lost".
 #[test]
@@ -910,7 +910,7 @@ fn intake_does_not_survive_observed_attachment_then_loss() {
     );
 }
 
-/// 5. Relay-accepted sends corroborate like intake: a quiet serve
+/// Relay-accepted sends corroborate like intake: a quiet serve
 /// that delivered a dozen announcements but whose ticks never
 /// observed the attachment must park, not contradict its own
 /// transmissions. The send path absorbs transport failures as zero
@@ -934,7 +934,7 @@ fn accepted_sends_without_attachment_exempt_unreachable() {
     );
 }
 
-/// 6. Accepted sends are not a permanent health latch either:
+/// Accepted sends are not a permanent health latch either:
 /// attached mid-run and then lost, with the loss observed, still
 /// fails. Like intake, sends exempt only the never-attached case.
 #[test]

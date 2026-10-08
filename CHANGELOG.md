@@ -64,6 +64,15 @@ version say exactly what changed.
   filter; repeats stay at debug. Logging only — obligations still
   pend and no Delivered fact commits on refusal.
 
+- Headless serving composition (`sync now --serve`, OD-23-V/W/X):
+  the bounded headless drain optionally binds the mount's serving
+  surface (open, bulk, flush, route, barrier) so its announcements
+  carry a dialable route and discharge waits on mirror readiness;
+  after the drain's own verdict the endpoint serves the converged
+  snapshot until SIGINT/SIGTERM and shuts down in mount order. No
+  barrier without serving (route-less authoring unchanged);
+  `--serve` refuses `--offline`; `docs/trust.md` names both
+  shipped member-hosted shapes. Bridge until `wyrd vault` exists.
 - Shed-wait attribution on `sync now` (`17-observability`, OD-17-2
   extension): pending-bound sheds carry their already-classified wait
   into `deferred_shed_unseen` / `deferred_shed_status_blocked`, and

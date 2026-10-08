@@ -445,6 +445,18 @@ enum SyncAction {
         /// combined with --relay.
         #[arg(long)]
         offline: bool,
+        /// Bind a serving endpoint for the run (OD-23-V option A):
+        /// the headless composition opens the mount's serving
+        /// surface, flushes it before announcing, and gates
+        /// announcement discharge on its readiness — so peers can
+        /// fetch what this run announces. A bridge/compatibility
+        /// composition, not a server: the bounded drain keeps its
+        /// verdict and exit code, then the endpoint serves the
+        /// converged snapshot until SIGINT/SIGTERM and shuts down in
+        /// order. Cannot be combined with --offline (no relay means
+        /// no route publication, so nothing could discover it).
+        #[arg(long)]
+        serve: bool,
     },
 }
 
@@ -2553,7 +2565,7 @@ fn sync(
             print!("{}", sync_status_render(&status));
             Ok(())
         }
-        SyncAction::Now { offline } => {
+        SyncAction::Now { offline, serve } => {
             // --offline means "run without relays": combining it with
             // --relay is contradictory, and silently ignoring the flag
             // would lie about the run. (clap conflicts_with cannot
@@ -2562,6 +2574,16 @@ fn sync(
             if offline && !relays.is_empty() {
                 return Err(CliError::Usage(
                     "--offline cannot be combined with --relay".into(),
+                ));
+            }
+            // --serve publishes its route inside relay announcements,
+            // so --offline (no relay, no send) would serve content
+            // nothing can discover. Refuse the combination rather
+            // than run a serving endpoint nobody can dial.
+            if serve && offline {
+                return Err(CliError::Usage(
+                    "--serve cannot be combined with --offline: serving needs a relay to publish its route"
+                        .into(),
                 ));
             }
             // A relay-less run exits 0 with an idle intake, which a
@@ -2574,20 +2596,26 @@ fn sync(
                         .into(),
                 ));
             }
-            sync_now(drive_dir, relays, passphrase, identity)
+            sync_now(drive_dir, relays, serve, passphrase, identity)
         }
     }
 }
 
 /// One bounded headless run: the mount's composition minus
-/// presentation. No FUSE session, no serving endpoint — so
-/// announcements discharge without a retrieval route (route-less
+/// presentation. Without `--serve` there is no serving endpoint —
+/// so announcements discharge without a retrieval route (route-less
 /// authoring: the snapshot is authored and announced, and peers
 /// learn it as known-but-unfetchable until a later mount publishes
-/// a route). Same live budgets as mount via `for_local_sync`.
+/// a route) — and no serving barrier either (OD-23-W option A: a
+/// barrier with no endpoint would hold obligations nobody can
+/// discharge). With `--serve` the run binds the mount's serving
+/// surface in the mount's order (open, bulk, flush, route, barrier)
+/// and serves the converged snapshot until SIGINT/SIGTERM. Same
+/// live budgets as mount via `for_local_sync`.
 fn sync_now(
     drive_dir: PathBuf,
     relays: Vec<String>,
+    serve: bool,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
@@ -2599,10 +2627,47 @@ fn sync_now(
     // node too, so a misconfigured quota must fail here rather than
     // in the first write.
     check_startup_retention(&config, &store)?;
+    // The serve phase below parks on this latch, so arm it before the
+    // drain: a signal during the drain trips the flag, the drain
+    // still reports its own verdict, and the serve phase then tears
+    // down immediately instead of parking. The non-serve path never
+    // reads the latch, so arming is harmless there.
+    if serve {
+        install_shutdown_handler()?;
+    }
     let mut daemon: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
         WyrdNode::new(engine, store)?;
     daemon.refresh_live_heads()?;
+    // The serving endpoint lives in the composer (never in the loop):
+    // the loop holds only the cloneable readiness handle as its
+    // discharge barrier. `None` without `--serve` is the OD-23-W
+    // conditional — route-less authoring, ungated discharge, and the
+    // exit-on-quiet drain below, all exactly as before.
+    let serving = if serve {
+        // A real-iroh endpoint like the mount's (never loopback):
+        // the announced route must be one a peer on another machine
+        // can dial.
+        let serving = daemon
+            .open_serving(&drive_dir, false)
+            .map_err(CliError::Serving)?;
+        let serving_id = hex::encode(serving.addr().id.as_bytes());
+        eprintln!("serving over iroh: {serving_id}");
+        tracing::info!(stage = "serving", iroh_id = %serving_id, "serving endpoint bound");
+        Some(serving)
+    } else {
+        None
+    };
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    if let Some(serving) = &serving {
+        // Mount order: flush before announcing the address, so the
+        // first seal carries a route peers can already dial; then
+        // publish the route and gate every pass's discharge on mirror
+        // readiness. A backed-up mirror leaves the obligation
+        // recorded, never discharged.
+        serving.flush().map_err(CliError::Serving)?;
+        live.set_node_addr(Some(serving.node_addr_bytes()));
+        live.set_serving_barrier(std::sync::Arc::new(serving.handle()));
+    }
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but
     // never served. Dropping them here is the same shape the
@@ -2649,14 +2714,41 @@ fn sync_now(
     }
     drop(bulk);
     drop(live);
-    let mut report = report?;
+    let mut report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            // The drain failed but a `--serve` endpoint is already
+            // bound: shut it down before returning so the error path
+            // never leaks residency.
+            let serving_result = shutdown_headless_serving(serving);
+            return combine_status(TeardownStatus {
+                loop_result: Err(error.into()),
+                session_result: Ok(()),
+                serving_result,
+            });
+        }
+    };
     report.mailbox = Some(health);
     print!("{}", sync_now_render(&report));
     let outcome = run_outcome_error(&report);
+    // The serve phase serves the converged snapshot — never more
+    // syncing. A failed drain tears down immediately with its own
+    // error instead of serving half-fetched state, and the verdict
+    // above is already printed: the exit below still names the
+    // drain, not the residency (Zander's OD-23-V constraint). That
+    // is what keeps `--serve` a bridge composition rather than a
+    // daemonized drain: quiesce first, reside second, shut down
+    // explicitly.
+    if serve && outcome.is_ok() {
+        eprintln!("serving converged snapshot until shutdown (SIGINT/SIGTERM)");
+        tracing::info!(stage = "serving", "serve phase parked on shutdown latch");
+        park_serving_until_shutdown();
+    }
+    let serving_result = shutdown_headless_serving(serving);
     combine_status(TeardownStatus {
         loop_result: outcome,
         session_result: Ok(()),
-        serving_result: Ok(()),
+        serving_result,
     })
 }
 
@@ -2664,6 +2756,36 @@ fn sync_now(
 /// reachability) and wrap it in the real bulk source.
 fn bind_bulk_source() -> Result<wyrd_sync::bulk::IrohBulkSource, CliError> {
     wyrd_sync::bulk::IrohBulkSource::connect_default().map_err(CliError::Bulk)
+}
+
+/// Park the `--serve` phase on the shutdown latch: the endpoint
+/// serves the converged snapshot while the process waits for
+/// SIGINT/SIGTERM. Polls in slices because a signal-handler trip
+/// cannot notify a channel — the same slow-path guarantee as the
+/// mount's own teardown wait, and fast enough for a path whose
+/// teardown already budgets a minute for transport close.
+fn park_serving_until_shutdown() {
+    loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            tracing::info!(stage = "serving", "shutdown latch tripped");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Shut a headless serving endpoint down under the mount's
+/// transport bound, or succeed vacuously when `--serve` was absent
+/// (OD-23-W: no endpoint, no shutdown, no hang).
+fn shutdown_headless_serving(
+    serving: Option<wyrd_sync::serving::ServingEndpoint>,
+) -> Result<(), CliError> {
+    match serving {
+        Some(serving) => serving
+            .shutdown(TRANSPORT_SHUTDOWN_DEADLINE)
+            .map_err(CliError::Serving),
+        None => Ok(()),
+    }
 }
 
 /// Administer drive membership offline over the keystore: reads

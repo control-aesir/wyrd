@@ -920,11 +920,15 @@ that sentence. "A vault" here is the target third-party replica: a
 peer that holds ciphertext and answers hash-addressed lookups over
 iroh (`iroh_blobs::ALPN`) with transport identity only — no keys, no
 Wyrd authorization, no control plane. What ships today is
-member-hosted: the serving endpoint opens from a member process
-holding the identity, epoch keys, and the live mailbox
-(`WyrdNode::open_serving`), so for that surface read the "drive
+member-hosted, in two shapes: the mount's serving endpoint and the
+headless `sync now --serve` composition both open from a member
+process holding the identity, epoch keys, and the live mailbox
+(`WyrdNode::open_serving`), so for either surface read the "drive
 member" row instead — the keyless replica is the posture new serving
-surfaces must preserve, not a description of the current composer.
+surfaces must preserve, not a description of either current
+composer. (OD-23-X option B: naming both shipped shapes keeps a
+future reader from mapping the headless one onto the keyless
+posture.)
 What the endpoint withholds is discovery, not hashes: it answers no
 listing and no enumeration (an unheld hash is a protocol error), while
 every request on the wire names its hash — the (address, hash) pairs

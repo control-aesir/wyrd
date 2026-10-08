@@ -449,6 +449,24 @@ A headless process is never left reachable after the command
 exits, advertises no address, and creates no new durable serving
 obligation.
 
+`now --serve` is the explicit exception: a bridge/compatibility
+composition (OD-23-V option A), not "sync now is now a server". The
+run binds the mount's serving surface in the mount's order (open,
+bulk, flush, route, barrier), so its announcements carry a route
+peers can dial and every pass's discharge waits on mirror
+readiness — a backed-up mirror leaves the obligation recorded,
+never discharged (OD-23-W). The bounded drain keeps its verdict
+and exit code; then the endpoint serves the converged snapshot
+until SIGINT/SIGTERM and shuts down in mount order (mailbox,
+bulk, serving under the same transport bound). A failed drain
+tears down immediately with its own error instead of serving
+half-fetched state. `--serve` cannot be combined with `--offline`:
+with no relay nothing publishes the route, so the endpoint would
+serve content nothing can discover. The persistent lifecycle is
+`wyrd vault` (a separate issue); `--serve` is the bridge until it
+exists, and it performs no further intake or fetch passes while
+parked.
+
 ### `pin` / `unpin` / `evict` / `cache` — local materialization policy
 
 What this device intends to retain, declared per subtree and stored

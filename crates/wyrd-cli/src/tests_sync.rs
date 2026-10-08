@@ -1501,6 +1501,48 @@ fn sync_now_with_relay_and_offline_is_a_usage_error() {
     );
 }
 
+/// `--serve` publishes its route inside relay announcements, so
+/// `--offline` (no relay, no send) would serve content nothing can
+/// discover: the combination is refused before the keystore opens,
+/// and the refusal names the pair. (OD-23-V option A needs this
+/// guard, otherwise the flag silently builds an undialable
+/// endpoint.)
+#[test]
+fn sync_now_serve_with_offline_is_a_usage_error() {
+    let fixture = Fixture::new();
+    // Both flags belong to `now`, after the action.
+    let mut args = fixture.sync_args(vec![], "now");
+    args.push("--serve".into());
+    args.push("--offline".into());
+    let error = command(args).unwrap_err();
+    let CliError::Usage(message) = error else {
+        panic!("expected a usage refusal, got: {error:?}");
+    };
+    assert!(
+        message.contains("--serve") && message.contains("--offline"),
+        "refusal names the contradictory combination: {message}"
+    );
+}
+
+/// `--serve` does not waive the relay requirement: a serving run
+/// with no relay and no `--offline` is the same usage error as a
+/// bare relay-less run, so the flag straddles the action the way
+/// `--offline` does.
+#[test]
+fn sync_now_serve_without_relay_or_offline_is_a_usage_error() {
+    let fixture = Fixture::new();
+    let mut args = fixture.sync_args(vec![], "now");
+    args.push("--serve".into());
+    let error = command(args).unwrap_err();
+    let CliError::Usage(message) = error else {
+        panic!("expected a usage refusal, got: {error:?}");
+    };
+    assert!(
+        message.contains("--relay") && message.contains("--offline"),
+        "refusal names both the missing flag and the opt-out: {message}"
+    );
+}
+
 /// Every counter the report carries accumulates across every pass —
 /// including the quiet-confirmation pass, which is a real pass with
 /// real intake, not a free re-read. Twelve synthetic passes with

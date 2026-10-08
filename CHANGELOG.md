@@ -23,6 +23,17 @@ version say exactly what changed.
 
 ### Added
 
+- Device-local durability levels (DG-2, normative in
+  `docs/write-path.md`): a completed write reports which of Working,
+  Committed, or Published it reached, indexed by the DG-1
+  commit-forcing event that fired — Working before the first
+  snapshot, Committed while an announcement obligation is queued,
+  Published once the outbox is quiet. Reported as one field on the
+  offline-capable `sync status` (`durability: working | committed |
+  published`); no new command, no per-write surface, no format
+  change. Working state stays never servable, never announceable,
+  and never readable as a head.
+
 - MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
   run the prefix closure over suite phases 1-11 (1-5 shared core,
   6-11 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty

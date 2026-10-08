@@ -6,6 +6,7 @@ use wyrd_format::{
     Snapshot, SnapshotId, StorageId, TransitionId,
 };
 
+use super::engine::DurabilityLevel;
 use super::{transport_is_represented, ManifestRecord, MaterializationState};
 use crate::control::{AnnouncementUpdate, ControlMessageId, SnapshotAnnouncement};
 
@@ -813,6 +814,30 @@ impl RuntimeState {
             .chain(roots)
             .collect::<BTreeSet<_>>()
             .into_iter()
+    }
+
+    /// The durability level the drive reached (DG-2, normative in
+    /// `docs/write-path.md`): Working with no recorded snapshot
+    /// body, Committed while the drive announcement outbox is
+    /// non-empty, Published once it is quiet. The predicate is
+    /// drive-global — recorded bodies plus the whole outbox, not
+    /// per-snapshot — so an older snapshot's never-accepted
+    /// obligation holds the drive at Committed even after a newer
+    /// snapshot's outbox is quiet. Announcement-only records do not
+    /// count: a device that has observed a peer's announcement but
+    /// holds no body has nothing durable of its own — no head
+    /// installs from an announcement alone, and nothing serves from
+    /// it. Pure committed facts, so `sync status` reads it off the
+    /// already-rebuilt state instead of rebuilding the store again.
+    pub fn durability_level(&self) -> DurabilityLevel {
+        if self.snapshot_bodies.is_empty() {
+            return DurabilityLevel::Working;
+        }
+        if self.pending_announcements().is_empty() {
+            DurabilityLevel::Published
+        } else {
+            DurabilityLevel::Committed
+        }
     }
 
     /// Every recorded manifest record, in manifest-id order.

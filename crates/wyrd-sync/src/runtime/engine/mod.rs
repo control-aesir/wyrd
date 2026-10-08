@@ -85,6 +85,42 @@ pub use super::author::{
 };
 pub use super::bootstrap::PairingRequest;
 
+/// The durability level the drive reached (DG-2, normative in
+/// `docs/write-path.md`): Working before the first recorded snapshot
+/// body, Committed while the drive announcement outbox is non-empty,
+/// Published once it is quiet. Drive-global — recorded bodies plus
+/// the whole outbox, not per-snapshot. Derived from committed facts
+/// only — identical before and after a restart over the same state —
+/// so `sync status` can report it offline. The level classifies
+/// snapshot durability on the local axis; propagation is never part
+/// of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityLevel {
+    /// No recorded snapshot body: everything unwritten or pending
+    /// is volatile memory, deterministically discarded on crash.
+    /// Announcement-only records do not count — observing a peer's
+    /// announcement holds nothing durable of this drive's own.
+    Working,
+    /// At least one committed snapshot, and the announcement outbox
+    /// is non-empty: durable here, not yet conveyed.
+    Committed,
+    /// At least one committed snapshot and an empty announcement
+    /// outbox: conveyed, or conveyable to nobody (a lone participant
+    /// announces to nobody, so a solo author lands here).
+    Published,
+}
+
+impl DurabilityLevel {
+    /// The `sync status` rendering: lowercase, matching the doc table.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DurabilityLevel::Working => "working",
+            DurabilityLevel::Committed => "committed",
+            DurabilityLevel::Published => "published",
+        }
+    }
+}
+
 /// Engine failures: durable-commit, runtime-record, and mailbox-
 /// settlement trouble are fatal. Per-envelope mailbox, decode, and
 /// ingest failures are counted in the [`DrainReport`], never raised,
@@ -1796,6 +1832,18 @@ impl Engine {
             .pending_announcements())
     }
 
+    /// The durability level the drive reached (DG-2): Working with
+    /// no recorded snapshot body, Committed while the drive
+    /// announcement outbox is non-empty, Published once it is quiet
+    /// (drive-global, not per-snapshot). Rebuilds from the store, so
+    /// the report is committed facts only — restart-equivalent by
+    /// construction. The predicate itself lives on
+    /// [`RuntimeState`](super::RuntimeState) so holders of an
+    /// already-rebuilt state do not rebuild again.
+    pub fn durability_level(&self) -> Result<DurabilityLevel, EngineError> {
+        Ok(self.store.rebuild(self.device)?.runtime.durability_level())
+    }
+
     /// Whether any outbound obligation awaits a send — announcements,
     /// transitions, or capabilities — from a single rebuild. The live
     /// loop's republication gate consults this so a quiet drive with a
@@ -2417,6 +2465,8 @@ mod tests_convergence;
 mod tests_delivery;
 #[cfg(test)]
 mod tests_drain;
+#[cfg(test)]
+mod tests_durability;
 #[cfg(test)]
 mod tests_harness;
 #[cfg(test)]

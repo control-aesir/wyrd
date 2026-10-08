@@ -418,3 +418,252 @@ fn guarded_setattrs_refuses_a_replaced_path() {
     ));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// DG-2 window fixture: like `scratch_parent_drive` but under a
+/// fixed identity, so the crash test below can reopen the drive with
+/// the identical secret and prove the pending window left nothing
+/// durable behind.
+fn scratch_fixed_drive(
+    tag: &str,
+) -> (
+    Engine,
+    std::path::PathBuf,
+    MemoryObjectStore,
+    ContentId,
+    AuthorizedSnapshot,
+) {
+    let dir = std::env::temp_dir().join(format!(
+        "wyrd-core-durability-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let identity = DeviceIdentitySecret::from_bytes([0xD4; 32]).unwrap();
+    let mut engine = Engine::create(dir.clone(), "durability-pass", identity).unwrap();
+    let mut store = MemoryObjectStore::default();
+    let parent = Tree::empty().insert_into(&mut store).unwrap();
+    let root = Tree::from_entries(vec![Entry::dir("parent", parent).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let head = engine.author_snapshot(&store, root).unwrap();
+    (engine, dir, store, root, head)
+}
+
+/// A create held for absent content, mirroring
+/// `deferred_create_fails_when_its_evaluated_head_changes`: the
+/// serving store carries the parent subtree but the mutation still
+/// defers with the evaluated head pinned.
+fn deferred_create(live: &mut LiveNode<TreeView>) -> MutationError {
+    let parent = live.mutations().capture_parent("parent").unwrap();
+    live.apply_mutation(
+        &MutationKind::CreateFile {
+            path: "parent/child".to_string(),
+            parent,
+        },
+        None,
+    )
+    .unwrap_err()
+}
+
+/// DG-2: a crash with a non-empty pending window leaves no new head,
+/// no announcement obligation, and no durable representation of the
+/// discarded mutation — deterministically, every time. The deferred
+/// create holds volatile intent only; dropping the node is the crash,
+/// and the reopen agrees with the pre-crash state exactly.
+#[test]
+fn a_crash_with_a_pending_window_leaves_no_head_or_obligation() {
+    let (engine, dir, source_store, root, head) = scratch_fixed_drive("crash-window");
+    let root_bytes = source_store.get(&root).unwrap().unwrap();
+    let root_tree = Tree::decode(&root_bytes).unwrap();
+    let parent_subtree = match &root_tree.entries().first().unwrap().content {
+        EntryContent::Dir { subtree } => *subtree,
+        _ => panic!("fixture root does not contain a directory"),
+    };
+    let old_head = head.snapshot().snapshot_id();
+    let mut serving_store = MemoryObjectStore::default();
+    let _ = Tree::from_entries(vec![Entry::dir("parent", parent_subtree).unwrap()])
+        .unwrap()
+        .insert_into(&mut serving_store)
+        .unwrap();
+    let mut live = live_over_tree(engine, serving_store, &[head]);
+    let deferred = deferred_create(&mut live);
+    assert!(
+        matches!(deferred, MutationError::NeedContent { base: Some(base), .. } if base == old_head),
+        "the create holds for content, committing nothing: {deferred:?}"
+    );
+    assert_eq!(
+        live.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id(),
+        old_head,
+        "the held mutation authors no snapshot"
+    );
+    assert!(
+        live.engine.pending_announcements().unwrap().is_empty(),
+        "the held mutation queues no obligation"
+    );
+
+    drop(live);
+    let reopened = Engine::open_keystore(
+        dir.clone(),
+        "durability-pass",
+        DeviceIdentitySecret::from_bytes([0xD4; 32]).unwrap(),
+    )
+    .unwrap();
+    let heads = reopened.live_heads().unwrap();
+    assert_eq!(heads.len(), 1, "no phantom head from the held mutation");
+    assert_eq!(heads[0].snapshot().snapshot_id(), old_head);
+    assert!(
+        reopened.pending_announcements().unwrap().is_empty(),
+        "no phantom obligation from the held mutation"
+    );
+    assert_eq!(
+        reopened.durability_level().unwrap(),
+        wyrd_sync::runtime::DurabilityLevel::Published
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// DG-2: the bounded-window property that makes discarding correct.
+/// A pending set folds with its forcing event and commits in the one
+/// call — no operator flush, no timer wait, no follow-up action: the
+/// returned success means the new state is committed and served. The
+/// fold carries two members and advances the sequence by exactly one
+/// snapshot holding both.
+#[test]
+fn a_pending_window_commits_without_operator_action() {
+    let (engine, dir, store, _root, head) = scratch_fixed_drive("bounded-window");
+    let old_head = head.snapshot().snapshot_id();
+    let mut live = live_over_tree(engine, store, &[head]);
+    let current = live.engine.current();
+    let outcome = live
+        .apply_mutation(
+            &MutationKind::Fold {
+                members: vec![
+                    FoldMember {
+                        kind: MutationKind::Mkdir {
+                            path: "parent/a".to_string(),
+                        },
+                        forcer: false,
+                    },
+                    FoldMember {
+                        kind: MutationKind::Mkdir {
+                            path: "parent/b".to_string(),
+                        },
+                        forcer: true,
+                    },
+                ],
+            },
+            None,
+        )
+        .expect("a forcing fold commits in the one call");
+    assert!(
+        matches!(outcome, MutationOutcome::Fold { .. }),
+        "the call folded and committed, not merely queued: {outcome:?}"
+    );
+    assert_eq!(
+        live.engine.current(),
+        current + 1,
+        "the pending set plus its forcer commit as exactly one snapshot"
+    );
+    let heads = live.live_heads_traced().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_ne!(
+        heads[0].snapshot().snapshot_id(),
+        old_head,
+        "the one call advanced the head"
+    );
+    for path in ["parent/a", "parent/b"] {
+        assert!(
+            matches!(
+                live.current_node(&heads, path).unwrap(),
+                Some(Node::Dir { .. })
+            ),
+            "both folded members are served from the one snapshot"
+        );
+    }
+    assert!(
+        live.engine.pending_announcements().unwrap().is_empty(),
+        "a lone participant announces to nobody"
+    );
+    assert_eq!(
+        live.engine.durability_level().unwrap(),
+        wyrd_sync::runtime::DurabilityLevel::Published
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// DG-2 hard criterion: device-local state creates no announcement
+/// obligation and appears in no manifest. Two shapes: a held mutation
+/// attempt (volatile intent), and bytes staged in the store the way a
+/// pre-commit write stages them — present but referenced by nothing.
+/// Neither crosses a boundary: only a committed snapshot queues
+/// obligations and records manifests.
+#[test]
+fn device_local_state_creates_no_announcement_obligation() {
+    let (engine, dir, source_store, root, head) = scratch_fixed_drive("no-obligation");
+    let root_bytes = source_store.get(&root).unwrap().unwrap();
+    let root_tree = Tree::decode(&root_bytes).unwrap();
+    let parent_subtree = match &root_tree.entries().first().unwrap().content {
+        EntryContent::Dir { subtree } => *subtree,
+        _ => panic!("fixture root does not contain a directory"),
+    };
+    let mut serving_store = MemoryObjectStore::default();
+    let _ = Tree::from_entries(vec![Entry::dir("parent", parent_subtree).unwrap()])
+        .unwrap()
+        .insert_into(&mut serving_store)
+        .unwrap();
+    let mut live = live_over_tree(engine, serving_store, std::slice::from_ref(&head));
+    let old_head = head.snapshot().snapshot_id();
+    let manifests_before = live
+        .engine
+        .runtime_state()
+        .unwrap()
+        .manifest_records()
+        .count();
+    // Shape one: the held create.
+    let deferred = deferred_create(&mut live);
+    assert!(
+        matches!(deferred, MutationError::NeedContent { .. }),
+        "the create holds for content: {deferred:?}"
+    );
+    // Shape two: staged bytes, present in the store and referenced
+    // by no snapshot — what a pre-commit write looks like before
+    // its snapshot commits.
+    let staged = live
+        .store
+        .write()
+        .unwrap()
+        .insert(wyrd_format::ObjectKind::Chunk, b"staged-never-committed")
+        .unwrap();
+    assert!(
+        live.store.read().unwrap().get(&staged).unwrap().is_some(),
+        "the staged bytes are really there, uncommitted"
+    );
+    assert!(
+        live.engine.pending_announcements().unwrap().is_empty(),
+        "held state and staged bytes queue no announcement"
+    );
+    assert_eq!(
+        live.engine
+            .runtime_state()
+            .unwrap()
+            .manifest_records()
+            .count(),
+        manifests_before,
+        "held state and staged bytes record no manifest"
+    );
+    assert_eq!(
+        live.live_heads_traced().unwrap()[0]
+            .snapshot()
+            .snapshot_id(),
+        old_head,
+        "held state and staged bytes install no head"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

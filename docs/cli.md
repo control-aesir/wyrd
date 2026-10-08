@@ -346,6 +346,11 @@ sync now
    cached/pinned policies plus locally held objects). Connectivity
    reads `not observed`: status never connects, so it says the
    omission out loud instead of letting silence read as healthy.
+   A `durability` row reports the drive's durability level (DG-2,
+   normative in `docs/write-path.md`): `working` with no recorded
+   snapshot body, `committed` while an announcement obligation is
+   queued, `published` once the outbox is quiet — from committed
+   facts only, so it renders offline.
 - `now`: runs the mount's sync machinery (drain, deliver,
   announce, fetch through `sync_once`) with the mount's live
   budgets and no FUSE session: vaults and NAS replicas converge

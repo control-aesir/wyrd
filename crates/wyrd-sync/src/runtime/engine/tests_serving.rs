@@ -1,4 +1,4 @@
-use super::tests_harness::{drain_side, restart, scenario, secret};
+use super::tests_harness::{drain_side, local_tree, restart, scenario, secret};
 use super::*;
 
 use crate::seal::EncryptedObject;
@@ -560,4 +560,111 @@ fn a_torn_authoring_commit_leaves_no_half_advertised_state() {
             "every recorded mapping is backed by the vault"
         );
     }
+}
+
+/// DG-2 hard criterion, serving half: a serving request cannot be
+/// satisfied from device-local state — not by snapshot reference,
+/// and not by storage id. The serving maps build over recorded
+/// snapshots and their manifest records alone, so anything without
+/// a committed snapshot behind it is unreachable by construction.
+/// The positive control first: a committed snapshot's recorded ids
+/// do serve, so the negatives below cannot pass vacuously on empty
+/// maps.
+#[test]
+fn device_local_state_is_never_servable() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let committed = authored.snapshot().snapshot_id();
+    let state = pair.a.engine.runtime_state().unwrap();
+    let mut source =
+        crate::serving::VaultSource::from_state(&state, pair.a.engine.vault()).unwrap();
+    assert!(
+        source
+            .fetch_root_manifest(&committed, usize::MAX)
+            .unwrap()
+            .is_some(),
+        "a committed snapshot serves by reference"
+    );
+    assert!(
+        source
+            .fetch_snapshot(&committed, usize::MAX)
+            .unwrap()
+            .is_some(),
+        "a committed body serves by reference"
+    );
+    // No snapshot was ever recorded under this id, and no manifest
+    // record names this storage id.
+    let unknown = SnapshotId::from_bytes([0xF1; 32]);
+    assert_eq!(
+        source.fetch_root_manifest(&unknown, usize::MAX).unwrap(),
+        None,
+        "no root manifest serves without a recorded snapshot"
+    );
+    assert_eq!(
+        source.fetch_snapshot(&unknown, usize::MAX).unwrap(),
+        None,
+        "no body serves without a recorded snapshot"
+    );
+    assert_eq!(
+        source
+            .fetch_sealed(&StorageId::from_bytes([0xF2; 32]), usize::MAX)
+            .unwrap(),
+        None,
+        "no storage id serves without a manifest record"
+    );
+}
+
+/// DG-2: working state is unreachable from any storage id. Every
+/// servable address resolves through a manifest record, and manifest
+/// records exist only for committed snapshots — so bytes sitting in
+/// the vault with no snapshot behind them (a torn authoring's
+/// orphans, or anything imported but never committed) serve nothing.
+#[test]
+fn working_state_is_unreachable_from_any_storage_id() {
+    let dir = TestDir::new("unreachable-storage");
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let mut engine = Engine::create(dir.path.clone(), "test-pass", identity).unwrap();
+    let mut objects = MemoryObjectStore::default();
+    let chunk = objects
+        .insert(ObjectKind::Chunk, b"committed bytes")
+        .unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("file.txt", 15, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    engine.author_snapshot(&objects, tree).unwrap();
+
+    // Orphan bytes: sealed into the vault directly, referenced by no
+    // manifest and no snapshot.
+    let orphan = engine.vault().import(b"uncommitted bytes").unwrap();
+    let state = engine.runtime_state().unwrap();
+    let source = crate::serving::VaultSource::from_state(&state, engine.vault()).unwrap();
+    let (_, _, sealed) = source.maps_for_test();
+    assert!(
+        !sealed.values().any(|transport| *transport == orphan),
+        "orphan vault bytes are unaddressable: no manifest record names them"
+    );
+    for (storage, _) in sealed.iter() {
+        assert!(
+            state.manifest_records().any(|record| record
+                .manifest
+                .entries()
+                .iter()
+                .any(|entry| entry.storage_id == *storage)
+                || record
+                    .manifest
+                    .children()
+                    .iter()
+                    .any(|link| link.storage == *storage)),
+            "every servable storage id resolves through a manifest record"
+        );
+    }
+    drop(source);
+    drop(engine);
 }

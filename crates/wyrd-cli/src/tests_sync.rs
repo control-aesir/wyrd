@@ -207,6 +207,7 @@ fn sync_status_reports_genesis_and_idle_mailbox() {
     let rendered = sync_status_render(&observe(&engine, 0).unwrap());
     assert!(rendered.contains("epoch 1 tip"), "{rendered}");
     assert!(rendered.contains("held secrets: 1"), "{rendered}");
+    assert!(rendered.contains("durability: working"), "{rendered}");
     assert!(rendered.contains("live heads: none"), "{rendered}");
     assert!(
         rendered.contains("mailbox: idle (no --relay given)"),

@@ -53,6 +53,28 @@ bounded_ngit() {
   fi
 }
 
+# Publish-path ngit call: capped at the caller's step budget, so a
+# slow publish after a slow resolve can never push the job past its
+# timeout (which would skip the cache save). Callers set a local
+# step_deadline before resolving; without one this degrades to
+# bounded_ngit. Reads step_deadline dynamically, so it works from any
+# caller scope.
+bounded_publish() {
+  if [ -n "${step_deadline:-}" ]; then
+    if [ "$SECONDS" -ge "$step_deadline" ]; then
+      echo "step budget exhausted; refusing to publish into the job timeout" >&2
+      exit 1
+    fi
+    local remaining=$((step_deadline - SECONDS))
+    if [ "$remaining" -gt "${NGIT_CALL_TIMEOUT_SECS:-300}" ]; then
+      remaining="${NGIT_CALL_TIMEOUT_SECS:-300}"
+    fi
+    NGIT_CALL_TIMEOUT_SECS="$remaining" bounded_ngit "$@"
+  else
+    bounded_ngit "$@"
+  fi
+}
+
 # Resolve the PR for this run and print its id. Fails loudly when no
 # path matches — never guess. Needs jq, git, and a git repository
 # anchor (a bare init suffices: the target travels in --repo, so no
@@ -102,7 +124,6 @@ resolve_pr() {
     fi
     NGIT_CALL_TIMEOUT_SECS="$remaining" bounded_ngit "$@"
   }
-
   # Fastest exact path first: coordinators that export the trigger event
   # let ngit map a 1618 proposal or a 1619 revision to its PR directly.
   if [ -z "$PR_ID" ] && [ -n "${NGIT_CI_TRIGGER_EVENT:-}" ]; then
@@ -212,6 +233,12 @@ report_failure_to_pr() {
     exit 0
   fi
 
+  # Shared budget for resolve plus both publishes: 60s under the
+  # 10-minute job ceiling for setup/save overhead. Publish calls are
+  # capped at what is left of it (bounded_publish), so the run can
+  # never stall into cancellation and skip the cache save.
+  local step_deadline=$((SECONDS + ${STEP_BUDGET_SECS:-540}))
+
   local PR_ID
   PR_ID="$(resolve_pr)"
   echo "Reporting CI failure on PR: $PR_ID"
@@ -256,13 +283,13 @@ report_failure_to_pr() {
     rm -f "$COMMENT_BODY.trimmed"
   fi
 
-  bounded_ngit --repo "$REPO_NADDR" \
+  bounded_publish --repo "$REPO_NADDR" \
     --nsec-file "$NGIT_NSEC_FILE" \
     pr comment "$PR_ID" \
     --body "$(cat "$COMMENT_BODY")" \
     --json
 
-  bounded_ngit --repo "$REPO_NADDR" \
+  bounded_publish --repo "$REPO_NADDR" \
     --nsec-file "$NGIT_NSEC_FILE" \
     pr draft "$PR_ID" \
     --reason "CI failed - returned to draft automatically" \
@@ -280,11 +307,16 @@ draft_new_pr() {
     exit 0
   fi
 
+  # Shared budget for resolve plus the draft publish: 60s under the
+  # 10-minute job ceiling for setup/save overhead (see
+  # report_failure_to_pr).
+  local step_deadline=$((SECONDS + ${STEP_BUDGET_SECS:-540}))
+
   local PR_ID
   PR_ID="$(resolve_pr)"
   seal_nsec
 
-  bounded_ngit --repo "$REPO_NADDR" \
+  bounded_publish --repo "$REPO_NADDR" \
     --nsec-file "$NGIT_NSEC_FILE" \
     pr draft "$PR_ID" \
     --reason "new PRs start as drafts" \

@@ -69,14 +69,14 @@ in
       pass_filenames = false;
     };
 
-    # Review helper tests: the stub suite runs when the helper, its
-    # library, or the suite itself changes, so broken resolve/post
+    # Review helper tests: the stub suites run when the helpers, their
+    # library, or the suites themselves change, so broken resolve/post
     # semantics never ship green.
     review-tests = {
       enable = true;
       name = "review helper tests";
-      entry = "bash .ngit/scripts/tests/test-review.sh";
-      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/test-(review|ngit-bounds)\\.sh)$";
+      entry = "bash .ngit/scripts/tests/run-all.sh";
+      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/.*\\.sh)$";
       pass_filenames = false;
     };
   };

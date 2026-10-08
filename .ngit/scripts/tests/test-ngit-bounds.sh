@@ -103,6 +103,40 @@ else
   bad "publish path bound: [$(cat "$TIMEOUT_LOG")]"
 fi
 
+# 5. Publish under an ample step budget uses the default bound.
+step_deadline=$((SECONDS + 1000))
+: > "$TIMEOUT_LOG"
+bounded_publish --repo "$REPO_NADDR" pr comment --json >/dev/null 2>&1
+if [ "$(cat "$TIMEOUT_LOG")" = "300" ]; then
+  ok "publish under ample budget keeps the default bound"
+else
+  bad "publish ample budget: [$(cat "$TIMEOUT_LOG")]"
+fi
+
+# 6. Publish under a tight step budget is capped at what is left.
+step_deadline=$((SECONDS + 45))
+: > "$TIMEOUT_LOG"
+bounded_publish --repo "$REPO_NADDR" pr comment --json >/dev/null 2>&1
+bound="$(head -n 1 "$TIMEOUT_LOG")"
+if [ "$bound" -ge 1 ] && [ "$bound" -le 45 ]; then
+  ok "publish under tight budget capped at remainder ($bound)"
+else
+  bad "publish tight budget: bound=[$bound]"
+fi
+
+# 7. Publish with an exhausted step budget fails before any ngit call.
+# (Subshell: the loud failure is `exit`, which must not kill this suite.)
+step_deadline=$((SECONDS - 1))
+: > "$TIMEOUT_LOG"
+(bounded_publish --repo "$REPO_NADDR" pr comment --json >/dev/null 2>"$T/err")
+code=$?
+if [ $code -ne 0 ] && [ ! -s "$TIMEOUT_LOG" ] && grep -q "budget exhausted" "$T/err"; then
+  ok "publish with exhausted budget fails before any call"
+else
+  bad "publish exhausted budget: code=$code calls=$(wc -l <"$TIMEOUT_LOG")"
+fi
+unset step_deadline
+
 echo "---"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

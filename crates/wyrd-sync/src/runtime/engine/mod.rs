@@ -85,14 +85,15 @@ pub use super::author::{
 };
 pub use super::bootstrap::PairingRequest;
 
-/// The durability level the drive's newest committed snapshot
-/// reached (DG-2, normative in `docs/write-path.md`): Working before
-/// the first snapshot, Committed while an announcement obligation is
-/// still queued, Published once the outbox is quiet. Derived from
-/// committed facts only — identical before and after a restart over
-/// the same state — so `sync status` can report it offline. The
-/// level classifies snapshot durability on the local axis;
-/// propagation is never part of it.
+/// The durability level the drive reached (DG-2, normative in
+/// `docs/write-path.md`): Working before the first recorded snapshot
+/// body, Committed while the drive announcement outbox is non-empty,
+/// Published once it is quiet. Drive-global — recorded bodies plus
+/// the whole outbox, not per-snapshot. Derived from committed facts
+/// only — identical before and after a restart over the same state —
+/// so `sync status` can report it offline. The level classifies
+/// snapshot durability on the local axis; propagation is never part
+/// of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurabilityLevel {
     /// No recorded snapshot body: everything unwritten or pending
@@ -1831,11 +1832,11 @@ impl Engine {
             .pending_announcements())
     }
 
-    /// The durability level the drive's newest committed snapshot
-    /// reached (DG-2): Working with no recorded snapshot body,
-    /// Committed while the announcement outbox is non-empty,
-    /// Published once it is quiet. Rebuilds from the store, so the
-    /// report is committed facts only — restart-equivalent by
+    /// The durability level the drive reached (DG-2): Working with
+    /// no recorded snapshot body, Committed while the drive
+    /// announcement outbox is non-empty, Published once it is quiet
+    /// (drive-global, not per-snapshot). Rebuilds from the store, so
+    /// the report is committed facts only — restart-equivalent by
     /// construction. The predicate itself lives on
     /// [`RuntimeState`](super::RuntimeState) so holders of an
     /// already-rebuilt state do not rebuild again.

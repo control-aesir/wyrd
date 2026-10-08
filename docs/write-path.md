@@ -267,10 +267,11 @@ separate axis: properties of a byte range at a point in the
 pipeline, not caller-visible levels. The two vocabularies must never
 be read as one ladder.
 
-The level is per drive, taken over the newest committed snapshot,
-and derives from committed facts only — so it is identical before
-and after a restart over the same state, and `sync status` can
-report it offline:
+The level is per drive — the drive's recorded snapshot bodies
+plus the drive announcement outbox, not per-snapshot — and derives
+from committed facts only — so it is identical before and after a
+restart over the same state, and `sync status` can report it
+offline:
 
 - no recorded snapshot body → **Working** (a genesis-only drive
   holds nothing durable beyond membership; announcement-only

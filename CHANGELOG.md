@@ -23,6 +23,14 @@ version say exactly what changed.
 
 ### Added
 
+- Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
+  in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):
+  `resolve-pr` maps the
+  current branch to its PR id offline-first, `pr-context` prints the PR
+  view with its comment thread, and `post-comment` takes the body on
+  stdin, posts exactly once as Wyrd AI Review, and verifies. Review
+  agents call these instead of re-deriving ngit ceremony.
+
 - Device-local durability levels (DG-2, normative in
   `docs/write-path.md`): a completed write reports which of Working,
   Committed, or Published it reached, indexed by the DG-1

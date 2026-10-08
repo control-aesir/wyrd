@@ -76,4 +76,13 @@ in
   # detection). Input is pinned to the release tag in a detached
   # worktree, never the working copy.
   scripts.build.exec = "${./.ngit/scripts/build.sh} \"$@\"";
+
+  # Review tooling: `review` wraps `.ngit/scripts/review.sh`, the
+  # tested resolve/context/post helpers local PR reviews call instead
+  # of re-deriving ngit ceremony. The store-installed script loses its
+  # sibling ngit.sh, so REVIEW_LIB_DIR points it back at the stored
+  # scripts directory. The stub-based suite runs from the checkout
+  # (`.ngit/scripts/tests/test-review.sh`), never installed: its
+  # fixtures resolve source-relative paths.
+  scripts.review.exec = "REVIEW_LIB_DIR=${./.ngit/scripts} ${./.ngit/scripts/review.sh} \"$@\"";
 }

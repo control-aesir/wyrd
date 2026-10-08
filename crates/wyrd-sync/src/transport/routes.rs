@@ -227,4 +227,114 @@ mod tests {
         assert_eq!(report.undecodable, 1, "the skip is counted, not silent");
         bulk.shutdown(std::time::Duration::from_secs(10));
     }
+
+    /// One snapshot announced twice with different routes: the
+    /// announcement table holds one record per snapshot identity and
+    /// a route-only difference is a route update, so the second
+    /// record replaces the first and the fetch candidates follow.
+    /// Shared harness for both orderings: same immutable core, two
+    /// providers, one sealed representation under test.
+    fn two_route_state(
+        first: &EndpointAddr,
+        second: &EndpointAddr,
+    ) -> (
+        RuntimeState,
+        wyrd_format::StorageId,
+        tokio::runtime::Runtime,
+    ) {
+        let drive = DriveId::from_bytes([0xEE; 32]);
+        let snapshot = SnapshotId::from_bytes([0x13; 32]);
+        let author = DeviceId::from_bytes([0x33; 32]);
+        let membership = TransitionId::from_bytes([0x44; 32]);
+        let body_root = BaoRoot::from_bytes([0x55; 32]);
+        let key = EpochSecret::from_bytes([0x51; 32]).manifest_key(&drive, 1, &snapshot);
+        let manifest = Manifest::new(snapshot, Vec::new(), Vec::new()).unwrap();
+        let (manifest_id, obj) = seal_manifest(&key, &manifest).unwrap();
+        let mut state = RuntimeState::new(drive);
+        for provider in [first, second] {
+            state
+                .record_announcement(SnapshotAnnouncement {
+                    snapshot,
+                    author,
+                    epoch: 1,
+                    membership,
+                    body_root,
+                    root_manifest: manifest_id,
+                    root_manifest_transport: transport_root(&obj),
+                    node_addr: Some(crate::transport::encode_node_addr(provider)),
+                    signature: [0; 64],
+                })
+                .unwrap();
+        }
+        state
+            .record_manifest(ManifestRecord {
+                is_root: true,
+                manifest_id,
+                representations: BTreeMap::from([(obj.storage_id(), transport_root(&obj))]),
+                transport: transport_root(&obj),
+                manifest,
+            })
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        (state, obj.storage_id(), runtime)
+    }
+
+    fn bound_bulk(runtime: Arc<tokio::runtime::Runtime>) -> IrohBulkSource {
+        let endpoint = runtime.block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+                .unwrap()
+        });
+        IrohBulkSource::with_runtime(endpoint, Arc::clone(&runtime))
+    }
+
+    /// Dead route recorded first, live route second: the live route
+    /// wins and the sealed representation's candidates name it.
+    /// This is the e2e order the two-server topology must establish
+    /// (stale reannouncement first, live author announcement after).
+    #[test]
+    fn route_update_replaces_dead_with_live() {
+        let dead = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0xDE; 32]).public());
+        let live = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x11; 32]).public());
+        let (state, storage, runtime) = two_route_state(&dead, &live);
+        let runtime = Arc::new(runtime);
+        let mut bulk = bound_bulk(Arc::clone(&runtime));
+        publish_recorded_routes(&state, &mut bulk);
+        let route = bulk.sealed_route(&storage).unwrap();
+        assert_eq!(route.len(), 1, "one record, one candidate");
+        assert_eq!(
+            route[0].provider.id, live.id,
+            "the live route replaced the dead one"
+        );
+        bulk.shutdown(std::time::Duration::from_secs(10));
+    }
+
+    /// Live route recorded first, dead route second: the dead route
+    /// wins, because the contract is last-accepted-wins with no
+    /// liveness awareness (`SnapshotAnnouncement::check_update`).
+    /// This pins why announcement ordering is part of the e2e
+    /// contract: a stale reannouncement arriving after the live one
+    /// poisons the candidates, and no fetch-layer preference rescues
+    /// it — the table holds one record per snapshot identity.
+    #[test]
+    fn route_update_last_writer_wins_even_when_dead() {
+        let dead = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0xDE; 32]).public());
+        let live = EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x11; 32]).public());
+        let (state, storage, runtime) = two_route_state(&live, &dead);
+        let runtime = Arc::new(runtime);
+        let mut bulk = bound_bulk(Arc::clone(&runtime));
+        publish_recorded_routes(&state, &mut bulk);
+        let route = bulk.sealed_route(&storage).unwrap();
+        assert_eq!(route.len(), 1, "one record, one candidate");
+        assert_eq!(
+            route[0].provider.id, dead.id,
+            "last accepted route wins, live or dead"
+        );
+        bulk.shutdown(std::time::Duration::from_secs(10));
+    }
 }

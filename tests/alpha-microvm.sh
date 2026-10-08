@@ -33,7 +33,7 @@
 # each other, so the run set is the prefix closure of the selection —
 # selecting phase N runs 1..N, never a lone dependent phase on stale
 # state. Entries 1-5 are the shared-core Lima steps (phase 1 runs the
-# 1..N prefix of those); 6-11 are the microvm phases below. Absent
+# 1..N prefix of those); 6-12 are the microvm phases below. Absent
 # means all phases (the runner refuses an explicit empty value, so
 # empty arriving here also means all).
 #
@@ -80,7 +80,7 @@ if [[ -n "$ONLY_STEP" ]]; then
   # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
   # without this it would run zero checks and pass.
   [[ ",$ONLY_STEP," != *,,* ]] \
-    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-11 entries)"
+    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-12 entries)"
   # Split on commas into a quoted array: an unquoted expansion would
   # glob each entry against the working directory first, so `--step
   # '*'` could pathname-expand into a digit-named file and slip past
@@ -88,12 +88,12 @@ if [[ -n "$ONLY_STEP" ]]; then
   _step_entries=()
   IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
   for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[01])$ ]] \
-      || die "--step: '$_e' is not a step (expected a comma list of 1-11)"
+    [[ "$_e" =~ ^([1-9]|1[012])$ ]] \
+      || die "--step: '$_e' is not a step (expected a comma list of 1-12)"
     if (( _e > MAX_STEP )); then MAX_STEP="$_e"; fi
   done
   unset _step_entries _e
-  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-11)"
+  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-12)"
 fi
 want_phase() { [[ -z "$ONLY_STEP" ]] || (( $1 <= MAX_STEP )); }
 # Shared-core steps selected: the 1..N prefix truncated to the core
@@ -406,11 +406,20 @@ pass "conflict versions export as name@N siblings on both drives"
 fi # want_phase 11
 
 # --- phase: microvm 12 (headless serving) --------------------------------
+if want_phase 12; then
 # Two headless peers exchange content with neither mounting
 # (issue 23-headless-serving): the owner drive serves via
 # `sync now --serve` while fresh devices join and converge with
-# plain `sync now`, then read the bytes through offline `export`.
-# C proves the positive case; a KILL mid-residency plus restart
+# plain `sync now`, then read the bytes through a mount (headless
+# reconciliation leaves file chunks RemoteOnly by policy, so the
+# read faults them in over the serve route — the feature under
+# review end to end).
+# The dataset is a fresh single-author drive (init, one mount
+# writing the targets, stop): v0 serving is author-bound and does
+# not replicate serving authority for historical snapshots, so a
+# deep multi-author closure is only convergent when every author
+# has a live route — replication serving is deferred to v0.7. C
+# proves the positive case; a KILL mid-residency plus restart
 # proves the mirror rebuilds from the vault; D — admitted after
 # the restart so its obligations are fresh for serve#3's route
 # (re-announcement reseals pending obligations, never resurrects
@@ -418,9 +427,33 @@ fi # want_phase 11
 # TERM stops prove the shutdown half. Drives are unmounted since
 # phase 11, so the keystore is free for the offline invites.
 echo "=== microvm 12: headless serving ==="
-rm -f "$RUN/headless-serve-ready" "$RUN/headless-fetch-c-done" \
+rm -f "$RUN/headless-setup-done" "$RUN/headless-serve-ready" "$RUN/headless-fetch-c-done" \
   "$RUN/headless-serve-stopped" "$RUN/headless-d-invited" \
   "$RUN/headless-serve3-ready" "$RUN/headless-fetch-d-done"
+HO="$RUN/creds/headless-owner"
+HF="$RUN/drives/headless-fresh"
+GHO="$GUEST_RUN/creds/headless-owner"
+GHF="$GUEST_RUN/drives/headless-fresh"
+mkdir -p "$HO" "$HF"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$HO/identity"
+printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$HO/passphrase"
+chmod 600 "$HO/identity" "$HO/passphrase"
+chown -R 1000:1000 "$HO" "$HF"
+as_guest "$WYRD_BIN" init --identity-file "$HO/identity" --passphrase-file "$HO/passphrase" \
+  "$HF" >"$RUN/logs/init-hf.out" 2>"$RUN/logs/init-hf.stderr" \
+  || die "headless fresh drive init failed"
+pass "headless dataset drive initialized"
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-setup $GHF $GHO" \
+  >"$RUN/logs/leg-headless-setup.out" 2>&1 &
+LEG_HSETUP=$!
+for ((i = 0; i < 300 * 2; i++)); do
+  [[ -f "$RUN/headless-setup-done" ]] && break
+  kill -0 "$LEG_HSETUP" 2>/dev/null || die "setup leg exited before writing the dataset (see logs/leg-headless-setup.out)"
+  sleep 0.5
+done
+[[ -f "$RUN/headless-setup-done" ]] || die "setup leg never wrote the dataset"
+wait "$LEG_HSETUP" || die "headless setup leg failed (see logs/leg-headless-setup.out)"
+pass "single-author dataset written"
 HC="$RUN/creds/headless-c"
 HD="$RUN/drives/headless-c"
 GHC="$GUEST_RUN/creds/headless-c"
@@ -436,15 +469,15 @@ as_guest "$WYRD_BIN" device --identity-file "$HC/identity" --passphrase-file "$H
 DEV_C="$(grep '^device ' "$RUN/pairing-hc.txt" | cut -d' ' -f2)"
 KEY_C="$(grep '^encryption-key ' "$RUN/pairing-hc.txt" | cut -d' ' -f2)"
 [[ "${#DEV_C}" == 64 && "${#KEY_C}" == 64 ]] || die "headless-c pairing material malformed"
-as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
-  --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
+as_guest "$WYRD_BIN" member --identity-file "$HO/identity" \
+  --passphrase-file "$HO/passphrase" "$HF" \
   invite "$DEV_C" "$KEY_C" "$RUN/invitation-hc" >"$RUN/logs/invite-hc.out" 2>"$RUN/logs/invite-hc.stderr" \
   || die "owner invite of headless-c failed"
 as_guest "$WYRD_BIN" device --identity-file "$HC/identity" --passphrase-file "$HC/passphrase" \
   "$HD" join "$RUN/invitation-hc" >"$RUN/logs/join-hc.out" 2>"$RUN/logs/join-hc.stderr" \
   || die "headless-c join failed"
 pass "headless-c joins from the owner invitation"
-on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-serve $OD $OC $RELAY_URL" \
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-serve $GHF $GHO $RELAY_URL" \
   >"$RUN/logs/leg-headless-serve.out" 2>&1 &
 LEG_HS=$!
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-fetch $GHD $GHC $RELAY_URL c headless-serve-ready headless-fetch-c-done" \
@@ -475,8 +508,8 @@ as_guest "$WYRD_BIN" device --identity-file "$HDD/identity" --passphrase-file "$
 DEV_D="$(grep '^device ' "$RUN/pairing-hd.txt" | cut -d' ' -f2)"
 KEY_D="$(grep '^encryption-key ' "$RUN/pairing-hd.txt" | cut -d' ' -f2)"
 [[ "${#DEV_D}" == 64 && "${#KEY_D}" == 64 ]] || die "headless-d pairing material malformed"
-as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
-  --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
+as_guest "$WYRD_BIN" member --identity-file "$HO/identity" \
+  --passphrase-file "$HO/passphrase" "$HF" \
   invite "$DEV_D" "$KEY_D" "$RUN/invitation-hd" >"$RUN/logs/invite-hd.out" 2>"$RUN/logs/invite-hd.stderr" \
   || die "owner invite of headless-d failed"
 as_guest "$WYRD_BIN" device --identity-file "$HDD/identity" --passphrase-file "$HDD/passphrase" \
@@ -491,14 +524,33 @@ wait "$LEG_HC" || die "headless fetch-c leg failed (see logs/leg-headless-fetch-
 wait "$LEG_HD" || die "headless fetch-d leg failed (see logs/leg-headless-fetch-d.out)"
 wait "$LEG_HS" || die "headless serve leg failed (see logs/leg-headless-serve.out)"
 pass "two headless peers exchange content with neither mounting"
+fi # want_phase 12
 
 # Host-side leak check over every log the host wrote (guest logs
 # are checked in-guest by each leg). Owner secrets always exist past
 # phase 1; member-n credentials exist only once phase 6 stages them,
-# so a prefix that stops earlier has nothing of theirs to check.
+# and the phase-12 headless credentials only once phase 12 stages
+# them, so a prefix that stops earlier has nothing of theirs to
+# check.
 for f in "$RUN"/logs/*; do
   [[ -f "$f" ]] || continue
   for s in "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
+    grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+  done
+  if want_phase 6; then
+    for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
+  if want_phase 12; then
+    for s in "$(cat "$HO/identity")" "$(cat "$HO/passphrase")" \
+             "$(cat "$HC/identity")" "$(cat "$HC/passphrase")" \
+             "$(cat "$HDD/identity")" "$(cat "$HDD/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
+done
+pass "no secrets in host logs"
     grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
   done
   if want_phase 6; then

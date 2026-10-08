@@ -786,6 +786,27 @@ conflict_assert_converged() {
   pass "conflicted drive fails writes EIO and still serves reads"
 }
 
+# leg_headless_setup <drive> <creds>: mount the fresh single-author
+# drive, write the target files, stop. Phase 12 intentionally uses
+# a fresh single-author dataset: v0 serving is author-bound and
+# does not replicate serving authority for historical snapshots,
+# so a deep multi-author closure is only convergent when every
+# author has a live route (replication serving is deferred to
+# v0.7). Do not "improve" this leg by reusing an existing deep
+# drive: every announcement C needs must carry A's live endpoint,
+# which holds exactly when A is the sole author.
+leg_headless_setup() {
+  local d="$1" c="$2"
+  step 12 "headless dataset setup"
+  start_mount xhfresh "$c" "$d" "$MNTS/xhfresh"
+  echo "serve-target-1" > "$MNTS/xhfresh/target-1.txt"
+  echo "serve-target-2" > "$MNTS/xhfresh/target-2.txt"
+  stop_mount xhfresh INT
+  check_no_leaks "$LOGDIR/mount-xhfresh.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  pass "single-author dataset written and unmounted"
+  touch "$E2E_ROOT/headless-setup-done"
+}
+
 # leg_headless_serve <drive> <creds> <relay>: the serving half of
 # the two-headless-peers exchange (issue 23-headless-serving). Runs
 # `sync now --serve` in the background, waits for the park line
@@ -915,10 +936,10 @@ leg_headless_fetch() {
   with_creds "$c" export "$d" "$E2E_ROOT/export-$tag" \
     >"$LOGDIR/headless-export-$tag.out" 2>"$LOGDIR/headless-export-$tag.err" \
     || die "headless export ($tag) failed"
-  [[ "$(cat "$E2E_ROOT/export-$tag/after-restart.txt")" == "after-restart" ]] \
-    || die "headless export ($tag) lost after-restart.txt"
-  [[ "$(cat "$E2E_ROOT/export-$tag/shared.txt")" == "owner-write-1" ]] \
-    || die "headless export ($tag) lost shared.txt"
+  [[ "$(cat "$E2E_ROOT/export-$tag/target-1.txt")" == "serve-target-1" ]] \
+    || die "headless export ($tag) lost target-1.txt"
+  [[ "$(cat "$E2E_ROOT/export-$tag/target-2.txt")" == "serve-target-2" ]] \
+    || die "headless export ($tag) lost target-2.txt"
   pass "headless export ($tag) reads the served bytes"
   touch "$E2E_ROOT/$done"
   check_no_content_ids "$LOGDIR/headless-fetch-$tag.out"
@@ -939,6 +960,7 @@ case "${1:-}" in
   conflict-member) leg_conflict_member "$2" "$3" "$4" ;;
   headless-serve) leg_headless_serve "$2" "$3" "$4" ;;
   headless-fetch) leg_headless_fetch "$2" "$3" "$4" "$5" "$6" "$7" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file>" >&2; exit 2 ;;
+  headless-setup) leg_headless_setup "$2" "$3" ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
 echo "legs: $PASS_COUNT checks passed"

@@ -16,7 +16,7 @@
 #   --step           run suite phases 1..N (comma lists allowed; the run
 #                    is the prefix closure, since phases build on each
 #                    other: 1-5 are the shared-core Lima steps on peer-o,
-#                    6-11 the microvm phases in tests/alpha-microvm.sh)
+#                    6-12 the microvm phases in tests/alpha-microvm.sh)
 #   --teardown       stop a kept run (daemons, taps, bridge) and exit;
 #                    takes the run lock, so it refuses while a suite
 #                    is active. State dirs and logs are retained.
@@ -68,7 +68,7 @@ if [[ -n "$ONLY_STEP" ]]; then
   # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
   # without this it would run zero checks and pass.
   [[ ",$ONLY_STEP," != *,,* ]] \
-    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-11 entries)" >&2; exit 2; }
+    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-12 entries)" >&2; exit 2; }
   # Split on commas into a quoted array: an unquoted expansion would
   # glob each entry against the working directory first, so `--step
   # '*'` could pathname-expand into a digit-named file and slip past
@@ -76,8 +76,8 @@ if [[ -n "$ONLY_STEP" ]]; then
   _step_entries=()
   IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
   for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[01])$ ]] \
-      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-11)" >&2; exit 2; }
+    [[ "$_e" =~ ^([1-9]|1[012])$ ]] \
+      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-12)" >&2; exit 2; }
   done
   unset _step_entries _e
 fi

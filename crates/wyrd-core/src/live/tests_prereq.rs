@@ -786,7 +786,7 @@ fn unwritable_durable_dir_fails_the_commit_with_denied() {
 
 /// A live node over the scratch drive with an explicit config, so a
 /// test can wire a resource bound the default config does not carry.
-fn live_over_configured(
+pub(super) fn live_over_configured(
     engine: Engine,
     store: MemoryObjectStore,
     heads: &[AuthorizedSnapshot],

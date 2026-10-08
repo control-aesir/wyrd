@@ -458,7 +458,10 @@ readiness — a backed-up mirror leaves the obligation recorded,
 never discharged (OD-23-W). The bounded drain keeps its verdict
 and exit code; then the endpoint serves the converged snapshot
 until SIGINT/SIGTERM and shuts down in mount order (mailbox,
-bulk, serving under the same transport bound). A failed drain
+bulk, serving under the same transport bound). Signals arriving
+during the drain take effect after its verdict — the drain runs
+to its bounded end first (at most 32 passes), so a stop during a
+long drain waits for the verdict, not for the park. A failed drain
 tears down immediately with its own error instead of serving
 half-fetched state. `--serve` cannot be combined with `--offline`:
 with no relay nothing publishes the route, so the endpoint would

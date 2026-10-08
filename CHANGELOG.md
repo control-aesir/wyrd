@@ -138,6 +138,17 @@ version say exactly what changed.
   observed. No bytes are unlinked, no protocol change, no new
   durable-fact kind; the vault is untouched.
 
+### Fixed
+
+- `sync now` mailbox verdict requires observation-validity: a
+  zero-connected sample with zero supervisor ticks no longer fails
+  the run (that is the mailbox's initial state, not a measurement),
+  and relay-delivered intake with no observed attachment exempts an
+  "unreachable relay" diagnosis. Attached-then-lost still fails, so
+  a genuinely dead relay keeps its verdict. Fixes quiet headless
+  restarts (e.g. `sync now --serve` re-park) exiting degraded within
+  a second of startup.
+
 ### Added
 
 - Fetch-failure diagnostics on `sync now` (peer-repair Part 1, fourth

@@ -1844,6 +1844,61 @@ fn mailbox_degraded(health: &MailboxHealth) -> bool {
         || health.relay_recovery_attempts > 0
 }
 
+/// Whether the degraded sample convicts the run: the observation-
+/// validity gate over [`mailbox_degraded`]. The sample predicate
+/// above reports what the last supervisor tick saw; this verdict
+/// decides whether that seeing counts. Two rules, both about not
+/// mistaking "not observed yet" for "observed zero":
+///
+/// A. A degraded verdict requires at least one completed post-start
+/// health observation (`supervisor_ticks > 0`). The counters start
+/// at zero per mailbox, and a run that exits before the first tick
+/// reads the initial zeros — that is unobserved, not degraded.
+///
+/// B. Relay-delivered intake with no observed attachment proves
+/// relay communication for that run: envelopes arrived, so an
+/// "unreachable relay" diagnosis contradicts the run's own intake.
+/// This is corroboration, not a health claim — a relay that
+/// delivered once and then died is still convictable, because the
+/// attachment latch below flips once any tick observes presence
+/// and never flips back. So intake exempts only the never-attached
+/// case; attached-then-lost still fails.
+///
+/// Positive-evidence arms (a relay-closed subscription, a
+/// supervisor episode that ran) fail immediately under both rules:
+/// they are observed trouble, not absent observations, and the
+/// tick gate never applies to them.
+fn mailbox_verdict_failed(health: &MailboxHealth, intake_observed: bool) -> bool {
+    if health.total_relays == 0 {
+        return false;
+    }
+    if health.closed_subscriptions > 0
+        || health.stream_recovery_attempts > 0
+        || health.relay_recovery_attempts > 0
+    {
+        return true;
+    }
+    if !health.is_live() {
+        if health.supervisor_ticks == 0 {
+            return false;
+        }
+        if intake_observed && !health.relay_attached {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+/// Whether the run's drainer observed any relay-delivered envelope:
+/// accepted, duplicate, deferred, skipped, or discarded all arrived
+/// over the relay — each is a delivery the sample counters cannot
+/// take back. The verdict path reads it as corroborating
+/// communication evidence (see `mailbox_verdict_failed`).
+fn report_intake_observed(report: &SyncRunReport) -> bool {
+    report.accepted + report.duplicates + report.deferred + report.skipped + report.discarded > 0
+}
+
 /// Recovery attempts over the run, both kinds: a stream death or a
 /// relay outage each leaves intake blind until its episode
 /// converges, so the run-level verdict counts either. Loop
@@ -2456,7 +2511,9 @@ fn sync_now_render(report: &SyncRunReport) -> String {
         // success but names its limits: it fetched nothing, so an
         // operator tailing only the last line sees the scope.
         RunOutcome::Quiet => match report.mailbox {
-            Some(health) if !mailbox_degraded(&health) && !reconciliation_open => {
+            Some(health)
+                if !mailbox_verdict_failed(&health, report_intake_observed(report))
+                    && !reconciliation_open => {
                 out.push_str("completed: quiet");
                 if health.total_relays == 0 {
                     out.push_str(" (offline run: local obligations only)");
@@ -2469,7 +2526,9 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             )),
         },
         RunOutcome::RemoteStalled => match report.mailbox {
-            Some(health) if !mailbox_degraded(&health) && !reconciliation_open => {
+            Some(health)
+                if !mailbox_verdict_failed(&health, report_intake_observed(report))
+                    && !reconciliation_open => {
                 out.push_str(&format!(
                     "completed: quiet with {} unfetchable heads (known but not local)",
                     report.unfetchable_heads,
@@ -2493,7 +2552,8 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             // keeps obligations pending forever, so the run never
             // reaches quiet. Name it here, not just in the stderr
             // error, so the stdout forensics show the cause.
-            if !matches!(report.mailbox, Some(health) if !mailbox_degraded(&health)) {
+            if !matches!(report.mailbox, Some(health)
+                if !mailbox_verdict_failed(&health, report_intake_observed(report))) {
                 out.push_str(&format!("; {}, convergence unverified", degraded_reason(report.mailbox)));
             }
             out.push('\n');
@@ -2518,7 +2578,7 @@ fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
         None => return Err(CliError::Unobserved),
         Some(health) => health,
     };
-    if mailbox_degraded(&mailbox) {
+    if mailbox_verdict_failed(&mailbox, report_intake_observed(report)) {
         return Err(CliError::Unverified {
             connected: mailbox.connected_relays,
             total: mailbox.total_relays,

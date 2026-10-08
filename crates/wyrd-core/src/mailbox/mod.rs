@@ -446,6 +446,12 @@ pub struct MailboxHealth {
     /// supervisor is still reporting while an episode spins — health
     /// fields alone read stale-zero through an outage.
     pub supervisor_ticks: u64,
+    /// A supervisor tick has observed at least one connected relay,
+    /// lifetime latch (mirrors the tick loop's `ever_connected`). The
+    /// verdict path uses it to separate "attached then lost" from
+    /// "never attached": only the former convicts a zero-connected
+    /// sample, because only the former ever observed presence.
+    pub relay_attached: bool,
     /// `recover_stream` loop iterations, lifetime total: stream-recovery
     /// progress while the episode is in flight. Episodes only spawn
     /// after first attachment, so a slow cold start never counts.
@@ -520,6 +526,14 @@ struct SupervisorState {
     /// A trigger while one runs coalesces into it: the flag was already
     /// claimed and the in-flight REQ replays everything retained.
     saturation_episode: AtomicBool,
+    /// A supervisor tick has observed at least one connected relay,
+    /// lifetime latch. Mirrors the tick loop's `ever_connected`: the
+    /// verdict path reads it to tell "attached then lost" (a real
+    /// outage, convictable) from "never attached" (no observation of
+    /// presence, so a zero-connected sample proves nothing). Set on
+    /// the tick, never cleared — attachment happened, even if the
+    /// relay is gone now.
+    relay_attached: AtomicBool,
     /// Last successful saturation replay, for the due gate. Written by
     /// the replay episode, read by the tick loop; the guard is never
     /// held across an await.
@@ -776,6 +790,7 @@ where
             stream_episode: AtomicBool::new(false),
             relay_episode: AtomicBool::new(false),
             saturation_episode: AtomicBool::new(false),
+            relay_attached: AtomicBool::new(false),
             saturation_replay_at: std::sync::Mutex::new(None),
         });
         // One stable subscription ID for the mailbox lifetime: every
@@ -879,6 +894,7 @@ where
             stream_recovery_attempts: self.health.stream_recovery_attempts.load(Ordering::Relaxed),
             relay_recovery_attempts: self.health.relay_recovery_attempts.load(Ordering::Relaxed),
             closed_subscriptions: self.health.closed_subscriptions.load(Ordering::Relaxed),
+            relay_attached: self.health.relay_attached.load(Ordering::Relaxed),
         }
     }
 
@@ -1348,6 +1364,7 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
         refresh(&client, &health).await;
         if health.connected_relays.load(Ordering::Relaxed) > 0 {
             ever_connected = true;
+            health.relay_attached.store(true, Ordering::Relaxed);
         }
         // Offline mailbox: nothing to re-drive; health is stream-alive
         // alone, and an empty client refuses connect/subscribe.

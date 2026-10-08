@@ -24,6 +24,7 @@ fn drainer_establishes_over_a_relay_less_client() {
         stream_episode: AtomicBool::new(false),
         relay_episode: AtomicBool::new(false),
         saturation_episode: AtomicBool::new(false),
+        relay_attached: AtomicBool::new(false),
         saturation_replay_at: std::sync::Mutex::new(None),
     });
     let intake_waker: Arc<std::sync::Mutex<Option<Arc<WakeSignal>>>> =

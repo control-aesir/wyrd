@@ -668,6 +668,7 @@ fn fixture_mailbox() -> MailboxHealth {
         stream_recovery_attempts: 0,
         relay_recovery_attempts: 0,
         closed_subscriptions: 0,
+        relay_attached: false,
     }
 }
 
@@ -684,6 +685,7 @@ fn blind_mailbox() -> MailboxHealth {
         stream_recovery_attempts: 0,
         relay_recovery_attempts: 0,
         closed_subscriptions: 0,
+        relay_attached: false,
     }
 }
 
@@ -747,7 +749,11 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
         RunOutcome::RemoteStalled,
         RunOutcome::PassLimit,
     ] {
-        let report = report_with(outcome, Some(blind_mailbox()));
+        // An observed zero-connected sample fails: the supervisor
+        // ticked, so the zero is a measurement, not an initial.
+        let mut observed = blind_mailbox();
+        observed.supervisor_ticks = 2;
+        let report = report_with(outcome, Some(observed));
         let error = run_outcome_error(&report).unwrap_err();
         assert!(
             matches!(
@@ -827,6 +833,83 @@ fn degraded_mailbox_fails_every_outcome_as_unverified() {
     );
 }
 
+/// 1. A quiet run that exits before the supervisor's first tick must
+/// not fail as unverified: `connected_relays == 0` with zero ticks
+/// is the mailbox's initial state, not a health observation. This is
+/// the serve#2 restart shape — three sub-second passes, intake
+/// quiet, exit before tick two — which the old verdict convicted on
+/// the uninitialized counters.
+#[test]
+fn unverified_verdict_requires_observation() {
+    let mailbox = blind_mailbox();
+    assert_eq!(mailbox.supervisor_ticks, 0);
+    let report = report_with(RunOutcome::Quiet, Some(mailbox));
+    assert!(
+        run_outcome_error(&report).is_ok(),
+        "zero ticks means unobserved, never degraded"
+    );
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("completed: quiet"),
+        "an unobserved-but-quiet run completes: {rendered}"
+    );
+}
+
+/// 2. An observed zero still fails: ticks ran, no relay attached,
+/// nothing arrived. Observation-validity gates the verdict; it does
+/// not excuse a genuinely unreachable relay.
+#[test]
+fn observed_zero_without_intake_still_fails() {
+    let mut mailbox = blind_mailbox();
+    mailbox.supervisor_ticks = 3;
+    let report = report_with(RunOutcome::Quiet, Some(mailbox));
+    let error = run_outcome_error(&report).unwrap_err();
+    assert!(
+        matches!(error, CliError::Unverified { connected: 0, .. }),
+        "an observed zero-connected run fails as unverified, got: {error}"
+    );
+}
+
+/// 3. Relay-delivered intake with no observed attachment contradicts
+/// an "unreachable relay" diagnosis: envelopes arrived, so the path
+/// worked during this run, and the zero-connected sample is stale
+/// rather than true. Intake is corroboration, not a health claim —
+/// it exempts only the never-attached case (see the next test).
+#[test]
+fn relay_intake_without_attachment_exempts_unreachable() {
+    let mut mailbox = blind_mailbox();
+    mailbox.supervisor_ticks = 2;
+    assert!(!mailbox.relay_attached);
+    let mut report = report_with(RunOutcome::Quiet, Some(mailbox));
+    report.accepted = 2;
+    assert!(
+        run_outcome_error(&report).is_ok(),
+        "intake without observed attachment proves communication"
+    );
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("completed: quiet"),
+        "the run completes instead of contradicting its own intake: {rendered}"
+    );
+}
+
+/// 4. Intake is not a permanent health latch: attached mid-run and
+/// then lost, with the loss observed, still fails. The exemption
+/// covers "never attached", never "attached then lost".
+#[test]
+fn intake_does_not_survive_observed_attachment_then_loss() {
+    let mut mailbox = blind_mailbox();
+    mailbox.supervisor_ticks = 5;
+    mailbox.relay_attached = true;
+    let mut report = report_with(RunOutcome::Quiet, Some(mailbox));
+    report.accepted = 2;
+    let error = run_outcome_error(&report).unwrap_err();
+    assert!(
+        matches!(error, CliError::Unverified { connected: 0, .. }),
+        "attached-then-lost fails despite earlier intake, got: {error}"
+    );
+}
+
 /// The mailbox line reads posture, never connection alone: an
 /// explicitly offline run is idle (neither live nor degraded), a
 /// connected run with no closures is live, and anything else names
@@ -884,9 +967,17 @@ fn mailbox_line_and_exit_agree_on_every_posture() {
     live.connected_relays = 1;
     assert!(mailbox_line(&live).starts_with("mailbox: live"));
     assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(live))).is_ok());
-    // Down or blind now: degraded line, failed exit.
+    // Down or blind now: degraded line, failed exit — once the
+    // supervisor has ticked, so the zero is observed, not initial.
+    let mut observed = blind_mailbox();
+    observed.supervisor_ticks = 2;
+    assert!(mailbox_line(&observed).starts_with("mailbox: degraded"));
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(observed))).is_err());
+    // No tick yet: the line still reports the zero sample honestly,
+    // but the exit cannot convict on it — "not observed yet" is not
+    // "observed zero" (see unverified_verdict_requires_observation).
     assert!(mailbox_line(&blind_mailbox()).starts_with("mailbox: degraded"));
-    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(blind_mailbox()))).is_err());
+    assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(blind_mailbox()))).is_ok());
     let mut closed = blind_mailbox();
     closed.connected_relays = 1;
     closed.closed_subscriptions = 1;
@@ -2260,5 +2351,6 @@ fn fixture_blind() -> MailboxHealth {
         stream_recovery_attempts: 0,
         relay_recovery_attempts: 0,
         closed_subscriptions: 0,
+        relay_attached: true,
     }
 }

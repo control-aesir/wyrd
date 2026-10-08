@@ -34,7 +34,8 @@
 # selecting phase N runs 1..N, never a lone dependent phase on stale
 # state. Entries 1-5 are the shared-core Lima steps (phase 1 runs the
 # 1..N prefix of those); 6-11 are the microvm phases below. Absent
-# or empty means all phases.
+# means all phases (the runner refuses an explicit empty value, so
+# empty arriving here also means all).
 #
 # The relay is a VM service the host stops/starts per conflict leg
 # via its tap (tap-r down/up); see nix/microvm/run-microvm.sh.
@@ -405,14 +406,19 @@ pass "conflict versions export as name@N siblings on both drives"
 fi # want_phase 11
 
 # Host-side leak check over every log the host wrote (guest logs
-# are checked in-guest by each leg). All four credential secrets,
-# matching the Lima step's coverage.
+# are checked in-guest by each leg). Owner secrets always exist past
+# phase 1; member-n credentials exist only once phase 6 stages them,
+# so a prefix that stops earlier has nothing of theirs to check.
 for f in "$RUN"/logs/*; do
   [[ -f "$f" ]] || continue
-  for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")" \
-           "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
+  for s in "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
     grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
   done
+  if want_phase 6; then
+    for s in "$(cat "$MC/identity")" "$(cat "$MC/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
 done
 pass "no secrets in host logs"
 

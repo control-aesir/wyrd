@@ -92,7 +92,7 @@ cd "$ROOT"
 # with --teardown is refused for the same reason (taps, bridge, and
 # daemon pattern are all host-global, so it would be ignored).
 if [[ "$TEARDOWN" == 1 ]]; then
-  [[ "$FRESH" == 0 && "$KEEP" == 0 ]] || { echo "error: --teardown takes no other flags" >&2; exit 2; }
+  [[ "$FRESH" == 0 && "$KEEP" == 0 && -z "$ONLY_STEP" ]] || { echo "error: --teardown takes no other flags" >&2; exit 2; }
   [[ "$STATE_DIR" == "/var/lib/wyrd-microvm/state" ]] || { echo "error: --teardown ignores --state-dir (host-global)" >&2; exit 2; }
   for t in git pgrep ps kill pkill ip flock; do need "$t"; done
 else

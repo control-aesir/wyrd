@@ -917,10 +917,19 @@ leg_headless_serve() {
 
 # leg_headless_fetch <drive> <creds> <relay> <tag> <ready-file> <done-file>:
 # the fetching half: an ordinary headless `sync now` (never --serve)
-# against a parked serving peer, then export proves the bytes. The
-# device starts empty, so a nonzero object count is bulk transfer
+# against a parked serving peer, then a mount read proves the bytes.
+# The device starts empty, so a nonzero object count is bulk transfer
 # from the serving peer — the advertised address is the one that
 # answers, proved by dialability rather than asserted from logs.
+# File content is deliberately NOT asserted via headless export:
+# headless reconciliation leaves file chunks `RemoteOnly` by policy
+# (structural closure only — trees, manifests, bodies), and v0
+# promises no headless materialization. The byte-exact proof comes
+# from mounting the fetcher and reading through the projection:
+# the read faults the remote-only chunks in over the serving peer's
+# announced route, which is the feature under review end to end
+# (serve -> route -> fault-in -> verify). This runs while the serve
+# side is still parked, before the done-file releases it for KILL.
 leg_headless_fetch() {
   local d="$1" c="$2" relay="$3" tag="$4" ready="$5" done="$6"
   step 12 "headless fetch leg ($tag)"
@@ -932,21 +941,18 @@ leg_headless_fetch() {
   grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/headless-fetch-$tag.out" \
     || die "headless fetch ($tag) fetched no objects (see headless-fetch-$tag.out)"
   pass "headless fetch ($tag) pulls objects over the serve route"
-  rm -rf "$E2E_ROOT/export-$tag"
-  with_creds "$c" export "$d" "$E2E_ROOT/export-$tag" \
-    >"$LOGDIR/headless-export-$tag.out" 2>"$LOGDIR/headless-export-$tag.err" \
-    || die "headless export ($tag) failed"
-  [[ "$(cat "$E2E_ROOT/export-$tag/target-1.txt")" == "serve-target-1" ]] \
-    || die "headless export ($tag) lost target-1.txt"
-  [[ "$(cat "$E2E_ROOT/export-$tag/target-2.txt")" == "serve-target-2" ]] \
-    || die "headless export ($tag) lost target-2.txt"
-  pass "headless export ($tag) reads the served bytes"
+  start_mount "xheadless-$tag" "$c" "$d" "$MNTS/xheadless-$tag" --relay "$relay"
+  [[ "$(cat "$MNTS/xheadless-$tag/target-1.txt")" == "serve-target-1" ]] \
+    || die "headless mount ($tag) lost target-1.txt"
+  [[ "$(cat "$MNTS/xheadless-$tag/target-2.txt")" == "serve-target-2" ]] \
+    || die "headless mount ($tag) lost target-2.txt"
+  pass "headless mount ($tag) faults the served bytes in over the serve route"
+  stop_mount "xheadless-$tag" INT
   touch "$E2E_ROOT/$done"
   check_no_content_ids "$LOGDIR/headless-fetch-$tag.out"
   check_no_leaks "$LOGDIR/headless-fetch-$tag.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-fetch-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
-  check_no_leaks "$LOGDIR/headless-export-$tag.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
-  check_no_leaks "$LOGDIR/headless-export-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-xheadless-$tag.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 case "${1:-}" in

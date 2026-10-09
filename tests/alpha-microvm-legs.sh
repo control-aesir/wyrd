@@ -808,23 +808,31 @@ leg_headless_setup() {
 }
 
 # leg_headless_serve <drive> <creds> <relay>: the serving half of
-# the two-headless-peers exchange (issue 22a: the vault process).
-# Runs `wyrd vault` in the background, waits for the ready line
-# (first routed pass complete, endpoint serving), then drives the
-# kill/restart/TERM sequence the fetch legs rendezvous on:
+# the two-headless-peers exchange (issue 22a: the vault process;
+# issue 22b: the crash-restart gate). Runs `wyrd vault` in the
+# background, waits for the ready line (first routed pass complete,
+# endpoint serving), then drives the kill/restart/TERM sequence the
+# fetch legs rendezvous on:
 #   serve#1 → C fetches → KILL (mid-flight) → serve#2 (mirror
-#   rebuilt from the vault) → TERM → host admits D → serve#3 → D
-#   fetches pre-kill content → TERM, clean exit 0.
-# D is admitted between serve#2 and serve#3 on purpose: the
-# re-announcement path reseals pending obligations with the live
-# route but never resurrects discharged ones, so D's obligations
-# must be fresh for serve#3's route. C proves the positive case, D
-# proves previously announced representations still serve after a
-# kill -9 and mirror rebuild.
+#   rebuilt from the vault) → E fetches against the replacement →
+#   TERM → host admits D → serve#3 → D fetches pre-kill content →
+#   TERM, clean exit 0.
+# E is admitted before the leg (alongside C) so its obligations are
+# fresh for serve#2's route: E proves the replacement re-announced
+# (E reconciles over the new route) AND serves content (pre-kill
+# bodies flow from the post-KILL process) — each peer-observed, not
+# read off the ready line. D is admitted between serve#2 and serve#3
+# on purpose: the re-announcement path reseals pending obligations
+# with the live route but never resurrects discharged ones, so D's
+# obligations must be fresh for serve#3's route. C proves the
+# positive case, E proves the crash-restart case, D proves
+# previously announced representations still serve after a kill -9
+# and mirror rebuild.
 leg_headless_serve() {
   local d="$1" c="$2" relay="$3"
   step 12 "headless serving leg"
   rm -f "$E2E_ROOT/headless-serve-ready" "$E2E_ROOT/headless-fetch-c-done" \
+    "$E2E_ROOT/headless-serve2-ready" "$E2E_ROOT/headless-fetch-e-done" \
     "$E2E_ROOT/headless-serve-stopped" "$E2E_ROOT/headless-d-invited" \
     "$E2E_ROOT/headless-serve3-ready" "$E2E_ROOT/headless-fetch-d-done"
   mkdir -p "$PIDDIR"
@@ -863,6 +871,16 @@ leg_headless_serve() {
   poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-2.err" \
     || die "serve#2 never reported ready after KILL (see headless-serve-2.err)"
   pass "serve#2 reports ready after KILL: the mirror rebuilt from the vault"
+  touch "$E2E_ROOT/headless-serve2-ready"
+  # E fetches the whole drive against the replacement: E was
+  # admitted before the leg so its obligations are fresh for
+  # serve#2's route, and E starts empty so every object it pulls is
+  # bulk transfer from the post-KILL process. Re-announcement and
+  # content service each peer-observed — the ready line alone is
+  # never the proof. Only then is serve#2 stopped.
+  poll_until 300 test -f "$E2E_ROOT/headless-fetch-e-done" \
+    || die "fetch-e never finished against serve#2"
+  pass "fetch-e converged against the KILL replacement: re-announced and serving"
   # TERM while parked: the ordered teardown (mailbox, bulk, serving
   # under the transport bound) must exit 0, proving the shutdown
   # half of the residency contract.

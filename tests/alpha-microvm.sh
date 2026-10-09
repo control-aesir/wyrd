@@ -408,26 +408,31 @@ fi # want_phase 11
 # --- phase: microvm 12 (headless serving) --------------------------------
 if want_phase 12; then
 # Two headless peers exchange content with neither mounting
-# (issue 22a: the vault process): the owner drive serves via
-# `wyrd vault` while fresh devices join and converge with
-# plain `sync now`, then read the bytes through a mount (headless
-# reconciliation leaves file chunks RemoteOnly by policy, so the
-# read faults them in over the serve route — the feature under
-# review end to end).
+# (issue 22a: the vault process; issue 22b: the crash-restart
+# gate): the owner drive serves via `wyrd vault` while fresh
+# devices join and converge with plain `sync now`, then read the
+# bytes through a mount (headless reconciliation leaves file chunks
+# RemoteOnly by policy, so the read faults them in over the serve
+# route — the feature under review end to end).
 # The dataset is a fresh single-author drive (init, one mount
 # writing the targets, stop): v0 serving is author-bound and does
 # not replicate serving authority for historical snapshots, so a
 # deep multi-author closure is only convergent when every author
 # has a live route — replication serving is deferred to v0.7. C
 # proves the positive case; a KILL mid-residency plus restart
-# proves the mirror rebuilds from the vault; D — admitted after
-# the restart so its obligations are fresh for serve#3's route
-# (re-announcement reseals pending obligations, never resurrects
-# discharged ones) — proves pre-kill content still serves; both
-# TERM stops prove the shutdown half. Drives are unmounted since
-# phase 11, so the keystore is free for the offline invites.
+# proves the mirror rebuilds from the vault; E — admitted up front
+# alongside C so its obligations are fresh for serve#2's route —
+# fetches against the immediate KILL replacement, proving
+# re-announcement and content service after the crash, each
+# peer-observed; D — admitted after the restart so its obligations
+# are fresh for serve#3's route (re-announcement reseals pending
+# obligations, never resurrects discharged ones) — proves pre-kill
+# content still serves; both TERM stops prove the shutdown half.
+# Drives are unmounted since phase 11, so the keystore is free for
+# the offline invites.
 echo "=== microvm 12: headless serving ==="
 rm -f "$RUN/headless-setup-done" "$RUN/headless-serve-ready" "$RUN/headless-fetch-c-done" \
+  "$RUN/headless-serve2-ready" "$RUN/headless-fetch-e-done" \
   "$RUN/headless-serve-stopped" "$RUN/headless-d-invited" \
   "$RUN/headless-serve3-ready" "$RUN/headless-fetch-d-done"
 HO="$RUN/creds/headless-owner"
@@ -477,12 +482,40 @@ as_guest "$WYRD_BIN" device --identity-file "$HC/identity" --passphrase-file "$H
   "$HD" join "$RUN/invitation-hc" >"$RUN/logs/join-hc.out" 2>"$RUN/logs/join-hc.stderr" \
   || die "headless-c join failed"
 pass "headless-c joins from the owner invitation"
+HE="$RUN/creds/headless-e"
+HED="$RUN/drives/headless-e"
+GHE="$GUEST_RUN/creds/headless-e"
+GHED="$GUEST_RUN/drives/headless-e"
+mkdir -p "$HE" "$HED"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$HE/identity"
+printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$HE/passphrase"
+chmod 600 "$HE/identity" "$HE/passphrase"
+chown -R 1000:1000 "$HE" "$HED"
+as_guest "$WYRD_BIN" device --identity-file "$HE/identity" --passphrase-file "$HE/passphrase" \
+  "$HED" pairing-request "$RUN/pairing-he.txt" >"$RUN/logs/pairing-he.out" 2>"$RUN/logs/pairing-he.stderr" \
+  || die "headless-e pairing-request failed"
+DEV_E="$(grep '^device ' "$RUN/pairing-he.txt" | cut -d' ' -f2)"
+KEY_E="$(grep '^encryption-key ' "$RUN/pairing-he.txt" | cut -d' ' -f2)"
+[[ "${#DEV_E}" == 64 && "${#KEY_E}" == 64 ]] || die "headless-e pairing material malformed"
+as_guest "$WYRD_BIN" member --identity-file "$HO/identity" \
+  --passphrase-file "$HO/passphrase" "$HF" \
+  invite "$DEV_E" "$KEY_E" "$RUN/invitation-he" >"$RUN/logs/invite-he.out" 2>"$RUN/logs/invite-he.stderr" \
+  || die "owner invite of headless-e failed"
+as_guest "$WYRD_BIN" device --identity-file "$HE/identity" --passphrase-file "$HE/passphrase" \
+  "$HED" join "$RUN/invitation-he" >"$RUN/logs/join-he.out" 2>"$RUN/logs/join-he.stderr" \
+  || die "headless-e join failed"
+pass "headless-e joins from the owner invitation"
 on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-serve $GHF $GHO $RELAY_URL" \
   >"$RUN/logs/leg-headless-serve.out" 2>&1 &
 LEG_HS=$!
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-fetch $GHD $GHC $RELAY_URL c headless-serve-ready headless-fetch-c-done" \
   >"$RUN/logs/leg-headless-fetch-c.out" 2>&1 &
 LEG_HC=$!
+# E waits on serve#2's ready file: it fetches against the immediate
+# KILL replacement, proving the 22b crash-restart gate.
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-fetch $GHED $GHE $RELAY_URL e headless-serve2-ready headless-fetch-e-done" \
+  >"$RUN/logs/leg-headless-fetch-e.out" 2>&1 &
+LEG_HE=$!
 # D is admitted mid-leg, after serve#2 stops and frees the owner
 # drive: its obligations must be fresh for serve#3's route. The
 # invite runs on the host (offline keystore op); the leg waits on
@@ -521,9 +554,10 @@ on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh headless-f
   >"$RUN/logs/leg-headless-fetch-d.out" 2>&1 &
 LEG_HD=$!
 wait "$LEG_HC" || die "headless fetch-c leg failed (see logs/leg-headless-fetch-c.out)"
+wait "$LEG_HE" || die "headless fetch-e leg failed (see logs/leg-headless-fetch-e.out)"
 wait "$LEG_HD" || die "headless fetch-d leg failed (see logs/leg-headless-fetch-d.out)"
 wait "$LEG_HS" || die "headless serve leg failed (see logs/leg-headless-serve.out)"
-pass "two headless peers exchange content with neither mounting"
+pass "three headless peers exchange content with neither mounting"
 fi # want_phase 12
 
 # Host-side leak check over every log the host wrote (guest logs

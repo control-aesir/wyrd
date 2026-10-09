@@ -824,7 +824,8 @@ as_guest "$WYRD_BIN" device --identity-file "$UN/identity" --passphrase-file "$U
 pass "uparent pair joins on a fresh drive"
 rm -f "$RUN"/uparent-owner-gone "$RUN"/uparent-member-probed \
   "$RUN"/uparent-owner-back "$RUN"/uparent-member-healed \
-  "$RUN"/uparent-announced "$RUN"/up-2.err "$RUN"/up-1.err
+  "$RUN"/uparent-announced "$RUN"/up-2.err "$RUN"/up-1.err \
+  "$RUN"/up-2.got "$RUN"/up-1.got
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GUND $GUN $RELAY_URL" \
   >"$RUN/logs/leg-uparent-member.out" 2>&1 &
 LEG_N=$!

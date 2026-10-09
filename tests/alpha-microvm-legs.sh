@@ -1413,7 +1413,10 @@ leg_uparent_owner() {
   local d="$1" c="$2" relay="$3"
   step 15 "unknown-parent owner leg"
   local old_e2e_log="${E2E_RUST_LOG-__unset}"
-  export E2E_RUST_LOG="wyrd_core=debug"
+  # wyrd_daemon=debug for the FUSE backend's per-opcode lines
+  # (errno, latency_us, queue_depth): the hung open's dispatch
+  # story lives there, which wyrd_core=debug does not cover.
+  export E2E_RUST_LOG="wyrd_core=debug,wyrd_daemon=debug"
   start_mount xup-o "$c" "$d" "$MNTS/xup-o" --relay "$relay"
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   echo "up-1-bytes" > "$MNTS/xup-o/up-1.txt"
@@ -1466,7 +1469,10 @@ leg_uparent_member() {
   local rc=0
   step 15 "unknown-parent member leg"
   local old_e2e_log="${E2E_RUST_LOG-__unset}"
-  export E2E_RUST_LOG="wyrd_core=debug"
+  # wyrd_daemon=debug for the FUSE backend's per-opcode lines
+  # (errno, latency_us, queue_depth): the hung open's dispatch
+  # story lives there, which wyrd_core=debug does not cover.
+  export E2E_RUST_LOG="wyrd_core=debug,wyrd_daemon=debug"
   start_mount xup-m "$c" "$d" "$MNTS/xup-m" --relay "$relay"
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   poll_until 180 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
@@ -1491,8 +1497,14 @@ leg_uparent_member() {
   # classification itself can queue behind a busy loop for seconds
   # before it runs.
   rc=0
-  timeout 25 cat "$MNTS/xup-m/up-2.txt" >/dev/null 2>"$E2E_ROOT/up-2.err" || rc=$?
-  [[ "$rc" == 1 ]] || die "unadopted-child open returned rc $rc, want ENOENT (1)"
+  timeout 25 cat "$MNTS/xup-m/up-2.txt" >"$E2E_ROOT/up-2.got" 2>"$E2E_ROOT/up-2.err" || rc=$?
+  if [[ "$rc" != 1 ]]; then
+    echo "--- up-2 probe failure evidence: projected view (timeout 10) ---"
+    timeout 10 ls -laR "$MNTS/xup-m" 2>&1 | head -n 40 || true
+    echo "--- drive + mount df ---"
+    df -k "$MNTS/xup-m" "$d" 2>&1 || true
+    die "unadopted-child open returned rc $rc, want ENOENT (1); body captured: $(wc -c <"$E2E_ROOT/up-2.got") bytes, err: $(cat "$E2E_ROOT/up-2.err")"
+  fi
   grep -q "No such file or directory" "$E2E_ROOT/up-2.err" \
     || die "unadopted-child open was not ENOENT: $(cat "$E2E_ROOT/up-2.err")"
   pass "unadopted snapshot's paths are ENOENT, never a hang"
@@ -1500,8 +1512,14 @@ leg_uparent_member() {
   # missing, so its read fails EIO bounded — bodies were really
   # withheld, the mount is alive, the ENOENT above is the verdict.
   rc=0
-  timeout 60 cat "$MNTS/xup-m/up-1.txt" >/dev/null 2>"$E2E_ROOT/up-1.err" || rc=$?
-  [[ "$rc" == 1 ]] || die "withheld-body read returned rc $rc, want EIO (1)"
+  timeout 60 cat "$MNTS/xup-m/up-1.txt" >"$E2E_ROOT/up-1.got" 2>"$E2E_ROOT/up-1.err" || rc=$?
+  if [[ "$rc" != 1 ]]; then
+    echo "--- up-1 probe failure evidence: projected view (timeout 10) ---"
+    timeout 10 ls -laR "$MNTS/xup-m" 2>&1 | head -n 40 || true
+    echo "--- drive + mount df ---"
+    df -k "$MNTS/xup-m" "$d" 2>&1 || true
+    die "withheld-body read returned rc $rc, want EIO (1); body captured: $(wc -c <"$E2E_ROOT/up-1.got") bytes, err: $(cat "$E2E_ROOT/up-1.err")"
+  fi
   grep -q "Input/output error" "$E2E_ROOT/up-1.err" \
     || die "withheld-body read was not EIO: $(cat "$E2E_ROOT/up-1.err")"
   pass "withheld parent body fails EIO bounded (control)"

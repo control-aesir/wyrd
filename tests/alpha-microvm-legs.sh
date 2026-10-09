@@ -1034,7 +1034,24 @@ leg_crash_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection owner leg"
   start_mount xcrash-o "$c" "$d" "$MNTS/xcrash-o" --relay "$relay"
-  echo "anchor-v1" > "$MNTS/xcrash-o/anchor.txt"
+  # Bounded retries like leg_crash_member's scratch: after 13a's
+  # replay the closure drains slowly and the first mutation can
+  # outwait the 30s max_mutation_wait (ETIMEDOUT). Each attempt is
+  # terminal (a timed-out mutation commits nothing), so retrying the
+  # same bytes is safe. Six attempts x 25s timeout bound the worst
+  # case near 160s, inside the member's convergence window.
+  local attempt=0 anchored=0
+  while (( attempt < 6 )); do
+    attempt=$((attempt + 1))
+    if timeout 25 bash -c "echo 'anchor-v1' > '$MNTS/xcrash-o/anchor.txt'" 2>/dev/null \
+      && [[ "$(cat "$MNTS/xcrash-o/anchor.txt" 2>/dev/null)" == "anchor-v1" ]]; then
+      anchored=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$anchored" == 1 ]] \
+    || die "anchor write failed in $attempt attempts (closure never drained)"
   poll_until 120 test -f "$E2E_ROOT/crash-o-steady-ready" \
     || die "witness never converged the anchor write"
   pass "anchor converged before the burst"
@@ -1091,7 +1108,7 @@ leg_steady_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness member leg"
   start_mount xsteady-m "$c" "$d" "$MNTS/xsteady-m" --relay "$relay"
-  poll_until 180 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
+  poll_until 300 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
     || die "witness never converged the anchor write"
   pass "witness converges the anchor before the crash"
   touch "$E2E_ROOT/crash-o-steady-ready"

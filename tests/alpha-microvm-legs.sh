@@ -888,10 +888,15 @@ leg_headless_serve() {
   # E's obligation is still pending (admitted up front, never
   # discharged: C discharged, D not yet admitted), so serve#2
   # re-announces it with the new route; the ready line proves the
-  # endpoint is back up and re-announced.
+  # endpoint is back up and re-announced. Debug on: the send
+  # recipients below are the 22b proof (re-announcement to E under
+  # the new route), and info level hides them.
+  local old_serve_log="${RUST_LOG-__unset}"
+  export RUST_LOG="wyrd_core=debug"
   with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-2.out" 2>"$LOGDIR/headless-serve-2.err" &
   echo $! > "$PIDDIR/headless-serve.pid"
+  if [[ "$old_serve_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_serve_log"; fi
   poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-2.err" \
     || die "serve#2 never reported ready after KILL (see headless-serve-2.err)"
   pass "serve#2 reports ready after KILL: the mirror rebuilt from the vault"
@@ -976,9 +981,16 @@ leg_headless_fetch() {
   step 12 "headless fetch leg ($tag)"
   poll_until 300 test -f "$E2E_ROOT/$ready" \
     || die "serve side never parked for $tag"
+  # Debug on: intake verdicts (duplicate vs route-update commit)
+  # and fetch dials below say whether a redelivered route was
+  # applied or the peer stayed pinned to the dead one — info
+  # level hides both.
+  local old_fetch_log="${RUST_LOG-__unset}"
+  export RUST_LOG="wyrd_core=debug"
   with_creds "$c" sync "$d" --relay "$relay" now \
     >"$LOGDIR/headless-fetch-$tag.out" 2>"$LOGDIR/headless-fetch-$tag.err" \
     || die "headless fetch ($tag) exited non-zero"
+  if [[ "$old_fetch_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_fetch_log"; fi
   grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/headless-fetch-$tag.out" \
     || die "headless fetch ($tag) fetched no objects (see headless-fetch-$tag.out)"
   pass "headless fetch ($tag) pulls objects over the serve route"

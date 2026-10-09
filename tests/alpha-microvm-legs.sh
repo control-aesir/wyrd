@@ -1056,11 +1056,25 @@ leg_crash_owner() {
   poll_until 120 test -f "$E2E_ROOT/crash-o-steady-ready" \
     || die "witness never converged the anchor write"
   pass "anchor converged before the burst"
-  local i=1
+  # Each burst write gets bounded retries: after the anchor the sync
+  # engine may still be publishing, and a bare echo to the FUSE mount
+  # hangs indefinitely when the mutation queue is blocked. timeout
+  # 35 covers the 30s max_mutation_wait; 3 attempts per write bound
+  # the worst case near 3 minutes for the burst.
+  local i=1 bw_attempt bw_ok
   while (( i <= 40 )); do
-    echo "burst-$i" > "$MNTS/xcrash-o/burst-$i.txt"
-    [[ "$(cat "$MNTS/xcrash-o/burst-$i.txt")" == "burst-$i" ]] \
-      || die "burst write $i never acknowledged"
+    bw_attempt=0 bw_ok=0
+    while (( bw_attempt < 3 )); do
+      bw_attempt=$((bw_attempt + 1))
+      if timeout 35 bash -c "echo 'burst-$i' > '$MNTS/xcrash-o/burst-$i.txt'" 2>/dev/null \
+        && [[ "$(cat "$MNTS/xcrash-o/burst-$i.txt" 2>/dev/null)" == "burst-$i" ]]; then
+        bw_ok=1
+        break
+      fi
+      sleep 1
+    done
+    [[ "$bw_ok" == 1 ]] \
+      || die "burst write $i never acknowledged after $bw_attempt attempts"
     i=$((i + 1))
   done
   pass "40 burst writes acknowledged (fence: post-ack, pre-reopen — the rename/CURRENT window)"

@@ -1148,25 +1148,50 @@ leg_crash_member() {
   poll_until 300 converged "$MNTS/xcrash-m/cold-u.txt" "cold-bytes-u" \
     || die "member never converged the cold bytes before authoring"
   pass "cold bytes flow before the member authors"
-  # Tree localization BEFORE the partition: this drive joined fresh
-  # and is manifest-only, and a mutation held waiting on remote
-  # base-closure content fails TimedOut (ETIMEDOUT) by design
-  # (max_mutation_wait) — it never becomes the pending obligation
-  # this leg needs. Committing a scratch file over the live relay
-  # forces the head tree local (completion is the signal — success
-  # means the trees are local), so the obligation write below is
-  # local-first and succeeds while undrainable.
-  echo "scratch-m" > "$MNTS/xcrash-m/scratch-m.txt"
-  [[ "$(cat "$MNTS/xcrash-m/scratch-m.txt")" == "scratch-m" ]] \
-    || die "scratch write never committed"
-  pass "scratch commit localizes the head tree over the live relay"
+  # Tree localization BEFORE the partition, with bounded retries:
+  # this drive joined fresh and its initial closure drains slowly
+  # (observed: single objects per pass while pending_heads=1), so a
+  # first-minute commit can outwait the 30s max_mutation_wait and
+  # fail TimedOut even with the body path proven. Each attempt is
+  # terminal (a timed-out mutation commits nothing), so retrying the
+  # same bytes is safe; the first success proves the head tree local.
+  # Eight attempts bound the worst case near eight minutes; the
+  # closure drains in about one, so green runs pass on an early
+  # retry. (Product note, out of G5 scope: fresh-join authorship in
+  # the first ~minute routinely outwaits the deadline — fail-closed
+  # and fast, but worth knowing.)
+  local attempt=0 localized=0
+  while (( attempt < 8 )); do
+    attempt=$((attempt + 1))
+    if timeout 60 bash -c "echo 'scratch-m' > '$MNTS/xcrash-m/scratch-m.txt'" 2>/dev/null \
+      && [[ "$(cat "$MNTS/xcrash-m/scratch-m.txt")" == "scratch-m" ]]; then
+      localized=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$localized" == 1 ]] \
+    || die "scratch never committed in $attempt attempts: the head tree never localized"
+  pass "scratch commit localizes the head tree over the live relay (attempt $attempt)"
   touch "$E2E_ROOT/crash-m-ready"
   poll_until 180 test -f "$E2E_ROOT/crash-m-partitioned" \
     || die "host never partitioned the relay"
   conflict_assert_partitioned "$relay"
-  echo "obligation-v1" > "$MNTS/xcrash-m/obligation.txt"
-  [[ "$(cat "$MNTS/xcrash-m/obligation.txt")" == "obligation-v1" ]] \
-    || die "obligation write never acknowledged"
+  # Bounded retries like the scratch above: trees are local now, so
+  # the first attempt should take — the loop is insurance against a
+  # straggler pass, not a second localization.
+  local oattempt=0 obligated=0
+  while (( oattempt < 3 )); do
+    oattempt=$((oattempt + 1))
+    if timeout 60 bash -c "echo 'obligation-v1' > '$MNTS/xcrash-m/obligation.txt'" 2>/dev/null \
+      && [[ "$(cat "$MNTS/xcrash-m/obligation.txt")" == "obligation-v1" ]]; then
+      obligated=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$obligated" == 1 ]] \
+    || die "obligation never acknowledged in $oattempt attempts under partition"
   pass "obligation acknowledged while the relay is down (fence: pending-outbox window)"
   local pid kstatus=0
   pid="$(cat "$PIDDIR/mount-xcrash-m.pid")"

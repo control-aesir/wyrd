@@ -78,8 +78,10 @@ version say exactly what changed.
   under partition replays and re-serves), resource exhaustion
   (filled filesystem fails closed ENOSPC, drive stays readable and
   recovers, offline export holds only byte-complete fills), and
-  unknown parent (withheld body leaves the child ENOENT bounded with
-  an EIO control, then heals). New suite phases 13-15; the whole-run
+  unknown parent (announcements converge with the owner down;
+  reads of unserved bodies fail EIO bounded, never hang; heal
+  converges once the owner returns; manifest-missing UnknownParent
+  stays pinned at contract level). New suite phases 13-15; the whole-run
   cap moves 90 to 120 minutes with the legs' stated budgets.
   The exhaustion drive lives on a fixed-size ext4 image
   loop-mounted in-guest: filling the shared state dir fills the

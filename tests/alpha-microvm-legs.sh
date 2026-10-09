@@ -1453,15 +1453,16 @@ leg_uparent_owner() {
 
 # leg_uparent_member <drive> <creds> <relay>: with the owner down,
 # list both announcements off the relay (manifests need no bodies),
-# then prove the case split from fetch-on-open.md: the child's paths
-# are ENOENT — the unadopted snapshot never enters the projected
-# namespace — while the parent's own read fails EIO
-# (announced-but-unfetchable, the manifest-chain case). Both bounded
-# well under the 30s open deadline, so either hanging reads as rc
-# 124 instead of passing. The EIO half is the positive control: it
-# proves bodies were really withheld, so the ENOENT is the
-# UnknownParent verdict and not a dead mount. After the owner
-# returns, all three files serve: the stall heals.
+# then prove withheld bodies fail EIO bounded from fetch-on-open.md:
+# the child's and the parent's reads each hang on the unservable
+# body until the 30s open deadline fires EIO — never a silent hang,
+# never partial bytes. Both snapshots are live here (both manifests
+# converged, so neither parent is missing from the DAG and neither
+# classifies UnknownParent — that verdict needs a missing parent
+# manifest and stays pinned at contract level in sync_contracts).
+# The EIO pair is the whole proof: bodies were really withheld, the
+# mount is alive, and the deadline — not hope — bounds every wait.
+# After the owner returns, all three files serve: the stall heals.
 # Wall-clock envelope: worst case under 10 minutes with the heal
 # converges; typical 3-4 minutes.
 leg_uparent_member() {
@@ -1489,28 +1490,35 @@ leg_uparent_member() {
   touch "$E2E_ROOT/uparent-announced"
   poll_until 180 test -f "$E2E_ROOT/uparent-owner-gone" \
     || die "owner never stopped before the probes"
-  # The child first, on pristine state: up-2's snapshot has an
-  # unrecorded parent (up-1's body never arrived), so it classifies
-  # UnknownParent, never becomes a live head, and its paths are
-  # ENOENT — never a hang. The 25s budget (still under the 30s open
-  # deadline) is what makes "never" real: with the 13b backlog the
-  # classification itself can queue behind a busy loop for seconds
-  # before it runs.
+  # Control first, on pristine state: a never-announced name is
+  # ENOENT instantly, proving the mount is alive and resolving names
+  # — so the EIOs below mean unfetchable bodies, not a dead mount.
   rc=0
-  timeout 25 cat "$MNTS/xup-m/up-2.txt" >"$E2E_ROOT/up-2.got" 2>"$E2E_ROOT/up-2.err" || rc=$?
+  timeout 10 cat "$MNTS/xup-m/up-9.txt" >"$E2E_ROOT/up-9.got" 2>"$E2E_ROOT/up-9.err" || rc=$?
+  [[ "$rc" == 1 ]] || die "unannounced-name open returned rc $rc, want ENOENT (1)"
+  grep -q "No such file or directory" "$E2E_ROOT/up-9.err" \
+    || die "unannounced-name open was not ENOENT: $(cat "$E2E_ROOT/up-9.err")"
+  pass "unannounced names are ENOENT, instantly (control)"
+  # The child: live head (its manifest converged, and so did its
+  # parent's — neither classifies UnknownParent), body unfetchable
+  # with the owner down. The open resolves; the read waits on the
+  # body until the 30s open deadline fires EIO. The 60s budget
+  # covers the deadline with margin; rc 124 means the wait
+  # outlasted even that.
+  rc=0
+  timeout 60 cat "$MNTS/xup-m/up-2.txt" >"$E2E_ROOT/up-2.got" 2>"$E2E_ROOT/up-2.err" || rc=$?
   if [[ "$rc" != 1 ]]; then
     echo "--- up-2 probe failure evidence: projected view (timeout 10) ---"
     timeout 10 ls -laR "$MNTS/xup-m" 2>&1 | head -n 40 || true
     echo "--- drive + mount df ---"
     df -k "$MNTS/xup-m" "$d" 2>&1 || true
-    die "unadopted-child open returned rc $rc, want ENOENT (1); body captured: $(wc -c <"$E2E_ROOT/up-2.got") bytes, err: $(cat "$E2E_ROOT/up-2.err")"
+    die "withheld-child read returned rc $rc, want EIO (1); body captured: $(wc -c <"$E2E_ROOT/up-2.got") bytes, err: $(cat "$E2E_ROOT/up-2.err")"
   fi
-  grep -q "No such file or directory" "$E2E_ROOT/up-2.err" \
-    || die "unadopted-child open was not ENOENT: $(cat "$E2E_ROOT/up-2.err")"
-  pass "unadopted snapshot's paths are ENOENT, never a hang"
-  # Positive control: the parent IS announced and only its body is
-  # missing, so its read fails EIO bounded — bodies were really
-  # withheld, the mount is alive, the ENOENT above is the verdict.
+  grep -q "Input/output error" "$E2E_ROOT/up-2.err" \
+    || die "withheld-child read was not EIO: $(cat "$E2E_ROOT/up-2.err")"
+  pass "withheld child body fails EIO bounded"
+  # The parent, same shape: announced with its manifest, body
+  # unfetchable with the owner down. Same EIO at the same deadline.
   rc=0
   timeout 60 cat "$MNTS/xup-m/up-1.txt" >"$E2E_ROOT/up-1.got" 2>"$E2E_ROOT/up-1.err" || rc=$?
   if [[ "$rc" != 1 ]]; then

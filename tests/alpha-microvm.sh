@@ -778,15 +778,18 @@ fi # want_phase 14
 # --- phase: microvm 15 (unknown parent) -----------------------------------
 # Fresh pair on the same topology (same guests, same relay — no
 # third VM, no proxy per OD-06-C): owner publishes two chained
-# snapshots and stops before the member fetches any body; the member
-# proves the UnknownParent case split (child ENOENT, parent EIO,
-# both bounded), then heals once the owner returns. Fresh drives
-# because 13b's forty-snapshot history makes every phase-15 bound a
-# backlog lottery (observed: the closure drains one object per pass
-# while pending_heads=1, and the up-2 probe hung past 25s with the
-# drain still in flight) — and the UnknownParent semantic does not
-# depend on history depth, so the backlog only confounds. Worst
-# case ~10 minutes; typical 3-4.
+# snapshots and stops before the member fetches any body; with both
+# manifests converged but neither body servable, the member's reads
+# fail EIO bounded (never hang, never partial), then heal once the
+# owner returns. Fresh drives because 13b's forty-snapshot history
+# makes every phase-15 bound a backlog lottery (observed: the
+# closure drains one object per pass while pending_heads=1) — and
+# the degraded path under test does not depend on history depth, so
+# the backlog only confounds. (True UnknownParent — parent manifest
+# missing from the DAG — stays pinned at contract level in
+# sync_contracts; this construction converges both manifests, so
+# both heads are live and the verdict here is EIO, not ENOENT.)
+# Worst case ~10 minutes; typical 3-4.
 if want_phase 15; then
 echo "=== microvm 15: unknown parent ==="
 UO="$RUN/creds/uparent-o"
@@ -825,7 +828,7 @@ pass "uparent pair joins on a fresh drive"
 rm -f "$RUN"/uparent-owner-gone "$RUN"/uparent-member-probed \
   "$RUN"/uparent-owner-back "$RUN"/uparent-member-healed \
   "$RUN"/uparent-announced "$RUN"/up-2.err "$RUN"/up-1.err \
-  "$RUN"/up-2.got "$RUN"/up-1.got
+  "$RUN"/up-2.got "$RUN"/up-1.got "$RUN"/up-9.err "$RUN"/up-9.got
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GUND $GUN $RELAY_URL" \
   >"$RUN/logs/leg-uparent-member.out" 2>&1 &
 LEG_N=$!
@@ -834,7 +837,7 @@ on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-ow
 LEG_O=$!
 wait "$LEG_N" || die "unknown-parent member leg failed (see logs/leg-uparent-member.out)"
 wait "$LEG_O" || die "unknown-parent owner leg failed (see logs/leg-uparent-owner.out)"
-pass "unknown-parent fails ENOENT bounded and heals"
+pass "withheld bodies fail EIO bounded and heal"
 fi # want_phase 15
 
 # Host-side leak check over every log the host wrote (guest logs

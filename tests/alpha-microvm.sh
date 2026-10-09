@@ -776,20 +776,59 @@ on_o "sudo umount '$GED'" >"$RUN/logs/umount-exh-fs.out" 2>&1 || true
 fi # want_phase 14
 
 # --- phase: microvm 15 (unknown parent) -----------------------------------
-# Reuses the healthy post-crash pair: owner publishes two chained
+# Fresh pair on the same topology (same guests, same relay — no
+# third VM, no proxy per OD-06-C): owner publishes two chained
 # snapshots and stops before the member fetches any body; the member
 # proves the UnknownParent case split (child ENOENT, parent EIO,
-# both bounded), then heals once the owner returns. No third VM, no
-# proxy (OD-06-C). Worst case ~10 minutes; typical 3-4.
+# both bounded), then heals once the owner returns. Fresh drives
+# because 13b's forty-snapshot history makes every phase-15 bound a
+# backlog lottery (observed: the closure drains one object per pass
+# while pending_heads=1, and the up-2 probe hung past 25s with the
+# drain still in flight) — and the UnknownParent semantic does not
+# depend on history depth, so the backlog only confounds. Worst
+# case ~10 minutes; typical 3-4.
 if want_phase 15; then
 echo "=== microvm 15: unknown parent ==="
+UO="$RUN/creds/uparent-o"
+UOD="$RUN/drives/uparent-o"
+UN="$RUN/creds/uparent-n"
+UND="$RUN/drives/uparent-n"
+GUO="$GUEST_RUN/creds/uparent-o"
+GUOD="$GUEST_RUN/drives/uparent-o"
+GUN="$GUEST_RUN/creds/uparent-n"
+GUND="$GUEST_RUN/drives/uparent-n"
+mkdir -p "$UO" "$UOD" "$UN" "$UND"
+for _cdir in "$UO" "$UN"; do
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_cdir/identity"
+  printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$_cdir/passphrase"
+  chmod 600 "$_cdir/identity" "$_cdir/passphrase"
+done
+unset _cdir
+chown -R 1000:1000 "$UO" "$UOD" "$UN" "$UND"
+as_guest "$WYRD_BIN" init --identity-file "$UO/identity" --passphrase-file "$UO/passphrase" \
+  "$UOD" >"$RUN/logs/init-uparent.out" 2>"$RUN/logs/init-uparent.stderr" \
+  || die "uparent pair drive init failed"
+as_guest "$WYRD_BIN" device --identity-file "$UN/identity" --passphrase-file "$UN/passphrase" \
+  "$UND" pairing-request "$RUN/pairing-uparent.txt" >"$RUN/logs/pairing-uparent.out" 2>"$RUN/logs/pairing-uparent.stderr" \
+  || die "uparent-n pairing-request failed"
+DEV_UPARENT="$(grep '^device ' "$RUN/pairing-uparent.txt" | cut -d' ' -f2)"
+KEY_UPARENT="$(grep '^encryption-key ' "$RUN/pairing-uparent.txt" | cut -d' ' -f2)"
+[[ "${#DEV_UPARENT}" == 64 && "${#KEY_UPARENT}" == 64 ]] || die "uparent-n pairing material malformed"
+as_guest "$WYRD_BIN" member --identity-file "$UO/identity" \
+  --passphrase-file "$UO/passphrase" "$UOD" \
+  invite "$DEV_UPARENT" "$KEY_UPARENT" "$RUN/invitation-uparent" >"$RUN/logs/invite-uparent.out" 2>"$RUN/logs/invite-uparent.stderr" \
+  || die "uparent owner invite of uparent-n failed"
+as_guest "$WYRD_BIN" device --identity-file "$UN/identity" --passphrase-file "$UN/passphrase" \
+  "$UND" join "$RUN/invitation-uparent" >"$RUN/logs/join-uparent.out" 2>"$RUN/logs/join-uparent.stderr" \
+  || die "uparent-n join failed"
+pass "uparent pair joins on a fresh drive"
 rm -f "$RUN"/uparent-owner-gone "$RUN"/uparent-member-probed \
   "$RUN"/uparent-owner-back "$RUN"/uparent-member-healed \
   "$RUN"/uparent-announced "$RUN"/up-2.err "$RUN"/up-1.err
-on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GCND $GCN $RELAY_URL" \
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GUND $GUN $RELAY_URL" \
   >"$RUN/logs/leg-uparent-member.out" 2>&1 &
 LEG_N=$!
-on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-owner $GCOD $GCO $RELAY_URL" \
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-owner $GUOD $GUO $RELAY_URL" \
   >"$RUN/logs/leg-uparent-owner.out" 2>&1 &
 LEG_O=$!
 wait "$LEG_N" || die "unknown-parent member leg failed (see logs/leg-uparent-member.out)"
@@ -800,7 +839,8 @@ fi # want_phase 15
 # Host-side leak check over every log the host wrote (guest logs
 # are checked in-guest by each leg). Owner secrets always exist past
 # phase 1; member-n credentials exist only once phase 6 stages them,
-# and the phase-12 headless credentials only once phase 12 stages
+# and the phase-12 headless, phase-13 crash, phase-14 exhaustion,
+# and phase-15 uparent credentials only once those phases stage
 # them, so a prefix that stops earlier has nothing of theirs to
 # check.
 for f in "$RUN"/logs/*; do
@@ -829,6 +869,12 @@ for f in "$RUN"/logs/*; do
   fi
   if want_phase 14; then
     for s in "$(cat "$EC/identity")" "$(cat "$EC/passphrase")"; do
+      grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
+    done
+  fi
+  if want_phase 15; then
+    for s in "$(cat "$UO/identity")" "$(cat "$UO/passphrase")" \
+             "$(cat "$UN/identity")" "$(cat "$UN/passphrase")"; do
       grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
     done
   fi

@@ -1686,6 +1686,14 @@ struct SyncRunReport {
     snapshot_bodies: usize,
     objects: usize,
     unfulfilled: usize,
+    /// Fetch work still owed when a quiet exit stopped the run: the
+    /// confirming pass's unfulfilled count, captured once at the end
+    /// like `pending`, never accumulated (the accumulated sum counts
+    /// pass-effort, not backlog). Zero is converged; nonzero is
+    /// quiescent-but-incomplete — no immediately actionable work
+    /// remained, but the target is not satisfied. The quiet line
+    /// renders the distinction; the exit code does not change.
+    closing_unfulfilled: usize,
     /// Fetch-attempt diagnostics, accumulated like the rest: stored
     /// for the surface that renders them (`14-fetch-failure-
     /// diagnostics` owns the class renderer — this report must not
@@ -1969,6 +1977,7 @@ where
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,
@@ -2019,6 +2028,7 @@ where
             report.accumulate(&confirm);
             if live.is_quiet(&confirm)? {
                 report.outcome = RunOutcome::Quiet;
+                report.closing_unfulfilled = confirm.fetched.unfulfilled;
                 break;
             }
             stalled_streak = 0;
@@ -2320,6 +2330,39 @@ fn reconciliation_gap_reason(report: &SyncRunReport) -> String {
     }
 }
 
+/// Cause clauses for a quiescent-but-incomplete quiet exit: the run's
+/// accumulated cause counters grouped by shape — deferred on
+/// transitions, failed attempts, or unavailable representations — so
+/// the line says what kind of stuck the leftover work is. Counts
+/// only, reusing the fetch-classes vocabulary; empty when the run
+/// never attempted the leftover work (budget-starved throughout),
+/// in which case the caller renders the bare tail.
+fn quiet_stall_clauses(report: &SyncRunReport) -> Vec<String> {
+    let mut clauses = Vec::new();
+    if report.deferred > 0 {
+        clauses.push(format!("{} deferred", report.deferred));
+    }
+    if report.transport_errors > 0 {
+        clauses.push(format!("{} transport errors", report.transport_errors));
+    }
+    if report.deadlines > 0 {
+        clauses.push(format!("{} budget discards", report.deadlines));
+    }
+    if report.missing > 0 {
+        clauses.push(format!("{} missing", report.missing));
+    }
+    if report.unavailable_keys > 0 {
+        clauses.push(format!("{} unavailable keys", report.unavailable_keys));
+    }
+    if report.invalid > 0 {
+        clauses.push(format!("{} invalid", report.invalid));
+    }
+    if report.local_failures > 0 {
+        clauses.push(format!("{} local failures", report.local_failures));
+    }
+    clauses
+}
+
 /// Render a headless run report. Built as a string so tests assert
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
@@ -2530,7 +2573,30 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             Some(health)
                 if !mailbox_verdict_failed(&health, report_intake_observed(report), report.sent)
                     && !reconciliation_open => {
-                out.push_str("completed: quiet");
+                if report.closing_unfulfilled == 0 {
+                    out.push_str("completed: quiet");
+                } else {
+                    // Quiescent but incomplete: the loop found nothing
+                    // actionable, but the confirming pass still owed
+                    // work — quiescence is not convergence. The exit
+                    // stays success (cron contract; cf.
+                    // RemoteStalled), and the line carries the backlog
+                    // plus its causes so automation can tell the two
+                    // quiets apart.
+                    let clauses = quiet_stall_clauses(report);
+                    out.push_str(&format!(
+                        "completed: quiet with {} unfulfilled",
+                        report.closing_unfulfilled,
+                    ));
+                    if clauses.is_empty() {
+                        out.push_str(" (work remains blocked or retry-delayed)");
+                    } else {
+                        out.push_str(&format!(
+                            " ({}; work remains blocked or retry-delayed)",
+                            clauses.join(", "),
+                        ));
+                    }
+                }
                 if health.total_relays == 0 {
                     out.push_str(" (offline run: local obligations only)");
                 }

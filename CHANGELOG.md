@@ -23,6 +23,15 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd sync now` distinguishes quiescence from convergence (22b):
+  a healthy quiet exit that still owes fetch work now reports
+  `completed: quiet with N unfulfilled (...)` with the backlog and
+  its causes, instead of the bare `completed: quiet` of a fully
+  satisfied target. The exit code is unchanged (success, like the
+  `unfetchable heads` quiet before it): automate on the unfulfilled
+  count and the cause clauses, not the exit status. No loop, pass-
+  cap, or backoff behavior changes — the distinction is terminal
+  classification only.
 - `wyrd vault` lifecycle ownership (22b): one vault or mount per
   drive, enforced by the kernel-held store lock. A second `vault`
   against a held drive exits 2 promptly, naming the drive —

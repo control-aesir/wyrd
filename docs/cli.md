@@ -417,7 +417,14 @@ sync now
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run
    as quiet with an explicit `N unfetchable heads` count instead of
-   burning the cap. Zero-progress passes park the settle window too,
+   burning the cap. A quiet exit that still owes fetch work is
+   quiescent, not converged: the completion line reads
+   `completed: quiet with N unfulfilled (...)` with the backlog and
+   its causes (deferred, transport errors, missing, and the rest),
+   so quiescence never reports the bare `completed: quiet` of a
+   fully satisfied target. The exit stays success either way —
+   automate on the unfulfilled count and the cause clauses, not the
+   exit status. Zero-progress passes park the settle window too,
    so dead churn waits on the relay instead of spinning. A
    `senders observed` section names the distinct senders whose
    envelopes the run processed, by full `DeviceId`: this process

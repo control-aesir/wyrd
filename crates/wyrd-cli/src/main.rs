@@ -39,6 +39,7 @@ use wyrd_format::{
     RECOVERY_FLAG,
 };
 use wyrd_sync::control::SealedBootstrap;
+use wyrd_sync::durable::DurableError;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
 use wyrd_sync::runtime::{Engine, EngineError, MergeSelection, RoutePublishing};
@@ -538,6 +539,12 @@ pub(crate) enum CliError {
     Identity(#[from] wyrd_sync::keys::CryptoError),
     #[error("engine failed: {0}")]
     Engine(#[from] wyrd_sync::runtime::EngineError),
+    /// A second vault against a drive another process holds: the
+    /// store lock is kernel-held, so this is definite contention,
+    /// never a stale record — and it names the drive, because the
+    /// wrapped open error does not. One vault or mount per drive.
+    #[error("another wyrd process holds the drive at {drive}: only one vault or mount per drive")]
+    VaultLocked { drive: PathBuf },
     #[error("daemon construction failed: {0}")]
     WyrdNode(#[from] wyrd_daemon::NodeError),
     #[error("object store failed: {0}")]
@@ -2890,7 +2897,18 @@ fn vault(
     let _vault_guard = vault_span.enter();
     tracing::info!(stage = "start", "vault diagnostics initialized");
 
-    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
+    let engine = match Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone()) {
+        // Definite contention, surfaced before any iroh or relay
+        // work: the try-lock is non-blocking, so refusal is prompt,
+        // and the drive is named, because the wrapped open error
+        // says "durable commit failed" without saying where.
+        Err(EngineError::Durable(DurableError::StoreLocked)) => {
+            return Err(CliError::VaultLocked {
+                drive: drive_dir.clone(),
+            });
+        }
+        result => result?,
+    };
     // Same shared budgets as mount and headless sync, through
     // `for_local_sync` (never `Default` directly): several are
     // correctness boundaries, and a vault-only default must never

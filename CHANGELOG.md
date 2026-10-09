@@ -23,6 +23,20 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd vault` lifecycle ownership (22b): one vault or mount per
+  drive, enforced by the kernel-held store lock. A second `vault`
+  against a held drive exits 2 promptly, naming the drive —
+  replacing the unnamed `durable commit failed` wording that said
+  nothing about where. The lock dies with its process, so a crash
+  leaves no stale record; a held lock proves occupancy only, never
+  health. No pidfile, socket, or status file; no
+  `start|stop|status` subcommands (those belong to 36-packaging).
+  Proven by a refusal process test (exit 2, drive named, drive
+  available after the holder exits, SIGKILL-then-replacement
+  reaches ready) and a microVM leg where a fresh peer fetches
+  against the immediate KILL replacement — re-announcement and
+  content service each peer-observed, never read off the ready
+  line.
 - `wyrd vault` foreground process (22a): the mount's live loop and
   serving surface with no presentation session — the persistent
   process that `sync now` (bounded one-shot, unchanged) is not.

@@ -367,3 +367,88 @@ fn vault_log_file_appends_across_restarts() {
         "both runs recorded readiness in one appended file, got:\n{body}"
     );
 }
+
+/// A second vault against a held drive is refused promptly with the
+/// drive named (issue `22b`): the kernel-held store lock is definite
+/// contention, never a stale record, and the try-lock is
+/// non-blocking, so refusal must not hang behind iroh or relay work.
+/// After the holder exits the drive opens again.
+#[test]
+fn vault_second_process_is_refused() {
+    let fixture = Fixture::new("locked");
+    fixture.init();
+    let relay = TestRelay::spawn();
+    let first = fixture.spawn_until_ready(&relay, None);
+    let start = Instant::now();
+    let mut second = fixture
+        .wyrd(&[
+            "vault",
+            fixture.drive.to_str().unwrap(),
+            "--relay",
+            &relay.url,
+            "--identity-file",
+            fixture.identity.to_str().unwrap(),
+            "--passphrase-file",
+            fixture.passphrase.to_str().unwrap(),
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("second vault spawns");
+    // try_wait, never wait: a hung refusal must fail the test, not
+    // the suite.
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("second vault reaps") {
+            break status;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "a refused vault must exit promptly, still running after {:?}",
+            start.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(
+        &mut BufReader::new(second.stderr.take().expect("stderr piped")),
+        &mut stderr,
+    )
+    .expect("stderr reads");
+    assert_eq!(status.code(), Some(2), "contention exits 2, got {status:?}");
+    assert!(
+        stderr.contains("another wyrd process holds")
+            && stderr.contains(fixture.drive.to_str().unwrap()),
+        "the refusal names the held drive, got: {stderr:?}"
+    );
+    // The holder's exit releases the kernel lock: the drive opens again.
+    sigterm(&first);
+    assert!(first.wait().success());
+    let third = fixture.spawn_until_ready(&relay, None);
+    sigterm(&third);
+    assert!(third.wait().success());
+    relay.shutdown();
+}
+
+/// SIGKILL mid-service is real process death, not a graceful
+/// restart: the replacement vault reacquires the kernel-held lock
+/// (which died with the killed process), recovers, and reaches
+/// ready on the same drive. Fetch-after-recovery is proven by the
+/// microVM leg; here the bar is reacquire plus ready.
+#[test]
+fn vault_sigkill_then_replacement_recovers() {
+    let fixture = Fixture::new("sigkill");
+    fixture.init();
+    let relay = TestRelay::spawn();
+    let mut first = fixture.spawn_until_ready(&relay, None);
+    first.child.kill().expect("SIGKILL delivers");
+    let status = first.wait();
+    assert!(
+        !status.success(),
+        "a SIGKILLed vault must not exit 0, got {status:?}"
+    );
+    // No stale lock survives the dead process: the replacement
+    // opens the same drive and serves again.
+    let second = fixture.spawn_until_ready(&relay, None);
+    sigterm(&second);
+    assert!(second.wait().success());
+    relay.shutdown();
+}

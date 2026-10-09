@@ -504,10 +504,13 @@ policy, quota, effective budgets, all already readable — never what
 it *guarantees*: retention promises wait for the DG-4 decision, and
 the help text makes no retention claim. No liveness handle, no
 status surface, no daemonization: supervision owns the pid
-(`systemd`/`launchd` track and restart it), the store lock stays
-exclusive (a second `wyrd` invocation against the running drive
-fails closed with the lock error, `sync status` included), and
-shutdown is SIGTERM plus the documented teardown order. Operator
+(`systemd`/`launchd` track and restart it). One vault or mount per
+drive, enforced by the kernel-held store lock: a second `vault`
+against a held drive exits 2 promptly, naming the drive
+(`another wyrd process holds ...: only one vault or mount per
+drive`). The lock dies with its process, so a crash leaves no
+stale record — but a held lock proves only occupancy, never
+health or convergence. Operator
 lifecycle (`start`/`stop`/`status`) and queryable health are separate
 follow-ons; this command is the foreground process they supervise.
 

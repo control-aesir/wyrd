@@ -93,8 +93,8 @@ cleanup_mounts() {
   done
 }
 # --- wall-clock accounting ----------------------------------------------
-# Relative seconds since this shell started, printed on every step header,
-# every check, and once more in a closing summary. SECONDS is the bash
+# Elapsed seconds since this helper was sourced, printed on every step
+# header, every check, and once more in a closing summary. SECONDS is the bash
 # builtin, so none of this forks a `date`; that matters because the numbers
 # are meant to land on the PASS lines, which are the run's primary artifact
 # and are read one at a time while a run is in flight.
@@ -121,10 +121,10 @@ step_close() {
 # tail of main(), and a diagnostic must never flip a run's verdict. Guarded, so
 # a harness that calls it from both places reports once and the line stays
 # parseable.
-E2E_TIMED_OUT=""
+E2E_TIMING_REPORTED=""
 e2e_timing_report() {
-  [[ -z "$E2E_TIMED_OUT" ]] || return 0
-  E2E_TIMED_OUT=1
+  [[ -z "$E2E_TIMING_REPORTED" ]] || return 0
+  E2E_TIMING_REPORTED=1
   step_close || true
   printf 'e2e timing: %ss total, %s checks\n' \
     "$(( SECONDS - E2E_T0 ))" "$PASS_COUNT" || true
@@ -134,7 +134,7 @@ trap 'e2e_timing_report; cleanup_mounts; collect_logs' EXIT
 
 PASS_COUNT=0
 step()  {
-  step_close
+  step_close || true
   E2E_STEP_LABEL="$1"; E2E_STEP_T0=$SECONDS
   echo "=== step $1: $2 (+$(( SECONDS - E2E_T0 ))s) ==="
 }

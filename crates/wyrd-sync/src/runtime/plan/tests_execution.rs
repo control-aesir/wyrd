@@ -1,6 +1,7 @@
 use super::*;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,9 +19,10 @@ use crate::durable::CrashStage;
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
-    admit_engine, announcement_msg, announcement_msg_with, body_root, capability_message, deliver,
-    drain, empty_roots, fixture, identity_secret, intake_body, intake_published, intake_snapshot,
-    publish_into, queue, reopen, transition_message, AnnouncedRoots, TestDir,
+    admit_engine, announce_snapshot, announcement_msg, announcement_msg_with, body_root,
+    capability_message, deliver, drain, empty_roots, fixture, identity_secret, intake_body,
+    intake_body_with_tree, intake_published, intake_snapshot, publish_into, queue, reopen,
+    transition_message, AnnouncedRoots, Fixture, TestDir,
 };
 use crate::runtime::MaterializationState;
 use crate::seal::{blob_root, entry_for, seal_manifest, SEAL_VERSION};
@@ -1303,4 +1305,404 @@ fn sliced_run_attempts_live_candidates_behind_a_dead_one() {
     );
     bulk.shutdown(Duration::from_secs(10));
     live_serving.shutdown(Duration::from_secs(10)).unwrap();
+}
+
+/// E-leg accounting identity (22b): transfer, fulfillment, revision,
+/// and totals must agree across sliced runs under a dead/live route
+/// split.
+///
+/// The double serves the inner peer's real bytes for live transport
+/// roots and fails dead ones fast with a dial timeout (no sleeping:
+/// the budget burn is a deployment fact, not a counting input). The
+/// eager routes fail dead snapshots the same way E's dialing fallback
+/// does (rather than reporting absence), so dead items show transport
+/// failures on both routes and nothing classifies silently.
+///
+/// Shape mirrors the E fetch: two history snapshots pinned to a dead
+/// route, the head on a live one. Run 1 fulfills the head (one body,
+/// one manifest, one revision bump) while the dead pair errors on
+/// body and root, transport and fallback alike; the dead keys strike
+/// out and cool, so later runs go quiet-but-unfulfilled with a frozen
+/// revision; past cooldown the errors resume. Totals equal the sum of
+/// pass reports and exactly one run carries fulfillments. A served-
+/// but-uncounted blob, a fulfillment without a revision advance, or
+/// a total disagreeing with its parts fails here instead of on odin.
+struct SplitRouteBulk {
+    inner: MemoryBulkSource,
+    dead_roots: BTreeSet<BaoRoot>,
+    dead_snapshots: BTreeSet<SnapshotId>,
+    garbage: BTreeSet<BaoRoot>,
+    transport_attempts: usize,
+    transport_served: usize,
+    transport_failed: usize,
+    eager_failed: usize,
+}
+
+impl AttemptBudget for SplitRouteBulk {}
+
+impl BulkSource for SplitRouteBulk {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        if self.dead_snapshots.contains(snapshot) {
+            self.eager_failed += 1;
+            return Err(BulkError::Transport("provider dial timed out".to_string()));
+        }
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if self.dead_snapshots.contains(snapshot) {
+            self.eager_failed += 1;
+            return Err(BulkError::Transport("provider dial timed out".to_string()));
+        }
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.transport_attempts += 1;
+        if self.dead_roots.contains(root) {
+            self.transport_failed += 1;
+            return Err(BulkError::Transport("provider dial timed out".to_string()));
+        }
+        // Garbage shadows the inner peer's real bytes: transport
+        // precedence means the eager routes never run for these
+        // roots, so the bytes always fail validation (invalid),
+        // never fall back.
+        if self.garbage.contains(root) {
+            self.transport_served += 1;
+            return Ok(Some(vec![0xFF; 32]));
+        }
+        let out = self.inner.fetch_transport(root, max);
+        if matches!(out, Ok(Some(_))) {
+            self.transport_served += 1;
+        }
+        out
+    }
+}
+
+/// Three announced snapshots with honest bodies and sealed roots:
+/// the first two pinned to `dead`, the third live. Returns the
+/// snapshot ids with their body and root-transport roots, so the
+/// caller splits the double's dead set exactly like the E leg's
+/// R1/R2 split. Transitions and capability commit once up front;
+/// each announcement drains accepted on its own.
+fn announce_three(
+    fixture: &mut Fixture,
+    inner: &mut MemoryBulkSource,
+    secrets: &[EpochSecret],
+) -> Vec<(SnapshotId, BaoRoot, BaoRoot)> {
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = secrets
+        .get(admission.epoch as usize - 1)
+        .expect("the capability carries the admission epoch's secret");
+    let cap = capability_message(
+        fixture.recipient,
+        admission.transition_id(),
+        admission.epoch,
+        secrets.to_vec(),
+    );
+    queue(
+        fixture,
+        vec![
+            deliver(fixture, 1, &transition_message(&genesis)),
+            deliver(fixture, 1, &transition_message(&admission)),
+            deliver(fixture, admission.epoch, &cap),
+        ],
+    );
+    assert_eq!(drain(fixture).accepted, 3);
+    let mut out = Vec::new();
+    for tag in [0xA1u8, 0xA2, 0xA3] {
+        let body = intake_body_with_tree(&builder, &admission, ContentId::from_bytes([tag; 32]));
+        let snapshot = body.snapshot_id();
+        let roots = empty_roots(inner, epoch_secret, admission.epoch, &snapshot);
+        let transport = roots.transport;
+        assert_eq!(
+            announce_snapshot(fixture, inner, &builder, &admission, &body, roots),
+            1,
+            "each announcement commits on its own"
+        );
+        out.push((snapshot, body_root(&body), transport));
+    }
+    out
+}
+
+#[test]
+fn sliced_runs_keep_transfer_fulfillment_revision_and_totals_consistent() {
+    let mut fixture = fixture();
+    let mut inner = MemoryBulkSource::default();
+    let secrets = vec![
+        EpochSecret::from_bytes([0x08; 32]),
+        EpochSecret::from_bytes([0x09; 32]),
+    ];
+    let announced = announce_three(&mut fixture, &mut inner, &secrets);
+    let dead_roots: BTreeSet<BaoRoot> = announced[..2]
+        .iter()
+        .flat_map(|(_, body, transport)| [*body, *transport])
+        .collect();
+    let dead_snapshots: BTreeSet<SnapshotId> = announced[..2]
+        .iter()
+        .map(|(snapshot, _, _)| *snapshot)
+        .collect();
+    let mut bulk = SplitRouteBulk {
+        inner,
+        dead_roots,
+        dead_snapshots,
+        garbage: BTreeSet::new(),
+        transport_attempts: 0,
+        transport_served: 0,
+        transport_failed: 0,
+        eager_failed: 0,
+    };
+    let mut objects = MemoryObjectStore::default();
+    let rev_start = fixture.engine.current();
+    let mut bodies = 0usize;
+    let mut manifests = 0usize;
+    let mut errors = 0usize;
+    let mut unfulfilled = 0usize;
+    let mut fulfilling_runs = 0usize;
+    let mut rev = rev_start;
+    // Past the 3-strike threshold into the 8-run cooldown and out
+    // again: errors on runs 1-3 and 12, silence on 4-11, work
+    // pending throughout.
+    for run in 1..=12usize {
+        let served_before = bulk.transport_served;
+        let failed_before = bulk.transport_failed;
+        let eager_before = bulk.eager_failed;
+        let report = fixture
+            .engine
+            .execute_plan_sliced(
+                &mut bulk,
+                &mut objects,
+                Some(Instant::now() + Duration::from_secs(30)),
+            )
+            .unwrap();
+        let served = bulk.transport_served - served_before;
+        let failed = bulk.transport_failed - failed_before;
+        let eager = bulk.eager_failed - eager_before;
+        bodies += report.snapshot_bodies;
+        manifests += report.manifests;
+        errors += report.transport_errors;
+        unfulfilled += report.unfulfilled;
+        assert_eq!(
+            report.objects, 0,
+            "empty manifests carry no objects: run {run}"
+        );
+        assert_eq!(
+            report.invalid, 0,
+            "honest bytes never fail validation: run {run}"
+        );
+        assert_eq!(
+            report.missing, 0,
+            "dead eager routes fail, never absent: run {run}"
+        );
+        let now = fixture.engine.current();
+        if report.snapshot_bodies + report.manifests + report.objects > 0 {
+            fulfilling_runs += 1;
+            assert!(
+                now > rev,
+                "a fulfillment commits facts: run {run} fulfilled without advancing the revision"
+            );
+        } else {
+            assert_eq!(
+                now, rev,
+                "no fulfillment, no commit: run {run} advanced the revision with nothing fulfilled"
+            );
+        }
+        rev = now;
+        match run {
+            // Run 1: the live head converges (one body, one manifest)
+            // while the dead pair errors on body and root, transport
+            // and fallback alike. The commit loops back for a
+            // convergence re-drive, which errors again (strikes are
+            // once per run, so the re-drive still attempts): eight
+            // errors over sixteen dead dials; four items stay pending.
+            // (E burns its whole budget on the first dial, so it sees
+            // one error per pass where this instant double sees every
+            // attempt: a deployment difference, not a counting one.)
+            1 => {
+                assert_eq!(report.snapshot_bodies, 1, "the live head's body lands");
+                assert_eq!(report.manifests, 1, "the live head's root lands");
+                assert_eq!(
+                    report.transport_errors, 8,
+                    "dead body+root, both routes, twice"
+                );
+                assert_eq!(report.unfulfilled, 4, "the dead pair stays pending");
+                assert_eq!(served, 2, "live body+root transfers");
+                assert_eq!(failed + eager, 16, "dead transfers, both routes, twice");
+            }
+            // Runs 2-3: the head is done; the dead pair strikes out
+            // (one iteration — nothing commits, so no re-drive).
+            2 | 3 => {
+                assert_eq!(report.snapshot_bodies + report.manifests, 0);
+                assert_eq!(report.transport_errors, 4);
+                assert_eq!(report.unfulfilled, 4);
+                assert_eq!(failed + eager, 8);
+            }
+            // Runs 4-11: struck out, cooling — nothing attempted,
+            // nothing fulfilled, work still pending.
+            4..=11 => {
+                assert_eq!(
+                    report.transport_errors, 0,
+                    "cooled keys are skipped, not attempted"
+                );
+                assert_eq!(report.unfulfilled, 4);
+                assert_eq!(failed + eager, 0, "no dials while cooling");
+            }
+            // Run 12: cooldown expired, the dead pair retries.
+            _ => {
+                assert_eq!(
+                    report.transport_errors, 4,
+                    "cooldown expiry re-arms the dead pair"
+                );
+                assert_eq!(report.unfulfilled, 4);
+                assert_eq!(failed + eager, 8);
+            }
+        }
+    }
+    // The E identities: totals equal the sum of pass reports (the
+    // CLI accumulate cannot disagree), exactly one run fulfilled,
+    // and the revision advanced exactly once with it. A total
+    // disagreeing with its parts — E's bodies paradox — fails here.
+    assert_eq!(bodies, 1, "only the live head ever fulfills");
+    assert_eq!(manifests, 1);
+    assert_eq!(errors, 20, "eight errors on run 1, four on runs 2-3 and 12");
+    assert_eq!(unfulfilled, 48, "four pending items on all twelve runs");
+    assert_eq!(fulfilling_runs, 1);
+    assert_eq!(
+        fixture.engine.current() - rev_start,
+        1,
+        "fulfillment and only fulfillment advances the revision"
+    );
+    assert_eq!(
+        bulk.transport_attempts,
+        bulk.transport_served + bulk.transport_failed,
+        "every transfer classifies"
+    );
+    assert_eq!(bulk.transport_served, 2, "live body+root, run 1 only");
+    assert_eq!(
+        bulk.transport_failed, 20,
+        "every error outcome began with a transport attempt"
+    );
+    assert_eq!(
+        bulk.eager_failed, 20,
+        "every error outcome ran its fallback attempt"
+    );
+    assert_eq!(
+        errors, bulk.transport_failed,
+        "one error outcome per failed transport attempt"
+    );
+}
+
+/// Served-but-invalid cools without committing (22b): bytes that
+/// arrive over a live route yet fail validation strike like any
+/// fault, enter cooldown past the threshold, and never advance the
+/// revision. E's every-pass served lines therefore cannot be
+/// invalid-shaped — invalid stops being attempted — which leaves
+/// fulfillment (commits, visible) or a non-striking outcome as the
+/// only surviving shapes for a perpetually served blob.
+#[test]
+fn served_but_invalid_cools_without_committing() {
+    let mut fixture = fixture();
+    let mut inner = MemoryBulkSource::default();
+    let secrets = vec![
+        EpochSecret::from_bytes([0x08; 32]),
+        EpochSecret::from_bytes([0x09; 32]),
+    ];
+    let announced = announce_three(&mut fixture, &mut inner, &secrets);
+    // Garbage shadows only the head's roots while the history pair
+    // stays live: history converges on run 1, and the head serves
+    // invalid bytes over the live route every run until it cools.
+    let garbage: BTreeSet<BaoRoot> = announced[2..]
+        .iter()
+        .flat_map(|(_, body, transport)| [*body, *transport])
+        .collect();
+    let mut bulk = SplitRouteBulk {
+        inner,
+        dead_roots: BTreeSet::new(),
+        dead_snapshots: BTreeSet::new(),
+        garbage,
+        transport_attempts: 0,
+        transport_served: 0,
+        transport_failed: 0,
+        eager_failed: 0,
+    };
+    let mut objects = MemoryObjectStore::default();
+    let rev_start = fixture.engine.current();
+    let mut invalid_total = 0usize;
+    let mut bodies = 0usize;
+    let mut manifests = 0usize;
+    for run in 1..=6usize {
+        let report = fixture
+            .engine
+            .execute_plan_sliced(
+                &mut bulk,
+                &mut objects,
+                Some(Instant::now() + Duration::from_secs(30)),
+            )
+            .unwrap();
+        invalid_total += report.invalid;
+        bodies += report.snapshot_bodies;
+        manifests += report.manifests;
+        assert_eq!(
+            fixture.engine.current(),
+            rev_start + 1,
+            "only run 1 commits (history convergence): run {run}"
+        );
+        match run {
+            // Run 1: history converges while the head fails twice —
+            // once per convergence iteration (strikes are once per
+            // run, so the re-drive still attempts).
+            1 => {
+                assert_eq!(report.snapshot_bodies, 2, "history bodies land");
+                assert_eq!(report.manifests, 2, "history roots land");
+                assert_eq!(report.invalid, 4, "live head fails validation, twice");
+                assert_eq!(report.unfulfilled, 2, "only the head stays pending");
+            }
+            2..=3 => {
+                assert_eq!(report.snapshot_bodies + report.manifests, 0);
+                assert_eq!(report.invalid, 2);
+                assert_eq!(report.unfulfilled, 2);
+            }
+            // Struck out: the garbage stops being attempted while
+            // the head's items stay pending.
+            _ => {
+                assert_eq!(
+                    report.invalid, 0,
+                    "cooled garbage is skipped, not attempted"
+                );
+                assert_eq!(report.unfulfilled, 2);
+            }
+        }
+    }
+    assert_eq!(bodies, 2);
+    assert_eq!(manifests, 2);
+    assert_eq!(invalid_total, 8, "four invalids on run 1, two on runs 2-3");
+    assert_eq!(fixture.engine.current() - rev_start, 1);
+    assert_eq!(
+        bulk.transport_served, 12,
+        "history (4, run 1) plus garbage (8, runs 1-3)"
+    );
+    assert_eq!(bulk.transport_failed, 0);
+    assert_eq!(bulk.eager_failed, 0);
 }

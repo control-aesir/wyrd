@@ -19,7 +19,7 @@ on:
       - ".ngit/scripts/review.sh"
       - ".ngit/scripts/tests/**"
   pull_request:
-    types: [opened, synchronize, ready_for_review]
+    types: [opened, ready_for_review]
     paths:
       - "crates/**"
       - "Cargo.toml"

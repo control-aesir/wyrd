@@ -385,19 +385,21 @@ impl RuntimeState {
 
     /// Every obligation the send path may discharge under one route,
     /// in `(snapshot, recipient)` order: still-pending pairs plus
-    /// discharged pairs for live heads whose recorded route differs
-    /// from the live one. Deterministic under replay (both halves
-    /// ordered, union sorted), so resume sends in a stable order like
-    /// the pending projection it extends.
+    /// discharged pairs for redelivery-scope members whose recorded
+    /// route differs from the live one. The scope is the live heads
+    /// plus their reachable closure (computed by the caller from
+    /// recorded bodies); snapshots outside it stay discharged no
+    /// matter how many endpoints they outlive. Deterministic under
+    /// replay (both halves ordered, union sorted), so resume sends
+    /// in a stable order like the pending projection it extends.
     ///
-    /// The head gate is what keeps a restart from re-announcing all
+    /// The scope gate is what keeps a restart from re-announcing all
     /// of history: every discharged pair's route differs after a new
     /// endpoint mints, so without it one restart resends the whole
     /// outbox past (182 sends stalled a live mutation's prerequisites
-    /// past expiry in e2e). A stranded peer needs the live heads, not
-    /// history — old snapshots stay discharged no matter how many
-    /// endpoints they outlive — and pending pairs (never sent) are
-    /// unaffected by the gate.
+    /// past expiry in e2e). A stranded peer needs the live heads and
+    /// the closure that discovers them, not unrelated history — and
+    /// pending pairs (never sent) are unaffected by the gate.
     ///
     /// `None` (no live serving route — an offline or headless run)
     /// degrades to plain pending: repair toward no route is
@@ -409,7 +411,7 @@ impl RuntimeState {
     pub fn announce_eligible_for(
         &self,
         route: Option<[u8; 32]>,
-        heads: &BTreeSet<SnapshotId>,
+        scope: &BTreeSet<SnapshotId>,
     ) -> Vec<(SnapshotId, DeviceId)> {
         let mut eligible: Vec<(SnapshotId, DeviceId)> = self
             .announcement_queued
@@ -423,7 +425,7 @@ impl RuntimeState {
                 .iter()
                 .copied()
                 .filter(|pair| {
-                    heads.contains(&pair.0)
+                    scope.contains(&pair.0)
                         && self.announcement_delivered_route.get(pair) != Some(&live)
                 })
                 .collect();

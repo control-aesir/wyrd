@@ -1356,10 +1356,12 @@ fn announcement_route_seals_round_trip_per_pair_first_wins() {
 /// Delivered-route records round-trip and scope redelivery
 /// eligibility: the record commits beside its marker, replays into
 /// the route map with last-write-wins, and `announce_eligible_for`
-/// reopens only live-head pairs whose recorded route differs from
+/// reopens only in-scope pairs whose recorded route differs from
 /// the live one — unknown routes count as changed, the live route
-/// quenches, non-head history stays discharged, and no route at all
-/// degrades to plain pending.
+/// quenches, out-of-scope history stays discharged, and no route at
+/// all degrades to plain pending. (The caller computes the scope as
+/// live heads plus their reachable closure; at the fact level the
+/// scope is just the gating set.)
 #[test]
 fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
     use std::collections::BTreeSet;
@@ -1382,15 +1384,15 @@ fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
             // Bob: delivered with no route (pre-record chain, or a
             // routeless send) — unknown, not current.
             Fact::AnnouncementDelivered(snapshot, bob),
-            // History: discharged under an older route, but no
-            // longer a live head — stays shut under any route.
+            // History: discharged under an older route, but outside
+            // the redelivery scope — stays shut under any route.
             Fact::AnnouncementQueued(history, alice),
             Fact::AnnouncementDelivered(history, alice),
             Fact::AnnouncementDeliveredRoute(history, alice, route_a),
         ])
         .unwrap();
 
-    let heads: BTreeSet<SnapshotId> = BTreeSet::from([snapshot]);
+    let scope: BTreeSet<SnapshotId> = BTreeSet::from([snapshot]);
     let rebuilt = store.rebuild(owner()).unwrap();
     assert_eq!(
         rebuilt.runtime.pending_announcements(),
@@ -1398,17 +1400,17 @@ fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
         "accounting stays queued-minus-delivered"
     );
     assert_eq!(
-        rebuilt.runtime.announce_eligible_for(Some(route_a), &heads),
+        rebuilt.runtime.announce_eligible_for(Some(route_a), &scope),
         vec![(snapshot, bob), (snapshot, carol)],
         "same route: pending plus unknown only"
     );
     assert_eq!(
-        rebuilt.runtime.announce_eligible_for(Some(route_b), &heads),
+        rebuilt.runtime.announce_eligible_for(Some(route_b), &scope),
         vec![(snapshot, alice), (snapshot, bob), (snapshot, carol)],
         "new route reopens the discharged head pair, not history"
     );
     assert_eq!(
-        rebuilt.runtime.announce_eligible_for(None, &heads),
+        rebuilt.runtime.announce_eligible_for(None, &scope),
         vec![(snapshot, carol)],
         "no route: plain pending, repair toward nothing"
     );
@@ -1420,7 +1422,7 @@ fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
         .unwrap();
     let rebuilt = store.rebuild(owner()).unwrap();
     assert_eq!(
-        rebuilt.runtime.announce_eligible_for(Some(route_b), &heads),
+        rebuilt.runtime.announce_eligible_for(Some(route_b), &scope),
         vec![(snapshot, bob), (snapshot, carol)],
         "re-recorded route quenches"
     );

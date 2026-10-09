@@ -196,8 +196,19 @@ WYRD_BIN="$OUT/bin/wyrd"
 echo "    $WYRD_BIN"
 
 echo "==> exporting the runtime closure for the guest"
-readarray -t CLOSURE < <(nix-store -qR "$OUT")
-nix-store --export "${CLOSURE[@]}" > "$SHARE/wyrd-closure.nar"
+# Skip the export when the guest already carries this exact binary: the
+# guest imports the nar only when $WYRD_BIN is not executable there
+# (provision.sh), so this probe mirrors that gate and the two cannot
+# disagree into a missing import. Any failure of the probe itself (a
+# flapping ssh, not a missing binary) falls through to the export, which
+# is the safe default. A warm guest trades one ssh round trip for a
+# ~92MiB write and read it does not need.
+if (cd / && limactl shell "$INSTANCE" -- test -x "$WYRD_BIN" 2>/dev/null); then
+  echo "    guest already carries $WYRD_BIN, skipping export"
+else
+  readarray -t CLOSURE < <(nix-store -qR "$OUT")
+  nix-store --export "${CLOSURE[@]}" > "$SHARE/wyrd-closure.nar"
+fi
 REV="$(python3 -c "import json; print(json.load(open('$ROOT/flake.lock'))['nodes']['nixpkgs']['locked']['rev'])")"
 # Shell-quoted, never interpolated raw: a checkout path or a step/log
 # filter with shell metacharacters must not become source.

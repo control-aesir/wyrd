@@ -142,6 +142,20 @@ version say exactly what changed.
   measurement, Lima full suite: step 6 is 133s of a 152s run and steps
   1-5 together are 19s, so the offline contract is free and the cost is
   entirely the network phase.
+- E2e harness hygiene, all locally provable (`lima/run-alpha.sh`,
+  `tests/alpha-common.sh`, `tests/alpha-lima.sh`, new
+  `tests/step-grammar.sh` with `tests/test-step-grammar.sh`).
+  `run-alpha.sh` skips the ~92MiB closure export when the guest already
+  carries the exact binary, mirroring `provision.sh`'s import gate so the
+  two cannot disagree into a missing import; a flapping probe falls
+  through to the export. `check_no_leaks` scans each log once for all
+  secrets instead of once per secret, and fails closed on an empty secret
+  set rather than passing vacuously. The `--step` comma-list grammar is
+  one shared `step_max` function with 40 stub checks (both ranges,
+  malformed inputs, glob safety, base-10 canonicalization); Lima adopts
+  it, and the two microVM copies stay inline until an odin run can prove
+  the adoption. Verified by a green Lima full suite (106 checks, 156s)
+  plus two end-to-end refusal proofs (`--step 99`, `--step 4,,5`).
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.

@@ -682,7 +682,7 @@ fi # want_phase 13
 # Worst case ~8 minutes; typical 3-4.
 if want_phase 14; then
 echo "=== microvm 14: resource exhaustion ==="
-rm -f "$RUN"/fill-*.stderr
+rm -f "$RUN"/fill-*.stderr "$RUN"/exh-failed-fill
 EC="$RUN/creds/exh"
 ED="$RUN/drives/exh"
 GEC="$GUEST_RUN/creds/exh"
@@ -723,19 +723,52 @@ on_o "$WYRD_BIN export --identity-file '$GEC/identity' --passphrase-file '$GEC/p
   || die "exhaustion export lost the pre-fill anchor"
 [[ "$(cat "$RUN/export-exh/recovery.txt")" == "recovered" ]] \
   || die "exhaustion export lost the recovery anchor"
-# Fill-file inventory: present means byte-complete (exactly 32 MiB),
-# absent or empty means never committed (an ENOSPC write can leave a
-# 0-byte directory entry when the handle releases its dropped buffer)
-# — torn is the partial-accept this phase exists to forbid.
+# Fill-file inventory against the write-path commit contract
+# (docs/write-path.md: `create` commits the empty file as its own
+# snapshot; a refused write commits nothing of the write; a ceiling
+# refuses at the commit boundary, never partially). The leg records
+# the first failing fill index; each file is judged by what its own
+# operation reported —
+#   before the failing index: writes reported success, so content
+#     must exist byte-complete (absent means committed bytes lost
+#     across reopen; partial means torn state);
+#   at the failing index: the create half may have committed (empty
+#     file, write refused) or been refused outright (absent) — both
+#     are contract-legal; anything else contradicts the op report;
+#   after the failing index: never attempted, so must be absent
+#     (present means phantom state).
+# Present-but-partial anywhere is the torn partial-accept this
+# phase exists to forbid. The index file lives beside the fill
+# stderrs on the share — never on the exhausted fs, so the failure
+# handler does not depend on the filesystem under test.
+[[ -f "$RUN/exh-failed-fill" ]] \
+  || die "exhaustion leg never recorded the failing fill index"
+_fidx="$(cat "$RUN/exh-failed-fill")"
+[[ "$_fidx" =~ ^[0-9]+$ ]] && (( _fidx >= 1 && _fidx <= 24 )) \
+  || die "exhaustion leg recorded a bogus failing fill index: $_fidx"
 for (( _x = 1; _x <= 24; _x++ )); do
   _f="$RUN/export-exh/fill-$_x.bin"
-  [[ -e "$_f" ]] || continue
-  _sz="$(stat -c %s "$_f")"
-  [[ "$_sz" == "0" ]] && continue
-  [[ "$_sz" == "33554432" ]] \
-    || die "exhaustion export holds torn fill-$_x.bin ($_sz bytes)"
+  if (( _x < _fidx )); then
+    [[ -e "$_f" ]] \
+      || die "exhaustion export lost fill-$_x.bin: its write reported success"
+    _sz="$(stat -c %s "$_f")"
+    [[ "$_sz" == "33554432" ]] \
+      || die "exhaustion export holds torn fill-$_x.bin ($_sz bytes)"
+  elif (( _x == _fidx )); then
+    if [[ ! -e "$_f" ]]; then
+      pass "failing fill-$_x.bin absent: create refused with the write"
+    else
+      _sz="$(stat -c %s "$_f")"
+      [[ "$_sz" == "0" ]] \
+        || die "exhaustion export holds fill-$_x.bin ($_sz bytes) after its write reported failure"
+      pass "failing fill-$_x.bin empty: create committed, write refused"
+    fi
+  else
+    [[ ! -e "$_f" ]] \
+      || die "exhaustion export holds unattempted fill-$_x.bin: phantom file"
+  fi
 done
-unset _x _f _sz
+unset _x _f _sz _fidx
 pass "exhaustion export holds only byte-complete fills plus both anchors"
 # Best-effort unmount: the loop device dies with the VM anyway and
 # $RUN is wiped by the next --fresh; this just keeps kept runs tidy.

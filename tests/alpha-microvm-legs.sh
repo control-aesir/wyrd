@@ -1366,6 +1366,8 @@ leg_exhaustion() {
   done
   [[ "$failed" == 1 ]] \
     || die "24 x 32 MiB fills never exhausted the disk: the leg would pass without ever seeing ENOSPC"
+  echo "$i" > "$E2E_ROOT/exh-failed-fill" \
+    || die "could not record the failing fill index"
   pass "write fails closed with ENOSPC after $i fills"
   # Readable under exhaustion: the failure must not take the drive's
   # read path down with it.

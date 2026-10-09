@@ -667,10 +667,18 @@ fi # want_phase 13
 # Fill the exhaustion drive's filesystem to 256 MiB headroom, then
 # write through an offline mount until ENOSPC. Offline on purpose:
 # exhaustion is a storage-stack property, not a sync one, and a
-# relay would only add failure modes to the wrong leg. The host
-# exports the drive offline afterwards and asserts the fail-closed
-# half: every fill file present is exactly 32 MiB (byte-complete)
-# or absent — never torn — plus the pre-fill and recovery anchors.
+# relay would only add failure modes to the wrong leg. The drive
+# lives on a fixed-size ext4 image loop-mounted IN the guest (never
+# on the shared state dir): filling the share fills odin's root fs,
+# and at 100% every write fails everywhere — guests die on block
+# faults while set -e kills the suite silently, because a FAIL line
+# is itself an unwritable write. The image caps host cost at ~2.3
+# GiB, so ENOSPC surfaces inside the container as a clean failed
+# write. The drive is exported afterwards (in-guest: the container
+# is invisible host-side) and the harness asserts
+# the fail-closed half: every fill file present is exactly 32 MiB
+# (byte-complete) or absent — never torn — plus the pre-fill and
+# recovery anchors.
 # Worst case ~8 minutes; typical 3-4.
 if want_phase 14; then
 echo "=== microvm 14: resource exhaustion ==="
@@ -679,23 +687,37 @@ EC="$RUN/creds/exh"
 ED="$RUN/drives/exh"
 GEC="$GUEST_RUN/creds/exh"
 GED="$GUEST_RUN/drives/exh"
+# Host guard: the contained image costs ~2.3 GiB. Fail loudly here
+# instead of dying silently mid-fill when the host is already sick.
+avail_kb="$(df -k --output=avail "$RUN" | tail -n 1 | tr -d ' ')"
+[[ "$avail_kb" -ge 4194304 ]] \
+  || die "host disk has only ${avail_kb} KiB free under $RUN: phase 14 needs 4 GiB for the contained exhaustion image"
+IMG="$RUN/exh-fs.img"
+GIMG="$GUEST_RUN/exh-fs.img"
+rm -f "$IMG"
+fallocate -l 2415919104 "$IMG" \
+  || die "exhaustion image preallocation failed"
 mkdir -p "$EC" "$ED"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$EC/identity"
 printf 'e2e-%s\n' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$EC/passphrase"
 chmod 600 "$EC/identity" "$EC/passphrase"
 chown -R 1000:1000 "$EC" "$ED"
-as_guest "$WYRD_BIN" init --identity-file "$EC/identity" --passphrase-file "$EC/passphrase" \
-  "$ED" >"$RUN/logs/init-exh.out" 2>"$RUN/logs/init-exh.stderr" \
+on_o "sudo mkfs.ext4 -q -m 0 '$GIMG'" >"$RUN/logs/mkfs-exh.out" 2>&1 \
+  || die "exhaustion image mkfs failed (see logs/mkfs-exh.out)"
+on_o "sudo mount -o loop '$GIMG' '$GED' && sudo chown e2e:users '$GED'" >"$RUN/logs/mount-exh-fs.out" 2>&1 \
+  || die "exhaustion image mount failed (see logs/mount-exh-fs.out)"
+# init and export run in-guest: the container's content is invisible
+# host-side (guest mount over the share), so as_guest can neither
+# seed nor read it. $WYRD_BIN is the same content-addressed path on
+# both sides, so no env plumbing is needed.
+on_o "$WYRD_BIN init --identity-file '$GEC/identity' --passphrase-file '$GEC/passphrase' '$GED'" >"$RUN/logs/init-exh.out" 2>&1 \
   || die "exhaustion drive init failed"
 pass "exhaustion drive initialized"
 on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh exhaustion $GED $GEC" \
   >"$RUN/logs/leg-exhaustion.out" 2>&1 || die "exhaustion leg failed (see logs/leg-exhaustion.out)"
 pass "writes fail closed ENOSPC and the drive recovers"
 rm -rf "$RUN/export-exh"
-as_guest "$WYRD_BIN" export \
-  --identity-file "$EC/identity" \
-  --passphrase-file "$EC/passphrase" \
-  "$ED" "$RUN/export-exh" >"$RUN/logs/export-exh.out" 2>&1 \
+on_o "$WYRD_BIN export --identity-file '$GEC/identity' --passphrase-file '$GEC/passphrase' '$GED' '$GUEST_RUN/export-exh'" >"$RUN/logs/export-exh.out" 2>&1 \
   || die "exhaustion drive does not export after reopen"
 [[ "$(cat "$RUN/export-exh/small.txt")" == "pre-fill" ]] \
   || die "exhaustion export lost the pre-fill anchor"
@@ -715,6 +737,9 @@ for (( _x = 1; _x <= 24; _x++ )); do
 done
 unset _x _f _sz
 pass "exhaustion export holds only byte-complete fills plus both anchors"
+# Best-effort unmount: the loop device dies with the VM anyway and
+# $RUN is wiped by the next --fresh; this just keeps kept runs tidy.
+on_o "sudo umount '$GED'" >"$RUN/logs/umount-exh-fs.out" 2>&1 || true
 fi # want_phase 14
 
 # --- phase: microvm 15 (unknown parent) -----------------------------------

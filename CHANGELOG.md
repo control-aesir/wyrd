@@ -81,6 +81,9 @@ version say exactly what changed.
   unknown parent (withheld body leaves the child ENOENT bounded with
   an EIO control, then heals). New suite phases 13-15; the whole-run
   cap moves 90 to 120 minutes with the legs' stated budgets.
+  The exhaustion drive lives on a fixed-size ext4 image
+  loop-mounted in-guest: filling the shared state dir fills the
+  host root fs, which kills guests and the suite silently.
 
 - Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
   in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):

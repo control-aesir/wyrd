@@ -31,6 +31,9 @@
     # The spike proved /dev/fuse is rw under the default microvm
     # kernel; no extra kernel modules needed. The suite fails loudly
     # at first mount if that ever regresses.
+    # loop: phase 14 loop-mounts a fixed-size ext4 image in-guest so
+    # the exhaustion fills can never reach the shared host disk.
+    boot.kernelModules = [ "loop" ];
     environment.systemPackages = with pkgs; [
       python3Minimal
       jq
@@ -38,6 +41,8 @@
       fuse3
       sudo
       procps
+      e2fsprogs
+      util-linux
     ];
     security.sudo.enable = true;
     # The suite runs as e2e, mirroring the Lima guest's unprivileged

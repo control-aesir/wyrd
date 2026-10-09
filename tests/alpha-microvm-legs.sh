@@ -1312,9 +1312,10 @@ leg_steady_owner() {
 # Bounded-failure assertions: the failing write is wrapped in
 # `timeout` (a hang is the bug, not a slow pass); the pre-fill file
 # stays readable under exhaustion; the drive accepts writes again
-# once the filler is gone. The host exports the drive offline and
-# asserts every fill file present is exactly 32 MiB (byte-complete)
-# or absent — never torn.
+# once the filler is gone. The harness exports the drive afterwards
+# (in-guest: the container is invisible host-side) and asserts every
+# fill file present is exactly 32 MiB (byte-complete) or absent —
+# never torn.
 # Wall-clock envelope: up to 24 x 32 MiB commits worst case
 # (~768 MiB of churn), under 8 minutes; typical 3-4 minutes.
 leg_exhaustion() {

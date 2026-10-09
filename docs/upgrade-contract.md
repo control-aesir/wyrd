@@ -187,6 +187,14 @@ Releases are not required to write every format they read:
     pending by scope boundary, and a future announcement retirement
     would allocate its own tag, never overload these two.
 
+    The announcement route record (`0x1C`) names, per discharged
+    announcement, the serving endpoint it was sent against: snapshot
+    (32) ‖ recipient DeviceId (32) ‖ endpoint id (32), fixed 96
+    bytes. An old node skips the unknown tag and keeps the pair
+    discharged, which is the safe direction: the resend it misses
+    is idempotent at the receiver (a route update over the same
+    immutable statement, deduped — never a second obligation).
+
     The wire kind is not a format break: the reconciliation request
     rides a new control kind byte (`0x04`) under the unchanged
     envelope version. An old node fails the kind byte closed

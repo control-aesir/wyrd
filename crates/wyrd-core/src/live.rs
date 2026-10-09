@@ -3355,3 +3355,7 @@ mod trigger_tests;
 #[cfg(test)]
 #[path = "live/tests_serve_barrier.rs"]
 mod serve_barrier_tests;
+
+#[cfg(test)]
+#[path = "live/tests_restart_redelivery.rs"]
+mod restart_redelivery_tests;

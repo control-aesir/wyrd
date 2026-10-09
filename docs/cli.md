@@ -518,8 +518,8 @@ against a held drive exits 2 promptly, naming the drive
 drive`). The lock dies with its process, so a crash leaves no
 stale record — but a held lock proves only occupancy, never
 health or convergence. A restart mints a new endpoint, so the
-vault re-announces discharged-but-unfetched obligations for the
-current head's reachable closure under the live route (same route
+vault re-announces obligations discharged against an older route
+for the current head's reachable closure under the live route (same route
 resends nothing, out-of-scope history stays discharged); the
 replacement serves the closure from the retained store, so a late
 peer recovers history, not just the head. Relay acceptance is not

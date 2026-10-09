@@ -52,6 +52,11 @@ jobs:
       - name: Shell suites
         run: bash .ngit/scripts/tests/run-all.sh
 
+      # Revision-bound evidence for the e2e harness claims that are
+      # provable without a guest: pure bash, no relay, secret, or cache.
+      - name: E2E step grammar stubs
+        run: bash tests/test-step-grammar.sh
+
   draft:
     if: github.event.action == 'opened'
     runs-on: ubuntu-latest

@@ -154,8 +154,10 @@ version say exactly what changed.
   one shared `step_max` function with 40 stub checks (both ranges,
   malformed inputs, glob safety, base-10 canonicalization); Lima adopts
   it, and the two microVM copies stay inline until an odin run can prove
-  the adoption. Verified by a green Lima full suite (106 checks, 156s)
-  plus two end-to-end refusal proofs (`--step 99`, `--step 4,,5`).
+  the adoption. The stub suite runs in CI (shell-tests), so that claim is
+  revision-bound; the green Lima full suite (106 checks, 156s) and the two
+  end-to-end refusal proofs (`--step 99`, `--step 4,,5`) are
+  local-operator evidence, not attached to a revision.
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.

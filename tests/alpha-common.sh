@@ -206,6 +206,10 @@ gen_passphrase() { # <out>: random passphrase with trailing newline, 600
 # check_no_leaks <log-file> <secret...>: fail if any secret bytes appear.
 check_no_leaks() {
   local log="$1"; shift
+  # Fail closed on an unreadable log, mirroring check_no_content_ids: a
+  # missing file makes grep exit 2, which the && below does not catch, so
+  # without this an absent log would report clean.
+  [[ -r "$log" ]] || die "check_no_leaks: $log unreadable"
   # Fail closed on an empty secret set: the loop this replaces would have
   # passed vacuously, and a privacy assertion that fails open is the wrong
   # default. Every caller passes at least identity and passphrase today.

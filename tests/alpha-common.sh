@@ -206,10 +206,20 @@ gen_passphrase() { # <out>: random passphrase with trailing newline, 600
 # check_no_leaks <log-file> <secret...>: fail if any secret bytes appear.
 check_no_leaks() {
   local log="$1"; shift
-  local s
-  for s in "$@"; do
-    grep -qF "$s" "$log" && die "secret leaked into $log"
-  done
+  # Fail closed on an unreadable log, mirroring check_no_content_ids: a
+  # missing file makes grep exit 2, which the && below does not catch, so
+  # without this an absent log would report clean.
+  [[ -r "$log" ]] || die "check_no_leaks: $log unreadable"
+  # Fail closed on an empty secret set: the loop this replaces would have
+  # passed vacuously, and a privacy assertion that fails open is the wrong
+  # default. Every caller passes at least identity and passphrase today.
+  [[ $# -gt 0 ]] || die "check_no_leaks: no secrets given for $log"
+  # One pass over the log for all secrets, not one grep per secret: the
+  # per-secret read is what made the host-side tail of a run O(files x
+  # secrets) full-file scans. Per-file attribution in the die line is
+  # unchanged; the message never named which secret matched.
+  grep -qF -f <(printf '%s\n' "$@") "$log" \
+    && die "secret leaked into $log"
   pass "no secrets in $(basename "$log")"
 }
 

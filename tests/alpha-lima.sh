@@ -13,6 +13,8 @@ HOST_LOGS="/tmp/lima/logs/$(date +%Y%m%d-%H%M%S)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/alpha-common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/step-grammar.sh"
 
 # --- step 1: init lifecycle --------------------------------------------
 step1_init() {
@@ -554,35 +556,15 @@ main() {
   local only="${E2E_ONLY_STEP:-}"
   # Comma list (`--step 1,4,6`): steps build on each other, so the run
   # set is the prefix closure of the selection — selecting step N runs
-  # 1..N, never a lone dependent step on wiped state. Every entry must
-  # name a real step, so `--step 99` fails instead of passing zero
-  # checks, and the highest entry decides the prefix.
+  # 1..N, never a lone dependent step on wiped state. The grammar lives
+  # in tests/step-grammar.sh, shared with the microVM harnesses (their
+  # copies are still inline; adopting the shared function there needs an
+  # odin run to prove, so it waits for one). The highest entry decides
+  # the prefix. An absent variable (the wrapper omits it) means all.
   local max_step=0
-  local entry
-  # Split on commas into a quoted array: an unquoted expansion would
-  # glob each entry against the working directory first, so `--step
-  # '*'` could pathname-expand into a digit-named file and slip past
-  # the grammar.
-  local -a entries=()
   if [[ -n "$only" ]]; then
-    IFS=',' read -r -a entries <<< "$only"
-  fi
-  for entry in "${entries[@]}"; do
-    [[ "$entry" =~ ^[1-6]$ ]] \
-      || die "--step: '$entry' is not a step (expected a comma list of 1-6)"
-    if (( entry > max_step )); then max_step=$entry; fi
-  done
-  # An empty or empty-entry selection (`,`, `4,,5`, `,4`) is a
-  # mistake, not "all steps": without this it would run zero checks
-  # and pass. An absent variable (the wrapper omits it) means all.
-  if [[ -n "$only" ]]; then
-    # The grammar is a comma list; whitespace is not a separator.
-    [[ "$only" != *[[:space:]]* ]] \
-      || die "--step: '$only' is not a comma list (got whitespace)"
-    [[ "$max_step" -gt 0 ]] \
-      || die "--step: '$only' names no step (expected a comma list of 1-6)"
-    [[ ",$only," != *,,* ]] \
-      || die "--step: '$only' has an empty entry (expected 1-6 entries)"
+    max_step="$(step_max 1 6 "$only")" \
+      || die "--step: '$only' is not a step (expected a comma list of 1-6)"
   fi
   want_step() { [[ -z "$only" ]] || (( $1 <= max_step )); }
   if want_step 1; then step1_init; fi

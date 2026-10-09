@@ -574,10 +574,11 @@ fi # want_phase 12
 # --- phase: microvm 13 (crash injection) ---------------------------------
 # Two SIGKILL legs against a fresh drive pair (the phase-10 pair is
 # conflicted — writes fail EIO there by design — so crashing on it
-# would prove nothing about the commit path). 13a kills the owner
-# mid-burst after 40 acknowledged writes; 13b kills the member with
-# a pending obligation under a host-driven relay partition (tap-r
-# surgery, same shape as phase 10). Every kill targets the shipped
+# would prove nothing about the commit path). 13a kills the member
+# with a pending obligation under a host-driven relay partition
+# (tap-r surgery, same shape as phase 10); 13b kills the owner
+# mid-burst after 40 acknowledged writes. The member-first order is
+# load-bearing (see the ORDER MATTERS note below). Every kill targets the shipped
 # binary's real process death — no test-only hooks (OD-06-A) — and
 # each leg records the fence its kill represents. Worst case ~12
 # minutes for the pair; typical 6-8.
@@ -616,20 +617,16 @@ as_guest "$WYRD_BIN" device --identity-file "$CN/identity" --passphrase-file "$C
   "$CND" join "$RUN/invitation-crash" >"$RUN/logs/join-crash.out" 2>"$RUN/logs/join-crash.stderr" \
   || die "crash-n join failed"
 pass "crash pair joins on a fresh drive"
-# 13a: owner burst + KILL, witness holds convergence across the death.
-rm -f "$RUN"/crash-o-steady-ready "$RUN"/crash-o-back "$RUN"/crash-o-member-done
-on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-member $GCND $GCN $RELAY_URL" \
-  >"$RUN/logs/leg-steady-member.out" 2>&1 &
-LEG_N=$!
-on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-owner $GCOD $GCO $RELAY_URL" \
-  >"$RUN/logs/leg-crash-owner.out" 2>&1 &
-LEG_O=$!
-wait "$LEG_N" || die "crash witness member leg failed (see logs/leg-steady-member.out)"
-wait "$LEG_O" || die "crash owner leg failed (see logs/leg-crash-owner.out)"
-pass "owner KILL mid-burst reopens clean and converges"
-# 13b: member KILL with a pending obligation under partition. Host
+# 13a: member KILL with a pending obligation under partition. Host
 # drives the partition like phase 10 (same tap, same EXIT-trap
 # discipline): the member authors alone while down.
+# ORDER MATTERS: 13a runs BEFORE 13b (the owner burst). The member
+# drive joins fresh here, so its first authorship must verify the
+# head closure — cheap on a two-snapshot history (init + cold-u),
+# ruinous after 13b's forty-burst history (observed: one closure
+# object per pass while the young mount drains, and first-minute
+# authorship outwaits the 30s max_mutation_wait). 13b's owner-side
+# authorship is local-first at any history size, so it goes second.
 rm -f "$RUN"/crash-m-listed "$RUN"/crash-m-ready "$RUN"/crash-m-partitioned "$RUN"/crash-m-killed \
   "$RUN"/crash-m-healed "$RUN"/crash-m-done "$RUN"/crash-m-witness-done
 on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-owner $GCOD $GCO $RELAY_URL" \
@@ -653,6 +650,17 @@ touch "$RUN/crash-m-healed"
 wait "$LEG_N" || die "crash member leg failed (see logs/leg-crash-member.out)"
 wait "$LEG_O" || die "crash witness owner leg failed (see logs/leg-steady-owner.out)"
 pass "member KILL under partition replays the obligation and re-serves"
+# 13b: owner burst + KILL, witness holds convergence across the death.
+rm -f "$RUN"/crash-o-steady-ready "$RUN"/crash-o-back "$RUN"/crash-o-member-done
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh steady-member $GCND $GCN $RELAY_URL" \
+  >"$RUN/logs/leg-steady-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-owner $GCOD $GCO $RELAY_URL" \
+  >"$RUN/logs/leg-crash-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "crash witness member leg failed (see logs/leg-steady-member.out)"
+wait "$LEG_O" || die "crash owner leg failed (see logs/leg-crash-owner.out)"
+pass "owner KILL mid-burst reopens clean and converges"
 fi # want_phase 13
 
 # --- phase: microvm 14 (resource exhaustion) -----------------------------

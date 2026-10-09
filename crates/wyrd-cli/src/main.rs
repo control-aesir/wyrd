@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::logging::{init_mount_diagnostics, init_vault_diagnostics};
+use crate::logging::{init_mount_diagnostics, init_sync_diagnostics, init_vault_diagnostics};
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
@@ -2695,6 +2695,11 @@ fn sync_now(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    // Stderr diagnostics before anything can emit: intake verdicts,
+    // route publication, and fetch dials are debug-level, and without
+    // a subscriber they vanish — a stuck headless run then shows
+    // only its summary counts. Stdout keeps the machine-read report.
+    init_sync_diagnostics();
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
     let config = LiveConfig::for_local_sync();
     let store = FsObjectStore::open(drive_dir.clone())

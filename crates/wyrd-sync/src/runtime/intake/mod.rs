@@ -661,13 +661,30 @@ fn message_action(
                         }
                         Some(TransitionStatus::Invalid(_)) => Ok(Action::Suppress),
                         Some(
-                            TransitionStatus::Contested
+                            status @ (TransitionStatus::Contested
                             | TransitionStatus::Voided
                             | TransitionStatus::Orphaned
-                            | TransitionStatus::Pending,
-                        ) => Ok(Action::Defer(DeferredWait::StatusBlocked(
-                            announcement.membership,
-                        ))),
+                            | TransitionStatus::Pending),
+                        ) => {
+                            // Forensics for headless stalls: the three
+                            // values naming what the announcement waits
+                            // on — the snapshot owed, the transition
+                            // whose standing blocks it, and the
+                            // standing itself. No payload, no device
+                            // identities. Only a later transition
+                            // commit re-drives this entry (see
+                            // `flush_pending`), so a quiet topology
+                            // holds it parked across passes.
+                            tracing::debug!(
+                                snapshot = ?announcement.snapshot,
+                                transition = ?announcement.membership,
+                                status = ?status,
+                                "announcement deferred on non-final transition status"
+                            );
+                            Ok(Action::Defer(DeferredWait::StatusBlocked(
+                                announcement.membership,
+                            )))
+                        }
                         // Observed a moment ago via transition(), but the
                         // fresh analysis classifies nothing for it: an
                         // internal disagreement, not sender data. Fail the

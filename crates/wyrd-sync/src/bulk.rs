@@ -497,6 +497,13 @@ impl IrohBulkSource {
                 Ok(bytes) => {
                     self.attempt_deadline = budget;
                     self.attempt_bound = None;
+                    // Forensics for headless stalls: which provider
+                    // served, joining the route-publication line
+                    // above on the hex endpoint id.
+                    tracing::debug!(
+                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "bulk candidate served"
+                    );
                     return Ok(Some(bytes));
                 }
                 Err(oversize @ BulkError::Oversize { .. }) => {
@@ -504,7 +511,19 @@ impl IrohBulkSource {
                     self.attempt_bound = None;
                     return Err(oversize);
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    // Forensics for headless stalls: which provider
+                    // failed and how — the dial outcome the fetch
+                    // counts collapse into transport errors. The
+                    // message carries the failure class; the provider
+                    // joins the route-publication line.
+                    tracing::debug!(
+                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        error = %error,
+                        "bulk candidate failed"
+                    );
+                    last_error = Some(error)
+                }
             }
         }
         self.attempt_deadline = budget;

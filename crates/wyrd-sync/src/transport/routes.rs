@@ -47,6 +47,16 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
             provider: provider.clone(),
             hash: *hash.as_bytes(),
         };
+        // Forensics for headless stalls: the provider each
+        // snapshot's fetches dial, as the hex endpoint id the
+        // serving side prints on its ready line — dial outcomes in
+        // the bulk walk below join on this value. No device
+        // identities, no relay URLs.
+        tracing::debug!(
+            snapshot = ?snapshot,
+            provider = %provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "route published"
+        );
         bulk.publish_root(
             snapshot,
             announcement.root_manifest,

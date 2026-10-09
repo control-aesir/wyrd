@@ -95,6 +95,12 @@ fn execute_inner(
             // carries only the id.
             let body_key = FetchKey::Body(*snapshot);
             if !engine.fetch_eligible(&body_key) {
+                // Forensics for headless stalls: a cooled item is
+                // never attempted, so its unfulfilled count survives
+                // passes that otherwise look idle. The key names the
+                // cooled representation; strikes cool it, fulfillment
+                // clears it.
+                tracing::debug!(key = ?body_key, "fetch skipped: backoff cooling");
                 continue;
             }
             match super::fetch::snapshot_body(bulk, &runtime, snapshot) {
@@ -183,6 +189,7 @@ fn execute_inner(
             // snapshot: no storage address exists before the fetch.
             let root_key = FetchKey::Root(*snapshot);
             if !engine.fetch_eligible(&root_key) {
+                tracing::debug!(key = ?root_key, "fetch skipped: backoff cooling");
                 continue;
             }
             match super::fetch::root(
@@ -232,6 +239,7 @@ fn execute_inner(
             // skipped while cooled — no attempt, item stays pending.
             let child_key = FetchKey::Storage(link.storage);
             if !engine.fetch_eligible(&child_key) {
+                tracing::debug!(key = ?child_key, "fetch skipped: backoff cooling");
                 continue;
             }
             engine.note_fetch_attempted(id);
@@ -288,6 +296,12 @@ fn execute_inner(
                 .cloned()
                 .collect();
             if eligible.is_empty() {
+                // Forensics for headless stalls: every representation
+                // cooled, so the item makes no attempt at all — the
+                // quiet predicate sees an idle pass while unfulfilled
+                // survives. One line per content identity, not per
+                // cooled candidate.
+                tracing::debug!(content = ?content, "fetch skipped: all representations cooling");
                 continue;
             }
             // The generation attempted: terminal evaluation may only

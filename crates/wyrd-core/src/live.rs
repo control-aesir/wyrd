@@ -1575,6 +1575,16 @@ where
                 revision = revision,
                 eligible_heads = self.published_heads,
                 pending_heads = pending_heads,
+                // Forensics for headless stalls: the quiet predicate
+                // below ignores unresolved fetch work and transport
+                // failures, so an idle-looking pass can still carry
+                // retryable items — the counts that decide whether
+                // `completed: quiet` is a legitimate terminal result
+                // or a misleading one ride along here.
+                unfulfilled = fetched.unfulfilled,
+                transport_errors = fetched.transport_errors,
+                deadlines = fetched.deadlines,
+                missing = fetched.missing,
                 "sync pass idle: revision unchanged, outbox empty"
             );
             return Ok(SyncReport {

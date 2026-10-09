@@ -298,3 +298,23 @@ pub(crate) fn init_vault_diagnostics(log_file: Option<&Path>) -> Result<Option<P
     }
     Ok(log_path)
 }
+
+/// Install stderr-only diagnostics for `sync now`: the same filter
+/// contract as the vault (notably `RUST_LOG` passthrough via
+/// [`build_mount_subscriber`]), but no log file — the harness
+/// captures stderr per run. Without this the headless path runs
+/// blind: intake verdicts, route publication, and fetch dials emit
+/// nothing anywhere, and a stuck run's only evidence is its summary
+/// counts. Observability only: no pass, verdict, or exit semantics
+/// change. Idempotent like the other inits — a second install in one
+/// process (tests, `--serve` composition) reuses the subscriber.
+pub(crate) fn init_sync_diagnostics() {
+    let _ = tracing_log::LogTracer::init();
+    let subscriber = build_mount_subscriber(None, false);
+    if tracing_subscriber::util::SubscriberInitExt::try_init(subscriber).is_err() {
+        tracing::warn!(
+            stage = "start",
+            "diagnostics already initialized; reusing the installed subscriber",
+        );
+    }
+}

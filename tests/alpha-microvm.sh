@@ -702,15 +702,18 @@ as_guest "$WYRD_BIN" export \
 [[ "$(cat "$RUN/export-exh/recovery.txt")" == "recovered" ]] \
   || die "exhaustion export lost the recovery anchor"
 # Fill-file inventory: present means byte-complete (exactly 32 MiB),
-# absent means never committed — torn is the partial-accept this
-# phase exists to forbid.
+# absent or empty means never committed (an ENOSPC write can leave a
+# 0-byte directory entry when the handle releases its dropped buffer)
+# — torn is the partial-accept this phase exists to forbid.
 for (( _x = 1; _x <= 24; _x++ )); do
   _f="$RUN/export-exh/fill-$_x.bin"
   [[ -e "$_f" ]] || continue
-  [[ "$(stat -c %s "$_f")" == "33554432" ]] \
-    || die "exhaustion export holds torn fill-$_x.bin ($(stat -c %s "$_f") bytes)"
+  _sz="$(stat -c %s "$_f")"
+  [[ "$_sz" == "0" ]] && continue
+  [[ "$_sz" == "33554432" ]] \
+    || die "exhaustion export holds torn fill-$_x.bin ($_sz bytes)"
 done
-unset _x _f
+unset _x _f _sz
 pass "exhaustion export holds only byte-complete fills plus both anchors"
 fi # want_phase 14
 

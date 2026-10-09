@@ -235,6 +235,15 @@ leg_fetch_member() {
   # blocking-open proof rather than a find-ready-bytes no-op.
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'cold-2.txt'" \
     || die "member never listed the cold file"
+  # The create authors its own empty snapshot before the flush
+  # commits the bytes (write-path DG-1: CreateFile is its own
+  # snapshot), so the name converges ahead of the size: a cat now
+  # serves a fully-converged empty file with rc 0, and the mismatch
+  # below dies on a transient. Wait for the manifest's size first
+  # (11 = "cold-bytes" plus the echo newline); the single cat after
+  # still proves open blocks for the chunks.
+  poll_until 120 bash -c "[[ \"\$(stat -c %s '$MNTS/xmember-f/cold-2.txt')\" == 11 ]]" \
+    || die "member never converged the cold file's size"
   timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" \
     || die "blocking cold open failed (open did not wait for the bytes)"
   [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \

@@ -785,7 +785,7 @@ if want_phase 15; then
 echo "=== microvm 15: unknown parent ==="
 rm -f "$RUN"/uparent-owner-gone "$RUN"/uparent-member-probed \
   "$RUN"/uparent-owner-back "$RUN"/uparent-member-healed \
-  "$RUN"/up-2.err "$RUN"/up-1.err
+  "$RUN"/uparent-announced "$RUN"/up-2.err "$RUN"/up-1.err
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh uparent-member $GCND $GCN $RELAY_URL" \
   >"$RUN/logs/leg-uparent-member.out" 2>&1 &
 LEG_N=$!

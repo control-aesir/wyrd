@@ -1412,7 +1412,10 @@ leg_exhaustion() {
 leg_uparent_owner() {
   local d="$1" c="$2" relay="$3"
   step 15 "unknown-parent owner leg"
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xup-o "$c" "$d" "$MNTS/xup-o" --relay "$relay"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   echo "up-1-bytes" > "$MNTS/xup-o/up-1.txt"
   [[ "$(cat "$MNTS/xup-o/up-1.txt")" == "up-1-bytes" ]] \
     || die "up-1 never committed"
@@ -1420,6 +1423,17 @@ leg_uparent_owner() {
   [[ "$(cat "$MNTS/xup-o/up-2.txt")" == "up-2-bytes" ]] \
     || die "up-2 never committed on top of up-1"
   pass "chained snapshots published (up-2 strictly on up-1)"
+  # Wait for the member to converge both announcements BEFORE
+  # stopping: announcements leave via the async outbox, and after
+  # 13b's forty-snapshot history the publish pipeline drains slowly
+  # (two local writes took 34s). Stopping first risks stranding
+  # up-2's announcement unsent in a dead outbox — while the remount
+  # that would deliver it waits for member-probed, which waits for
+  # the listing: a circular wait, not a timeout. The member's
+  # listing IS the publication confirmation, so the stop below can
+  # only happen with both announcements relay-visible.
+  poll_until 300 test -f "$E2E_ROOT/uparent-announced" \
+    || die "member never converged the announcements"
   stop_mount xup-o INT
   check_no_leaks "$LOGDIR/mount-xup-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   touch "$E2E_ROOT/uparent-owner-gone"
@@ -1451,12 +1465,22 @@ leg_uparent_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0
   step 15 "unknown-parent member leg"
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xup-m "$c" "$d" "$MNTS/xup-m" --relay "$relay"
-  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
+  poll_until 180 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
     || die "member never listed up-1"
-  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
+  poll_until 180 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
     || die "member never listed up-2"
-  pass "both announcements listed with the owner down"
+  pass "both announcements listed; owner holds until this signal"
+  # Signal BEFORE waiting for the stop: the owner must not stop
+  # until both announcements are relay-visible (see the owner leg).
+  # Race-free: fetch is strictly demand-driven (fetch-on-open.md —
+  # the loop never prefetches), and nothing opens either file before
+  # the probes below, so no body can be cached before the owner is
+  # down; the EIO control below still holds unconditionally.
+  touch "$E2E_ROOT/uparent-announced"
   poll_until 180 test -f "$E2E_ROOT/uparent-owner-gone" \
     || die "owner never stopped before the probes"
   # The child first, on pristine state: up-2's snapshot has an

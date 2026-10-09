@@ -499,9 +499,13 @@ impl IrohBulkSource {
                     self.attempt_bound = None;
                     // Forensics for headless stalls: which provider
                     // served, joining the route-publication line
-                    // above on the hex endpoint id.
+                    // above on the hex endpoint id. The hash names
+                    // the representation (body root vs manifest
+                    // transport), so a served-but-uncounted blob can
+                    // be traced to its fetch kind.
                     tracing::debug!(
                         provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                         "bulk candidate served"
                     );
                     return Ok(Some(bytes));
@@ -519,6 +523,7 @@ impl IrohBulkSource {
                     // joins the route-publication line.
                     tracing::debug!(
                         provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                         error = %error,
                         "bulk candidate failed"
                     );

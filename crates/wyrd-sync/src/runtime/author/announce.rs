@@ -152,6 +152,22 @@ fn route_id_of(node_addr: Option<&[u8]>) -> Option<[u8; 32]> {
     node_addr.and_then(endpoint_id)
 }
 
+/// The live-head snapshot set gating redelivery reopen: derived
+/// from the freshly rebuilt membership/DAG state, exactly as
+/// `stage_carry_heads` derives its staging set, so only current
+/// heads reopen — a restart re-addresses what the dead route
+/// stranded without re-announcing all of history.
+fn eligible_head_set(
+    engine: &Engine,
+    rebuilt: &Rebuilt,
+) -> std::collections::BTreeSet<wyrd_format::SnapshotId> {
+    let mut dag = crate::authorization::SnapshotDag::new(engine.drive);
+    for body in rebuilt.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    dag.eligible_heads(&rebuilt.log).into_iter().collect()
+}
+
 /// Resume every send-eligible announcement obligation across snapshots,
 /// returning the number of relay-accepted sends this call. This is the
 /// restart path: after a crash or a partial send, the durable outbox
@@ -178,12 +194,15 @@ pub(crate) fn announce_pending(
     let route_id = route_id_of(node_addr);
     // Distinct snapshots with send-eligible obligations, in
     // snapshot-id order (`announce_eligible_for` yields sorted
-    // pairs): still-pending pairs plus pairs discharged against an
-    // older route, so a restart under a new endpoint re-addresses
-    // what the dead route stranded.
+    // pairs): still-pending pairs plus pairs for live heads
+    // discharged against an older route, so a restart under a new
+    // endpoint re-addresses what the dead route stranded. History
+    // stays discharged: without the head gate one restart resends
+    // the whole outbox past and stalls live work behind it.
+    let heads = eligible_head_set(engine, &rebuilt);
     let mut snapshots: Vec<wyrd_format::SnapshotId> = rebuilt
         .runtime
-        .announce_eligible_for(route_id)
+        .announce_eligible_for(route_id, &heads)
         .into_iter()
         .map(|(snapshot, _)| snapshot)
         .collect();
@@ -492,10 +511,10 @@ fn reannounce_one(
 }
 
 /// Send the sealed bytes to every send-eligible recipient of one
-/// snapshot — still-pending pairs plus pairs discharged against an
-/// older route — recording one delivered marker plus its serving-route
-/// record per relay-accepted send. A send failure returns immediately
-/// with the rest still pending.
+/// snapshot — still-pending pairs plus, for live heads, pairs
+/// discharged against an older route — recording one delivered
+/// marker plus its serving-route record per relay-accepted send. A
+/// send failure returns immediately with the rest still pending.
 fn send_pending_for(
     engine: &mut Engine,
     snapshot: wyrd_format::SnapshotId,
@@ -507,11 +526,14 @@ fn send_pending_for(
     // send, so the delivery snapshot above may predate the obligation.
     // The resume paths (`announce_pending`, `reannounce_one`) commit
     // no queue facts mid-pass, so their frozen lists stay exact — but
-    // the fresh read is exact in both cases.
+    // the fresh read is exact in both cases. The head gate travels
+    // with the re-read, so a per-snapshot send reopens only live
+    // heads, exactly as the selecting pass did.
     let rebuilt = engine.store.rebuild(engine.device)?;
+    let heads = eligible_head_set(engine, &rebuilt);
     let recipients: Vec<wyrd_format::DeviceId> = rebuilt
         .runtime
-        .announce_eligible_for(route_id)
+        .announce_eligible_for(route_id, &heads)
         .into_iter()
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)

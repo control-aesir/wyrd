@@ -39,8 +39,10 @@ version say exactly what changed.
   line. The leg caught a real defect on its first run: relay
   acceptance had discharged announcements a dead route stranded,
   so route-scoped redelivery now reopens discharged announcements
-  under a new serving endpoint (same route resends nothing;
-  transitions and capabilities stay discharged).
+  for live heads under a new serving endpoint (same route resends
+  nothing; history stays discharged, so one restart cannot
+  re-announce the whole outbox past; transitions and capabilities
+  stay discharged).
 - `wyrd vault` foreground process (22a): the mount's live loop and
   serving surface with no presentation session — the persistent
   process that `sync now` (bounded one-shot, unchanged) is not.

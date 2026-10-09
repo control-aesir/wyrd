@@ -385,10 +385,19 @@ impl RuntimeState {
 
     /// Every obligation the send path may discharge under one route,
     /// in `(snapshot, recipient)` order: still-pending pairs plus
-    /// discharged pairs whose recorded route differs from the live
-    /// one. Deterministic under replay (both halves ordered, union
-    /// sorted), so resume sends in a stable order like the pending
-    /// projection it extends.
+    /// discharged pairs for live heads whose recorded route differs
+    /// from the live one. Deterministic under replay (both halves
+    /// ordered, union sorted), so resume sends in a stable order like
+    /// the pending projection it extends.
+    ///
+    /// The head gate is what keeps a restart from re-announcing all
+    /// of history: every discharged pair's route differs after a new
+    /// endpoint mints, so without it one restart resends the whole
+    /// outbox past (182 sends stalled a live mutation's prerequisites
+    /// past expiry in e2e). A stranded peer needs the live heads, not
+    /// history — old snapshots stay discharged no matter how many
+    /// endpoints they outlive — and pending pairs (never sent) are
+    /// unaffected by the gate.
     ///
     /// `None` (no live serving route — an offline or headless run)
     /// degrades to plain pending: repair toward no route is
@@ -397,7 +406,11 @@ impl RuntimeState {
     /// route, chains predating the record) always count as changed.
     /// Transitions and capabilities are untouched — only
     /// announcements carry a route.
-    pub fn announce_eligible_for(&self, route: Option<[u8; 32]>) -> Vec<(SnapshotId, DeviceId)> {
+    pub fn announce_eligible_for(
+        &self,
+        route: Option<[u8; 32]>,
+        heads: &BTreeSet<SnapshotId>,
+    ) -> Vec<(SnapshotId, DeviceId)> {
         let mut eligible: Vec<(SnapshotId, DeviceId)> = self
             .announcement_queued
             .iter()
@@ -409,7 +422,10 @@ impl RuntimeState {
                 .announcement_delivered
                 .iter()
                 .copied()
-                .filter(|pair| self.announcement_delivered_route.get(pair) != Some(&live))
+                .filter(|pair| {
+                    heads.contains(&pair.0)
+                        && self.announcement_delivered_route.get(pair) != Some(&live)
+                })
                 .collect();
             eligible.append(&mut stale);
             eligible.sort();

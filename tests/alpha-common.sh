@@ -92,11 +92,58 @@ cleanup_mounts() {
     fusermount3 -uz "$m" 2>/dev/null || true
   done
 }
-trap 'cleanup_mounts; collect_logs' EXIT
+# --- wall-clock accounting ----------------------------------------------
+# Elapsed seconds since this helper was sourced, printed on every step
+# header, every check, and once more in a closing summary. SECONDS is the bash
+# builtin, so none of this forks a `date`; that matters because the numbers
+# are meant to land on the PASS lines, which are the run's primary artifact
+# and are read one at a time while a run is in flight.
+#
+# Three deltas, deliberately distinct: +Ns on a step header is the run-relative
+# arrival time, +Ns on a PASS is the cost of that one check since the previous
+# check, and the step total attributes a slow phase to its own header rather
+# than to whatever step happens to follow it.
+E2E_T0=$SECONDS
+E2E_STEP_T0=$SECONDS
+E2E_LAST_PASS=$SECONDS
+E2E_STEP_LABEL=""
+
+# Close the open step, if any. Called at the head of step() and once more by
+# the summary, so the final step's total is never lost.
+step_close() {
+  [[ -n "$E2E_STEP_LABEL" ]] || return 0
+  printf '  --- step %s total: %ss ---\n' "$E2E_STEP_LABEL" "$(( SECONDS - E2E_STEP_T0 ))"
+  E2E_STEP_LABEL=""
+}
+
+# e2e_timing_report: close the open step, then print the run total and check
+# count. Masked against failure on purpose: it runs from EXIT traps and at the
+# tail of main(), and a diagnostic must never flip a run's verdict. Guarded, so
+# a harness that calls it from both places reports once and the line stays
+# parseable.
+E2E_TIMING_REPORTED=""
+e2e_timing_report() {
+  [[ -z "$E2E_TIMING_REPORTED" ]] || return 0
+  E2E_TIMING_REPORTED=1
+  step_close || true
+  printf 'e2e timing: %ss total, %s checks\n' \
+    "$(( SECONDS - E2E_T0 ))" "$PASS_COUNT" || true
+}
+
+trap 'e2e_timing_report; cleanup_mounts; collect_logs' EXIT
 
 PASS_COUNT=0
-step()  { echo "=== step $1: $2 ==="; }
-pass()  { PASS_COUNT=$((PASS_COUNT + 1)); echo "  PASS: $1"; }
+step()  {
+  step_close || true
+  E2E_STEP_LABEL="$1"; E2E_STEP_T0=$SECONDS
+  echo "=== step $1: $2 (+$(( SECONDS - E2E_T0 ))s) ==="
+}
+pass()  {
+  local d=$(( SECONDS - E2E_LAST_PASS ))
+  PASS_COUNT=$((PASS_COUNT + 1))
+  E2E_LAST_PASS=$SECONDS
+  echo "  PASS: $1 (+${d}s)"
+}
 die()   { echo "  FAIL: $1" >&2; exit 1; }
 
 wyrd() { "$WYRD_BIN" "$@"; }

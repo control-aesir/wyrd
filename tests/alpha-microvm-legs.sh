@@ -968,4 +968,5 @@ case "${1:-}" in
   headless-setup) leg_headless_setup "$2" "$3" ;;
   *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
+e2e_timing_report
 echo "legs: $PASS_COUNT checks passed"

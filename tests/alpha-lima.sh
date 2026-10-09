@@ -530,6 +530,7 @@ main() {
   # classes the suite starts: a new background job must join this
   # reap order, or it re-creates the hang.
   reap_background() {
+    e2e_timing_report
     stop_relay
     cleanup_mounts
     collect_logs
@@ -590,6 +591,7 @@ main() {
   if want_step 4; then step4_member; fi
   if want_step 5; then step5_export; fi
   if want_step 6; then step6_relay; fi
+  e2e_timing_report
   echo "e2e: $PASS_COUNT checks passed"
 }
 

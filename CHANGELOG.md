@@ -127,6 +127,21 @@ version say exactly what changed.
 
 ### Changed
 
+- Wall-clock accounting in the e2e harnesses (`tests/alpha-common.sh`):
+  every step header, every check line, and a closing summary now carry
+  elapsed seconds, taken from bash's `SECONDS` builtin so no check forks
+  a `date`. Three deltas, kept distinct on purpose: run-relative arrival
+  on a step header, the cost of one check on its PASS line, and a step
+  total so a slow phase is attributed to its own header rather than to
+  whatever step follows it. Both harnesses share the helper, so Lima and
+  the microVM gate report the same shape, and the summary is guarded to
+  print once per shell even though the harness calls it from both `main`
+  and its EXIT trap.
+  The gate had no timing at all outside `stop_mount`, so no claim about
+  where its minutes went could be checked against anything. First
+  measurement, Lima full suite: step 6 is 133s of a 152s run and steps
+  1-5 together are 19s, so the offline contract is free and the cost is
+  entirely the network phase.
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.

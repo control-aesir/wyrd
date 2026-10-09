@@ -984,9 +984,14 @@ leg_headless_fetch() {
   # Debug on: intake verdicts (duplicate vs route-update commit)
   # and fetch dials below say whether a redelivered route was
   # applied or the peer stayed pinned to the dead one — info
-  # level hides both.
+  # level hides both. Both crate targets: wyrd_core carries the
+  # pass reports, wyrd_sync carries intake verdicts, route
+  # publication, bulk dials, and backoff skips. (An EnvFilter with
+  # only wyrd_core=debug silences wyrd_sync entirely — that is why
+  # the previous instrumented run showed pass reports but no
+  # verdicts.)
   local old_fetch_log="${RUST_LOG-__unset}"
-  export RUST_LOG="wyrd_core=debug"
+  export RUST_LOG="wyrd_core=debug,wyrd_sync=debug"
   with_creds "$c" sync "$d" --relay "$relay" now \
     >"$LOGDIR/headless-fetch-$tag.out" 2>"$LOGDIR/headless-fetch-$tag.err" \
     || die "headless fetch ($tag) exited non-zero"

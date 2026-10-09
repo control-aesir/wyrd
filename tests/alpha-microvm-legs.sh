@@ -1317,7 +1317,8 @@ leg_steady_owner() {
 # fill file present is exactly 32 MiB (byte-complete) or absent —
 # never torn.
 # Wall-clock envelope: up to 24 x 32 MiB commits worst case
-# (~768 MiB of churn), under 8 minutes; typical 3-4 minutes.
+# (~768 MiB of churn) plus bounded recovery retries while the
+# engine drains, under 10 minutes; typical 4-5 minutes.
 leg_exhaustion() {
   local d="$1" c="$2"
   step 14 "resource-exhaustion leg"
@@ -1327,16 +1328,25 @@ leg_exhaustion() {
   avail_kb="$(df -k --output=avail "$d" | tail -n 1 | tr -d ' ')"
   [[ "$avail_kb" -ge 2097152 ]] \
     || die "only ${avail_kb} KiB free under $d: the exhaustion leg needs 2 GiB headroom to fail loudly, not vacuously"
-  # Leave 256 MiB breathing room for the guest itself (logs, mounts):
-  # the filler takes the rest, and the drive's own writes eat the
-  # remainder until the disk refuses.
+  # The filler must live INSIDE the drive dir: it is the only path
+  # visible inside the container ($d/.. is the shared host dir, and
+  # filling there fills odin, not the test fs). A stray file in the
+  # drive dir is fine — nothing references it, and it is removed
+  # before recovery and export below.
+  # Leave 256 MiB breathing room: the filler takes the rest, and the
+  # drive's own writes eat the remainder until something refuses.
+  # That something may be the disk or the daemon's 256 MiB write
+  # budget (budgets.rs: ENOSPC past the aggregate) — both reach the
+  # mount as fail-closed ENOSPC, and the recovery retries below
+  # cover either.
   filler_bytes=$(( (avail_kb - 262144) * 1024 ))
-  rm -f "$d/../exhaustion-filler.bin"
-  fallocate -l "$filler_bytes" "$d/../exhaustion-filler.bin" \
+  rm -f "$d/../exhaustion-filler.bin" "$d/exhaustion-filler.bin"
+  fallocate -l "$filler_bytes" "$d/exhaustion-filler.bin" \
     || die "filler preallocation failed"
   pass "filesystem filled, 256 MiB headroom left"
   start_mount xexh "$c" "$d" "$MNTS/xexh"
-  echo "pre-fill" > "$MNTS/xexh/small.txt"
+  echo "pre-fill" > "$MNTS/xexh/small.txt" \
+    || die "pre-fill anchor write failed"
   [[ "$(cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \
     || die "pre-fill anchor never committed"
   pass "pre-fill anchor committed before exhaustion"
@@ -1362,9 +1372,26 @@ leg_exhaustion() {
   [[ "$(timeout 60 cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \
     || die "pre-fill anchor unreadable under exhaustion"
   pass "drive stays readable while full"
-  rm -f "$d/../exhaustion-filler.bin" \
+  rm -f "$d/../exhaustion-filler.bin" "$d/exhaustion-filler.bin" \
     || die "filler removal failed"
-  echo "recovered" > "$MNTS/xexh/recovery.txt"
+  # Bounded retries, not a single shot: freeing disk space does not
+  # drain the daemon's write buffers, so if the budget (not the
+  # disk) capped the fills, the first recovery write still sees
+  # ENOSPC. Each attempt is terminal for its own bytes; a later one
+  # lands once the engine publishes the backlog. Worst case ~6
+  # minutes; the engine typically drains in under one.
+  local r_attempt=0 recovered=0
+  while (( r_attempt < 10 )); do
+    r_attempt=$((r_attempt + 1))
+    if timeout 30 bash -c "echo 'recovered' > '$MNTS/xexh/recovery.txt'" 2>/dev/null \
+      && [[ "$(timeout 10 cat "$MNTS/xexh/recovery.txt" 2>/dev/null)" == "recovered" ]]; then
+      recovered=1
+      break
+    fi
+    sleep 5
+  done
+  [[ "$recovered" == 1 ]] \
+    || die "drive never accepted writes after the filler was removed ($r_attempt attempts)"
   [[ "$(cat "$MNTS/xexh/recovery.txt")" == "recovered" ]] \
     || die "drive never accepted writes after the filler was removed"
   pass "drive accepts writes again once space returns"

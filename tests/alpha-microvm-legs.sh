@@ -238,7 +238,7 @@ leg_fetch_member() {
   timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" \
     || die "blocking cold open failed (open did not wait for the bytes)"
   [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
-    || die "cold open returned wrong bytes"
+    || { echo "--- cold-2.got ($(wc -c <"$E2E_ROOT/cold-2.got") bytes) ---"; od -c "$E2E_ROOT/cold-2.got" | head -n 10; die "cold open returned wrong bytes"; }
   pass "single open blocks until the announced bytes arrive"
   touch "$E2E_ROOT/member-cold-done"
   # Manifest-only convergence: readdir pulls the manifest chain

@@ -1353,6 +1353,105 @@ fn announcement_route_seals_round_trip_per_pair_first_wins() {
     );
 }
 
+/// Delivered-route records round-trip and scope redelivery
+/// eligibility: the record commits beside its marker, replays into
+/// the route map with last-write-wins, and `announce_eligible_for`
+/// reopens only pairs whose recorded route differs from the live
+/// one — unknown routes count as changed, the live route quenches,
+/// and no route at all degrades to plain pending.
+#[test]
+fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
+    let dir = TestDir::new("route-delivery");
+    let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    let snapshot = SnapshotId::from_bytes([0xA1; 32]);
+    let alice = DeviceId::from_bytes([0xB1; 32]);
+    let bob = DeviceId::from_bytes([0xB2; 32]);
+    let carol = DeviceId::from_bytes([0xB3; 32]);
+    let route_a = [0xA1; 32];
+    let route_b = [0xB2; 32];
+    store
+        .commit(&[
+            Fact::AnnouncementQueued(snapshot, alice),
+            Fact::AnnouncementQueued(snapshot, bob),
+            Fact::AnnouncementQueued(snapshot, carol),
+            Fact::AnnouncementDelivered(snapshot, alice),
+            Fact::AnnouncementDeliveredRoute(snapshot, alice, route_a),
+            // Bob: delivered with no route (pre-record chain, or a
+            // routeless send) — unknown, not current.
+            Fact::AnnouncementDelivered(snapshot, bob),
+        ])
+        .unwrap();
+
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert_eq!(
+        rebuilt.runtime.pending_announcements(),
+        vec![(snapshot, carol)],
+        "accounting stays queued-minus-delivered"
+    );
+    assert_eq!(
+        rebuilt.runtime.announce_eligible_for(Some(route_a)),
+        vec![(snapshot, bob), (snapshot, carol)],
+        "same route: pending plus unknown only"
+    );
+    assert_eq!(
+        rebuilt.runtime.announce_eligible_for(Some(route_b)),
+        vec![(snapshot, alice), (snapshot, bob), (snapshot, carol)],
+        "new route reopens the discharged pair"
+    );
+    assert_eq!(
+        rebuilt.runtime.announce_eligible_for(None),
+        vec![(snapshot, carol)],
+        "no route: plain pending, repair toward nothing"
+    );
+
+    // Overwrite: last write wins on replay, quenching under the new
+    // route without touching the marker.
+    store
+        .commit(&[Fact::AnnouncementDeliveredRoute(snapshot, alice, route_b)])
+        .unwrap();
+    let rebuilt = store.rebuild(owner()).unwrap();
+    assert_eq!(
+        rebuilt.runtime.announce_eligible_for(Some(route_b)),
+        vec![(snapshot, bob), (snapshot, carol)],
+        "re-recorded route quenches"
+    );
+    assert_eq!(
+        rebuilt.runtime.pending_announcements(),
+        vec![(snapshot, carol)],
+        "re-recording moves no accounting"
+    );
+}
+
+/// The delivered-route tag is a clean upgrade boundary: 0x1C is new
+/// (no old reader decodes it as another fact) and pinned (a
+/// different value is a different format), and a malformed record
+/// fails closed instead of decoding as a wrong pair.
+#[test]
+fn delivered_route_tag_is_a_clean_upgrade_boundary() {
+    use super::codec::{KNOWN_TAGS, TAG_ANNOUNCEMENT_DELIVERED_ROUTE};
+    let pre_route_tags = [
+        0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+    ];
+    assert!(
+        !pre_route_tags.contains(&TAG_ANNOUNCEMENT_DELIVERED_ROUTE),
+        "the route tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_ANNOUNCEMENT_DELIVERED_ROUTE, 0x1C,
+        "the tag is pinned: a different value is a different format"
+    );
+    let mut sorted = KNOWN_TAGS.to_vec();
+    sorted.sort_unstable();
+    let len = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        len,
+        "a duplicate tag decodes as the wrong fact"
+    );
+}
+
 /// A rotation-framed sealed fact commits when it names the
 /// obligation's epoch, and fails when it names another: the
 /// commit-time gate accepts either framing, with the recipient

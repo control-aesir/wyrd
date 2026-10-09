@@ -691,3 +691,135 @@ fn authored_snapshot_survives_restart() {
         id
     );
 }
+
+/// A live route for the redelivery tests: real canonical route bytes
+/// around a fresh endpoint identity, so route-scoped eligibility
+/// compares endpoint ids instead of degrading to plain pending (as
+/// undecodable fake routes would).
+fn live_route(byte: u8) -> Vec<u8> {
+    let id = iroh::SecretKey::from_bytes(&[byte; 32]).public();
+    crate::transport::encode_node_addr(&iroh::EndpointAddr::new(id))
+}
+
+/// Route-scoped redelivery (22b): a discharged announcement is
+/// discharged for its serving route, not forever. The same route
+/// resends nothing and a routeless resume repairs nothing; a restart
+/// under a new endpoint identity reopens eligibility, reseals under
+/// the live route, and quenches — while relay-acceptance accounting
+/// (still discharged, still no re-queue) and the other obligation
+/// classes stay untouched.
+#[test]
+fn route_change_redelivers_discharged_announcements() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let id = authored.snapshot().snapshot_id();
+
+    // Discharge under route A: both members served, obligations
+    // pending-empty, route recorded with the marker.
+    let route_a = live_route(0xA1);
+    let endpoint_a = crate::transport::endpoint_id(&route_a).unwrap();
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2);
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert_eq!(state.announcement_delivered_route.len(), 2);
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_a),
+        "every discharge records route A"
+    );
+
+    // Same route: nothing resends. No route: nothing repairs.
+    for route in [Some(route_a.as_slice()), None] {
+        let sent = {
+            let mut mailbox = MemoryMailbox {
+                relay: &mut pair.relay,
+                owner: pair.a.device,
+            };
+            pair.a.engine.announce_pending(&mut mailbox, route).unwrap()
+        };
+        assert_eq!(sent, 0, "no redelivery without a route change");
+    }
+
+    // Crash between discharge and repair: memory drops, the route
+    // record replays from the fact log.
+    restart(&mut pair.a, &controls);
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_a),
+        "the route record survives the crash"
+    );
+
+    // New endpoint identity reopens eligibility: both pairs resend
+    // under the live route, and the receiver converges on the
+    // reseal (route update, deduped — not a duplicate obligation).
+    let route_b = live_route(0xB2);
+    let endpoint_b = crate::transport::endpoint_id(&route_b).unwrap();
+    assert_ne!(endpoint_a, endpoint_b);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2, "the route change redelivers both pairs");
+    // Accounting intact: still discharged (no re-queue, pending
+    // stays empty), route now recorded as B — self-quenching.
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_b),
+        "redelivery re-records the live route"
+    );
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 0, "the repair quenches under the recorded route");
+    // The route-B reseal reaches the peer alongside its undrained
+    // route-A copy: two envelopes, one obligation — the reseal is a
+    // route update, not a duplicate, and the peer converges once.
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 2);
+    let state = pair.b.engine.runtime_state().unwrap();
+    assert!(state.announcement(&id).is_some());
+    assert!(
+        pair.a
+            .engine
+            .runtime_state()
+            .unwrap()
+            .announcement_route_sealed_bytes(&id, &route_b)
+            .is_some(),
+        "the redelivery persists the route-B reseal"
+    );
+}

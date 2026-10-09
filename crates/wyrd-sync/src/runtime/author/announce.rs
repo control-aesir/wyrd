@@ -6,6 +6,7 @@ use crate::control::{seal as seal_control, Message, SnapshotAnnouncement};
 use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
+use crate::transport::endpoint_id;
 use crate::transport::mailbox::Mailbox;
 
 /// Announce an authored snapshot to every other admitted device of the
@@ -133,13 +134,28 @@ pub(crate) fn announce(
         engine.commit_facts(&obligation)?;
     }
 
-    send_pending_for(engine, body.snapshot_id(), &sealed_bytes, mailbox)
+    send_pending_for(
+        engine,
+        body.snapshot_id(),
+        &sealed_bytes,
+        mailbox,
+        route_id_of(node_addr),
+    )
 }
 
-/// Resume every undischarged announcement obligation across snapshots,
+/// The serving endpoint identity behind route bytes, for
+/// route-scoped redelivery eligibility and per-send route records.
+/// `None` for missing or malformed routes: unknown routes always
+/// count as changed at eligibility time, so redelivery fails toward
+/// resending, never toward stranding a peer on a dead route.
+fn route_id_of(node_addr: Option<&[u8]>) -> Option<[u8; 32]> {
+    node_addr.and_then(endpoint_id)
+}
+
+/// Resume every send-eligible announcement obligation across snapshots,
 /// returning the number of relay-accepted sends this call. This is the
 /// restart path: after a crash or a partial send, the durable outbox
-/// still holds the queued-minus-delivered pairs, and this sends them
+/// still holds the send-eligible pairs, and this sends them
 /// without re-authoring anything. Snapshots with no persisted sealed
 /// bytes are sealed now (the epoch key must be held; the root manifest
 /// must be recorded) under the given `node_addr`; already-sealed
@@ -155,11 +171,19 @@ pub(crate) fn announce_pending(
     node_addr: Option<&[u8]>,
 ) -> Result<usize, EngineError> {
     let rebuilt = engine.store.rebuild(engine.device)?;
-    // Distinct snapshots with pending obligations, in snapshot-id
-    // order (`pending_announcements` already yields sorted pairs).
+    // The live route's endpoint identity, for route-scoped
+    // redelivery below. `None` (no serving route) degrades the
+    // eligibility to plain pending: repair toward no route is
+    // meaningless.
+    let route_id = route_id_of(node_addr);
+    // Distinct snapshots with send-eligible obligations, in
+    // snapshot-id order (`announce_eligible_for` yields sorted
+    // pairs): still-pending pairs plus pairs discharged against an
+    // older route, so a restart under a new endpoint re-addresses
+    // what the dead route stranded.
     let mut snapshots: Vec<wyrd_format::SnapshotId> = rebuilt
         .runtime
-        .pending_announcements()
+        .announce_eligible_for(route_id)
         .into_iter()
         .map(|(snapshot, _)| snapshot)
         .collect();
@@ -298,7 +322,13 @@ fn send_with_live_route(
         };
         bytes
     };
-    Ok(Some(send_pending_for(engine, snapshot, &bytes, mailbox)?))
+    Ok(Some(send_pending_for(
+        engine,
+        snapshot,
+        &bytes,
+        mailbox,
+        route_id_of(node_addr),
+    )?))
 }
 
 /// Reuse the persisted route-specific reseal for one snapshot under
@@ -385,6 +415,14 @@ fn reuse_or_seal_route(
 /// to the author's statement (same routes included), sealed under its
 /// epoch key. Unknown snapshots are skipped orphan-tolerant — the
 /// obligation stays pending for a later pass.
+///
+/// Pending-only, deliberately: the resent bytes carry the author's
+/// route, not this engine's, so route-scoped redelivery by this
+/// engine would resend a route it cannot heal. The author's own
+/// engine owns that repair (its redelivery reseals under its live
+/// route); this path records no route and resends nothing already
+/// discharged. The author's redelivery arrives as a route update the
+/// receiver dedupes.
 fn reannounce_one(
     engine: &mut Engine,
     rebuilt: &Rebuilt,
@@ -450,17 +488,20 @@ fn reannounce_one(
             bytes
         }
     };
-    send_pending_for(engine, snapshot, &sealed_bytes, mailbox)
+    send_pending_for(engine, snapshot, &sealed_bytes, mailbox, None)
 }
 
-/// Send the sealed bytes to every still-pending recipient of one
-/// snapshot, recording one delivered marker per relay-accepted send. A
-/// send failure returns immediately with the rest still pending.
+/// Send the sealed bytes to every send-eligible recipient of one
+/// snapshot — still-pending pairs plus pairs discharged against an
+/// older route — recording one delivered marker plus its serving-route
+/// record per relay-accepted send. A send failure returns immediately
+/// with the rest still pending.
 fn send_pending_for(
     engine: &mut Engine,
     snapshot: wyrd_format::SnapshotId,
     sealed_bytes: &[u8],
     mailbox: &mut impl Mailbox,
+    route_id: Option<[u8; 32]>,
 ) -> Result<usize, EngineError> {
     // Re-read fresh: `announce` commits new queue facts before this
     // send, so the delivery snapshot above may predate the obligation.
@@ -470,7 +511,7 @@ fn send_pending_for(
     let rebuilt = engine.store.rebuild(engine.device)?;
     let recipients: Vec<wyrd_format::DeviceId> = rebuilt
         .runtime
-        .pending_announcements()
+        .announce_eligible_for(route_id)
         .into_iter()
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)
@@ -485,6 +526,17 @@ fn send_pending_for(
         &obligation,
         sealed_bytes,
         recipients,
-        |recipient| Fact::AnnouncementDelivered(snapshot, recipient),
+        |recipient| {
+            let mut facts = vec![Fact::AnnouncementDelivered(snapshot, recipient)];
+            // The route record commits atomically with its marker, so
+            // a crash can never leave a delivered pair route-unknown
+            // mid-repair: unknown routes count as changed and resend.
+            if let Some(endpoint) = route_id {
+                facts.push(Fact::AnnouncementDeliveredRoute(
+                    snapshot, recipient, endpoint,
+                ));
+            }
+            facts
+        },
     )
 }

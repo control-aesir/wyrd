@@ -138,6 +138,24 @@ pub fn decode_node_addr(bytes: &[u8]) -> Result<EndpointAddr, NodeAddrError> {
     Ok(address)
 }
 
+/// The serving endpoint identity carried by route bytes, if they
+/// decode: the endpoint public key, which is what makes one route
+/// dialable after another endpoint's death meaningless. Identity —
+/// not the full address — scopes announcement redelivery: same
+/// endpoint with new IPs stays dialable through discovery, while a
+/// new endpoint invalidates every route sealed under the old one.
+/// `None` for missing or malformed routes; unknown routes always
+/// count as changed, so redelivery fails toward resending, never
+/// toward stranding a peer on a dead route.
+pub fn endpoint_id(route: &[u8]) -> Option<[u8; 32]> {
+    decode_node_addr(route).ok().map(|address| {
+        let bytes = address.id.as_bytes();
+        let mut id = [0u8; 32];
+        id.copy_from_slice(bytes);
+        id
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

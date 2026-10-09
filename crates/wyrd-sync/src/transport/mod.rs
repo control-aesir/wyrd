@@ -29,7 +29,7 @@ pub mod mailbox;
 pub mod routes;
 pub mod signer;
 
-pub use addr::{decode_node_addr, encode_node_addr};
+pub use addr::{decode_node_addr, encode_node_addr, endpoint_id};
 pub use mailbox::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
 };

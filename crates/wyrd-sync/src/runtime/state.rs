@@ -125,6 +125,17 @@ pub struct RuntimeState {
     pub(super) announcement_queued: BTreeSet<(SnapshotId, DeviceId)>,
     pub(super) announcement_sealed: BTreeMap<SnapshotId, Vec<u8>>,
     pub(super) announcement_delivered: BTreeSet<(SnapshotId, DeviceId)>,
+    /// The serving endpoint identity each discharged announcement
+    /// was sent against, by obligation pair. A discharged
+    /// announcement is discharged for its route, not forever: when
+    /// the live route's endpoint differs, the pair becomes eligible
+    /// for redelivery (last route wins on the wire, deduped as a
+    /// route update by the receiver). Last write wins on replay, in
+    /// commit order like every fact bucket. Absent for sends with no
+    /// live route and for chains written before the record existed —
+    /// unknown routes always count as changed. Transitions and
+    /// capabilities carry no route and have no entry here.
+    pub(super) announcement_delivered_route: BTreeMap<(SnapshotId, DeviceId), [u8; 32]>,
     /// Route-specific announcement reseals: one sealed envelope per
     /// (snapshot, route) for resumes whose live route differs from the
     /// first seal's. First seal per pair wins, like the canonical map
@@ -199,6 +210,7 @@ impl RuntimeState {
             announcement_sealed: BTreeMap::new(),
             announcement_route_sealed: BTreeMap::new(),
             announcement_delivered: BTreeSet::new(),
+            announcement_delivered_route: BTreeMap::new(),
             transition_queued: BTreeSet::new(),
             transition_sealed: BTreeMap::new(),
             transition_delivered: BTreeSet::new(),
@@ -352,6 +364,57 @@ impl RuntimeState {
         recipient: DeviceId,
     ) -> bool {
         self.announcement_delivered.insert((snapshot, recipient))
+    }
+
+    /// Record the serving endpoint identity one discharged
+    /// announcement was sent against. Committed in the same batch as
+    /// its delivered marker, so the two can never diverge across a
+    /// crash; last write wins on replay. Overwrites — a pair
+    /// redelivered under a new route records the new route, which is
+    /// what makes the repair self-quenching instead of resending
+    /// every pass.
+    pub fn record_announcement_delivered_route(
+        &mut self,
+        snapshot: SnapshotId,
+        recipient: DeviceId,
+        endpoint: [u8; 32],
+    ) {
+        self.announcement_delivered_route
+            .insert((snapshot, recipient), endpoint);
+    }
+
+    /// Every obligation the send path may discharge under one route,
+    /// in `(snapshot, recipient)` order: still-pending pairs plus
+    /// discharged pairs whose recorded route differs from the live
+    /// one. Deterministic under replay (both halves ordered, union
+    /// sorted), so resume sends in a stable order like the pending
+    /// projection it extends.
+    ///
+    /// `None` (no live serving route — an offline or headless run)
+    /// degrades to plain pending: repair toward no route is
+    /// meaningless, and the run must not resend what it cannot
+    /// re-address. Unknown recorded routes (sends with no live
+    /// route, chains predating the record) always count as changed.
+    /// Transitions and capabilities are untouched — only
+    /// announcements carry a route.
+    pub fn announce_eligible_for(&self, route: Option<[u8; 32]>) -> Vec<(SnapshotId, DeviceId)> {
+        let mut eligible: Vec<(SnapshotId, DeviceId)> = self
+            .announcement_queued
+            .iter()
+            .copied()
+            .filter(|pair| !self.announcement_delivered.contains(pair))
+            .collect();
+        if let Some(live) = route {
+            let mut stale: Vec<(SnapshotId, DeviceId)> = self
+                .announcement_delivered
+                .iter()
+                .copied()
+                .filter(|pair| self.announcement_delivered_route.get(pair) != Some(&live))
+                .collect();
+            eligible.append(&mut stale);
+            eligible.sort();
+        }
+        eligible
     }
 
     /// The sealed announcement bytes for one snapshot, if the first

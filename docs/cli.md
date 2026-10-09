@@ -510,7 +510,10 @@ against a held drive exits 2 promptly, naming the drive
 (`another wyrd process holds ...: only one vault or mount per
 drive`). The lock dies with its process, so a crash leaves no
 stale record — but a held lock proves only occupancy, never
-health or convergence. Operator
+health or convergence. A restart mints a new endpoint, so the
+vault re-announces discharged-but-unfetched obligations under
+the live route (same route resends nothing); relay acceptance
+is not peer acquisition. Operator
 lifecycle (`start`/`stop`/`status`) and queryable health are separate
 follow-ons; this command is the foreground process they supervise.
 

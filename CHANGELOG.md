@@ -150,7 +150,7 @@ version say exactly what changed.
   two cannot disagree into a missing import; a flapping probe falls
   through to the export. `check_no_leaks` scans each log once for all
   secrets instead of once per secret, and fails closed on an empty secret
-  set rather than passing vacuously. The `--step` comma-list grammar is
+  set or an unreadable log rather than passing vacuously. The `--step` comma-list grammar is
   one shared `step_max` function with 40 stub checks (both ranges,
   malformed inputs, glob safety, base-10 canonicalization); Lima adopts
   it, and the two microVM copies stay inline until an odin run can prove

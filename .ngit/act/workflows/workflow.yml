@@ -19,7 +19,7 @@ on:
       - ".ngit/scripts/review.sh"
       - ".ngit/scripts/tests/**"
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, synchronize, ready_for_review]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -54,8 +54,10 @@ jobs:
 
       # Revision-bound evidence for the e2e harness claims that are
       # provable without a guest: pure bash, no relay, secret, or cache.
-      - name: E2E step grammar stubs
-        run: bash tests/test-step-grammar.sh
+      - name: E2E harness stubs
+        run: |
+          bash tests/test-step-grammar.sh
+          bash tests/test-baked-set.sh
 
   draft:
     if: github.event.action == 'opened'

@@ -1146,7 +1146,10 @@ leg_steady_member() {
     || die "witness never converged the anchor write"
   pass "witness converges the anchor before the crash"
   touch "$E2E_ROOT/crash-o-steady-ready"
-  poll_until 120 test -f "$E2E_ROOT/crash-o-back" \
+  # 300s: instrumentation shows 40 burst writes take ~200s (some
+  # hit 21s when the sync engine is mid-publish), plus KILL + remount
+  # + verify ~30s. The old 120s expired at burst[18].
+  poll_until 300 test -f "$E2E_ROOT/crash-o-back" \
     || die "owner never came back after the KILL"
   poll_until 300 converged "$MNTS/xsteady-m/after-crash.txt" "after-crash" \
     || die "witness never converged the post-crash head"

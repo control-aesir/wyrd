@@ -1486,10 +1486,12 @@ leg_uparent_member() {
   # The child first, on pristine state: up-2's snapshot has an
   # unrecorded parent (up-1's body never arrived), so it classifies
   # UnknownParent, never becomes a live head, and its paths are
-  # ENOENT — never a hang. The 10s budget (well under the 30s open
-  # deadline) is what makes "never" real.
+  # ENOENT — never a hang. The 25s budget (still under the 30s open
+  # deadline) is what makes "never" real: with the 13b backlog the
+  # classification itself can queue behind a busy loop for seconds
+  # before it runs.
   rc=0
-  timeout 10 cat "$MNTS/xup-m/up-2.txt" >/dev/null 2>"$E2E_ROOT/up-2.err" || rc=$?
+  timeout 25 cat "$MNTS/xup-m/up-2.txt" >/dev/null 2>"$E2E_ROOT/up-2.err" || rc=$?
   [[ "$rc" == 1 ]] || die "unadopted-child open returned rc $rc, want ENOENT (1)"
   grep -q "No such file or directory" "$E2E_ROOT/up-2.err" \
     || die "unadopted-child open was not ENOENT: $(cat "$E2E_ROOT/up-2.err")"

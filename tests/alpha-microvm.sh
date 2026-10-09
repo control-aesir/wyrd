@@ -579,6 +579,7 @@ for f in "$RUN"/logs/*; do
   if want_phase 12; then
     for s in "$(cat "$HO/identity")" "$(cat "$HO/passphrase")" \
              "$(cat "$HC/identity")" "$(cat "$HC/passphrase")" \
+             "$(cat "$HE/identity")" "$(cat "$HE/passphrase")" \
              "$(cat "$HDD/identity")" "$(cat "$HDD/passphrase")"; do
       grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"
     done

@@ -863,8 +863,10 @@ leg_headless_serve() {
   pass "serve#1 dies on KILL"
   # serve#2: restart the vault over the same drive — the mirror
   # rebuilds from the vault by replay, never by re-deriving bytes.
-  # Nothing new to announce (C discharged, D not yet admitted); the
-  # ready line proves the endpoint is back up and re-announced.
+  # E's obligation is still pending (admitted up front, never
+  # discharged: C discharged, D not yet admitted), so serve#2
+  # re-announces it with the new route; the ready line proves the
+  # endpoint is back up and re-announced.
   with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-2.out" 2>"$LOGDIR/headless-serve-2.err" &
   echo $! > "$PIDDIR/headless-serve.pid"

@@ -166,6 +166,24 @@ evidence rather than resumed from a cursor. Pinned by
 `retire_commits_across_chunks` for the multi-chunk shape and by
 the same tear test for the atomicity direction.
 
+An announcement send also commits the route it went out under as its
+own fact (`AnnouncementDeliveredRoute`), recorded per `(snapshot,
+recipient)` pair alongside the delivered mark. The reseal and its
+record are two facts in one atomic commit per pair, so a crash between
+them cannot leave a route that was sent but never recorded: on resume
+the pair re-sends under the live route rather than stranding a peer on
+an address that no longer answers. Last route wins — a peer learns the
+live route at most once per change, and the replay is a pure function
+of the log. Pinned by
+`announcement_delivered_routes_round_trip_and_scope_eligibility`,
+`delivered_route_tag_is_a_clean_upgrade_boundary`
+(`durable/tests.rs`), `route_change_redelivers_discharged_announcements`,
+`route_change_redelivers_the_reachable_closure_and_quenches`,
+`route_change_leaves_out_of_scope_pairs_discharged`
+(`engine/tests_drain.rs`), and
+`restarted_node_sends_redelivery_with_empty_pending_outbox`
+(`live/tests_restart_redelivery.rs`).
+
 ### The obligation invariant
 
 > A durable obligation must replay to the same obligation, or to an

@@ -51,7 +51,9 @@ version say exactly what changed.
   for the current head's reachable closure under a new serving
   endpoint (same route resends nothing; out-of-scope history stays
   discharged, so one restart cannot re-announce the whole outbox
-  past; transitions and capabilities stay discharged). The
+  past; transitions and capabilities stay discharged). Every send
+  records the route it went out under, last route wins, so the
+  repair repeats on no subsequent pass. The
   replacement serves the closure from the retained vault store, so
   a late peer recovers history, not just the head.
 - `wyrd vault` foreground process (22a): the mount's live loop and

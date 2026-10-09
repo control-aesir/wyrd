@@ -552,9 +552,16 @@ leg_fetch_member() {
 leg_conflict_owner() {
   local d="$1" c="$2" relay="$3"
   step 10 "partition-conflict owner leg"
+  # Debug for this mount only, same scoped pattern as the fetch
+  # member leg: a silent victim-write failure here cascades into a
+  # misleading member-side FAIL two polls later.
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xowner-c "$c" "$d" "$MNTS/xowner-c" --relay "$relay"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   conflict_assert_reachable "$relay"
-  echo "victim" > "$MNTS/xowner-c/rename-victim.txt"
+  echo "victim" > "$MNTS/xowner-c/rename-victim.txt" \
+    || die "owner victim write failed"
   poll_until 120 test -f "$E2E_ROOT/conflict-rename-member-ready" \
     || die "member never opened the rename victim"
   mv "$MNTS/xowner-c/rename-victim.txt" "$MNTS/xowner-c/renamed.txt" \
@@ -597,7 +604,13 @@ leg_conflict_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0 crc=0
   step 10 "partition-conflict member leg"
+  # Debug for this mount only, same scoped pattern as the fetch
+  # member leg: shows what (if anything) converges while the
+  # victim poll runs.
+  local old_e2e_log_m="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xmember-c "$c" "$d" "$MNTS/xmember-c" --relay "$relay"
+  if [[ "$old_e2e_log_m" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log_m"; fi
   conflict_assert_reachable "$relay"
   poll_until 120 converged "$MNTS/xmember-c/rename-victim.txt" "victim" \
     || die "member never converged the rename victim"

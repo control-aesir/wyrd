@@ -1034,16 +1034,17 @@ leg_crash_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection owner leg"
   start_mount xcrash-o "$c" "$d" "$MNTS/xcrash-o" --relay "$relay"
-  # Bounded retries like leg_crash_member's scratch: after 13a's
-  # replay the closure drains slowly and the first mutation can
-  # outwait the 30s max_mutation_wait (ETIMEDOUT). Each attempt is
-  # terminal (a timed-out mutation commits nothing), so retrying the
-  # same bytes is safe. Six attempts x 25s timeout bound the worst
-  # case near 160s, inside the member's convergence window.
+  # Converge the member's readiness signal first: this fetch settles
+  # the sync engine (the closure gate blocks mutations until the
+  # fetch completes). Without it the anchor write ETIMEDOUTs —
+  # retries alone never drain the gate. Then the anchor write itself
+  # gets bounded retries as insurance against a straggler pass.
+  poll_until 300 converged "$MNTS/xcrash-o/member-ready.txt" "member-ready" \
+    || die "member never published readiness"
   local attempt=0 anchored=0
   while (( attempt < 6 )); do
     attempt=$((attempt + 1))
-    if timeout 25 bash -c "echo 'anchor-v1' > '$MNTS/xcrash-o/anchor.txt'" 2>/dev/null \
+    if timeout 35 bash -c "echo 'anchor-v1' > '$MNTS/xcrash-o/anchor.txt'" 2>/dev/null \
       && [[ "$(cat "$MNTS/xcrash-o/anchor.txt" 2>/dev/null)" == "anchor-v1" ]]; then
       anchored=1
       break
@@ -1108,6 +1109,12 @@ leg_steady_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness member leg"
   start_mount xsteady-m "$c" "$d" "$MNTS/xsteady-m" --relay "$relay"
+  # Publish readiness before waiting for the anchor: the owner
+  # converges this first, which triggers the fetch that settles its
+  # sync engine. Without it the owner's first mutation hits the
+  # closure gate and ETIMEDOUTs (observed: retries alone never
+  # drain the gate).
+  echo "member-ready" > "$MNTS/xsteady-m/member-ready.txt"
   poll_until 300 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
     || die "witness never converged the anchor write"
   pass "witness converges the anchor before the crash"

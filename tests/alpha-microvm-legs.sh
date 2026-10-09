@@ -1044,8 +1044,13 @@ leg_crash_owner() {
   local attempt=0 anchored=0
   while (( attempt < 6 )); do
     attempt=$((attempt + 1))
-    if timeout -s KILL 35 bash -c "echo 'anchor-v1' > '$MNTS/xcrash-o/anchor.txt'" 2>/dev/null \
-      && [[ "$(timeout 10 cat "$MNTS/xcrash-o/anchor.txt" 2>/dev/null)" == "anchor-v1" ]]; then
+    local _awrc=1 _agot=""
+    timeout -s KILL 35 bash -c "echo 'anchor-v1' > '$MNTS/xcrash-o/anchor.txt'" 2>/dev/null && _awrc=0
+    if ((_awrc == 0)); then
+      _agot="$(timeout 10 cat "$MNTS/xcrash-o/anchor.txt" 2>/dev/null)"
+    fi
+    step 13 "  anchor attempt $attempt: write_rc=$_awrc got='${_agot:0:20}'"
+    if ((_awrc == 0)) && [[ "$_agot" == "anchor-v1" ]]; then
       anchored=1
       break
     fi
@@ -1069,8 +1074,13 @@ leg_crash_owner() {
       # SIGKILL not SIGTERM: a FUSE write stuck in D state ignores
       # SIGTERM and timeout hangs forever waiting for the process.
       # The read-back gets its own timeout for the same reason.
-      if timeout -s KILL 35 bash -c "echo 'burst-$i' > '$MNTS/xcrash-o/burst-$i.txt'" 2>/dev/null \
-        && [[ "$(timeout 10 cat "$MNTS/xcrash-o/burst-$i.txt" 2>/dev/null)" == "burst-$i" ]]; then
+      local _wrc=1 _got=""
+      timeout -s KILL 35 bash -c "echo 'burst-$i' > '$MNTS/xcrash-o/burst-$i.txt'" 2>/dev/null && _wrc=0
+      if ((_wrc == 0)); then
+        _got="$(timeout 10 cat "$MNTS/xcrash-o/burst-$i.txt" 2>/dev/null)"
+      fi
+      step 13 "  burst[$i] attempt $bw_attempt: write_rc=$_wrc got='${_got:0:20}'"
+      if ((_wrc == 0)) && [[ "$_got" == "burst-$i" ]]; then
         bw_ok=1
         break
       fi

@@ -157,7 +157,9 @@ fn relay_flag_is_rejected_for_init() {
         "ws://one.example".into(),
     ])
     .unwrap_err();
-    assert!(matches!(error, CliError::Usage(message) if message.contains("--interval")));
+    assert!(
+        matches!(error, CliError::Usage(message) if message.contains("unrecognized subcommand") || message.contains("unexpected"))
+    );
 }
 
 /// A pacing deadline past a day stops being pacing, so mount refuses

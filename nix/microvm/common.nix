@@ -31,6 +31,9 @@
     # The spike proved /dev/fuse is rw under the default microvm
     # kernel; no extra kernel modules needed. The suite fails loudly
     # at first mount if that ever regresses.
+    # loop: phase 14 loop-mounts a fixed-size ext4 image in-guest so
+    # the exhaustion fills can never reach the shared host disk.
+    boot.kernelModules = [ "loop" ];
     environment.systemPackages = with pkgs; [
       python3Minimal
       jq
@@ -38,12 +41,15 @@
       fuse3
       sudo
       procps
+      e2fsprogs
+      util-linux
     ];
     security.sudo.enable = true;
     # The suite runs as e2e, mirroring the Lima guest's unprivileged
     # user: step 1's credential-hardening negatives (wrong owner,
     # group-readable) only mean anything as non-root. Passwordless
-    # sudo covers the suite's `sudo tc` / `sudo chown` calls.
+    # sudo covers the suite's `sudo tc` / `sudo chown` calls plus
+    # phase 14's `sudo mkfs.ext4` and `sudo mount -o loop`.
     # /dev/fuse is 0666 via systemd's default udev rules, and the
     # setuid fusermount wrapper below lets e2e mount.
     users.users.e2e = {

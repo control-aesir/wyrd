@@ -2386,6 +2386,18 @@ fn body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent() {
             .all(|head| head.snapshot().snapshot_id() != child_id),
         "the undecided child is not a live head"
     );
+    // The undecided child projects no paths either: the namespace
+    // still resolves nothing, synchronously — the verdict above is
+    // not just a label, and the lookup below cannot hang waiting on
+    // the still-missing parent (this test is fully synchronous, so
+    // completion itself is the no-hang evidence; boundedness under a
+    // live mount is the e2e leg's job, not this unit's).
+    daemon.refresh_live_heads().unwrap();
+    assert_eq!(
+        daemon.view().lookup("payload"),
+        Err(ViewError::NotFound),
+        "unadopted child projects no paths while its parent is unrecorded"
+    );
 
     // No poisoning: a further pass rejects nothing, the announcement
     // is still durably recorded (its redelivery collapses to a

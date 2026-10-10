@@ -265,6 +265,9 @@ start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
   # to start with `error: `, so the restored shell must not leak it.
   local old_rust_log="${RUST_LOG-__unset}"
   [[ -n "${E2E_RUST_LOG:-}" ]] && export RUST_LOG="$E2E_RUST_LOG"
+  if [[ -n "${E2E_RUST_LOG:-}" ]]; then
+    echo "start_mount $name: scoped RUST_LOG=$RUST_LOG for the mount process" >&2
+  fi
   with_creds "$c" mount "$d" "$m" "$@" \
     >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
   mkdir -p "$PIDDIR"

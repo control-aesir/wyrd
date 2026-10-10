@@ -72,6 +72,20 @@ version say exactly what changed.
   copy shared by mount, `sync now --serve`, and vault (route-plus-
   barrier wiring pinned by a test a hand-wired barrier cannot
   satisfy; flush-before-route is the shared code order).
+- MicroVM degraded-path legs (G5, tests only — no behavior change):
+  crash injection (owner SIGKILL mid-burst reopens clean with
+  byte-complete survivors; member SIGKILL with a pending obligation
+  under partition replays and re-serves), resource exhaustion
+  (filled filesystem fails closed ENOSPC, drive stays readable and
+  recovers, offline export holds only byte-complete fills), and
+  unknown parent (announcements converge with the owner down;
+  reads of unserved bodies fail EIO bounded, never hang; heal
+  converges once the owner returns; manifest-missing UnknownParent
+  stays pinned at contract level). New suite phases 13-15; the whole-run
+  cap moves 90 to 120 minutes with the legs' stated budgets.
+  The exhaustion drive lives on a fixed-size ext4 image
+  loop-mounted in-guest: filling the shared state dir fills the
+  host root fs, which kills guests and the suite silently.
 
 - Tested review helpers (`.ngit/scripts/review.sh`, exposed as `review`
   in dev shells, with a stub-based suite under `.ngit/scripts/tests/`):
@@ -104,8 +118,8 @@ version say exactly what changed.
   and never readable as a head.
 
 - MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
-  run the prefix closure over suite phases 1-12 (1-5 shared core,
-  6-12 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
+  run the prefix closure over suite phases 1-15 (1-5 shared core,
+  6-15 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
   entry or a non-step is refused; omitting the flag means all phases.
 
 - Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):

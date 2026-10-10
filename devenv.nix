@@ -14,6 +14,7 @@ in
     cargo-deny
     cargo-nextest
     pkg-config
+    shellcheck
   ] ++ optionals isLinux [
     # Fast parallel linker for large debug artifacts. Only wired up when we
     # add .cargo/config.toml with -fuse-ld=mold; falls back to the system

@@ -58,6 +58,7 @@ jobs:
         run: |
           bash tests/test-step-grammar.sh
           bash tests/test-baked-set.sh
+          bash tests/test-runner-fd.sh
 
   draft:
     if: github.event.action == 'opened'

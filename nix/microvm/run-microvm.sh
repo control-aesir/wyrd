@@ -42,6 +42,14 @@
 # bound is whole-run pathology cover.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared --step grammar (pure function, no traps or side effects — safe
+# to source in every mode including --teardown). The host orchestrator
+# re-checks with the same function, so a direct
+# tests/alpha-microvm.sh invocation fails the same way.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../../tests/step-grammar.sh"
+
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
 
 STATE_DIR="/var/lib/wyrd-microvm/state"
@@ -69,24 +77,8 @@ done
 # typo must fail here. The orchestrator re-checks (same grammar), so
 # a direct tests/alpha-microvm.sh invocation fails the same way.
 if [[ -n "$ONLY_STEP" ]]; then
-  # The grammar is a comma list; whitespace is not a separator.
-  [[ "$ONLY_STEP" != *[[:space:]]* ]] \
-    || { echo "error: --step: '$ONLY_STEP' is not a comma list (got whitespace)" >&2; exit 2; }
-  # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
-  # without this it would run zero checks and pass.
-  [[ ",$ONLY_STEP," != *,,* ]] \
-    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-15 entries)" >&2; exit 2; }
-  # Split on commas into a quoted array: an unquoted expansion would
-  # glob each entry against the working directory first, so `--step
-  # '*'` could pathname-expand into a digit-named file and slip past
-  # the grammar.
-  _step_entries=()
-  IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
-  for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[0-5])$ ]] \
-      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-15)" >&2; exit 2; }
-  done
-  unset _step_entries _e
+  step_max 1 15 "$ONLY_STEP" >/dev/null \
+    || { echo "error: --step: '$ONLY_STEP' is not a step (expected a comma list of 1-15)" >&2; exit 2; }
 fi
 
 [[ "$EUID" == 0 ]] || { echo "error: run as root (taps, bridge, virtiofsd need it)" >&2; exit 2; }
@@ -119,6 +111,9 @@ BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
 WORK="$STATE_DIR/work"
+# Build logs live outside $RUN: phase 1's guest pre-clean empties the
+# shared state root, so anything under $RUN/logs is gone post-run.
+BUILD_LOGS="$STATE_DIR/build-logs"
 SSH_KEY="$STATE_DIR/sshkey"
 
 die() { echo "  FAIL: $1" >&2; exit 1; }
@@ -194,32 +189,53 @@ fi
 kill_stale_daemons
 
 echo "==> state dir $STATE_DIR"
-mkdir -p "$RUN" "$RUN/logs" "$WORK"
+mkdir -p "$RUN" "$RUN/logs" "$WORK" "$BUILD_LOGS"
 [[ "$FRESH" == 1 ]] && rm -rf "$RUN" && mkdir -p "$RUN" "$RUN/logs"
 # The share is root-owned from the host; guest e2e (uid 1000, the
 # only normal user — numeric, no host user needed) must own the run
 # state or every drive/cred/mount mkdir fails. sshkey stays root.
 chown -R 1000:1000 "$RUN"
 
-echo "==> building wyrd + VM runners"
-if ! WYRD_OUT="$(nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs 2>"$RUN/logs/nix-build-wyrd.log" | tail -n 1)"; then
-  die "host build failed (see run/logs/nix-build-wyrd.log)"
-fi
-WYRD_BIN="$WYRD_OUT/bin/wyrd"
-[[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see run/logs/nix-build-wyrd.log)"
-echo "    $WYRD_BIN"
+echo "==> building wyrd + nak + 3 VM runners (parallel: wall time is the slowest, not the sum)"
+# Fail fast with no orphans: the first failed wait kills the siblings
+# before dying, so a dead build never burns CPU through teardown. The
+# array is complete before any wait below runs; kill errors on reaped
+# or finished pids are expected and ignored. Per-build logs keep each
+# failure attributable to its own file.
+wait_build() { # <pid> <what>
+  wait "$1" || { kill "${BUILD_PIDS[@]}" 2>/dev/null || true; die "$2"; }
+}
+nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs \
+  >"$BUILD_LOGS/nix-build-wyrd.out" 2>"$BUILD_LOGS/nix-build-wyrd.log" 9>&- &
+BUILD_WYRD=$!
+BUILD_PIDS=("$BUILD_WYRD")
 # Pinned nak for the opacity probe (see the flake comment): same
 # no-link pattern as wyrd, so the suite never floats the registry.
-if ! NAK_OUT="$(nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs 2>"$RUN/logs/nix-build-nak.log" | tail -n 1)"; then
-  die "host nak build failed (see run/logs/nix-build-nak.log)"
-fi
-NAK_BIN="$NAK_OUT/bin/nak"
-[[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see run/logs/nix-build-nak.log)"
-echo "    $NAK_BIN"
+nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs \
+  >"$BUILD_LOGS/nix-build-nak.out" 2>"$BUILD_LOGS/nix-build-nak.log" 9>&- &
+BUILD_NAK=$!
+BUILD_PIDS+=("$BUILD_NAK")
+declare -A BUILD_PID=()
 for role in peer-o peer-n relay; do
   nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
-    --out-link "$WORK/runner-$role" --print-build-logs 2>&1 | tee "$RUN/logs/nix-build-$role.log"
+    --out-link "$WORK/runner-$role" --print-build-logs \
+    >"$BUILD_LOGS/nix-build-$role.log" 2>&1 9>&- &
+  BUILD_PID[$role]=$!
+  BUILD_PIDS+=("${BUILD_PID[$role]}")
 done
+wait_build "$BUILD_WYRD" "host build failed (see build-logs/nix-build-wyrd.log)"
+wait_build "$BUILD_NAK" "host nak build failed (see build-logs/nix-build-nak.log)"
+for role in peer-o peer-n relay; do
+  wait_build "${BUILD_PID[$role]}" "$role runner build failed (see build-logs/nix-build-$role.log)"
+done
+WYRD_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-wyrd.out")"
+WYRD_BIN="$WYRD_OUT/bin/wyrd"
+[[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see build-logs/nix-build-wyrd.log)"
+echo "    $WYRD_BIN"
+NAK_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-nak.out")"
+NAK_BIN="$NAK_OUT/bin/nak"
+[[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see build-logs/nix-build-nak.log)"
+echo "    $NAK_BIN"
 
 echo "==> network: $BRIDGE ${NET}.0/24"
 ip link add "$BRIDGE" type bridge 2>/dev/null || true

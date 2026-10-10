@@ -198,7 +198,7 @@ version say exactly what changed.
   through to the export. `check_no_leaks` scans each log once for all
   secrets instead of once per secret, and fails closed on an empty secret
   set or an unreadable log rather than passing vacuously. The `--step` comma-list grammar is
-  one shared `step_max` function with 40 stub checks (both ranges,
+  one shared `step_max` function with 40 stub checks (1-6/1-15,
   malformed inputs, glob safety, base-10 canonicalization); Lima adopts
   it, and the microVM runner and host orchestrator adopt it in the entry
   below. The stub suite runs in CI (shell-tests), so that claim is
@@ -208,7 +208,7 @@ version say exactly what changed.
 - MicroVM gate batch 2: parallel builds, host phase timing, one `--step`
   grammar (`nix/microvm/run-microvm.sh`, `tests/alpha-microvm.sh`). The
   five builds (wyrd, nak, three runners) run in the background behind one
-  fail-fast wait each: the first failure kills its siblings before dying,
+  fail-fast wait each: the first failed wait kills its siblings before dying,
   so a dead build never burns CPU through teardown, and wall time is the
   slowest build rather than the sum. The runner and the host orchestrator
   both adopt the shared `step_max` grammar, so `--step 01` canonicalizes
@@ -218,7 +218,11 @@ version say exactly what changed.
   same `SECONDS`-based deltas as the guest helper, closing the last
   timing blind spot the interval-knob decision needs. Build and timing
   proof needs odin (neither runs on macOS); the grammar refusals are
-  proven locally below, and the stub suites still pass.
+  proven locally below, and the stub suites still pass. Review round:
+  backgrounded builds close fd 9 (run-lock discipline, stub-pinned by
+  the new `tests/test-runner-fd.sh`), build logs move to
+  `$STATE_DIR/build-logs` outside the phase-1 pre-clean (host leak check
+  covers both dirs), stubs pin the 1-15 range (40 checks).
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.

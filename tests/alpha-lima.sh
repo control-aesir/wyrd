@@ -557,9 +557,9 @@ main() {
   # Comma list (`--step 1,4,6`): steps build on each other, so the run
   # set is the prefix closure of the selection — selecting step N runs
   # 1..N, never a lone dependent step on wiped state. The grammar lives
-  # in tests/step-grammar.sh, shared with the microVM harnesses (their
-  # copies are still inline; adopting the shared function there needs an
-  # odin run to prove, so it waits for one). The highest entry decides
+  # in tests/step-grammar.sh, shared with the microVM harnesses (runner
+  # and host orchestrator both call step_max, proven on odin). The
+  # highest entry decides
   # the prefix. An absent variable (the wrapper omits it) means all.
   local max_step=0
   if [[ -n "$only" ]]; then

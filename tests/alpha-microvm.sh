@@ -59,6 +59,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Shared --step comma-list grammar (pure function, no traps — safe
 # here; this file must never source alpha-common.sh, whose EXIT trap
 # would reap guest pid files from the host namespace).
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/step-grammar.sh"
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
@@ -850,8 +851,9 @@ fi # want_phase 15
 # and the phase-12 headless, phase-13 crash, phase-14 exhaustion,
 # and phase-15 uparent credentials only once those phases stage
 # them, so a prefix that stops earlier has nothing of theirs to
-# check.
-for f in "$RUN"/logs/*; do
+# check. Build logs live beside $RUN (outside the phase-1 pre-clean)
+# and are scanned too.
+for f in "$RUN"/logs/* "$STATE_DIR"/build-logs/*; do
   [[ -f "$f" ]] || continue
   for s in "$(cat "$RUN/creds/owner/identity")" "$(cat "$RUN/creds/owner/passphrase")"; do
     grep -qF "$s" "$f" && die "secret leaked into $(basename "$f")"

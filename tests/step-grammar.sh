@@ -3,7 +3,7 @@
 # (never executed) by the harnesses that accept step selections. The rule is
 # one everywhere: a comma list of integers in [lo,hi], no whitespace, no
 # empty entries. Ranges differ per harness (Lima steps 1-6, microVM phases
-# 1-12), so the range is a parameter and the callers name it in their own
+# 1-15), so the range is a parameter and the callers name it in their own
 # error text.
 #
 # step_max <lo> <hi> <selection>: print the highest entry. Exit 0 with the

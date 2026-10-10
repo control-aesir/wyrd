@@ -47,6 +47,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # to source in every mode including --teardown). The host orchestrator
 # re-checks with the same function, so a direct
 # tests/alpha-microvm.sh invocation fails the same way.
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/../../tests/step-grammar.sh"
 
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
@@ -110,6 +111,9 @@ BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
 WORK="$STATE_DIR/work"
+# Build logs live outside $RUN: phase 1's guest pre-clean empties the
+# shared state root, so anything under $RUN/logs is gone post-run.
+BUILD_LOGS="$STATE_DIR/build-logs"
 SSH_KEY="$STATE_DIR/sshkey"
 
 die() { echo "  FAIL: $1" >&2; exit 1; }
@@ -185,7 +189,7 @@ fi
 kill_stale_daemons
 
 echo "==> state dir $STATE_DIR"
-mkdir -p "$RUN" "$RUN/logs" "$WORK"
+mkdir -p "$RUN" "$RUN/logs" "$WORK" "$BUILD_LOGS"
 [[ "$FRESH" == 1 ]] && rm -rf "$RUN" && mkdir -p "$RUN" "$RUN/logs"
 # The share is root-owned from the host; guest e2e (uid 1000, the
 # only normal user — numeric, no host user needed) must own the run
@@ -202,35 +206,35 @@ wait_build() { # <pid> <what>
   wait "$1" || { kill "${BUILD_PIDS[@]}" 2>/dev/null || true; die "$2"; }
 }
 nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs \
-  >"$RUN/logs/nix-build-wyrd.out" 2>"$RUN/logs/nix-build-wyrd.log" &
+  >"$BUILD_LOGS/nix-build-wyrd.out" 2>"$BUILD_LOGS/nix-build-wyrd.log" 9>&- &
 BUILD_WYRD=$!
 BUILD_PIDS=("$BUILD_WYRD")
 # Pinned nak for the opacity probe (see the flake comment): same
 # no-link pattern as wyrd, so the suite never floats the registry.
 nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs \
-  >"$RUN/logs/nix-build-nak.out" 2>"$RUN/logs/nix-build-nak.log" &
+  >"$BUILD_LOGS/nix-build-nak.out" 2>"$BUILD_LOGS/nix-build-nak.log" 9>&- &
 BUILD_NAK=$!
 BUILD_PIDS+=("$BUILD_NAK")
 declare -A BUILD_PID=()
 for role in peer-o peer-n relay; do
   nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
     --out-link "$WORK/runner-$role" --print-build-logs \
-    >"$RUN/logs/nix-build-$role.log" 2>&1 &
+    >"$BUILD_LOGS/nix-build-$role.log" 2>&1 9>&- &
   BUILD_PID[$role]=$!
   BUILD_PIDS+=("${BUILD_PID[$role]}")
 done
-wait_build "$BUILD_WYRD" "host build failed (see run/logs/nix-build-wyrd.log)"
-wait_build "$BUILD_NAK" "host nak build failed (see run/logs/nix-build-nak.log)"
+wait_build "$BUILD_WYRD" "host build failed (see build-logs/nix-build-wyrd.log)"
+wait_build "$BUILD_NAK" "host nak build failed (see build-logs/nix-build-nak.log)"
 for role in peer-o peer-n relay; do
-  wait_build "${BUILD_PID[$role]}" "$role runner build failed (see run/logs/nix-build-$role.log)"
+  wait_build "${BUILD_PID[$role]}" "$role runner build failed (see build-logs/nix-build-$role.log)"
 done
-WYRD_OUT="$(tail -n 1 "$RUN/logs/nix-build-wyrd.out")"
+WYRD_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-wyrd.out")"
 WYRD_BIN="$WYRD_OUT/bin/wyrd"
-[[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see run/logs/nix-build-wyrd.log)"
+[[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see build-logs/nix-build-wyrd.log)"
 echo "    $WYRD_BIN"
-NAK_OUT="$(tail -n 1 "$RUN/logs/nix-build-nak.out")"
+NAK_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-nak.out")"
 NAK_BIN="$NAK_OUT/bin/nak"
-[[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see run/logs/nix-build-nak.log)"
+[[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see build-logs/nix-build-nak.log)"
 echo "    $NAK_BIN"
 
 echo "==> network: $BRIDGE ${NET}.0/24"

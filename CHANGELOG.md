@@ -23,6 +23,14 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd mount --interval SECS` paces the live loop's idle deadline
+  (1-86400s, default 5s): producers still wake the loop
+  immediately, so this only bounds how long total silence may delay
+  a pass. The e2e suites pass it through from `E2E_INTERVAL`
+  (validated at mount time), and the microVM runner now reports
+  host-side section timings (`HOST sections: build=… boot=…
+  ssh_wait=… relay_wait=…`) alongside the phase headers.
+
 - `wyrd sync now` distinguishes quiescence from convergence (22b):
   a healthy quiet exit that still owes fetch work now reports
   `completed: quiet with N unfulfilled (...)` with the backlog and

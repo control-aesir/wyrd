@@ -268,6 +268,15 @@ start_mount() { # <name> <cred-dir> <drive> <mnt> [mount args...]
   if [[ -n "${E2E_RUST_LOG:-}" ]]; then
     echo "start_mount $name: scoped RUST_LOG=$RUST_LOG for the mount process" >&2
   fi
+  # Pacing passthrough for the live loop's idle deadline: empty means
+  # the binary default (5s). Validated here so a typo fails fast at
+  # mount time instead of deep in the legs (the binary refuses 0 too).
+  if [[ -n "${E2E_INTERVAL:-}" ]]; then
+    [[ "$E2E_INTERVAL" =~ ^[1-9][0-9]*$ ]] \
+      || die "E2E_INTERVAL must be a positive integer of seconds, got '$E2E_INTERVAL'"
+    echo "start_mount $name: live-interval ${E2E_INTERVAL}s" >&2
+    set -- --interval "$E2E_INTERVAL" "$@"
+  fi
   with_creds "$c" mount "$d" "$m" "$@" \
     >"$LOGDIR/mount-$name.out" 2>"$LOGDIR/mount-$name.err" &
   mkdir -p "$PIDDIR"

@@ -183,6 +183,49 @@ fn mount_accepts_a_verbose_diagnostics_flag() {
     );
 }
 
+/// `--interval` paces the live loop's idle deadline: it defaults
+/// to the historical 5s and accepts an explicit value.
+#[test]
+fn mount_defaults_and_accepts_a_live_interval() {
+    let base = [
+        "wyrd".to_owned(),
+        "mount".into(),
+        "/tmp/drive".into(),
+        "/tmp/mnt".into(),
+        "--identity-file".into(),
+        "/tmp/id".into(),
+        "--passphrase-file".into(),
+        "/tmp/pp".into(),
+    ];
+    let cli = Cli::try_parse_from(base.clone()).unwrap();
+    assert!(
+        matches!(cli.command, Command::Mount { interval: 5, .. }),
+        "mount defaults the live idle pacing to 5s"
+    );
+    let cli = Cli::try_parse_from(
+        base.into_iter()
+            .chain(["--interval".into(), "1".into()])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        matches!(cli.command, Command::Mount { interval: 1, .. }),
+        "mount accepts an explicit live idle pacing"
+    );
+}
+
+/// The flag reaches the loop: `live_config` carries the interval
+/// into the config, so the knob cannot silently become a no-op.
+#[test]
+fn live_config_carries_the_interval_to_the_loop() {
+    assert_eq!(live_config(1).interval, std::time::Duration::from_secs(1));
+    assert_eq!(
+        live_config(5).interval,
+        LiveConfig::for_local_sync().interval,
+        "the default flag value reproduces the stock config"
+    );
+}
+
 /// The mount serves a read-write `wyrd` filesystem: the backend
 /// carries the live daemon's mutation channel, so the kernel must
 /// not gate writes behind a read-only flag.
@@ -293,7 +336,16 @@ fn live_mount_serves_read_write_until_shutdown() {
     let drive_path = drive.clone();
     let mut mount = MountGuard {
         server: Some(std::thread::spawn(move || {
-            mount(drive, mountpoint, Vec::new(), false, "test-pass", identity)
+            // Default idle pacing: these cover serving, not the knob.
+            mount(
+                drive,
+                mountpoint,
+                Vec::new(),
+                false,
+                5,
+                "test-pass",
+                identity,
+            )
         })),
     };
     let target = temp.0.join("mnt").join("hello.txt");
@@ -386,7 +438,16 @@ fn live_mount_preserves_dirty_handle_across_shutdown() {
     let drive_path = drive.clone();
     let mut mount = MountGuard {
         server: Some(std::thread::spawn(move || {
-            mount(drive, mountpoint, Vec::new(), false, "test-pass", identity)
+            // Default idle pacing: these cover serving, not the knob.
+            mount(
+                drive,
+                mountpoint,
+                Vec::new(),
+                false,
+                5,
+                "test-pass",
+                identity,
+            )
         })),
     };
     let target = temp.0.join("mnt").join("hello.txt");

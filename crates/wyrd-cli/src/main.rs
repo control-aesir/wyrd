@@ -109,6 +109,13 @@ enum Command {
         /// costs one enabled-check.
         #[arg(long)]
         verbose: bool,
+        /// Live-loop idle pacing in whole seconds: bounds how long
+        /// total silence may delay a sync pass (default 5). Producers
+        /// wake the loop immediately, so this only paces quiet
+        /// stretches — it is the e2e wall-time knob, not a semantic
+        /// bound. Must be positive: zero would busy-spin the loop.
+        #[arg(long, value_name = "SECS", default_value_t = 5)]
+        interval: u64,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -656,15 +663,24 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             mountpoint,
             relays,
             verbose,
+            interval,
             ..
-        } => mount(
-            drive_dir,
-            mountpoint,
-            relays.relay,
-            verbose,
-            &passphrase,
-            identity,
-        ),
+        } => {
+            if interval == 0 {
+                return Err(CliError::Usage(
+                    "--interval must be at least 1 second, got 0".to_owned(),
+                ));
+            }
+            mount(
+                drive_dir,
+                mountpoint,
+                relays.relay,
+                verbose,
+                interval,
+                &passphrase,
+                identity,
+            )
+        }
         Command::Export {
             drive_dir, out_dir, ..
         } => export(drive_dir, out_dir, &passphrase, identity),
@@ -896,6 +912,7 @@ fn mount(
     mountpoint: PathBuf,
     relays: Vec<String>,
     verbose: bool,
+    interval: u64,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
@@ -921,8 +938,11 @@ fn mount(
     // budgets and ceilings — several are correctness boundaries, and
     // a mount-only default must never silently diverge them. One
     // value from here to `into_live`, so the startup check below and
-    // the loop compare against the same numbers.
-    let config = LiveConfig::for_local_sync();
+    // the loop compare against the same numbers. The idle pacing is
+    // the one deliberate override: `--interval` only shortens
+    // how long total silence may delay a pass, never any ceiling.
+    let mut config = LiveConfig::for_local_sync();
+    config.interval = Duration::from_secs(interval);
     let store = FsObjectStore::open(drive_dir.clone())
         .map_err(|error| CliError::Store(error.to_string()))?;
     // Fail fast on macOS before binding any endpoint: a missing

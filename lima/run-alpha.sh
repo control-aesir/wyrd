@@ -220,6 +220,7 @@ REV="$(python3 -c "import json; print(json.load(open('$ROOT/flake.lock'))['nodes
   # malformed list the guest must refuse.
   [[ -z "$ONLY_STEP" ]] || printf 'E2E_ONLY_STEP=%q\n' "$ONLY_STEP"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
+  printf 'E2E_INTERVAL=%q\n' "${E2E_INTERVAL:-}"
 } > "$SHARE/e2e-env.sh"
 
 echo "==> provisioning the guest (idempotent)"

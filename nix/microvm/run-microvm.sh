@@ -205,6 +205,7 @@ echo "==> building wyrd + nak + 3 VM runners (parallel: wall time is the slowest
 wait_build() { # <pid> <what>
   wait "$1" || { kill "${BUILD_PIDS[@]}" 2>/dev/null || true; die "$2"; }
 }
+BUILD_START=$(date +%s)
 nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs \
   >"$BUILD_LOGS/nix-build-wyrd.out" 2>"$BUILD_LOGS/nix-build-wyrd.log" 9>&- &
 BUILD_WYRD=$!
@@ -228,6 +229,8 @@ wait_build "$BUILD_NAK" "host nak build failed (see build-logs/nix-build-nak.log
 for role in peer-o peer-n relay; do
   wait_build "${BUILD_PID[$role]}" "$role runner build failed (see build-logs/nix-build-$role.log)"
 done
+BUILD_S=$(( $(date +%s) - BUILD_START ))
+echo "    builds took ${BUILD_S}s (parallel wall time)"
 WYRD_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-wyrd.out")"
 WYRD_BIN="$WYRD_OUT/bin/wyrd"
 [[ -x "$WYRD_BIN" ]] || die "host build produced no wyrd binary (see build-logs/nix-build-wyrd.log)"
@@ -256,9 +259,11 @@ cp "$SSH_KEY.pub" "$STATE_DIR/authorized_keys.pub"
   printf 'CHECKOUT=%q\n' "/etc/wyrd-tests"
   printf 'E2E_ROOT=%q\n' "/mnt/wyrd-state/run"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
+  printf 'E2E_INTERVAL=%q\n' "${E2E_INTERVAL:-}"
 } > "$STATE_DIR/e2e-env.sh"
 
 echo "==> booting guests"
+BOOT_START=$(date +%s)
 for role in peer-o peer-n relay; do
   tap="${TAP_DEV[$role]}"
   ip link del "$tap" 2>/dev/null || true
@@ -291,8 +296,11 @@ for role in peer-o peer-n relay; do
   ( cd "$vmdir" && ./runner/bin/microvm-run > qemu.log 2>&1 & ) 9>&-
   echo "    $role up (tap $tap)"
 done
+BOOT_S=$(( $(date +%s) - BOOT_START ))
+echo "    boot took ${BOOT_S}s (virtiofsd + qemu per guest)"
 
 echo "==> waiting for ssh"
+SSH_START=$(date +%s)
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes"
 for ip in 11 12; do
   for i in $(seq 1 60); do
@@ -302,17 +310,22 @@ for ip in 11 12; do
   done
   echo "    e2e@$NET.$ip reachable"
 done
+SSH_S=$(( $(date +%s) - SSH_START ))
+echo "    ssh wait took ${SSH_S}s"
 
 # Relay readiness before the suite: the first relay dial happens
 # deep in the legs, where a slow relay boot surfaces as an opaque
 # convergence timeout. Fail fast with the real cause instead.
 echo "==> waiting for relay"
+RELAY_START=$(date +%s)
 for i in $(seq 1 30); do
   timeout 2 bash -c "</dev/tcp/$NET.10/18761" 2>/dev/null && break
   [[ "$i" == 30 ]] && die "relay never listened on $NET.10:18761"
   sleep 2
 done
-echo "    relay control plane reachable"
+RELAY_S=$(( $(date +%s) - RELAY_START ))
+echo "    relay control plane reachable (wait took ${RELAY_S}s)"
+echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 
 echo "==> running the suite"
 set +e
@@ -322,6 +335,7 @@ timeout 7200 env \
   "MICROVM_ONLY_STEP=$ONLY_STEP" \
   "WYRD_BIN=$WYRD_BIN" \
   "NAK_BIN=$NAK_BIN" \
+  "E2E_INTERVAL=${E2E_INTERVAL:-}" \
   "RELAY_URL=ws://$NET.10:18761" \
   "PEER_O=e2e@$NET.11" \
   "PEER_N=e2e@$NET.12" \

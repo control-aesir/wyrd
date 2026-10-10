@@ -95,9 +95,16 @@ pub(super) const TAG_TRANSITION_RECONCILED: u8 = 0x1A;
 /// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1B,
 /// fixed 72 bytes, same shape and same scope note as above.
 pub(super) const TAG_CAPABILITY_RECONCILED: u8 = 0x1B;
+/// The endpoint identity one discharged announcement was sent
+/// against: snapshot (32) ‖ recipient DeviceId (32) ‖ endpoint id
+/// (32). Tag 0x1C: the tag space is append-only. Fixed 96 bytes —
+/// a redelivery record names the obligation, whom it went to, and
+/// exactly which serving endpoint carried it, nothing else.
+/// Crate-visible for the tag-boundary pin below.
+pub(super) const TAG_ANNOUNCEMENT_DELIVERED_ROUTE: u8 = 0x1C;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-pub(super) const KNOWN_TAGS: [u8; 27] = [
+pub(super) const KNOWN_TAGS: [u8; 28] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -125,6 +132,7 @@ pub(super) const KNOWN_TAGS: [u8; 27] = [
     TAG_RECONCILIATION_REQUEST,
     TAG_TRANSITION_RECONCILED,
     TAG_CAPABILITY_RECONCILED,
+    TAG_ANNOUNCEMENT_DELIVERED_ROUTE,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -307,6 +315,13 @@ pub(super) fn encode_fact(
             bytes.extend_from_slice(snapshot.as_bytes());
             bytes.extend_from_slice(recipient.as_bytes());
             Ok((TAG_ANNOUNCEMENT_DELIVERED, bytes))
+        }
+        Fact::AnnouncementDeliveredRoute(snapshot, recipient, endpoint) => {
+            let mut bytes = Vec::with_capacity(96);
+            bytes.extend_from_slice(snapshot.as_bytes());
+            bytes.extend_from_slice(recipient.as_bytes());
+            bytes.extend_from_slice(endpoint);
+            Ok((TAG_ANNOUNCEMENT_DELIVERED_ROUTE, bytes))
         }
         Fact::AnnouncementRouteSealed(snapshot, route, sealed) => {
             // Same structural gate as the canonical seal, at commit
@@ -735,6 +750,17 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
             let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
             Some(DecodedFact::AnnouncementDelivered(snapshot, recipient))
         }
+        TAG_ANNOUNCEMENT_DELIVERED_ROUTE => {
+            if record.len() != 96 {
+                return None;
+            }
+            let snapshot = SnapshotId::from_bytes(record[..32].try_into().ok()?);
+            let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+            let endpoint: [u8; 32] = record[64..96].try_into().ok()?;
+            Some(DecodedFact::AnnouncementDeliveredRoute(
+                snapshot, recipient, endpoint,
+            ))
+        }
         TAG_ANNOUNCEMENT_ROUTE_SEALED => {
             if record.len() <= 36 {
                 return None;
@@ -1060,6 +1086,7 @@ pub(super) enum DecodedFact {
     AnnouncementSealed(SnapshotId, Vec<u8>),
     AnnouncementRouteSealed(SnapshotId, Vec<u8>, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
+    AnnouncementDeliveredRoute(SnapshotId, DeviceId, [u8; 32]),
     TransitionQueued(TransitionId, DeviceId),
     TransitionSealed(TransitionId, Vec<u8>),
     TransitionDelivered(TransitionId, DeviceId),

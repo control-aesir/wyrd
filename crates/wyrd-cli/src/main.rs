@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::logging::{init_mount_diagnostics, init_vault_diagnostics};
+use crate::logging::{init_mount_diagnostics, init_sync_diagnostics, init_vault_diagnostics};
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
@@ -39,6 +39,7 @@ use wyrd_format::{
     RECOVERY_FLAG,
 };
 use wyrd_sync::control::SealedBootstrap;
+use wyrd_sync::durable::DurableError;
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::membership::TransitionStatus;
 use wyrd_sync::runtime::{Engine, EngineError, MergeSelection, RoutePublishing};
@@ -538,6 +539,12 @@ pub(crate) enum CliError {
     Identity(#[from] wyrd_sync::keys::CryptoError),
     #[error("engine failed: {0}")]
     Engine(#[from] wyrd_sync::runtime::EngineError),
+    /// A second vault against a drive another process holds: the
+    /// store lock is kernel-held, so this is definite contention,
+    /// never a stale record — and it names the drive, because the
+    /// wrapped open error does not. One vault or mount per drive.
+    #[error("another wyrd process holds the drive at {drive}: only one vault or mount per drive")]
+    VaultLocked { drive: PathBuf },
     #[error("daemon construction failed: {0}")]
     WyrdNode(#[from] wyrd_daemon::NodeError),
     #[error("object store failed: {0}")]
@@ -1679,6 +1686,14 @@ struct SyncRunReport {
     snapshot_bodies: usize,
     objects: usize,
     unfulfilled: usize,
+    /// Fetch work still owed when a quiet exit stopped the run: the
+    /// confirming pass's unfulfilled count, captured once at the end
+    /// like `pending`, never accumulated (the accumulated sum counts
+    /// pass-effort, not backlog). Zero is converged; nonzero is
+    /// quiescent-but-incomplete — no immediately actionable work
+    /// remained, but the target is not satisfied. The quiet line
+    /// renders the distinction; the exit code does not change.
+    closing_unfulfilled: usize,
     /// Fetch-attempt diagnostics, accumulated like the rest: stored
     /// for the surface that renders them (`14-fetch-failure-
     /// diagnostics` owns the class renderer — this report must not
@@ -1962,6 +1977,7 @@ where
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,
@@ -2012,6 +2028,7 @@ where
             report.accumulate(&confirm);
             if live.is_quiet(&confirm)? {
                 report.outcome = RunOutcome::Quiet;
+                report.closing_unfulfilled = confirm.fetched.unfulfilled;
                 break;
             }
             stalled_streak = 0;
@@ -2313,6 +2330,39 @@ fn reconciliation_gap_reason(report: &SyncRunReport) -> String {
     }
 }
 
+/// Cause clauses for a quiescent-but-incomplete quiet exit: the run's
+/// accumulated cause counters grouped by shape — deferred on
+/// transitions, failed attempts, or unavailable representations — so
+/// the line says what kind of stuck the leftover work is. Counts
+/// only, reusing the fetch-classes vocabulary; empty when the run
+/// never attempted the leftover work (budget-starved throughout),
+/// in which case the caller renders the bare tail.
+fn quiet_stall_clauses(report: &SyncRunReport) -> Vec<String> {
+    let mut clauses = Vec::new();
+    if report.deferred > 0 {
+        clauses.push(format!("{} deferred", report.deferred));
+    }
+    if report.transport_errors > 0 {
+        clauses.push(format!("{} transport errors", report.transport_errors));
+    }
+    if report.deadlines > 0 {
+        clauses.push(format!("{} budget discards", report.deadlines));
+    }
+    if report.missing > 0 {
+        clauses.push(format!("{} missing", report.missing));
+    }
+    if report.unavailable_keys > 0 {
+        clauses.push(format!("{} unavailable keys", report.unavailable_keys));
+    }
+    if report.invalid > 0 {
+        clauses.push(format!("{} invalid", report.invalid));
+    }
+    if report.local_failures > 0 {
+        clauses.push(format!("{} local failures", report.local_failures));
+    }
+    clauses
+}
+
 /// Render a headless run report. Built as a string so tests assert
 /// the rendering without capturing stdout.
 fn sync_now_render(report: &SyncRunReport) -> String {
@@ -2523,7 +2573,30 @@ fn sync_now_render(report: &SyncRunReport) -> String {
             Some(health)
                 if !mailbox_verdict_failed(&health, report_intake_observed(report), report.sent)
                     && !reconciliation_open => {
-                out.push_str("completed: quiet");
+                if report.closing_unfulfilled == 0 {
+                    out.push_str("completed: quiet");
+                } else {
+                    // Quiescent but incomplete: the loop found nothing
+                    // actionable, but the confirming pass still owed
+                    // work — quiescence is not convergence. The exit
+                    // stays success (cron contract; cf.
+                    // RemoteStalled), and the line carries the backlog
+                    // plus its causes so automation can tell the two
+                    // quiets apart.
+                    let clauses = quiet_stall_clauses(report);
+                    out.push_str(&format!(
+                        "completed: quiet with {} unfulfilled",
+                        report.closing_unfulfilled,
+                    ));
+                    if clauses.is_empty() {
+                        out.push_str(" (work remains blocked or retry-delayed)");
+                    } else {
+                        out.push_str(&format!(
+                            " ({}; work remains blocked or retry-delayed)",
+                            clauses.join(", "),
+                        ));
+                    }
+                }
                 if health.total_relays == 0 {
                     out.push_str(" (offline run: local obligations only)");
                 }
@@ -2688,6 +2761,11 @@ fn sync_now(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    // Stderr diagnostics before anything can emit: intake verdicts,
+    // route publication, and fetch dials are debug-level, and without
+    // a subscriber they vanish — a stuck headless run then shows
+    // only its summary counts. Stdout keeps the machine-read report.
+    init_sync_diagnostics();
     let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
     let config = LiveConfig::for_local_sync();
     let store = FsObjectStore::open(drive_dir.clone())
@@ -2890,7 +2968,18 @@ fn vault(
     let _vault_guard = vault_span.enter();
     tracing::info!(stage = "start", "vault diagnostics initialized");
 
-    let engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone())?;
+    let engine = match Engine::open_keystore(drive_dir.clone(), passphrase, identity.clone()) {
+        // Definite contention, surfaced before any iroh or relay
+        // work: the try-lock is non-blocking, so refusal is prompt,
+        // and the drive is named, because the wrapped open error
+        // says "durable commit failed" without saying where.
+        Err(EngineError::Durable(DurableError::StoreLocked)) => {
+            return Err(CliError::VaultLocked {
+                drive: drive_dir.clone(),
+            });
+        }
+        result => result?,
+    };
     // Same shared budgets as mount and headless sync, through
     // `for_local_sync` (never `Default` directly): several are
     // correctness boundaries, and a vault-only default must never

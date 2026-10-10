@@ -1575,6 +1575,28 @@ where
                 revision = revision,
                 eligible_heads = self.published_heads,
                 pending_heads = pending_heads,
+                // Forensics for headless stalls: the quiet predicate
+                // below ignores unresolved fetch work and transport
+                // failures, so an idle-looking pass can still carry
+                // retryable items — the counts that decide whether
+                // `completed: quiet` is a legitimate terminal result
+                // or a misleading one ride along here. The full
+                // fetched breakdown rides too: fulfillments and
+                // silent classifiers (invalid, key-less, local) are
+                // otherwise invisible on idle passes, and an
+                // idle-pass total that disagrees with the sum of
+                // these fields is itself a counting bug worth
+                // catching.
+                unfulfilled = fetched.unfulfilled,
+                transport_errors = fetched.transport_errors,
+                deadlines = fetched.deadlines,
+                missing = fetched.missing,
+                invalid = fetched.invalid,
+                unavailable_keys = fetched.unavailable_keys,
+                local_failures = fetched.local_failures,
+                manifests = fetched.manifests,
+                snapshot_bodies = fetched.snapshot_bodies,
+                objects = fetched.objects,
                 "sync pass idle: revision unchanged, outbox empty"
             );
             return Ok(SyncReport {
@@ -3333,3 +3355,7 @@ mod trigger_tests;
 #[cfg(test)]
 #[path = "live/tests_serve_barrier.rs"]
 mod serve_barrier_tests;
+
+#[cfg(test)]
+#[path = "live/tests_restart_redelivery.rs"]
+mod restart_redelivery_tests;

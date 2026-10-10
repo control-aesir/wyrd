@@ -708,6 +708,7 @@ fn report_with(outcome: RunOutcome, mailbox: Option<MailboxHealth>) -> SyncRunRe
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,
@@ -948,6 +949,85 @@ fn sends_do_not_survive_observed_attachment_then_loss() {
     assert!(
         matches!(error, CliError::Unverified { connected: 0, .. }),
         "attached-then-lost fails despite earlier sends, got: {error}"
+    );
+}
+
+/// Quiescence is not convergence (22b): a healthy quiet exit that
+/// still owed work reports quiescent-but-incomplete, naming the
+/// backlog and its causes, instead of the bare converged line. The
+/// exit stays success (cron contract) — the distinction lives in
+/// the rendered line, which is what automation greps.
+#[test]
+fn quiet_with_unfulfilled_reports_quiescent_not_converged() {
+    let mut live = blind_mailbox();
+    live.connected_relays = 1;
+    live.supervisor_ticks = 3;
+    live.relay_attached = true;
+    let mut report = report_with(RunOutcome::Quiet, Some(live));
+    report.accepted = 12;
+    report.transport_errors = 13;
+    report.closing_unfulfilled = 12;
+    assert!(
+        run_outcome_error(&report).is_ok(),
+        "the qualified quiet keeps the success exit"
+    );
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains(
+            "completed: quiet with 12 unfulfilled (13 transport errors; work remains blocked or retry-delayed)"
+        ),
+        "backlog plus causes, not the bare line: {rendered}"
+    );
+    assert!(
+        !rendered.contains("completed: quiet\n"),
+        "the bare converged line must not appear beside a backlog: {rendered}"
+    );
+}
+
+/// The qualified quiet degrades by cause shape: deferred work names
+/// transitions, unavailable representations name themselves, and a
+/// run that never attempted the leftover work renders the bare tail.
+#[test]
+fn quiet_with_unfulfilled_names_cause_shapes() {
+    let mut report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    report.closing_unfulfilled = 4;
+    report.deferred = 2;
+    report.deferred_unseen = 2;
+    report.missing = 3;
+    report.unavailable_keys = 1;
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains(
+            "completed: quiet with 4 unfulfilled (2 deferred, 3 missing, 1 unavailable keys; work remains blocked or retry-delayed)"
+        ),
+        "transition-blocked and unavailable causes, in order: {rendered}"
+    );
+    let mut starved = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    starved.closing_unfulfilled = 4;
+    let starved_rendered = sync_now_render(&starved);
+    assert!(
+        starved_rendered.contains(
+            "completed: quiet with 4 unfulfilled (work remains blocked or retry-delayed)"
+        ),
+        "budget-starved leftovers render the bare tail: {starved_rendered}"
+    );
+}
+
+/// The bare converged line is pinned byte-adjacent: a fully
+/// satisfied quiet exit renders exactly `completed: quiet` (plus the
+/// offline suffix when relay-less), so a future edit cannot blur
+/// convergence into quiescence silently.
+#[test]
+fn quiet_converged_still_renders_bare_completed() {
+    let report = report_with(RunOutcome::Quiet, Some(fixture_mailbox()));
+    let rendered = sync_now_render(&report);
+    assert!(
+        rendered.contains("completed: quiet (offline run: local obligations only)\n"),
+        "converged offline quiet keeps its exact line: {rendered}"
+    );
+    assert!(
+        !rendered.contains("unfulfilled ("),
+        "no backlog clause on a converged run: {rendered}"
     );
 }
 
@@ -1203,6 +1283,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,
@@ -1245,6 +1326,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,
@@ -1287,6 +1369,7 @@ fn run_outcome_maps_to_success_or_incomplete() {
         snapshot_bodies: 0,
         objects: 0,
         unfulfilled: 0,
+        closing_unfulfilled: 0,
         transport_errors: 0,
         deadlines: 0,
         missing: 0,

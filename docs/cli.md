@@ -417,7 +417,14 @@ sync now
   A head whose closure is not local is a remote
    condition, not local work: after one grace pass it stops the run
    as quiet with an explicit `N unfetchable heads` count instead of
-   burning the cap. Zero-progress passes park the settle window too,
+   burning the cap. A quiet exit that still owes fetch work is
+   quiescent, not converged: the completion line reads
+   `completed: quiet with N unfulfilled (...)` with the backlog and
+   its causes (deferred, transport errors, missing, and the rest),
+   so quiescence never reports the bare `completed: quiet` of a
+   fully satisfied target. The exit stays success either way —
+   automate on the unfulfilled count and the cause clauses, not the
+   exit status. Zero-progress passes park the settle window too,
    so dead churn waits on the relay instead of spinning. A
    `senders observed` section names the distinct senders whose
    envelopes the run processed, by full `DeviceId`: this process
@@ -504,10 +511,19 @@ policy, quota, effective budgets, all already readable — never what
 it *guarantees*: retention promises wait for the DG-4 decision, and
 the help text makes no retention claim. No liveness handle, no
 status surface, no daemonization: supervision owns the pid
-(`systemd`/`launchd` track and restart it), the store lock stays
-exclusive (a second `wyrd` invocation against the running drive
-fails closed with the lock error, `sync status` included), and
-shutdown is SIGTERM plus the documented teardown order. Operator
+(`systemd`/`launchd` track and restart it). One vault or mount per
+drive, enforced by the kernel-held store lock: a second `vault`
+against a held drive exits 2 promptly, naming the drive
+(`another wyrd process holds ...: only one vault or mount per
+drive`). The lock dies with its process, so a crash leaves no
+stale record — but a held lock proves only occupancy, never
+health or convergence. A restart mints a new endpoint, so the
+vault re-announces obligations discharged against an older route
+for the current head's reachable closure under the live route (same route
+resends nothing, out-of-scope history stays discharged); the
+replacement serves the closure from the retained store, so a late
+peer recovers history, not just the head. Relay acceptance is not
+peer acquisition. Operator
 lifecycle (`start`/`stop`/`status`) and queryable health are separate
 follow-ons; this command is the foreground process they supervise.
 

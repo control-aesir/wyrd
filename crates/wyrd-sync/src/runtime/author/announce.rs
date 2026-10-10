@@ -6,6 +6,7 @@ use crate::control::{seal as seal_control, Message, SnapshotAnnouncement};
 use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact, Rebuilt};
 use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
+use crate::transport::endpoint_id;
 use crate::transport::mailbox::Mailbox;
 
 /// Announce an authored snapshot to every other admitted device of the
@@ -35,6 +36,7 @@ pub(crate) fn announce(
     snapshot: &AuthorizedSnapshot,
     mailbox: &mut impl Mailbox,
     node_addr: Option<&[u8]>,
+    scope: &std::collections::BTreeSet<wyrd_format::SnapshotId>,
 ) -> Result<usize, EngineError> {
     let body = snapshot.snapshot();
     // The announcement is signed by this engine's identity, so it may
@@ -133,13 +135,67 @@ pub(crate) fn announce(
         engine.commit_facts(&obligation)?;
     }
 
-    send_pending_for(engine, body.snapshot_id(), &sealed_bytes, mailbox)
+    send_pending_for(
+        engine,
+        body.snapshot_id(),
+        &sealed_bytes,
+        mailbox,
+        route_id_of(node_addr),
+        scope,
+    )
 }
 
-/// Resume every undischarged announcement obligation across snapshots,
+/// The serving endpoint identity behind route bytes, for
+/// route-scoped redelivery eligibility and per-send route records.
+/// `None` for missing or malformed routes: unknown routes always
+/// count as changed at eligibility time, so redelivery fails toward
+/// resending, never toward stranding a peer on a dead route.
+fn route_id_of(node_addr: Option<&[u8]>) -> Option<[u8; 32]> {
+    node_addr.and_then(endpoint_id)
+}
+
+/// The redelivery scope gating reopen: the live heads plus their
+/// reachable closure through recorded bodies. Derived from the
+/// freshly rebuilt membership/DAG state, exactly as
+/// `stage_carry_heads` derives its staging set — and the ancestry
+/// walk mirrors admission's catch-up closure, so a restart
+/// re-addresses the retained history a late peer needs, and nothing
+/// it doesn't. Snapshots without recorded bodies are unservable here
+/// and stay out: a route change never resurrects what this engine
+/// cannot serve. The work is bounded by the closure, once per route:
+/// every reopened pair re-records the live route on send, so the
+/// repair quenches instead of replaying every restart.
+///
+/// `pub(crate)` for the single-announce API below, which owns no
+/// selecting pass to inherit a scope from.
+pub(crate) fn redelivery_scope_set(
+    engine: &Engine,
+    rebuilt: &Rebuilt,
+) -> std::collections::BTreeSet<wyrd_format::SnapshotId> {
+    let mut dag = crate::authorization::SnapshotDag::new(engine.drive);
+    for body in rebuilt.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    let mut scope: std::collections::BTreeSet<wyrd_format::SnapshotId> =
+        dag.eligible_heads(&rebuilt.log).into_iter().collect();
+    let mut stack: Vec<wyrd_format::SnapshotId> = scope.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        let Some(body) = rebuilt.runtime.snapshot_body(&id) else {
+            continue;
+        };
+        for parent in &body.parents {
+            if scope.insert(*parent) {
+                stack.push(*parent);
+            }
+        }
+    }
+    scope
+}
+
+/// Resume every send-eligible announcement obligation across snapshots,
 /// returning the number of relay-accepted sends this call. This is the
 /// restart path: after a crash or a partial send, the durable outbox
-/// still holds the queued-minus-delivered pairs, and this sends them
+/// still holds the send-eligible pairs, and this sends them
 /// without re-authoring anything. Snapshots with no persisted sealed
 /// bytes are sealed now (the epoch key must be held; the root manifest
 /// must be recorded) under the given `node_addr`; already-sealed
@@ -155,11 +211,23 @@ pub(crate) fn announce_pending(
     node_addr: Option<&[u8]>,
 ) -> Result<usize, EngineError> {
     let rebuilt = engine.store.rebuild(engine.device)?;
-    // Distinct snapshots with pending obligations, in snapshot-id
-    // order (`pending_announcements` already yields sorted pairs).
+    // The live route's endpoint identity, for route-scoped
+    // redelivery below. `None` (no serving route) degrades the
+    // eligibility to plain pending: repair toward no route is
+    // meaningless.
+    let route_id = route_id_of(node_addr);
+    // Distinct snapshots with send-eligible obligations, in
+    // snapshot-id order (`announce_eligible_for` yields sorted
+    // pairs): still-pending pairs plus pairs in the redelivery scope
+    // (live heads and their reachable closure) discharged against an
+    // older route, so a restart under a new endpoint re-addresses
+    // the retained history a late peer needs. Unreachable history
+    // stays discharged: without the scope gate one restart resends
+    // the whole outbox past and stalls live work behind it.
+    let scope = redelivery_scope_set(engine, &rebuilt);
     let mut snapshots: Vec<wyrd_format::SnapshotId> = rebuilt
         .runtime
-        .pending_announcements()
+        .announce_eligible_for(route_id, &scope)
         .into_iter()
         .map(|(snapshot, _)| snapshot)
         .collect();
@@ -167,11 +235,11 @@ pub(crate) fn announce_pending(
     let mut sent = 0usize;
     for snapshot_id in snapshots {
         let Some(body) = rebuilt.runtime.snapshot_body(&snapshot_id) else {
-            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox)?;
+            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox, &scope)?;
             continue;
         };
         if body.author != engine.device {
-            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox)?;
+            sent += reannounce_one(engine, &rebuilt, snapshot_id, mailbox, &scope)?;
             continue;
         }
         let authorized = AuthorizedSnapshot::authorize(body.clone(), &engine.drive)
@@ -198,6 +266,7 @@ pub(crate) fn announce_pending(
                     body.epoch,
                     &obligation,
                     mailbox,
+                    &scope,
                 )? {
                     Some(sent_now) => sent += sent_now,
                     // No sealing key: retain the obligation for a later
@@ -207,7 +276,7 @@ pub(crate) fn announce_pending(
                 }
             }
             None => {
-                match announce(engine, &authorized, mailbox, node_addr) {
+                match announce(engine, &authorized, mailbox, node_addr, &scope) {
                     Ok(sent_now) => sent += sent_now,
                     // No sealing key: the obligation stays pending and
                     // observable via the pending projection instead of
@@ -254,6 +323,7 @@ fn send_with_live_route(
     epoch: u64,
     obligation: &str,
     mailbox: &mut impl Mailbox,
+    scope: &std::collections::BTreeSet<wyrd_format::SnapshotId>,
 ) -> Result<Option<usize>, EngineError> {
     let Some((sealed_epoch, message)) =
         open_reused_sealed(engine, keyring, sealed_bytes, obligation)?
@@ -298,7 +368,14 @@ fn send_with_live_route(
         };
         bytes
     };
-    Ok(Some(send_pending_for(engine, snapshot, &bytes, mailbox)?))
+    Ok(Some(send_pending_for(
+        engine,
+        snapshot,
+        &bytes,
+        mailbox,
+        route_id_of(node_addr),
+        scope,
+    )?))
 }
 
 /// Reuse the persisted route-specific reseal for one snapshot under
@@ -385,11 +462,20 @@ fn reuse_or_seal_route(
 /// to the author's statement (same routes included), sealed under its
 /// epoch key. Unknown snapshots are skipped orphan-tolerant — the
 /// obligation stays pending for a later pass.
+///
+/// Pending-only, deliberately: the resent bytes carry the author's
+/// route, not this engine's, so route-scoped redelivery by this
+/// engine would resend a route it cannot heal. The author's own
+/// engine owns that repair (its redelivery reseals under its live
+/// route); this path records no route and resends nothing already
+/// discharged. The author's redelivery arrives as a route update the
+/// receiver dedupes.
 fn reannounce_one(
     engine: &mut Engine,
     rebuilt: &Rebuilt,
     snapshot: wyrd_format::SnapshotId,
     mailbox: &mut impl Mailbox,
+    scope: &std::collections::BTreeSet<wyrd_format::SnapshotId>,
 ) -> Result<usize, EngineError> {
     let Some(known) = rebuilt.runtime.announcement(&snapshot).cloned() else {
         return Ok(0);
@@ -450,27 +536,36 @@ fn reannounce_one(
             bytes
         }
     };
-    send_pending_for(engine, snapshot, &sealed_bytes, mailbox)
+    send_pending_for(engine, snapshot, &sealed_bytes, mailbox, None, scope)
 }
 
-/// Send the sealed bytes to every still-pending recipient of one
-/// snapshot, recording one delivered marker per relay-accepted send. A
-/// send failure returns immediately with the rest still pending.
+/// Send the sealed bytes to every send-eligible recipient of one
+/// snapshot — still-pending pairs plus, for redelivery-scope
+/// members, pairs discharged against an older route — recording one
+/// delivered marker plus its serving-route record per relay-accepted
+/// send. A send failure returns immediately with the rest still
+/// pending.
 fn send_pending_for(
     engine: &mut Engine,
     snapshot: wyrd_format::SnapshotId,
     sealed_bytes: &[u8],
     mailbox: &mut impl Mailbox,
+    route_id: Option<[u8; 32]>,
+    scope: &std::collections::BTreeSet<wyrd_format::SnapshotId>,
 ) -> Result<usize, EngineError> {
     // Re-read fresh: `announce` commits new queue facts before this
     // send, so the delivery snapshot above may predate the obligation.
     // The resume paths (`announce_pending`, `reannounce_one`) commit
     // no queue facts mid-pass, so their frozen lists stay exact — but
-    // the fresh read is exact in both cases.
+    // the fresh read is exact in both cases. The scope arrives as a
+    // parameter instead of recomputed here: queue and route-seal
+    // commits mid-pass never touch the DAG, the bodies, or the
+    // membership log the scope derives from, so the selecting pass's
+    // set stays exact for the whole drain.
     let rebuilt = engine.store.rebuild(engine.device)?;
     let recipients: Vec<wyrd_format::DeviceId> = rebuilt
         .runtime
-        .pending_announcements()
+        .announce_eligible_for(route_id, scope)
         .into_iter()
         .filter(|(id, _)| *id == snapshot)
         .map(|(_, recipient)| recipient)
@@ -485,6 +580,17 @@ fn send_pending_for(
         &obligation,
         sealed_bytes,
         recipients,
-        |recipient| Fact::AnnouncementDelivered(snapshot, recipient),
+        |recipient| {
+            let mut facts = vec![Fact::AnnouncementDelivered(snapshot, recipient)];
+            // The route record commits atomically with its marker, so
+            // a crash can never leave a delivered pair route-unknown
+            // mid-repair: unknown routes count as changed and resend.
+            if let Some(endpoint) = route_id {
+                facts.push(Fact::AnnouncementDeliveredRoute(
+                    snapshot, recipient, endpoint,
+                ));
+            }
+            facts
+        },
     )
 }

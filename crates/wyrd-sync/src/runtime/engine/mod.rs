@@ -1806,7 +1806,12 @@ impl Engine {
         mailbox: &mut impl Mailbox,
         node_addr: Option<&[u8]>,
     ) -> Result<usize, EngineError> {
-        super::author::announce(self, snapshot, mailbox, node_addr)
+        // No selecting pass here, so the scope is computed for this
+        // single send (one DAG walk, same as the drain path spends
+        // per resume, not per snapshot).
+        let rebuilt = self.store.rebuild(self.device)?;
+        let scope = super::author::redelivery_scope_set(self, &rebuilt);
+        super::author::announce(self, snapshot, mailbox, node_addr, &scope)
     }
 
     /// Resume every undischarged announcement obligation across

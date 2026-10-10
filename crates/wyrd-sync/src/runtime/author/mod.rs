@@ -60,6 +60,7 @@ pub(super) use admission::admit_device;
 pub(super) use admission::admit_reader;
 pub(super) use admission::reissue_invitation;
 pub use admission::AdmitOutcome;
+pub(super) use announce::redelivery_scope_set;
 pub(super) use announce::{announce, announce_pending};
 pub(super) use deliver::deliver_pending;
 pub(super) use deliver::deliver_scoped;

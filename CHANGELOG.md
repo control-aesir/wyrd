@@ -23,6 +23,39 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd sync now` distinguishes quiescence from convergence (22b):
+  a healthy quiet exit that still owes fetch work now reports
+  `completed: quiet with N unfulfilled (...)` with the backlog and
+  its causes, instead of the bare `completed: quiet` of a fully
+  satisfied target. The exit code is unchanged (success, like the
+  `unfetchable heads` quiet before it): automate on the unfulfilled
+  count and the cause clauses, not the exit status. No loop, pass-
+  cap, or backoff behavior changes — the distinction is terminal
+  classification only.
+- `wyrd vault` lifecycle ownership (22b): one vault or mount per
+  drive, enforced by the kernel-held store lock. A second `vault`
+  against a held drive exits 2 promptly, naming the drive —
+  replacing the unnamed `durable commit failed` wording that said
+  nothing about where. The lock dies with its process, so a crash
+  leaves no stale record; a held lock proves occupancy only, never
+  health. No pidfile, socket, or status file; no
+  `start|stop|status` subcommands (those belong to 36-packaging).
+  Proven by a refusal process test (exit 2, drive named, drive
+  available after the holder exits, SIGKILL-then-replacement
+  reaches ready) and a microVM leg where a fresh peer fetches
+  against the immediate KILL replacement — re-announcement and
+  content service each peer-observed, never read off the ready
+  line. The leg caught a real defect on its first run: relay
+  acceptance had discharged announcements a dead route stranded,
+  so route-scoped redelivery now reopens discharged announcements
+  for the current head's reachable closure under a new serving
+  endpoint (same route resends nothing; out-of-scope history stays
+  discharged, so one restart cannot re-announce the whole outbox
+  past; transitions and capabilities stay discharged). Every send
+  records the route it went out under, last route wins, so the
+  repair repeats on no subsequent pass. The
+  replacement serves the closure from the retained vault store, so
+  a late peer recovers history, not just the head.
 - `wyrd vault` foreground process (22a): the mount's live loop and
   serving surface with no presentation session — the persistent
   process that `sync now` (bounded one-shot, unchanged) is not.

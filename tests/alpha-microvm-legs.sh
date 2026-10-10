@@ -235,10 +235,19 @@ leg_fetch_member() {
   # blocking-open proof rather than a find-ready-bytes no-op.
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'cold-2.txt'" \
     || die "member never listed the cold file"
+  # The create authors its own empty snapshot before the flush
+  # commits the bytes (write-path DG-1: CreateFile is its own
+  # snapshot), so the name converges ahead of the size: a cat now
+  # serves a fully-converged empty file with rc 0, and the mismatch
+  # below dies on a transient. Wait for the manifest's size first
+  # (11 = "cold-bytes" plus the echo newline); the single cat after
+  # still proves open blocks for the chunks.
+  poll_until 120 bash -c "[[ \"\$(stat -c %s '$MNTS/xmember-f/cold-2.txt')\" == 11 ]]" \
+    || die "member never converged the cold file's size"
   timeout 120 cat "$MNTS/xmember-f/cold-2.txt" >"$E2E_ROOT/cold-2.got" \
     || die "blocking cold open failed (open did not wait for the bytes)"
   [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
-    || die "cold open returned wrong bytes"
+    || { echo "--- cold-2.got ($(wc -c <"$E2E_ROOT/cold-2.got") bytes) ---"; od -c "$E2E_ROOT/cold-2.got" | head -n 10; die "cold open returned wrong bytes"; }
   pass "single open blocks until the announced bytes arrive"
   touch "$E2E_ROOT/member-cold-done"
   # Manifest-only convergence: readdir pulls the manifest chain
@@ -543,9 +552,16 @@ leg_fetch_member() {
 leg_conflict_owner() {
   local d="$1" c="$2" relay="$3"
   step 10 "partition-conflict owner leg"
+  # Debug for this mount only, same scoped pattern as the fetch
+  # member leg: a silent victim-write failure here cascades into a
+  # misleading member-side FAIL two polls later.
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xowner-c "$c" "$d" "$MNTS/xowner-c" --relay "$relay"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   conflict_assert_reachable "$relay"
-  echo "victim" > "$MNTS/xowner-c/rename-victim.txt"
+  echo "victim" > "$MNTS/xowner-c/rename-victim.txt" \
+    || die "owner victim write failed"
   poll_until 120 test -f "$E2E_ROOT/conflict-rename-member-ready" \
     || die "member never opened the rename victim"
   mv "$MNTS/xowner-c/rename-victim.txt" "$MNTS/xowner-c/renamed.txt" \
@@ -588,7 +604,13 @@ leg_conflict_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0 crc=0
   step 10 "partition-conflict member leg"
+  # Debug for this mount only, same scoped pattern as the fetch
+  # member leg: shows what (if anything) converges while the
+  # victim poll runs.
+  local old_e2e_log_m="${E2E_RUST_LOG-__unset}"
+  export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xmember-c "$c" "$d" "$MNTS/xmember-c" --relay "$relay"
+  if [[ "$old_e2e_log_m" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log_m"; fi
   conflict_assert_reachable "$relay"
   poll_until 120 converged "$MNTS/xmember-c/rename-victim.txt" "victim" \
     || die "member never converged the rename victim"
@@ -808,23 +830,31 @@ leg_headless_setup() {
 }
 
 # leg_headless_serve <drive> <creds> <relay>: the serving half of
-# the two-headless-peers exchange (issue 22a: the vault process).
-# Runs `wyrd vault` in the background, waits for the ready line
-# (first routed pass complete, endpoint serving), then drives the
-# kill/restart/TERM sequence the fetch legs rendezvous on:
+# the two-headless-peers exchange (issue 22a: the vault process;
+# issue 22b: the crash-restart gate). Runs `wyrd vault` in the
+# background, waits for the ready line (first routed pass complete,
+# endpoint serving), then drives the kill/restart/TERM sequence the
+# fetch legs rendezvous on:
 #   serve#1 → C fetches → KILL (mid-flight) → serve#2 (mirror
-#   rebuilt from the vault) → TERM → host admits D → serve#3 → D
-#   fetches pre-kill content → TERM, clean exit 0.
-# D is admitted between serve#2 and serve#3 on purpose: the
-# re-announcement path reseals pending obligations with the live
-# route but never resurrects discharged ones, so D's obligations
-# must be fresh for serve#3's route. C proves the positive case, D
-# proves previously announced representations still serve after a
-# kill -9 and mirror rebuild.
+#   rebuilt from the vault) → E fetches against the replacement →
+#   TERM → host admits D → serve#3 → D fetches pre-kill content →
+#   TERM, clean exit 0.
+# E is admitted before the leg (alongside C) so its obligations are
+# fresh for serve#2's route: E proves the replacement re-announced
+# (E reconciles over the new route) AND serves content (pre-kill
+# bodies flow from the post-KILL process) — each peer-observed, not
+# read off the ready line. D is admitted between serve#2 and serve#3
+# on purpose: the re-announcement path reseals pending obligations
+# with the live route but never resurrects discharged ones, so D's
+# obligations must be fresh for serve#3's route. C proves the
+# positive case, E proves the crash-restart case, D proves
+# previously announced representations still serve after a kill -9
+# and mirror rebuild.
 leg_headless_serve() {
   local d="$1" c="$2" relay="$3"
   step 12 "headless serving leg"
   rm -f "$E2E_ROOT/headless-serve-ready" "$E2E_ROOT/headless-fetch-c-done" \
+    "$E2E_ROOT/headless-serve2-ready" "$E2E_ROOT/headless-fetch-e-done" \
     "$E2E_ROOT/headless-serve-stopped" "$E2E_ROOT/headless-d-invited" \
     "$E2E_ROOT/headless-serve3-ready" "$E2E_ROOT/headless-fetch-d-done"
   mkdir -p "$PIDDIR"
@@ -855,14 +885,31 @@ leg_headless_serve() {
   pass "serve#1 dies on KILL"
   # serve#2: restart the vault over the same drive — the mirror
   # rebuilds from the vault by replay, never by re-deriving bytes.
-  # Nothing new to announce (C discharged, D not yet admitted); the
-  # ready line proves the endpoint is back up and re-announced.
+  # E's obligation is still pending (admitted up front, never
+  # discharged: C discharged, D not yet admitted), so serve#2
+  # re-announces it with the new route; the ready line proves the
+  # endpoint is back up and re-announced. Debug on: the send
+  # recipients below are the 22b proof (re-announcement to E under
+  # the new route), and info level hides them.
+  local old_serve_log="${RUST_LOG-__unset}"
+  export RUST_LOG="wyrd_core=debug"
   with_creds "$c" vault "$d" --relay "$relay" \
     >"$LOGDIR/headless-serve-2.out" 2>"$LOGDIR/headless-serve-2.err" &
   echo $! > "$PIDDIR/headless-serve.pid"
+  if [[ "$old_serve_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_serve_log"; fi
   poll_until 300 grep -q "vault ready: serving " "$LOGDIR/headless-serve-2.err" \
     || die "serve#2 never reported ready after KILL (see headless-serve-2.err)"
   pass "serve#2 reports ready after KILL: the mirror rebuilt from the vault"
+  touch "$E2E_ROOT/headless-serve2-ready"
+  # E fetches the whole drive against the replacement: E was
+  # admitted before the leg so its obligations are fresh for
+  # serve#2's route, and E starts empty so every object it pulls is
+  # bulk transfer from the post-KILL process. Re-announcement and
+  # content service each peer-observed — the ready line alone is
+  # never the proof. Only then is serve#2 stopped.
+  poll_until 300 test -f "$E2E_ROOT/headless-fetch-e-done" \
+    || die "fetch-e never finished against serve#2"
+  pass "fetch-e converged against the KILL replacement: re-announced and serving"
   # TERM while parked: the ordered teardown (mailbox, bulk, serving
   # under the transport bound) must exit 0, proving the shutdown
   # half of the residency contract.
@@ -934,9 +981,21 @@ leg_headless_fetch() {
   step 12 "headless fetch leg ($tag)"
   poll_until 300 test -f "$E2E_ROOT/$ready" \
     || die "serve side never parked for $tag"
+  # Debug on: intake verdicts (duplicate vs route-update commit)
+  # and fetch dials below say whether a redelivered route was
+  # applied or the peer stayed pinned to the dead one — info
+  # level hides both. Both crate targets: wyrd_core carries the
+  # pass reports, wyrd_sync carries intake verdicts, route
+  # publication, bulk dials, and backoff skips. (An EnvFilter with
+  # only wyrd_core=debug silences wyrd_sync entirely — that is why
+  # the previous instrumented run showed pass reports but no
+  # verdicts.)
+  local old_fetch_log="${RUST_LOG-__unset}"
+  export RUST_LOG="wyrd_core=debug,wyrd_sync=debug"
   with_creds "$c" sync "$d" --relay "$relay" now \
     >"$LOGDIR/headless-fetch-$tag.out" 2>"$LOGDIR/headless-fetch-$tag.err" \
     || die "headless fetch ($tag) exited non-zero"
+  if [[ "$old_fetch_log" == "__unset" ]]; then unset RUST_LOG; else export RUST_LOG="$old_fetch_log"; fi
   grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/headless-fetch-$tag.out" \
     || die "headless fetch ($tag) fetched no objects (see headless-fetch-$tag.out)"
   pass "headless fetch ($tag) pulls objects over the serve route"

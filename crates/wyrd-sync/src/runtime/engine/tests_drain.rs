@@ -3,7 +3,7 @@ use super::tests_harness::{
 };
 use super::*;
 
-use wyrd_format::{ContentId, MemoryObjectStore, ObjectKind};
+use wyrd_format::{ContentId, MemoryObjectStore, ObjectKind, SnapshotId};
 
 use crate::durable::AuthorizedSnapshot;
 use crate::durable::{atomic_write, commit_name, encode_commit};
@@ -690,4 +690,422 @@ fn authored_snapshot_survives_restart() {
         SnapshotId::from_bytes(*ContentId::derive(ObjectKind::Snapshot, &served_body).as_bytes()),
         id
     );
+}
+
+/// A live route for the redelivery tests: real canonical route bytes
+/// around a fresh endpoint identity, so route-scoped eligibility
+/// compares endpoint ids instead of degrading to plain pending (as
+/// undecodable fake routes would).
+fn live_route(byte: u8) -> Vec<u8> {
+    let id = iroh::SecretKey::from_bytes(&[byte; 32]).public();
+    crate::transport::encode_node_addr(&iroh::EndpointAddr::new(id))
+}
+
+/// One chain link with distinct bytes: sequential authoring parents
+/// each snapshot onto the previous head, so three calls build a
+/// linear S1 -> S2 -> S3 closure (unlike `local_tree`, which would
+/// re-derive one id).
+fn chain_tree(objects: &mut MemoryObjectStore, byte: u8) -> ContentId {
+    let chunk = objects.insert(ObjectKind::Chunk, &[byte; 16]).unwrap();
+    wyrd_format::Tree::from_entries(vec![wyrd_format::Entry::file(
+        "file.txt",
+        16,
+        false,
+        vec![chunk],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(objects)
+    .unwrap()
+}
+
+/// Route-scoped redelivery (22b): a discharged announcement is
+/// discharged for its serving route, not forever. The same route
+/// resends nothing and a routeless resume repairs nothing; a restart
+/// under a new endpoint identity reopens eligibility, reseals under
+/// the live route, and quenches — while relay-acceptance accounting
+/// (still discharged, still no re-queue) and the other obligation
+/// classes stay untouched.
+#[test]
+fn route_change_redelivers_discharged_announcements() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let id = authored.snapshot().snapshot_id();
+
+    // Discharge under route A: both members served, obligations
+    // pending-empty, route recorded with the marker.
+    let route_a = live_route(0xA1);
+    let endpoint_a = crate::transport::endpoint_id(&route_a).unwrap();
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2);
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert_eq!(state.announcement_delivered_route.len(), 2);
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_a),
+        "every discharge records route A"
+    );
+
+    // Same route: nothing resends. No route: nothing repairs.
+    for route in [Some(route_a.as_slice()), None] {
+        let sent = {
+            let mut mailbox = MemoryMailbox {
+                relay: &mut pair.relay,
+                owner: pair.a.device,
+            };
+            pair.a.engine.announce_pending(&mut mailbox, route).unwrap()
+        };
+        assert_eq!(sent, 0, "no redelivery without a route change");
+    }
+
+    // Crash between discharge and repair: memory drops, the route
+    // record replays from the fact log.
+    restart(&mut pair.a, &controls);
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_a),
+        "the route record survives the crash"
+    );
+
+    // New endpoint identity reopens eligibility: both pairs resend
+    // under the live route, and the receiver converges on the
+    // reseal (route update, deduped — not a duplicate obligation).
+    let route_b = live_route(0xB2);
+    let endpoint_b = crate::transport::endpoint_id(&route_b).unwrap();
+    assert_ne!(endpoint_a, endpoint_b);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2, "the route change redelivers both pairs");
+    // Accounting intact: still discharged (no re-queue, pending
+    // stays empty), route now recorded as B — self-quenching.
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_b),
+        "redelivery re-records the live route"
+    );
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 0, "the repair quenches under the recorded route");
+    // The route-B reseal reaches the peer alongside its undrained
+    // route-A copy: two envelopes, one obligation — the reseal is a
+    // route update, not a duplicate, and the peer converges once.
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 2);
+    let state = pair.b.engine.runtime_state().unwrap();
+    assert!(state.announcement(&id).is_some());
+    assert!(
+        pair.a
+            .engine
+            .runtime_state()
+            .unwrap()
+            .announcement_route_sealed_bytes(&id, &route_b)
+            .is_some(),
+        "the redelivery persists the route-B reseal"
+    );
+}
+
+/// Closure-scoped redelivery (22b): on a serving-route change the
+/// current head AND its reachable closure reopen — the retained
+/// history a late peer needs to discover content, not just the head.
+/// Same-route resumes send nothing and the repair quenches; the
+/// receiver applies every reseal as a route update and converges.
+/// This is the E leg in-crate: discharge a chain under A, crash,
+/// resume under B, and the peer re-addresses the whole closure.
+#[test]
+fn route_change_redelivers_the_reachable_closure_and_quenches() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let route_a = live_route(0xA1);
+    let endpoint_a = crate::transport::endpoint_id(&route_a).unwrap();
+    let mut ids = Vec::new();
+    for byte in [0xC1u8, 0xC2, 0xC3] {
+        let tree = chain_tree(&mut objects, byte);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        let sent = pair
+            .a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+            .unwrap();
+        assert_eq!(sent, 2, "each link fans out to both members");
+        ids.push(authored.snapshot().snapshot_id());
+    }
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert_eq!(state.announcement_delivered_route.len(), 6);
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_a),
+        "the whole chain discharges under route A"
+    );
+    // The peer converges the chain under A first (the C leg's
+    // positive case): three original announcements, all applied.
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 3);
+    for id in &ids {
+        let announcement = pair
+            .b
+            .engine
+            .runtime_state()
+            .unwrap()
+            .announcement(id)
+            .expect("peer holds the announcement")
+            .clone();
+        assert_eq!(
+            announcement.node_addr,
+            Some(route_a.clone()),
+            "peer serves the chain under route A"
+        );
+    }
+    // Crash, then resume under a new endpoint: the head plus its two
+    // ancestors reopen (six sends), nothing else exists to reopen.
+    restart(&mut pair.a, &controls);
+    let route_b = live_route(0xB2);
+    let endpoint_b = crate::transport::endpoint_id(&route_b).unwrap();
+    assert_ne!(endpoint_a, endpoint_b);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 6, "the route change redelivers the whole closure");
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_b),
+        "redelivery re-records the live route for every link"
+    );
+    // Same route again: quenched. The peer applies the three reseals
+    // as route updates — deduped, not duplicated — and serves the
+    // chain under the replacement.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 0, "the repair quenches under the recorded route");
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 3);
+    for id in &ids {
+        let announcement = pair
+            .b
+            .engine
+            .runtime_state()
+            .unwrap()
+            .announcement(id)
+            .expect("peer holds the announcement")
+            .clone();
+        assert_eq!(
+            announcement.node_addr,
+            Some(route_b.clone()),
+            "peer re-addresses every link to route B"
+        );
+    }
+}
+
+/// Out-of-scope pairs stay discharged (22b): a discharged
+/// announcement outside the redelivery closure — known here, but
+/// with no recorded body, so unservable — is not resurrected by a
+/// route change. Only the servable closure reopens; the stranger
+/// keeps its old route record and sends nothing.
+#[test]
+fn route_change_leaves_out_of_scope_pairs_discharged() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let route_a = live_route(0xA1);
+    let endpoint_a = crate::transport::endpoint_id(&route_a).unwrap();
+    let mut ids = Vec::new();
+    for byte in [0xC1u8, 0xC2, 0xC3] {
+        let tree = chain_tree(&mut objects, byte);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        let sent = pair
+            .a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+            .unwrap();
+        assert_eq!(sent, 2);
+        ids.push(authored.snapshot().snapshot_id());
+    }
+    // A stranger's discharged pair, committed the way a crash-era
+    // outbox would hold it: queued, relay-accepted under route A,
+    // route recorded — but no body this engine could serve.
+    let stranger = SnapshotId::from_bytes([0xF0; 32]);
+    pair.a
+        .engine
+        .commit_facts(&[
+            Fact::AnnouncementQueued(stranger, pair.b.device),
+            Fact::AnnouncementDelivered(stranger, pair.b.device),
+            Fact::AnnouncementDeliveredRoute(stranger, pair.b.device, endpoint_a),
+        ])
+        .unwrap();
+    // Crash, then resume under a new endpoint: the servable closure
+    // reopens (six sends) while the stranger stays shut — still
+    // recorded under A, still sending nothing.
+    restart(&mut pair.a, &controls);
+    let route_b = live_route(0xB2);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 6, "only the servable closure reopens");
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert_eq!(
+        state
+            .announcement_delivered_route
+            .get(&(ids[0], pair.b.device)),
+        Some(&crate::transport::endpoint_id(&route_b).unwrap()),
+        "closure links re-record the live route"
+    );
+    assert_eq!(
+        state
+            .announcement_delivered_route
+            .get(&(stranger, pair.b.device)),
+        Some(&endpoint_a),
+        "the stranger keeps its obsolete route record without resending"
+    );
+}
+
+/// New work sends alongside closure redelivery (22b): a snapshot
+/// authored after the restart drains in the same resume pass as the
+/// reopened closure — eight sends, one call, no second pass — so a
+/// live mutation is never ordered behind unbounded history. The next
+/// resume under the same route sends nothing.
+#[test]
+fn new_work_sends_alongside_closure_redelivery() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let route_a = live_route(0xA1);
+    for byte in [0xC1u8, 0xC2, 0xC3] {
+        let tree = chain_tree(&mut objects, byte);
+        let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        assert_eq!(
+            pair.a
+                .engine
+                .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+                .unwrap(),
+            2
+        );
+    }
+    // Restart, author onto the new tip, then resume once: the fresh
+    // snapshot (never sent) plus the reopened closure (three links)
+    // discharge together.
+    restart(&mut pair.a, &controls);
+    let tree = chain_tree(&mut objects, 0xC4);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let fresh = authored.snapshot().snapshot_id();
+    let route_b = live_route(0xB2);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 8, "fresh work plus closure in a single resume");
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let endpoint_b = crate::transport::endpoint_id(&route_b).unwrap();
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == endpoint_b),
+        "one resume records one route for everything it sent"
+    );
+    assert!(
+        state
+            .announcement_delivered_route
+            .keys()
+            .any(|(snapshot, _)| *snapshot == fresh),
+        "the fresh snapshot discharged under the live route"
+    );
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_b.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 0, "fresh and redelivered alike quench");
 }

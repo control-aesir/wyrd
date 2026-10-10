@@ -38,6 +38,7 @@ pub enum RuntimeFact {
     AnnouncementSealed(SnapshotId, Vec<u8>),
     AnnouncementRouteSealed(SnapshotId, Vec<u8>, Vec<u8>),
     AnnouncementDelivered(SnapshotId, DeviceId),
+    AnnouncementDeliveredRoute(SnapshotId, DeviceId, [u8; 32]),
     TransitionQueued(TransitionId, DeviceId),
     TransitionSealed(TransitionId, Vec<u8>),
     TransitionDelivered(TransitionId, DeviceId),
@@ -73,6 +74,7 @@ pub struct LoadedFacts {
     pub announcement_sealed: Vec<(SnapshotId, Vec<u8>)>,
     pub announcement_route_sealed: Vec<(SnapshotId, Vec<u8>, Vec<u8>)>,
     pub announcement_delivered: Vec<(SnapshotId, DeviceId)>,
+    pub announcement_delivered_route: Vec<(SnapshotId, DeviceId, [u8; 32])>,
     pub transition_queued: Vec<(TransitionId, DeviceId)>,
     pub transition_sealed: Vec<(TransitionId, Vec<u8>)>,
     pub transition_delivered: Vec<(TransitionId, DeviceId)>,
@@ -190,6 +192,14 @@ impl LoadedFacts {
                 self.announcement_delivered.push((snapshot, recipient));
                 self.runtime_facts
                     .push(RuntimeFact::AnnouncementDelivered(snapshot, recipient));
+            }
+            DecodedFact::AnnouncementDeliveredRoute(snapshot, recipient, endpoint) => {
+                self.announcement_delivered_route
+                    .push((snapshot, recipient, endpoint));
+                self.runtime_facts
+                    .push(RuntimeFact::AnnouncementDeliveredRoute(
+                        snapshot, recipient, endpoint,
+                    ));
             }
             DecodedFact::TransitionQueued(id, recipient) => {
                 // Same orphan tolerance as the announcement outbox: a
@@ -396,6 +406,9 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::AnnouncementDelivered(snapshot, recipient) => {
                 runtime.record_announcement_delivered(snapshot, recipient);
+            }
+            RuntimeFact::AnnouncementDeliveredRoute(snapshot, recipient, endpoint) => {
+                runtime.record_announcement_delivered_route(snapshot, recipient, endpoint);
             }
             RuntimeFact::TransitionQueued(id, recipient) => {
                 runtime.record_transition_queued(id, recipient);

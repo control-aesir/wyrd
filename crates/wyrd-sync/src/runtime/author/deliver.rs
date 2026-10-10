@@ -226,12 +226,18 @@ pub(crate) fn announcement_obligation(snapshot: &wyrd_format::SnapshotId) -> Str
 }
 
 /// Send verified sealed bytes to each recipient under the mailbox's
-/// outer recipient seal, committing one delivered marker per
+/// outer recipient seal, committing delivered markers per
 /// relay-accepted send. A send no relay accepts commits nothing —
 /// the Delivered fact means relay-accepted, so zero acceptance
 /// leaves the obligation pending for a later pass instead of
 /// recording a fact no acceptance supports. A send failure returns
 /// immediately with the rest still pending.
+///
+/// The marker closure returns the fact batch for one accepted send:
+/// one Delivered fact for transitions and capabilities (no route to
+/// record), Delivered plus the serving-route record for
+/// announcements — committed atomically, so the two can never
+/// diverge across a crash.
 ///
 /// The first refusal of an obligation warns once: a policy refusal
 /// that can never flip would otherwise retry silently forever under
@@ -246,7 +252,7 @@ pub(super) fn send_sealed_to(
     obligation: &str,
     sealed_bytes: &[u8],
     recipients: impl IntoIterator<Item = DeviceId>,
-    delivered: impl Fn(DeviceId) -> Fact,
+    delivered: impl Fn(DeviceId) -> Vec<Fact>,
 ) -> Result<usize, EngineError> {
     let mut sent = 0usize;
     for recipient in recipients {
@@ -277,7 +283,7 @@ pub(super) fn send_sealed_to(
         // stuck peer's whole outbox can be reconstructed envelope by
         // envelope.
         tracing::debug!(kind, recipient = ?recipient, "outbox send");
-        engine.commit_facts(&[delivered(recipient)])?;
+        engine.commit_facts(&delivered(recipient))?;
         sent += 1;
     }
     Ok(sent)
@@ -441,7 +447,7 @@ fn deliver_transitions(
             &obligation,
             &sealed_bytes,
             recipients,
-            |recipient| Fact::TransitionDelivered(id, recipient),
+            |recipient| vec![Fact::TransitionDelivered(id, recipient)],
         )?;
         if let Some(scope) = scope.as_mut() {
             // One attempt per recipient: in a scoped send there is at
@@ -644,7 +650,7 @@ fn deliver_capabilities(
             &obligation,
             &sealed_bytes,
             [recipient],
-            |delivered| Fact::CapabilityDelivered(epoch, delivered),
+            |delivered| vec![Fact::CapabilityDelivered(epoch, delivered)],
         )?;
         if let Some(scope) = scope.as_mut() {
             scope.remaining = scope.remaining.saturating_sub(1);

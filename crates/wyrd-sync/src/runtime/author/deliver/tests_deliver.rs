@@ -388,7 +388,7 @@ fn refusal_warn_marker_covers_every_control_kind() {
                 obligation,
                 &[0x02; 64],
                 [recipient],
-                |_| delivered.clone(),
+                |_| vec![delivered.clone()],
             )
             .expect("refusal is pending, not an error");
             assert_eq!(warns(), before + 1, "{kind}: the first refusal warns");
@@ -399,7 +399,7 @@ fn refusal_warn_marker_covers_every_control_kind() {
                 obligation,
                 &[0x02; 64],
                 [recipient],
-                |_| delivered.clone(),
+                |_| vec![delivered.clone()],
             )
             .expect("refusal is pending, not an error");
             assert_eq!(warns(), before + 1, "{kind}: the repeat stays at debug");
@@ -410,7 +410,7 @@ fn refusal_warn_marker_covers_every_control_kind() {
                 obligation,
                 &[0x02; 64],
                 [recipient],
-                |_| delivered.clone(),
+                |_| vec![delivered.clone()],
             )
             .expect("acceptance discharges");
             send_sealed_to(
@@ -420,7 +420,7 @@ fn refusal_warn_marker_covers_every_control_kind() {
                 obligation,
                 &[0x02; 64],
                 [recipient],
-                |_| delivered.clone(),
+                |_| vec![delivered.clone()],
             )
             .expect("refusal is pending, not an error");
             assert_eq!(

@@ -372,6 +372,21 @@ pub enum Fact {
     /// to the mailbox for this recipient. Append-only like every fact —
     /// pending is derived as queued-minus-delivered, never by deletion.
     AnnouncementDelivered(SnapshotId, DeviceId),
+    /// The serving endpoint identity one discharged announcement was
+    /// sent against: the endpoint public key (32 bytes) decoded from
+    /// the `node_addr` route of the resent envelope, committed in the
+    /// same batch as its delivered marker so the two can never
+    /// diverge across a crash. A discharged announcement is
+    /// discharged for its serving route, not forever: when the live
+    /// route's endpoint differs, the pair becomes eligible for
+    /// redelivery under the new route (the send path reseals for it
+    /// and the receiver dedupes it as a route update). Absent for
+    /// sends with no live route and for chains written before this
+    /// record existed — unknown routes always count as changed, so
+    /// redelivery fails toward resending, never toward stranding a
+    /// peer on a dead route. Transitions and capabilities carry no
+    /// route and keep plain delivered markers.
+    AnnouncementDeliveredRoute(SnapshotId, DeviceId, [u8; 32]),
     /// A transition-delivery obligation: this transition must still be
     /// sent to this recipient. Committed atomically with the admitting
     /// (or any authored) transition, so a crash before the first send

@@ -16,7 +16,7 @@
 #   --step           run suite phases 1..N (comma lists allowed; the run
 #                    is the prefix closure, since phases build on each
 #                    other: 1-5 are the shared-core Lima steps on peer-o,
-#                    6-12 the microvm phases in tests/alpha-microvm.sh)
+#                    6-15 the microvm phases in tests/alpha-microvm.sh)
 #   --teardown       stop a kept run (daemons, taps, bridge) and exit;
 #                    takes the run lock, so it refuses while a suite
 #                    is active. State dirs and logs are retained.
@@ -28,13 +28,18 @@
 # report -> teardown (unless --keep).
 # The whole suite runs under `timeout` (120 min): a hung guest must
 # never wedge the host. Raised from 90 when the crash/exhaustion/
-# unknown-parent phases landed: phases 13-15 document ~12, ~8, and
-# ~10 minute nominal worst cases on top of the earlier ~11 and
-# ~20-25 minute conflict phases, and an opaque SIGKILL at the cap
-# must never be the way a slow phase reports. Each new phase states
-# its own worst-case duration in tests/alpha-microvm.sh, and the cap
-# moves only with that statement attached. Legs carry their own
-# shorter polls; this bound is whole-run pathology cover.
+# unknown-parent phases landed. Arithmetic: base phases 1-12 run
+# ~20-25 min observed; new-phase typicals sum to ~15-20 min;
+# dominant budget products (13b bursts ~61 min, fills ~48 min) are
+# flake insurance that returns early and only all fire together in
+# pathology. The cap covers typicals plus margin and pathology —
+# it is not the sum of worst cases, and an opaque SIGKILL at the
+# cap must never be the way a slow phase reports (every phase and
+# long loop dies loudly on its own budget first). Each new phase
+# states its typical plus dominant products in
+# tests/alpha-microvm.sh, and the cap moves only with that
+# statement attached. Legs carry their own shorter polls; this
+# bound is whole-run pathology cover.
 set -euo pipefail
 
 need() { command -v "$1" >/dev/null || { echo "error: missing host tool: $1" >&2; exit 2; }; }
@@ -70,7 +75,7 @@ if [[ -n "$ONLY_STEP" ]]; then
   # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
   # without this it would run zero checks and pass.
   [[ ",$ONLY_STEP," != *,,* ]] \
-    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-12 entries)" >&2; exit 2; }
+    || { echo "error: --step: '$ONLY_STEP' has an empty entry (expected 1-15 entries)" >&2; exit 2; }
   # Split on commas into a quoted array: an unquoted expansion would
   # glob each entry against the working directory first, so `--step
   # '*'` could pathname-expand into a digit-named file and slip past
@@ -78,8 +83,8 @@ if [[ -n "$ONLY_STEP" ]]; then
   _step_entries=()
   IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
   for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[012])$ ]] \
-      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-12)" >&2; exit 2; }
+    [[ "$_e" =~ ^([1-9]|1[0-5])$ ]] \
+      || { echo "error: --step: '$_e' is not a step (expected a comma list of 1-15)" >&2; exit 2; }
   done
   unset _step_entries _e
 fi
@@ -98,7 +103,7 @@ if [[ "$TEARDOWN" == 1 ]]; then
   [[ "$STATE_DIR" == "/var/lib/wyrd-microvm/state" ]] || { echo "error: --teardown ignores --state-dir (host-global)" >&2; exit 2; }
   for t in git pgrep ps kill pkill ip flock; do need "$t"; done
 else
-  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill; do need "$t"; done
+  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill fallocate; do need "$t"; done
 fi
 
 # One run at a time per host, not per state dir: taps, the bridge,

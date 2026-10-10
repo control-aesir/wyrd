@@ -1028,8 +1028,11 @@ leg_headless_fetch() {
 # leg pins the crash-model window, not the stage.
 # Bounded-failure assertions: anchor read bounded (120s), post-crash
 # convergence bounded (300s member-side via the witness done-file).
-# Wall-clock envelope: ~40 local commits plus two converges, worst
-# case under 8 minutes; typical green run 2-3 minutes.
+# Wall-clock envelope: typical 3-5 min observed green; dominant
+# budget products are the burst loop (40 x up to 2 x 46s ~= 61 min)
+# and the fixed rendezvous waits (~20 min). Simultaneous exhaustion
+# of all budgets is pathology, covered by the whole-run cap — not
+# by this envelope.
 leg_crash_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection owner leg"
@@ -1039,7 +1042,7 @@ leg_crash_owner() {
   # fetch completes). Without it the anchor write ETIMEDOUTs —
   # retries alone never drain the gate. Then the anchor write itself
   # gets bounded retries as insurance against a straggler pass.
-  poll_until 300 converged "$MNTS/xcrash-o/member-ready.txt" "member-ready" \
+  poll_until 180 converged "$MNTS/xcrash-o/member-ready.txt" "member-ready" \
     || die "member never published readiness"
   local attempt=0 anchored=0
   while (( attempt < 6 )); do
@@ -1064,12 +1067,13 @@ leg_crash_owner() {
   # Each burst write gets bounded retries: after the anchor the sync
   # engine may still be publishing, and a bare echo to the FUSE mount
   # hangs indefinitely when the mutation queue is blocked. timeout
-  # 35 covers the 30s max_mutation_wait; 3 attempts per write bound
-  # the worst case near 3 minutes for the burst.
+  # 35 covers the 30s max_mutation_wait; 2 attempts per write, 40
+  # writes: worst product ~61 min, observed full loops ~200s with
+  # every write landing first try.
   local i=1 bw_attempt bw_ok
   while (( i <= 40 )); do
     bw_attempt=0 bw_ok=0
-    while (( bw_attempt < 3 )); do
+    while (( bw_attempt < 2 )); do
       bw_attempt=$((bw_attempt + 1))
       # SIGKILL not SIGTERM: a FUSE write stuck in D state ignores
       # SIGTERM and timeout hangs forever waiting for the process.
@@ -1108,18 +1112,21 @@ leg_crash_owner() {
   # must carry its full acknowledged bytes — a torn survivor is the
   # partial-accept this leg exists to forbid. Absent is fine (never
   # committed); partial is not.
-  local f torn=0 n=0 i
+  local f torn=0 n=0 i got
   for (( i = 1; i <= 40; i++ )); do
     f="$MNTS/xcrash-o2/burst-$i.txt"
     [[ -e "$f" ]] || continue
     n=$((n + 1))
-    [[ "$(cat "$f")" == "burst-$i" ]] || torn=$((torn + 1))
+    got="$(timeout 60 cat "$f" 2>/dev/null)" \
+      || die "burst survivor $i unreadable after remount (rc $?)"
+    [[ "$got" == "burst-$i" ]] || torn=$((torn + 1))
   done
   [[ "$torn" == 0 ]] || die "$torn burst survivors are torn after the KILL"
   pass "burst survivors ($n files) are byte-complete, never torn"
-  echo "after-crash" > "$MNTS/xcrash-o2/after-crash.txt"
+  timeout 35 bash -c "echo 'after-crash' > '$MNTS/xcrash-o2/after-crash.txt'" 2>/dev/null \
+    || die "post-crash write failed after remount"
   touch "$E2E_ROOT/crash-o-back"
-  poll_until 300 test -f "$E2E_ROOT/crash-o-member-done" \
+  poll_until 180 test -f "$E2E_ROOT/crash-o-member-done" \
     || die "witness never converged the post-crash head"
   stop_mount xcrash-o2 INT
   check_no_leaks "$LOGDIR/mount-xcrash-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1141,8 +1148,9 @@ leg_steady_member() {
   # sync engine. Without it the owner's first mutation hits the
   # closure gate and ETIMEDOUTs (observed: retries alone never
   # drain the gate).
-  echo "member-ready" > "$MNTS/xsteady-m/member-ready.txt"
-  poll_until 300 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
+  timeout 35 bash -c "echo 'member-ready' > '$MNTS/xsteady-m/member-ready.txt'" 2>/dev/null \
+    || die "witness readiness write failed"
+  poll_until 180 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
     || die "witness never converged the anchor write"
   pass "witness converges the anchor before the crash"
   touch "$E2E_ROOT/crash-o-steady-ready"
@@ -1151,7 +1159,7 @@ leg_steady_member() {
   # + verify ~30s. The old 120s expired at burst[18].
   poll_until 300 test -f "$E2E_ROOT/crash-o-back" \
     || die "owner never came back after the KILL"
-  poll_until 300 converged "$MNTS/xsteady-m/after-crash.txt" "after-crash" \
+  poll_until 180 converged "$MNTS/xsteady-m/after-crash.txt" "after-crash" \
     || die "witness never converged the post-crash head"
   pass "post-crash head converges without remount"
   touch "$E2E_ROOT/crash-o-member-done"
@@ -1176,8 +1184,11 @@ leg_steady_member() {
 # Single-writer discipline holds throughout: the witness authors
 # nothing while partitioned, so no fork can mask a lost obligation.
 # Bounded-failure assertions: cold serve bounded (300s), witness
-# convergence bounded host-side. Wall-clock envelope: worst case
-# under 10 minutes with the partition waits; typical 3-4 minutes.
+# convergence bounded host-side. Wall-clock envelope: typical 3-4
+# min observed green; dominant budget products are the scratch
+# retries (6 x ~67s), cold converges (300s x2), and partition/heal
+# rendezvous (~10 min). Simultaneous exhaustion is pathology,
+# covered by the whole-run cap — not by this envelope.
 leg_crash_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection member leg"
@@ -1209,13 +1220,13 @@ leg_crash_member() {
   # fail TimedOut even with the body path proven. Each attempt is
   # terminal (a timed-out mutation commits nothing), so retrying the
   # same bytes is safe; the first success proves the head tree local.
-  # Eight attempts bound the worst case near eight minutes; the
+  # Six attempts bound the worst case near six minutes; the
   # closure drains in about one, so green runs pass on an early
   # retry. (Product note, out of G5 scope: fresh-join authorship in
   # the first ~minute routinely outwaits the deadline — fail-closed
   # and fast, but worth knowing.)
   local attempt=0 localized=0
-  while (( attempt < 8 )); do
+  while (( attempt < 6 )); do
     attempt=$((attempt + 1))
     if timeout 60 bash -c "echo 'scratch-m' > '$MNTS/xcrash-m/scratch-m.txt'" 2>/dev/null \
       && [[ "$(cat "$MNTS/xcrash-m/scratch-m.txt")" == "scratch-m" ]]; then
@@ -1285,11 +1296,12 @@ leg_steady_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness owner leg"
   start_mount xsteady-o "$c" "$d" "$MNTS/xsteady-o" --relay "$relay"
-  echo "cold-bytes-u" > "$MNTS/xsteady-o/cold-u.txt"
+  timeout 35 bash -c "echo 'cold-bytes-u' > '$MNTS/xsteady-o/cold-u.txt'" 2>/dev/null \
+    || die "cold announcement write failed"
   poll_until 120 test -f "$E2E_ROOT/crash-m-listed" \
     || die "member never listed the cold file"
   pass "cold announcement published before the partition"
-  poll_until 300 converged "$MNTS/xsteady-o/obligation.txt" "obligation-v1" \
+  poll_until 180 converged "$MNTS/xsteady-o/obligation.txt" "obligation-v1" \
     || die "member obligation never replayed after the KILL"
   pass "killed member's obligation replays after heal"
   touch "$E2E_ROOT/crash-m-witness-done"
@@ -1316,9 +1328,12 @@ leg_steady_owner() {
 # (in-guest: the container is invisible host-side) and asserts every
 # fill file present is exactly 32 MiB (byte-complete) or absent —
 # never torn.
-# Wall-clock envelope: up to 24 x 32 MiB commits worst case
-# (~768 MiB of churn) plus bounded recovery retries while the
-# engine drains, under 10 minutes; typical 4-5 minutes.
+# Wall-clock envelope: typical 4-5 min observed green (full pass
+# ~185s with ENOSPC breaking early); dominant budget product is the
+# fill loop (24 x 120s ~= 48 min if every fill hung to timeout yet
+# succeeded — unreachable in practice since ENOSPC breaks the loop
+# by fill ~9). Simultaneous exhaustion is pathology, covered by the
+# whole-run cap — not by this envelope.
 leg_exhaustion() {
   local d="$1" c="$2"
   step 14 "resource-exhaustion leg"
@@ -1354,7 +1369,7 @@ leg_exhaustion() {
   while (( i < 24 )); do
     i=$((i + 1))
     rc=0
-    timeout 300 bash -c "head -c 33554432 /dev/urandom > '$MNTS/xexh/fill-$i.bin'" \
+    timeout 120 bash -c "head -c 33554432 /dev/urandom > '$MNTS/xexh/fill-$i.bin'" \
       2>"$E2E_ROOT/fill-$i.stderr" || rc=$?
     if (( rc != 0 )); then
       [[ "$rc" == 1 ]] || die "fill-$i exited $rc, want ENOSPC (1)"
@@ -1419,11 +1434,13 @@ leg_uparent_owner() {
   export E2E_RUST_LOG="wyrd_core=debug,wyrd_daemon=debug"
   start_mount xup-o "$c" "$d" "$MNTS/xup-o" --relay "$relay"
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
-  echo "up-1-bytes" > "$MNTS/xup-o/up-1.txt"
-  [[ "$(cat "$MNTS/xup-o/up-1.txt")" == "up-1-bytes" ]] \
+  timeout 35 bash -c "echo 'up-1-bytes' > '$MNTS/xup-o/up-1.txt'" 2>/dev/null \
+    || die "up-1 write failed"
+  [[ "$(timeout 60 cat "$MNTS/xup-o/up-1.txt" 2>/dev/null)" == "up-1-bytes" ]] \
     || die "up-1 never committed"
-  echo "up-2-bytes" > "$MNTS/xup-o/up-2.txt"
-  [[ "$(cat "$MNTS/xup-o/up-2.txt")" == "up-2-bytes" ]] \
+  timeout 35 bash -c "echo 'up-2-bytes' > '$MNTS/xup-o/up-2.txt'" 2>/dev/null \
+    || die "up-2 write failed"
+  [[ "$(timeout 60 cat "$MNTS/xup-o/up-2.txt" 2>/dev/null)" == "up-2-bytes" ]] \
     || die "up-2 never committed on top of up-1"
   pass "chained snapshots published (up-2 strictly on up-1)"
   # Wait for the member to converge both announcements BEFORE
@@ -1435,7 +1452,7 @@ leg_uparent_owner() {
   # the listing: a circular wait, not a timeout. The member's
   # listing IS the publication confirmation, so the stop below can
   # only happen with both announcements relay-visible.
-  poll_until 300 test -f "$E2E_ROOT/uparent-announced" \
+  poll_until 180 test -f "$E2E_ROOT/uparent-announced" \
     || die "member never converged the announcements"
   stop_mount xup-o INT
   check_no_leaks "$LOGDIR/mount-xup-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1443,7 +1460,8 @@ leg_uparent_owner() {
   poll_until 300 test -f "$E2E_ROOT/uparent-member-probed" \
     || die "member never finished the unknown-parent probes"
   start_mount xup-o2 "$c" "$d" "$MNTS/xup-o2" --relay "$relay"
-  echo "up-3-bytes" > "$MNTS/xup-o2/up-3.txt"
+  timeout 35 bash -c "echo 'up-3-bytes' > '$MNTS/xup-o2/up-3.txt'" 2>/dev/null \
+    || die "up-3 write failed"
   touch "$E2E_ROOT/uparent-owner-back"
   poll_until 300 test -f "$E2E_ROOT/uparent-member-healed" \
     || die "member never healed after the bodies arrived"
@@ -1463,8 +1481,11 @@ leg_uparent_owner() {
 # The EIO pair is the whole proof: bodies were really withheld, the
 # mount is alive, and the deadline — not hope — bounds every wait.
 # After the owner returns, all three files serve: the stall heals.
-# Wall-clock envelope: worst case under 10 minutes with the heal
-# converges; typical 3-4 minutes.
+# Wall-clock envelope: typical 3-4 min observed green; dominant
+# budget products are the four 300s heal/return converges plus
+# listing and rendezvous polls (~30 min). Simultaneous exhaustion
+# is pathology, covered by the whole-run cap — not by this
+# envelope.
 leg_uparent_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0
@@ -1498,6 +1519,8 @@ leg_uparent_member() {
   [[ "$rc" == 1 ]] || die "unannounced-name open returned rc $rc, want ENOENT (1)"
   grep -q "No such file or directory" "$E2E_ROOT/up-9.err" \
     || die "unannounced-name open was not ENOENT: $(cat "$E2E_ROOT/up-9.err")"
+  [[ ! -s "$E2E_ROOT/up-9.got" ]] \
+    || die "unannounced-name read captured bytes it must not have"
   pass "unannounced names are ENOENT, instantly (control)"
   # The child: live head (its manifest converged, and so did its
   # parent's — neither classifies UnknownParent), body unfetchable
@@ -1516,6 +1539,8 @@ leg_uparent_member() {
   fi
   grep -q "Input/output error" "$E2E_ROOT/up-2.err" \
     || die "withheld-child read was not EIO: $(cat "$E2E_ROOT/up-2.err")"
+  [[ ! -s "$E2E_ROOT/up-2.got" ]] \
+    || die "withheld-child read captured bytes it must not have"
   pass "withheld child body fails EIO bounded"
   # The parent, same shape: announced with its manifest, body
   # unfetchable with the owner down. Same EIO at the same deadline.
@@ -1530,6 +1555,8 @@ leg_uparent_member() {
   fi
   grep -q "Input/output error" "$E2E_ROOT/up-1.err" \
     || die "withheld-body read was not EIO: $(cat "$E2E_ROOT/up-1.err")"
+  [[ ! -s "$E2E_ROOT/up-1.got" ]] \
+    || die "withheld-body read captured bytes it must not have"
   pass "withheld parent body fails EIO bounded (control)"
   touch "$E2E_ROOT/uparent-member-probed"
   poll_until 300 test -f "$E2E_ROOT/uparent-owner-back" \

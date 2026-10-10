@@ -580,8 +580,11 @@ fi # want_phase 12
 # mid-burst after 40 acknowledged writes. The member-first order is
 # load-bearing (see the ORDER MATTERS note below). Every kill targets the shipped
 # binary's real process death — no test-only hooks (OD-06-A) — and
-# each leg records the fence its kill represents. Worst case ~12
-# minutes for the pair; typical 6-8.
+# each leg records the fence its kill represents. Typical 6-8 min
+# observed green; dominant budget products are the 13b burst loop
+# (~61 min) and the 13a scratch/cold/converge chain (~30 min).
+# Simultaneous exhaustion of all budgets is pathology, covered by
+# the whole-run cap — not by this envelope.
 if want_phase 13; then
 echo "=== microvm 13: crash injection ==="
 CO="$RUN/creds/crash-o"
@@ -635,13 +638,13 @@ LEG_O=$!
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh crash-member $GCND $GCN $RELAY_URL" \
   >"$RUN/logs/leg-crash-member.out" 2>&1 &
 LEG_N=$!
-wait_conflict_file 300 "$RUN/crash-m-ready" \
+wait_conflict_file 600 "$RUN/crash-m-ready" \
   "member never localized its tree for the obligation (see logs/leg-crash-member.out)" "$LEG_N"
 heal_tap() { ip link set tap-r up 2>/dev/null || true; }
 trap heal_tap EXIT
 ip link set tap-r down || die "host could not partition tap-r"
 touch "$RUN/crash-m-partitioned"
-wait_conflict_file 300 "$RUN/crash-m-killed" \
+wait_conflict_file 120 "$RUN/crash-m-killed" \
   "member never died on KILL under partition (see logs/leg-crash-member.out)" "$LEG_N"
 pass "member KILL lands with the obligation pending"
 ip link set tap-r up || die "host could not heal tap-r"
@@ -678,8 +681,10 @@ fi # want_phase 13
 # is invisible host-side) and the harness asserts
 # the fail-closed half: every fill file present is exactly 32 MiB
 # (byte-complete) or absent — never torn — plus the pre-fill and
-# recovery anchors.
-# Worst case ~8 minutes; typical 3-4.
+# recovery anchors. Typical 3-4 min observed green; dominant
+# budget product is the fill loop (24 x 120s, broken early by the
+# ENOSPC the leg exists to produce). Simultaneous exhaustion is
+# pathology, covered by the whole-run cap — not by this envelope.
 if want_phase 14; then
 echo "=== microvm 14: resource exhaustion ==="
 rm -f "$RUN"/fill-*.stderr "$RUN"/exh-failed-fill
@@ -773,6 +778,7 @@ pass "exhaustion export holds only byte-complete fills plus both anchors"
 # Best-effort unmount: the loop device dies with the VM anyway and
 # $RUN is wiped by the next --fresh; this just keeps kept runs tidy.
 on_o "sudo umount '$GED'" >"$RUN/logs/umount-exh-fs.out" 2>&1 || true
+rm -f "$IMG"
 fi # want_phase 14
 
 # --- phase: microvm 15 (unknown parent) -----------------------------------
@@ -789,7 +795,9 @@ fi # want_phase 14
 # missing from the DAG — stays pinned at contract level in
 # sync_contracts; this construction converges both manifests, so
 # both heads are live and the verdict here is EIO, not ENOENT.)
-# Worst case ~10 minutes; typical 3-4.
+# Typical 3-4 min observed green; dominant budget products are the
+# heal/return converges. Simultaneous exhaustion is pathology,
+# covered by the whole-run cap — not by this envelope.
 if want_phase 15; then
 echo "=== microvm 15: unknown parent ==="
 UO="$RUN/creds/uparent-o"

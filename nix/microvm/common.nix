@@ -48,7 +48,8 @@
     # The suite runs as e2e, mirroring the Lima guest's unprivileged
     # user: step 1's credential-hardening negatives (wrong owner,
     # group-readable) only mean anything as non-root. Passwordless
-    # sudo covers the suite's `sudo tc` / `sudo chown` calls.
+    # sudo covers the suite's `sudo tc` / `sudo chown` calls plus
+    # phase 14's `sudo mkfs.ext4` and `sudo mount -o loop`.
     # /dev/fuse is 0666 via systemd's default udev rules, and the
     # setuid fusermount wrapper below lets e2e mount.
     users.users.e2e = {

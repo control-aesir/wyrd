@@ -1244,12 +1244,13 @@ leg_crash_member() {
   conflict_assert_partitioned "$relay"
   # Bounded retries like the scratch above: trees are local now, so
   # the first attempt should take — the loop is insurance against a
-  # straggler pass, not a second localization.
+  # straggler pass, not a second localization. Two attempts bound
+  # ~150s, inside the host's 180s killed wait below.
   local oattempt=0 obligated=0
-  while (( oattempt < 3 )); do
+  while (( oattempt < 2 )); do
     oattempt=$((oattempt + 1))
     if timeout 60 bash -c "echo 'obligation-v1' > '$MNTS/xcrash-m/obligation.txt'" 2>/dev/null \
-      && [[ "$(cat "$MNTS/xcrash-m/obligation.txt")" == "obligation-v1" ]]; then
+      && [[ "$(timeout 10 cat "$MNTS/xcrash-m/obligation.txt" 2>/dev/null)" == "obligation-v1" ]]; then
       obligated=1
       break
     fi
@@ -1451,8 +1452,9 @@ leg_uparent_owner() {
   # that would deliver it waits for member-probed, which waits for
   # the listing: a circular wait, not a timeout. The member's
   # listing IS the publication confirmation, so the stop below can
-  # only happen with both announcements relay-visible.
-  poll_until 180 test -f "$E2E_ROOT/uparent-announced" \
+  # only happen with both announcements relay-visible. The 300s
+  # covers both sequential listing polls (120s each) with margin.
+  poll_until 300 test -f "$E2E_ROOT/uparent-announced" \
     || die "member never converged the announcements"
   stop_mount xup-o INT
   check_no_leaks "$LOGDIR/mount-xup-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1497,9 +1499,9 @@ leg_uparent_member() {
   export E2E_RUST_LOG="wyrd_core=debug,wyrd_daemon=debug"
   start_mount xup-m "$c" "$d" "$MNTS/xup-m" --relay "$relay"
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
-  poll_until 180 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
+  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-1.txt'" \
     || die "member never listed up-1"
-  poll_until 180 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
+  poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
     || die "member never listed up-2"
   pass "both announcements listed; owner holds until this signal"
   # Signal BEFORE waiting for the stop: the owner must not stop

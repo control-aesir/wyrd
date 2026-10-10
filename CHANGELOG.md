@@ -118,8 +118,8 @@ version say exactly what changed.
   and never readable as a head.
 
 - MicroVM step selection (`nix/microvm/run-microvm.sh --step N[,N...]`):
-  run the prefix closure over suite phases 1-12 (1-5 shared core,
-  6-12 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
+  run the prefix closure over suite phases 1-15 (1-5 shared core,
+  6-15 microvm legs), mirroring `lima/run-alpha.sh --step`. An empty
   entry or a non-step is refused; omitting the flag means all phases.
 
 - Owner recovery-snapshot workflow (`wyrd snapshot recover plan/run`):

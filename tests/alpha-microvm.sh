@@ -644,7 +644,7 @@ heal_tap() { ip link set tap-r up 2>/dev/null || true; }
 trap heal_tap EXIT
 ip link set tap-r down || die "host could not partition tap-r"
 touch "$RUN/crash-m-partitioned"
-wait_conflict_file 120 "$RUN/crash-m-killed" \
+wait_conflict_file 180 "$RUN/crash-m-killed" \
   "member never died on KILL under partition (see logs/leg-crash-member.out)" "$LEG_N"
 pass "member KILL lands with the obligation pending"
 ip link set tap-r up || die "host could not heal tap-r"

@@ -12,7 +12,7 @@ this document is stale.
 
 ```
 wyrd init --identity-file <path> --passphrase-file <path> <drive_dir>
-wyrd mount [--relay <url>...] [--verbose] \
+wyrd mount [--relay <url>...] [--verbose] [--interval <secs>] \
     --identity-file <path> --passphrase-file <path> <drive_dir> <mountpoint>
 wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir>
 wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
@@ -56,6 +56,10 @@ peers can fetch what this drive holds.
 - `--verbose`: debug-level FUSE request logs (opcode, latency, reply
   errno) on stderr and in `mount.log`. Without it the mount logs at
   info level.
+- `--interval <secs>` (default 5, range 1-86400): live-loop idle
+  pacing — bounds how long total silence may delay a sync pass.
+  Producers wake the loop immediately, so this only paces quiet
+  stretches, never any semantic bound.
 
 On macOS the mount preflights the macFUSE runtime before binding any
 endpoint: a missing kext or mount daemon fails fast with the checklist
@@ -687,6 +691,11 @@ show and composes with the party table.
   and the microVM gate in `nix/microvm/run-microvm.sh`)
   sets the mount's `RUST_LOG` for stuck-peer forensics, e.g.
   `E2E_RUST_LOG=wyrd_core=debug ./lima/run-alpha.sh --keep --step 6`.
+- `E2E_INTERVAL` (same two runners) passes `--interval` through
+  `start_mount` to every mount; unset means the binary default.
+  Proven green at 2s and 5s on the microVM gate — 1s trips the
+  phase-9 dead-route choreography (the member out-fetches the EIO
+  probe), so it stays untuned until that leg is deterministic.
 - `--help` and `--version` print and exit successfully.
 - Exit `0` on success; exit `2` on any failure, with the reason on
   stderr (`error: ...`). Usage errors (bad flags, missing options)

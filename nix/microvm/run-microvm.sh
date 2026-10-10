@@ -343,4 +343,5 @@ timeout 7200 env \
 STATUS=$?
 set -e
 [[ "$STATUS" == 0 ]] || die "microvm suite failed (exit $STATUS, logs under $RUN/logs)"
+echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 echo "microvm: suite green, logs under $RUN/logs"

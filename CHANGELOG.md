@@ -24,7 +24,7 @@ version say exactly what changed.
 ### Added
 
 - `wyrd mount --interval SECS` paces the live loop's idle deadline
-  (default 5, must be positive): producers still wake the loop
+  (1-86400s, default 5s): producers still wake the loop
   immediately, so this only bounds how long total silence may delay
   a pass. The e2e suites pass it through from `E2E_INTERVAL`
   (validated at mount time), and the microVM runner now reports

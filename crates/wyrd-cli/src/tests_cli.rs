@@ -157,9 +157,31 @@ fn relay_flag_is_rejected_for_init() {
         "ws://one.example".into(),
     ])
     .unwrap_err();
-    assert!(
-        matches!(error, CliError::Usage(message) if message.contains("unrecognized subcommand") || message.contains("unexpected"))
-    );
+    assert!(matches!(error, CliError::Usage(message) if message.contains("--interval")));
+}
+
+/// A pacing deadline past a day stops being pacing, so mount refuses
+/// it as a usage error before touching the drive.
+#[test]
+fn absurd_live_interval_is_a_usage_error() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    let error = command(vec![
+        "mount".into(),
+        "/tmp/drive".into(),
+        "/tmp/mnt".into(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+        "--interval".into(),
+        "86401".into(),
+    ])
+    .unwrap_err();
+    assert!(matches!(error, CliError::Usage(message) if message.contains("--interval")));
 }
 
 /// A zero live idle pacing would busy-spin the loop, so mount

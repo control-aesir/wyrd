@@ -214,6 +214,18 @@ fn mount_defaults_and_accepts_a_live_interval() {
     );
 }
 
+/// The flag reaches the loop: `live_config` carries the interval
+/// into the config, so the knob cannot silently become a no-op.
+#[test]
+fn live_config_carries_the_interval_to_the_loop() {
+    assert_eq!(live_config(1).interval, std::time::Duration::from_secs(1));
+    assert_eq!(
+        live_config(5).interval,
+        LiveConfig::for_local_sync().interval,
+        "the default flag value reproduces the stock config"
+    );
+}
+
 /// The mount serves a read-write `wyrd` filesystem: the backend
 /// carries the live daemon's mutation channel, so the kernel must
 /// not gate writes behind a read-only flag.

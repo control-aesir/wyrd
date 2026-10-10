@@ -55,6 +55,12 @@
 # auto-resolve parser reads.)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared --step comma-list grammar (pure function, no traps — safe
+# here; this file must never source alpha-common.sh, whose EXIT trap
+# would reap guest pid files from the host namespace).
+source "$SCRIPT_DIR/step-grammar.sh"
+
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
 RUN="$STATE_DIR/run"
 SSH_KEY="$STATE_DIR/sshkey"
@@ -69,7 +75,14 @@ GUEST_TESTS="/etc/wyrd-tests"
 GUEST_ENV="/mnt/wyrd-state/e2e-env.sh"
 
 PASS=0
-pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
+# Host-side wall-clock accounting, same shape as the guest helper in
+# tests/alpha-common.sh (which this file must not source): run-relative
+# arrival on each phase header, per-check cost on its PASS line, run
+# total on the closing line. SECONDS is a bash builtin, so no check
+# forks a date.
+HOST_T0=$SECONDS
+HOST_LAST_PASS=$SECONDS
+pass() { local d=$((SECONDS - HOST_LAST_PASS)); PASS=$((PASS + 1)); HOST_LAST_PASS=$SECONDS; echo "  PASS: $1 (+${d}s)"; }
 die() { echo "  FAIL: $1" >&2; exit 1; }
 
 ONLY_STEP="${MICROVM_ONLY_STEP:-}"
@@ -77,29 +90,12 @@ ONLY_STEP="${MICROVM_ONLY_STEP:-}"
 # set is the prefix closure of the selection — selecting phase N runs
 # 1..N, never a lone dependent phase on stale state. Every entry must
 # name a real phase, so `--step 99` fails instead of passing zero
-# checks, and the highest entry decides the prefix.
+# checks, and the highest entry decides the prefix. Grammar shared
+# with the runner and the Lima harness (tests/step-grammar.sh).
 MAX_STEP=0
 if [[ -n "$ONLY_STEP" ]]; then
-  # The grammar is a comma list; whitespace is not a separator.
-  [[ "$ONLY_STEP" != *[[:space:]]* ]] \
-    || die "--step: '$ONLY_STEP' is not a comma list (got whitespace)"
-  # An empty entry (`,`, `4,,5`, `,4`) is a mistake, not "all phases":
-  # without this it would run zero checks and pass.
-  [[ ",$ONLY_STEP," != *,,* ]] \
-    || die "--step: '$ONLY_STEP' has an empty entry (expected 1-15 entries)"
-  # Split on commas into a quoted array: an unquoted expansion would
-  # glob each entry against the working directory first, so `--step
-  # '*'` could pathname-expand into a digit-named file and slip past
-  # the grammar.
-  _step_entries=()
-  IFS=',' read -r -a _step_entries <<< "$ONLY_STEP"
-  for _e in "${_step_entries[@]}"; do
-    [[ "$_e" =~ ^([1-9]|1[0-5])$ ]] \
-      || die "--step: '$_e' is not a step (expected a comma list of 1-15)"
-    if (( _e > MAX_STEP )); then MAX_STEP="$_e"; fi
-  done
-  unset _step_entries _e
-  (( MAX_STEP > 0 )) || die "--step: '$ONLY_STEP' names no step (expected a comma list of 1-15)"
+  MAX_STEP="$(step_max 1 15 "$ONLY_STEP")" \
+    || die "--step: '$ONLY_STEP' is not a step (expected a comma list of 1-15)"
 fi
 want_phase() { [[ -z "$ONLY_STEP" ]] || (( $1 <= MAX_STEP )); }
 # Shared-core steps selected: the 1..N prefix truncated to the core
@@ -144,14 +140,14 @@ wait_conflict_file() { # <seconds> <file> <what> <leg-pid>
 # --- phase 1: shared core on peer-o ------------------------------------
 # Always runs: every prefix starts at 1. The selection only truncates
 # the core depth (CORE_ONLY above).
-echo "=== microvm 1-5: shared core on peer-o ==="
+echo "=== microvm 1-5: shared core on peer-o (+$((SECONDS - HOST_T0))s) ==="
 on_o "E2E_ENV_FILE=$GUEST_ENV E2E_ONLY_STEP=$CORE_ONLY bash $GUEST_TESTS/alpha-lima.sh" \
   || die "shared core steps ($CORE_ONLY) failed on peer-o"
 pass "shared core steps ($CORE_ONLY) green on peer-o"
 
 # --- phase 2: second member natively on peer-n --------------------------
 if want_phase 6; then
-echo "=== microvm 6: member-n invite/join split ==="
+echo "=== microvm 6: member-n invite/join split (+$((SECONDS - HOST_T0))s) ==="
 # Created here, not at the top: phase 1's guest pre-clean empties
 # the shared state root, so anything made earlier would be wiped
 # before the first redirect that needs it.
@@ -197,7 +193,7 @@ fi # want_phase 6
 
 # --- phase 3: cross-host convergence ------------------------------------
 if want_phase 7; then
-echo "=== microvm 7: cross-host convergence ==="
+echo "=== microvm 7: cross-host convergence (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN/owner-done"
 OD="$GUEST_RUN/drives/owner"
 OC="$GUEST_RUN/creds/owner"
@@ -269,7 +265,7 @@ fi # want_phase 7
 
 # --- phase 4: serving restart -------------------------------------------
 if want_phase 8; then
-echo "=== microvm 8: serving restart ==="
+echo "=== microvm 8: serving restart (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN/member-ready" "$RUN/member-done"
 on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh restart-member $GMD $GMC $RELAY_URL" \
   >"$RUN/logs/leg-restart-member.out" 2>&1 &
@@ -290,7 +286,7 @@ fi # want_phase 8
 
 # --- phase 5: fetch plane ---------------------------------------------
 if want_phase 9; then
-echo "=== microvm 9: fetch plane ==="
+echo "=== microvm 9: fetch plane (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN/member-cold-done" "$RUN/member-listed-done" \
   "$RUN/member-scratch-done" "$RUN/owner-stopped" "$RUN/member-fetch-done" \
   "$RUN/member-probed-done" "$RUN/owner-converged-done" \
@@ -322,7 +318,7 @@ fi # want_phase 9
 # A host EXIT trap re-ups tap-r: any die between down and up must
 # not strand the relay unreachable in a --keep run.
 if want_phase 10; then
-echo "=== microvm 10: relay-partition conflict ==="
+echo "=== microvm 10: relay-partition conflict (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN"/conflict-rename-member-ready "$RUN"/conflict-rename-owner-done \
   "$RUN"/conflict-rename-member-done "$RUN"/conflict-partitioned \
   "$RUN"/conflict-owner-written "$RUN"/conflict-member-written \
@@ -369,7 +365,7 @@ fi # want_phase 10
 # coupled phases. (Prefix closure guarantees the dependency: phase 11
 # never runs without phase 9.)
 if want_phase 11; then
-echo "=== microvm 11: offline reopen ==="
+echo "=== microvm 11: offline reopen (+$((SECONDS - HOST_T0))s) ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
   "$MD" id >"$RUN/logs/reopen-n.out" 2>&1 || die "member-n drive does not reopen"
 as_guest "$WYRD_BIN" device --identity-file "$RUN/creds/owner/identity" \
@@ -441,7 +437,7 @@ if want_phase 12; then
 # content still serves; both TERM stops prove the shutdown half.
 # Drives are unmounted since phase 11, so the keystore is free for
 # the offline invites.
-echo "=== microvm 12: headless serving ==="
+echo "=== microvm 12: headless serving (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN/headless-setup-done" "$RUN/headless-serve-ready" "$RUN/headless-fetch-c-done" \
   "$RUN/headless-serve2-ready" "$RUN/headless-fetch-e-done" \
   "$RUN/headless-serve-stopped" "$RUN/headless-d-invited" \
@@ -586,7 +582,7 @@ fi # want_phase 12
 # Simultaneous exhaustion of all budgets is pathology, covered by
 # the whole-run cap — not by this envelope.
 if want_phase 13; then
-echo "=== microvm 13: crash injection ==="
+echo "=== microvm 13: crash injection (+$((SECONDS - HOST_T0))s) ==="
 CO="$RUN/creds/crash-o"
 COD="$RUN/drives/crash-o"
 CN="$RUN/creds/crash-n"
@@ -686,7 +682,7 @@ fi # want_phase 13
 # ENOSPC the leg exists to produce). Simultaneous exhaustion is
 # pathology, covered by the whole-run cap — not by this envelope.
 if want_phase 14; then
-echo "=== microvm 14: resource exhaustion ==="
+echo "=== microvm 14: resource exhaustion (+$((SECONDS - HOST_T0))s) ==="
 rm -f "$RUN"/fill-*.stderr "$RUN"/exh-failed-fill
 EC="$RUN/creds/exh"
 ED="$RUN/drives/exh"
@@ -799,7 +795,7 @@ fi # want_phase 14
 # heal/return converges. Simultaneous exhaustion is pathology,
 # covered by the whole-run cap — not by this envelope.
 if want_phase 15; then
-echo "=== microvm 15: unknown parent ==="
+echo "=== microvm 15: unknown parent (+$((SECONDS - HOST_T0))s) ==="
 UO="$RUN/creds/uparent-o"
 UOD="$RUN/drives/uparent-o"
 UN="$RUN/creds/uparent-n"
@@ -893,4 +889,4 @@ for f in "$RUN"/logs/*; do
 done
 pass "no secrets in host logs"
 
-echo "microvm: $PASS host checks passed (guest legs report their own totals above)"
+echo "microvm: $PASS host checks passed in $((SECONDS - HOST_T0))s (guest legs report their own totals above)"

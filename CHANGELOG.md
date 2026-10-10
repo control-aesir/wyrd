@@ -200,11 +200,25 @@ version say exactly what changed.
   set or an unreadable log rather than passing vacuously. The `--step` comma-list grammar is
   one shared `step_max` function with 40 stub checks (both ranges,
   malformed inputs, glob safety, base-10 canonicalization); Lima adopts
-  it, and the two microVM copies stay inline until an odin run can prove
-  the adoption. The stub suite runs in CI (shell-tests), so that claim is
+  it, and the microVM runner and host orchestrator adopt it in the entry
+  below. The stub suite runs in CI (shell-tests), so that claim is
   revision-bound; the green Lima full suite (106 checks, 156s) and the two
   end-to-end refusal proofs (`--step 99`, `--step 4,,5`) are
   local-operator evidence, not attached to a revision.
+- MicroVM gate batch 2: parallel builds, host phase timing, one `--step`
+  grammar (`nix/microvm/run-microvm.sh`, `tests/alpha-microvm.sh`). The
+  five builds (wyrd, nak, three runners) run in the background behind one
+  fail-fast wait each: the first failure kills its siblings before dying,
+  so a dead build never burns CPU through teardown, and wall time is the
+  slowest build rather than the sum. The runner and the host orchestrator
+  both adopt the shared `step_max` grammar, so `--step 01` canonicalizes
+  to 1 everywhere and the refusals (`--step 99`, `--step 4,,5`,
+  whitespace) hold with one message shape; the `step-grammar.sh` header
+  no longer claims Lima-only. Host phase headers and PASS lines carry the
+  same `SECONDS`-based deltas as the guest helper, closing the last
+  timing blind spot the interval-knob decision needs. Build and timing
+  proof needs odin (neither runs on macOS); the grammar refusals are
+  proven locally below, and the stub suites still pass.
 - CI `rust` and `nix` jobs run in parallel (the `needs: rust` ordering
   is dropped): wall time is the slower job, not the sum. Wasted nix
   compute when `rust` fails fast is accepted.

@@ -16,9 +16,8 @@
 # arithmetically in base 10 (the `10#` prefix keeps `08` from parsing as
 # octal), so `01` and `1` are the same step. The previous per-harness
 # regexes refused `01`; accepting it is a deliberate loosening, pinned by
-# tests/test-step-grammar.sh. It is Lima-only until the microVM harnesses
-# adopt this function: their inline copies still refuse `01`, so the rule
-# is one everywhere except that single input, which converges on adoption.
+# tests/test-step-grammar.sh. Shared by the Lima harness, the microVM
+# runner, and the host orchestrator: one rule everywhere.
 step_max() {
   local lo="$1" hi="$2" only="$3"
   local -a entries=()

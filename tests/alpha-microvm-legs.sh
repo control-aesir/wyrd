@@ -947,19 +947,14 @@ leg_headless_serve() {
   poll_until 300 test -f "$E2E_ROOT/headless-fetch-c-done" \
     || die "fetch-c never finished against serve#1"
   pass "fetch-c converged against the serving headless peer"
-  # 22c: minutes in, posture events have published — the verdict
-  # line is populated (ok or failed with its class, whatever the
-  # loop observed) under the same instance. The poll above waited
-  # for the first posture line, so "none observed" here would mean
-  # the loop wedged without publishing.
   # 22c: the verdict needs a published posture event (60s cadence).
   # Ready proves the first pass completed, but only a Posture event
   # carries its counters and verdict into the sidecar — the sidecar
   # mirrors the log stream, and the log stream has no per-pass
   # posture line before the first interval. So wait for the first
-  # posture line, then the verdict is populated under the same
-  # instance. "None observed" before that is the truth (no Posture
-  # event has published yet), not a wedged loop.
+  # posture line (poll below), then the verdict is populated under
+  # the same instance; "none observed" after that wait would mean
+  # the loop wedged without publishing.
   poll_until 300 grep -q "vault posture:" "$LOGDIR/headless-serve-1.err" \
     || die "serve#1 never published a posture event (see headless-serve-1.err)"
   with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-2.out" \

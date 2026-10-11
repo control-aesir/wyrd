@@ -3221,12 +3221,6 @@ fn vault_status(
     outcome
 }
 
-/// Build the status report as a string beside its outcome (the
-/// printer above is the only stdout edge): process posture from the
-/// sidecar beside durable state, the two strictly separated. The
-/// outcome stays non-zero when durable state was unreadable, but the
-/// string still carries the process section — a durable failure must
-/// not take down what the sidecar read needs no credentials for.
 /// Whether an `open_keystore` failure proves the drive was free:
 /// true exactly when the failure arose unambiguously after
 /// `DurableStore::open` acquired the lock (the lock was ours, so no
@@ -3268,6 +3262,12 @@ enum DurableProbe {
     },
 }
 
+/// Build the status report as a string beside its outcome (the
+/// printer above is the only stdout edge): process posture from the
+/// sidecar beside durable state, the two strictly separated. The
+/// outcome stays non-zero when durable state was unreadable, but the
+/// string still carries the process section — a durable failure must
+/// not take down what the sidecar read needs no credentials for.
 fn vault_status_report(
     drive_dir: PathBuf,
     relays: Vec<String>,

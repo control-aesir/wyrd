@@ -248,6 +248,7 @@ Four verdicts, per surface:
 | Suppression verdicts | lost, correctly | `suppression_cache_loss_re_derives_the_same_verdict` (warm-cache short-circuit vs post-restart revalidation to the same outcome); also `suppression_revalidates_after_restart`, `redelivery_after_restart_stays_duplicate` |
 | Mutation queue and parent tokens | lost, correctly | session-local by design (`core/mutation.rs`); shutdown completes blocked submitters with `Shutdown` (`shutdown_with_registry_releases_held_wants`, `submit_after_shutdown_fails_fast`) |
 | **Serving endpoint identity/address** | **excluded** | rebound on restart by design; post-restart announcement is convergence, tested separately — never make it durable to satisfy this table |
+| Posture sidecar (`vault.posture` file) | lost, correctly | the bytes survive but the claim does not: the replacement mints a new instance id at startup and publishes ready only for itself, so the old generation is never adopted — pinned by `restart_cannot_inherit_readiness` and `vault_status_shows_replacement_instance_never_inherited_readiness`; the fresh-to-stale transition pinned by `stale_after_threshold` |
 | Timestamps, counters, retry generations, telemetry, transient connection state | excluded | must differ; outside the relation |
 
 The restart-loss rule, normative for state that does not exist

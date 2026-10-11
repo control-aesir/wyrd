@@ -18,7 +18,7 @@ wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir
 wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
 wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd sync [--relay <url>...] --identity-file <path> --passphrase-file <path> <drive_dir> (status | now)
-wyrd vault --relay <url>... [--log-file <path>] --identity-file <path> --passphrase-file <path> <drive_dir>
+wyrd vault --relay <url>... [--log-file <path>] --identity-file <path> --passphrase-file <path> <drive_dir> [start | status]
 wyrd pin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
 wyrd unpin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
 wyrd evict --identity-file <path> --passphrase-file <path> <drive_dir> <path>
@@ -502,6 +502,9 @@ vault
     = periodic `vault posture` lines while it runs (passes, errors
       retried, sends, uptime): proof of life, never a health claim
     = failures with the mount's reporting shape
+    = one posture sidecar per drive at `<drive_dir>/vault.posture`
+      (see `status` below): published atomically with fsync on every
+      loop event, best-effort, never failing the vault
     = SIGTERM exits 0 when the loop stopped clean and every
       transport closed; a transport close that times out exits
       non-zero, after everything else still shut down. Exit 0 is
@@ -514,22 +517,36 @@ What the vault states is what the device is *doing* — residency
 policy, quota, effective budgets, all already readable — never what
 it *guarantees*: retention promises wait for the DG-4 decision, and
 the help text makes no retention claim. No liveness handle, no
-status surface, no daemonization: supervision owns the pid
-(`systemd`/`launchd` track and restart it). One vault or mount per
-drive, enforced by the kernel-held store lock: a second `vault`
-against a held drive exits 2 promptly, naming the drive
-(`another wyrd process holds ...: only one vault or mount per
-drive`). The lock dies with its process, so a crash leaves no
-stale record — but a held lock proves only occupancy, never
-health or convergence. A restart mints a new endpoint, so the
-vault re-announces obligations discharged against an older route
-for the current head's reachable closure under the live route (same route
-resends nothing, out-of-scope history stays discharged); the
-replacement serves the closure from the retained store, so a late
-peer recovers history, not just the head. Relay acceptance is not
-peer acquisition. Operator
-lifecycle (`start`/`stop`/`status`) and queryable health are separate
-follow-ons; this command is the foreground process they supervise.
+daemonization: supervision owns the pid (`systemd`/`launchd` track
+and restart it). One vault or mount per drive, enforced by the
+kernel-held store lock: a second `vault` against a held drive exits
+2 promptly, naming the drive (`another wyrd process holds ...: only
+one vault or mount per drive`). The lock dies with its process, so
+a crash leaves no stale record — but a held lock proves only
+occupancy, never health or convergence. A restart mints a new
+endpoint, so the vault re-announces obligations discharged against
+an older route for the current head's reachable closure under the
+live route (same route resends nothing, out-of-scope history stays
+discharged); the replacement serves the closure from the retained
+store, so a late peer recovers history, not just the head. Relay
+acceptance is not peer acquisition.
+
+`wyrd vault <drive> status` queries the process without opening
+the store, so it works while the vault holds the lock. Two
+strictly separated sections: process posture from the sidecar
+(instance, serving id, startup/ready timestamps, last-pass
+timestamp and verdict, run counters, posture timestamp with its
+age) and durable state (the same facts `sync status` reports when
+the drive is stopped; unavailable — never guessed — while the
+vault runs). Fresh means recent, stale means last-recorded, and
+both say liveness unverified: a process can die immediately after
+writing, and a fresh posture is not convergence. The staleness
+threshold is three posture intervals (180s), part of the contract.
+A stale, absent, or malformed sidecar reports posture unavailable,
+never a healthy stopped vault; a restart mints a new instance id
+before it is ready, so it can never inherit the dead instance's
+readiness. Operator `stop` stays the supervisor's job (`systemctl
+stop` delivers SIGTERM and waits for the documented teardown).
 
 ### `pin` / `unpin` / `evict` / `cache` — local materialization policy
 
@@ -633,6 +650,12 @@ Both are read and hardened by wyrd code, never by clap:
   `vault` logs to stderr always, plus an appended operator-chosen
   file under `--log-file` — never a drive-resident default, never
   truncated: a restart must not destroy the previous run's record.
+  Separately, the running vault publishes `<drive_dir>/vault.posture`
+  (schema v1, temp write plus file and directory fsync plus atomic
+  rename, best-effort): instance id, serving id,
+  startup/ready timestamps, last-pass timestamp and verdict, run
+  counters, posture timestamp. Rebuildable runtime state, never
+  authoritative — see `upgrade-contract.md`.
   Every dispatch line carries the opcode, its reply errno, its
   latency, and the mutation-queue backlog observed at dispatch
   entry — queue pressure per dispatch, no metrics pipeline.
@@ -645,7 +668,11 @@ Both are read and hardened by wyrd code, never by clap:
   sequenced after `wyrd vault`, because a boundary needs a vault
   process to be meaningful. What these surfaces
   print is counts, latencies, class breakdowns,
-  and pressure against the bounds in `resource-limits.md`. What
+  and pressure against the bounds in `resource-limits.md`. `vault
+  status` adds only timestamps and the serving id to that surface —
+  the same facts the ready/posture log lines already carry — and
+  its reader ignores unknown sidecar fields, so a future field can
+  never widen what status prints before the matrix says so. What
   they never print is ContentIds, filesystem paths, file bytes,
   or secrets — the observation half of the privacy boundary.
   Snapshot and membership transition ids do appear on `sync status`:

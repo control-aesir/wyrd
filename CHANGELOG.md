@@ -23,6 +23,20 @@ version say exactly what changed.
 
 ### Added
 
+- `wyrd vault <drive> status` (22c): process posture from a
+  vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
+  beside durable state, strictly separated. The running vault
+  publishes instance id, serving id, startup/ready timestamps,
+  last-pass timestamp and verdict, and run counters atomically on
+  every loop event; status reads them without opening the store, so
+  it works while the vault holds the exclusive lock. Fresh means
+  recent, stale means last-recorded (threshold: three posture
+  intervals, 180s) — both report liveness unverified, and neither
+  claims convergence. Durable state reuses `sync status` facts when
+  stopped and reports unavailable while running; restarts mint a new
+  instance before ready and never inherit. Bare `wyrd vault
+  <drive>` still starts the process.
+
 - Step-15 unknown-parent legs report per-probe section timings
   (`step15 probe <name>=<Ns>` in the leg logs): instrument-first
   evidence for the last uninstrumented e2e chunk, no probe behavior

@@ -5196,10 +5196,13 @@ version = "0.2.0-alpha"
 dependencies = [
  "clap",
  "fuser",
+ "getrandom 0.2.17",
  "hex",
  "libc",
  "nostr",
  "nostr-sdk",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

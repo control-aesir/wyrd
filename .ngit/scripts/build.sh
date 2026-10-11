@@ -122,6 +122,24 @@ capable() {
   esac
 }
 
+# Canonical archive name for a nix system: the name the release gate
+# and `wyrd update` resolve by. The nix store output carries a
+# hash-prefixed basename, so every copy below renames through this
+# function — never through the store basename. One mapping, three
+# call sites (build, verify, strict gate).
+canonical_artifact() {
+  case "$1" in
+    aarch64-darwin) echo "wyrd-$VERSION-macos-aarch64.tar.gz" ;;
+    x86_64-darwin) echo "wyrd-$VERSION-macos-x86_64.tar.gz" ;;
+    aarch64-linux) echo "wyrd-$VERSION-linux-aarch64.tar.gz" ;;
+    x86_64-linux) echo "wyrd-$VERSION-linux-x86_64.tar.gz" ;;
+    *)
+      echo "unknown system: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
 QUEUE=()
 SKIPPED=()
 if [ -z "${WANTED[*]:-}" ]; then
@@ -153,13 +171,15 @@ for SYSTEM in ${QUEUE[@]+"${QUEUE[@]}"}; do
   "${NIX[@]}" build "$EXPORT#packages.$SYSTEM.wyrd-dist" --out-link "$EXPORT/dist-$SYSTEM"
   # Forced: nix outputs are read-only, so a re-run over an existing dist/
   # must replace, not fail (BSD cp cannot overwrite read-only files).
-  cp -f "$EXPORT/dist-$SYSTEM" "$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-$SYSTEM")")"
+  # Renamed to the canonical name: the store basename is hash-prefixed
+  # and the strict gate resolves canonical names only.
+  cp -f "$EXPORT/dist-$SYSTEM" "$ROOT/dist/$(canonical_artifact "$SYSTEM")"
   BUILT+=("$SYSTEM")
 done
 
 if [ "$VERIFY" = true ]; then
   for SYSTEM in ${BUILT[@]+"${BUILT[@]}"}; do
-    FILE="$ROOT/dist/$(basename "$(readlink "$EXPORT/dist-$SYSTEM")")"
+    FILE="$ROOT/dist/$(canonical_artifact "$SYSTEM")"
     # Only foreign-OS binaries cannot run here (cross-arch macOS
     # binaries still run under Rosetta); verifying those is CI's job
     # on their native runners.
@@ -229,9 +249,12 @@ echo "built: ${BUILT[*]}"
 [ -n "${SKIPPED[*]:-}" ] && echo "skipped: ${SKIPPED[*]}"
 
 # Release gate: --strict requires every archive release.yaml names,
-# since ngit rejects partial platform coverage on main.
+# since ngit rejects partial platform coverage on main. Names come
+# from the same mapping as the build loop, so the gate can never
+# drift from what the copy step produces.
 if [ "$STRICT" = true ]; then
-  for ARTIFACT in "$ROOT/dist/wyrd-$VERSION-macos-aarch64.tar.gz" "$ROOT/dist/wyrd-$VERSION-macos-x86_64.tar.gz" "$ROOT/dist/wyrd-$VERSION-linux-aarch64.tar.gz" "$ROOT/dist/wyrd-$VERSION-linux-x86_64.tar.gz"; do
+  for SYSTEM in aarch64-darwin x86_64-darwin aarch64-linux x86_64-linux; do
+    ARTIFACT="$ROOT/dist/$(canonical_artifact "$SYSTEM")"
     [ -f "$ARTIFACT" ] || {
       echo "missing expected artifact $ARTIFACT" >&2
       exit 1

@@ -1082,7 +1082,7 @@ leg_headless_fetch() {
 leg_crash_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection owner leg"
-  PROBE_STEP=13
+  local PROBE_STEP=13
   start_mount xcrash-o "$c" "$d" "$MNTS/xcrash-o" --relay "$relay"
   # Converge the member's readiness signal first: this fetch settles
   # the sync engine (the closure gate blocks mutations until the
@@ -1195,7 +1195,7 @@ leg_crash_owner() {
 leg_steady_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness member leg"
-  PROBE_STEP=13
+  local PROBE_STEP=13
   start_mount xsteady-m "$c" "$d" "$MNTS/xsteady-m" --relay "$relay"
   # Publish readiness before waiting for the anchor: the owner
   # converges this first, which triggers the fetch that settles its
@@ -1249,7 +1249,7 @@ leg_steady_member() {
 leg_crash_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection member leg"
-  PROBE_STEP=13
+  local PROBE_STEP=13
   # Debug for this mount only, Lima step-6 style (see leg_fetch_member):
   # the scratch commit below is under investigation — if it outwaits
   # its deadline again, the daemon log must show what the commit
@@ -1361,7 +1361,7 @@ leg_crash_member() {
 leg_steady_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness owner leg"
-  PROBE_STEP=13
+  local PROBE_STEP=13
   start_mount xsteady-o "$c" "$d" "$MNTS/xsteady-o" --relay "$relay"
   timeout 35 bash -c "echo 'cold-bytes-u' > '$MNTS/xsteady-o/cold-u.txt'" 2>/dev/null \
     || die "cold announcement write failed"

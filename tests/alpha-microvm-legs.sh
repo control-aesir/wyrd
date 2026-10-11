@@ -1030,6 +1030,8 @@ leg_headless_serve() {
     || die "vault status failed on the stopped drive (see headless-status-4.out)"
   grep -q "^durable: stopped drive" "$LOGDIR/headless-status-4.out" \
     || die "durable state missing on the stopped drive"
+  grep -q "^process: retained posture" "$LOGDIR/headless-status-4.out" \
+    || die "serve#2's fresh posture not reclassified as retained on the free drive"
   diff "$E2E_ROOT/headless-serve2-instance" <(grep "^process: instance: " "$LOGDIR/headless-status-4.out" | head -n 1) \
     || die "serve#2's last posture did not survive its shutdown"
   pass "status renders durable state beside the retained last posture"

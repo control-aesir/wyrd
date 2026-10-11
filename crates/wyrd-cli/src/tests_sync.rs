@@ -647,12 +647,34 @@ fn vault_status_renders_process_beside_durable_failure() {
         vault_status_report(fixture.drive.clone(), vec![], "wrong-pass", identity);
     assert!(outcome.is_err(), "a durable failure still fails closed");
     assert!(
-        report.contains("process: fresh posture"),
-        "the credential-free section survives:\n{report}"
+        report.contains("process: retained posture"),
+        "a wrong passphrase fails the post-lock KDF, which proves the drive was free:\n{report}"
     );
     assert!(
         report.contains("durable: unavailable (durable state unreadable; detail on stderr)"),
         "the failure folds into its own line:\n{report}"
+    );
+}
+
+/// A pre-lock durable failure (no DRIVE file: the directory was
+/// never a drive) proves nothing about occupancy, so a fresh sidecar
+/// keeps the live reading — the conservative arm of the provenance
+/// classifier.
+#[test]
+fn vault_status_keeps_live_reading_on_prelock_failure() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("nodrive");
+    std::fs::create_dir_all(&drive).unwrap();
+    let recorder = super::posture::PostureRecorder::new(&drive, "aa".into()).unwrap();
+    recorder.note_startup();
+    recorder.note_ready();
+    recorder.note_posture(41, 0, 7, 312);
+    let identity = DeviceIdentitySecret::generate().unwrap();
+    let (report, outcome) = vault_status_report(drive, vec![], "test-pass", identity);
+    assert!(outcome.is_err(), "a missing drive still fails closed");
+    assert!(
+        report.contains("process: fresh posture"),
+        "pre-lock failure must not reclassify as retained:\n{report}"
     );
 }
 

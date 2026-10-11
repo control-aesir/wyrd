@@ -3227,6 +3227,47 @@ fn vault_status(
 /// outcome stays non-zero when durable state was unreadable, but the
 /// string still carries the process section — a durable failure must
 /// not take down what the sidecar read needs no credentials for.
+/// Whether an `open_keystore` failure proves the drive was free:
+/// true exactly when the failure arose unambiguously after
+/// `DurableStore::open` acquired the lock (the lock was ours, so no
+/// other process held the drive when the probe ran). Scoped to the
+/// open/observe path below, whose pre-lock section is exactly three
+/// probes: the DRIVE read, the keystore existence check, and the
+/// LOCK open plus `try_lock` (`bootstrap::open_keystore`,
+/// `DurableStore::open`). Variants those probes can produce are
+/// unproven; everything else the open path returns — the post-lock
+/// DRIVE re-verify, the store-key KDF, the CURRENT read, the custody
+/// decode and checks — is proven free. Shared variants stay
+/// conservative: `Io` covers the LOCK creation as well as post-lock
+/// reads, and `MalformedKeystore` covers the pre-lock existence
+/// probe as well as the post-lock custody decode.
+fn open_error_proves_free(error: &EngineError) -> bool {
+    match error {
+        // Contention proves occupancy, never freedom (the caller
+        // handles it in its own arm; listed so the wildcard below
+        // cannot absorb it).
+        EngineError::Durable(DurableError::StoreLocked) => false,
+        // Ambiguous pre/post-lock variants: conservative.
+        EngineError::Durable(DurableError::Io(_)) | EngineError::Io(_) => false,
+        EngineError::MalformedDrive | EngineError::MalformedKeystore => false,
+        // Post-lock only, on the current open order.
+        _ => true,
+    }
+}
+
+/// What the durable probe found. `Unreadable` carries the failure
+/// plus its lock provenance: the process section renders either way,
+/// but only a proven-free failure reclassifies a fresh sidecar as
+/// retained history.
+enum DurableProbe {
+    Stopped(Box<SyncStatus>),
+    Held,
+    Unreadable {
+        failure: CliError,
+        proven_free: bool,
+    },
+}
+
 fn vault_status_report(
     drive_dir: PathBuf,
     relays: Vec<String>,
@@ -3237,38 +3278,55 @@ fn vault_status_report(
     // The durable probe first: its outcome classifies the sidecar. A
     // successful open proves no process holds the lock, so a
     // timestamp-fresh file renders as retained history instead of a
-    // live process disagreeing with a stopped drive. `None` is the
-    // held drive; any other failure keeps its error for the tail.
-    let durable: Result<Option<SyncStatus>, EngineError> =
-        match Engine::open_keystore(drive_dir, passphrase, identity) {
-            Ok(engine) => observe(&engine, relays.len()).map(Some),
-            Err(EngineError::Durable(DurableError::StoreLocked)) => Ok(None),
-            Err(error) => Err(error),
-        };
-    match durable {
-        Ok(Some(status)) => {
+    // live process disagreeing with a stopped drive. `Held` is the
+    // contended drive; any other failure keeps its error plus its
+    // lock provenance for the tail.
+    let probe = match Engine::open_keystore(drive_dir, passphrase, identity) {
+        Ok(engine) => match observe(&engine, relays.len()) {
+            // Observed through our own open: the lock was ours
+            // throughout, so the drive was free when the probe ran.
+            Ok(status) => DurableProbe::Stopped(Box::new(status)),
+            Err(error) => DurableProbe::Unreadable {
+                proven_free: true,
+                failure: error.into(),
+            },
+        },
+        Err(EngineError::Durable(DurableError::StoreLocked)) => DurableProbe::Held,
+        Err(error) => {
+            let proven_free = open_error_proves_free(&error);
+            DurableProbe::Unreadable {
+                proven_free,
+                failure: error.into(),
+            }
+        }
+    };
+    match probe {
+        DurableProbe::Stopped(status) => {
             let process = posture::read_posture(&sidecar);
             let mut out = posture::render_process_section(&process, true);
             out.push_str("durable: stopped drive (same facts `sync status` reports)\n");
             out.push_str(&sync_status_render(&status));
             (out, Ok(()))
         }
-        Ok(None) => {
+        DurableProbe::Held => {
             let process = posture::read_posture(&sidecar);
             let mut out = posture::render_process_section(&process, false);
             out.push_str("durable: unavailable (drive held by a running process: the lock is exclusive, so durable state needs a stopped drive)\n");
             (out, Ok(()))
         }
-        Err(error) => {
+        DurableProbe::Unreadable {
+            failure,
+            proven_free,
+        } => {
             // The sidecar needs no credentials, so a durable failure
             // must not take the process section down with it: render
             // what was readable, keep the failure detail on stderr
             // (stdout stays within the no-paths surface), and still
-            // fail closed.
-            let failure: CliError = error.into();
+            // fail closed. A proven-free failure reclassifies a fresh
+            // file as retained history, exactly like a clean open.
             eprintln!("durable state unreadable: {failure}");
             let process = posture::read_posture(&sidecar);
-            let mut out = posture::render_process_section(&process, false);
+            let mut out = posture::render_process_section(&process, proven_free);
             out.push_str("durable: unavailable (durable state unreadable; detail on stderr)\n");
             (out, Err(failure))
         }

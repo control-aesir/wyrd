@@ -23,6 +23,11 @@ version say exactly what changed.
 
 ### Added
 
+- Step-9 fetch-plane legs report per-probe section timings
+  (`step9 probe <name>=<Ns>` in the leg logs, with the recovery
+  attempt count): instrument-first evidence for the revival-budget
+  work, no probe behavior changed.
+
 - `wyrd mount --interval SECS` paces the live loop's idle deadline
   (1-86400s, default 5s): producers still wake the loop
   immediately, so this only bounds how long total silence may delay

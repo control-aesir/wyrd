@@ -20,6 +20,17 @@ source /etc/wyrd-tests/alpha-common.sh
 # pids must not be. (alpha-common.sh sources the env file itself.)
 PIDDIR="$E2E_ROOT/pids/$(hostname -s)"
 
+# Per-probe section timing for the long legs (step 9 today): each mark
+# prints the wall seconds since the previous mark, so the breakdown is
+# greppable in the leg log (`step9 probe <name>=<Ns>`) without changing
+# any probe. Marks sit beside the passes they follow; the pass deltas
+# stay the check-level view.
+STEP9_MARK=$SECONDS
+probe_mark() { # <name>
+  echo "step9 probe $1=$(( SECONDS - STEP9_MARK ))s"
+  STEP9_MARK=$SECONDS
+}
+
 # leg_converge_owner <drive> <creds> <relay>: mount, write shared.txt,
 # wait for the member's reply, stop.
 leg_converge_owner() {
@@ -117,6 +128,7 @@ leg_fetch_owner() {
   poll_until 120 test -f "$E2E_ROOT/member-cold-done" \
     || die "member never completed the blocking cold open"
   pass "member's single open unblocked on the announcement"
+  probe_mark cold_served
   echo "stale-bytes" > "$MNTS/xowner-f/stale-1.txt"
   echo "stale-2-bytes" > "$MNTS/xowner-f/stale-2.txt"
   poll_until 120 test -f "$E2E_ROOT/member-listed-done" \
@@ -129,15 +141,18 @@ leg_fetch_owner() {
   stop_mount xowner-f INT
   check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   touch "$E2E_ROOT/owner-stopped"
+  probe_mark stopped
   poll_until 240 test -f "$E2E_ROOT/member-probed-done" \
     || die "member never finished the dead-route probes"
   pass "owner stayed down while the member probed the dead route"
+  probe_mark probed_wait
   # The bitrot block runs three deadline-bounded reads plus its
   # asserts after the probes: stay down until it signals
   # completion, or the remount below heals its later reads
   # mid-block and the fail-closed asserts race the recovery.
   poll_until 500 test -f "$E2E_ROOT/member-bitrot-done" \
     || die "member never finished the bitrot block"
+  probe_mark bitrot_wait
   # Recovery setup: remount on a fresh endpoint (new iroh identity
   # over the same drive) and write a new file BEFORE the member
   # authors anything: the member converges this head first, so the
@@ -159,15 +174,18 @@ leg_fetch_owner() {
   poll_until 120 converged "$MNTS/xowner-f2/scratch-del.txt" "scratch" \
     || die "owner never converged the scratch file's bytes"
   pass "owner converges the member's scratch write with bytes"
+  probe_mark scratch_converged
   poll_until 240 test -f "$E2E_ROOT/member-fetch-done" \
     || die "member never finished the delete"
   poll_until 120 bash -c "! test -e '$MNTS/xowner-f2/stale-1.txt'" \
     || die "owner never converged the member's offline delete"
   pass "owner converges the delete before finishing"
+  probe_mark delete_converged
   # Convergence ack: the member must not shut down until its
   # announcements have arrived here — a fast member would otherwise
   # outrun its own outbox drain and this leg could never converge.
   touch "$E2E_ROOT/owner-converged-done"
+  probe_mark converged_ack
   # Ten attempts bound the member's worst case near eleven minutes
   # (10 x (60s attempt + 5s sleep)), so this wait must clear it or
   # the owner's diagnostic masks the member's own.
@@ -175,6 +193,7 @@ leg_fetch_owner() {
     || die "member never recovered the stale identity"
   stop_mount xowner-f2 INT
   check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  probe_mark recovery_wait
 }
 
 # leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
@@ -199,6 +218,9 @@ leg_fetch_owner() {
 # probes ~130s worst case, owner convergence chain concurrent with
 # the member's recovery, recovery loop 650s worst case, ack waits
 # fail-fast (120s member-side). Typical green run: 4-6 minutes.
+# Per-probe `step9 probe <name>=<Ns>` lines in the leg logs break the
+# total down (see probe_mark above); the recovery mark also reports
+# the attempts used.
 # Two matrix items are deliberately NOT e2e-legged here:
 # timeout-then-completion (the waiter leaves with
 # EIO while the fetch continues (unit-pinned by
@@ -230,6 +252,7 @@ leg_fetch_member() {
   export E2E_RUST_LOG="wyrd_core=debug"
   start_mount xmember-f "$c" "$d" "$MNTS/xmember-f" --relay "$relay"
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
+  probe_mark cold_mount
   # Announcement first (listing shows the new head), bytes second
   # (the single cat below): this split is what makes the cat a
   # blocking-open proof rather than a find-ready-bytes no-op.
@@ -249,6 +272,7 @@ leg_fetch_member() {
   [[ "$(cat "$E2E_ROOT/cold-2.got")" == "cold-bytes" ]] \
     || { echo "--- cold-2.got ($(wc -c <"$E2E_ROOT/cold-2.got") bytes) ---"; od -c "$E2E_ROOT/cold-2.got" | head -n 10; die "cold open returned wrong bytes"; }
   pass "single open blocks until the announced bytes arrive"
+  probe_mark cold_open
   touch "$E2E_ROOT/member-cold-done"
   # Manifest-only convergence: readdir pulls the manifest chain
   # without opening contents, so the member holds the announcements
@@ -258,6 +282,7 @@ leg_fetch_member() {
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'stale-2.txt'" \
     || die "member never listed stale-2.txt"
   touch "$E2E_ROOT/member-listed-done"
+  probe_mark stale_listed
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
   # Window start for the class assertion below: only passes logged
@@ -273,6 +298,7 @@ leg_fetch_member() {
   grep -q "Input/output error" "$E2E_ROOT/stale-1.err" \
     || die "stale-manifest read was not EIO: $(cat "$E2E_ROOT/stale-1.err")"
   pass "announced-but-unfetchable read fails closed and bounded"
+  probe_mark stale1_eio
   # Never announced at all: resolve fails fast, no 30s wait for an
   # announcement that may never come. The 10s budget (well under the
   # 30s open deadline) is what makes "immediately" real: a regression
@@ -284,6 +310,7 @@ leg_fetch_member() {
   grep -q "No such file or directory" "$E2E_ROOT/never-announced.err" \
     || die "unknown-path open was not ENOENT: $(cat "$E2E_ROOT/never-announced.err")"
   pass "unknown-path open fails fast, never hangs for an announcement"
+  probe_mark unknown_path
   # The recovery identity must FAIL first: bounded EIO against the
   # dead route, so the later success proves revival rather than a
   # first attempt that never saw trouble. The failure must be FAST
@@ -312,6 +339,7 @@ leg_fetch_member() {
   [[ "$fast" == 1 ]] \
     || die "stale-2 read never failed fast: the identity never went terminal (all attempts ran to the deadline)"
   pass "second stale identity fails closed, bounded, and fast (terminal verdict, not deadline)"
+  probe_mark stale2_verdict
   # Fetch-failure classes outside a debug-attached session
   # (peer-repair child 14): the probes above forced fetch attempts
   # against a gone peer, so a pass line must name peer absence or
@@ -323,6 +351,7 @@ leg_fetch_member() {
     | grep -qE "missing=[1-9]|transport_errors=[1-9]" \
     || die "member log never named a fetch-failure class for the dead-route probes"
   pass "dead-route probes surface peer absence in the pass log"
+  probe_mark failure_class
   touch "$E2E_ROOT/member-probed-done"
   # Bitrot with a live claim (quarantine leg, peer-repair child
   # 12): cold-2.txt is verified local on the member — the blocking
@@ -364,6 +393,7 @@ leg_fetch_member() {
   [[ ! -e "$cold_chunk" ]] \
     || die "bitrotted chunk file still on disk after the quarantine drain"
   pass "bitrotted read fails closed, serves nothing, names the rejection"
+  probe_mark bitrot
   # Rendezvous: the owner remounts only after this block is fully
   # done. Without it the returned owner would heal reads 2-3
   # mid-block (repair-on-demand working as designed) and the
@@ -378,6 +408,7 @@ leg_fetch_member() {
   poll_until 120 bash -c "ls '$MNTS/xmember-f' | grep -qx 'owner-back-1.txt'" \
     || die "member never listed the post-restart write"
   pass "member converges on the post-restart head over the new route"
+  probe_mark owner_back
   # Repair-on-demand without remount: the same mount that failed
   # closed on the bitrotted chunk now serves verified bytes — the
   # loop discarded the bad representation, unclaimed it, and
@@ -389,6 +420,7 @@ leg_fetch_member() {
   [[ "$(cat "$E2E_ROOT/cold-2-healed.got")" == "cold-bytes" ]] \
     || die "healed read returned wrong bytes"
   pass "quarantined chunk heals from the returned owner without remount"
+  probe_mark heal
   # Out-of-band loss with a live claim (scrub leg, peer-repair
   # child 13): cold-2.txt is verified local on the member again —
   # the heal above served its bytes — so deleting its chunk file
@@ -411,6 +443,7 @@ leg_fetch_member() {
   grep -q "unclaiming and re-demanding" "$LOGDIR/mount-xmember-f.err" \
     || die "mount log never named the lost representation for scrub"
   pass "lost chunk heals from the returned owner without remount"
+  probe_mark reloss
   # Scratch write against the live route: creating a file forces
   # the current head's tree object to materialize (reads never
   # fetch tree objects, only manifests and chunks), and the delete
@@ -420,6 +453,7 @@ leg_fetch_member() {
   poll_until 120 converged "$MNTS/xmember-f/scratch-del.txt" "scratch" \
     || die "scratch write never became readable"
   pass "scratch write forces tree materialization over the live route"
+  probe_mark scratch
   touch "$E2E_ROOT/member-scratch-done"
   # Delete of stale-1: the scratch write above authored a head
   # whose tree object is local by construction, so this delete
@@ -430,6 +464,7 @@ leg_fetch_member() {
   timeout 60 rm "$MNTS/xmember-f/stale-1.txt" \
     || die "member cannot author the delete"
   pass "member authors the delete with trees local"
+  probe_mark delete
   touch "$E2E_ROOT/member-fetch-done"
   # Recovery without remount: the owner is back on a fresh endpoint
   # with a new route (see owner leg), and this mount never went
@@ -451,6 +486,7 @@ leg_fetch_member() {
   poll_until 180 converged "$MNTS/xmember-f/owner-back-1.txt" "owner-back" \
     || die "member never fetched the post-restart bytes"
   pass "post-restart bytes land over the new route"
+  probe_mark post_restart
   local attempt=0
   while (( attempt < 10 )); do
     if timeout 60 cat "$MNTS/xmember-f/stale-2.txt" >"$E2E_ROOT/stale-2-recovered.got" 2>/dev/null \
@@ -463,6 +499,7 @@ leg_fetch_member() {
   [[ "$attempt" -lt 10 ]] \
     || die "stale identity never recovered without remount after $attempt bounded opens"
   pass "failed fetch recovers after re-announcement without remount"
+  probe_mark "recovery attempts=$attempt"
   # Stay up until the owner confirms convergence: shutting down
   # here would outrun the outbox drain and strand the scratch and
   # delete announcements this leg's owner polls wait for. Short
@@ -472,6 +509,7 @@ leg_fetch_member() {
   poll_until 120 test -f "$E2E_ROOT/owner-converged-done" \
     || die "owner never converged the scratch and delete"
   touch "$E2E_ROOT/member-recovered-done"
+  probe_mark converged_wait
   stop_mount xmember-f TERM
   # Dedupe proof over the step-8 restart's redelivery, read after the
   # mount is down so no concurrent append can slip mid-read. Two
@@ -533,6 +571,7 @@ leg_fetch_member() {
   grep -qE "^terminal: [0-9]+ identities exhausted$" "$E2E_ROOT/sync-now-member.out" \
     || die "sync now stdout lost the terminal gauge"
   pass "sync now renders the fetch surface (total, deadlines, terminal)"
+  probe_mark dedupe_syncnow
   check_no_content_ids "$E2E_ROOT/sync-now-member.out"
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$E2E_ROOT/sync-now-member.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"

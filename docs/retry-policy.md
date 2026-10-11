@@ -22,14 +22,31 @@ walk in `wyrd-sync`.
    a full share). What the split adds is measurement: every attempt
    records its phase outcome, dial latency, and bytes streamed
    before failure (see Metrics below).
-2. **Freshness ordering — pending design.** Cap the first K
-   candidates per pass, or order candidates by route freshness so
-   dead routes sink to tail latency. Requires a per-provider
-   outcome memory that does not exist today (candidate lists are
-   publication order; repeated publication is a dedup no-op), and a
-   ruling on how stale or superseded evidence (re-announcements,
-   cooldowns) affects the order without breaking "a dead route
-   must not displace a live alternate".
+2. **Freshness ordering — implemented.** The walk orders each
+   attempt's candidates from a per-provider outcome memory on the
+   source: providers with a live failure mark sink behind unmarked
+   ones, publication order stable within each tier, nobody dropped.
+   Only dial-phase failures train the memory — transport failures
+   from the dial lay a mark, sliced-deadline expiries do not, and
+   transfer-phase failures (including a live member's legitimate
+   "not found" for one representation) never sink the provider for
+   others it serves. Fulfillment clears. Marks expire after 5
+   minutes (judgment: spans passes, recovers restarted peers
+   without operator action).
+   Rulings on the open questions: re-announcement clears nothing
+   (an announcement attests addressing, never liveness — otherwise
+   a dead route re-announced every pass would never sink);
+   engine cooldowns are untouched (per-representation, above the
+   walk; strike counting unchanged); no K-cap (dropping candidates
+   would risk displacing a live alternate — sinking never skips).
+   One honest interaction: the walk returns the last error and
+   position sets the bound, so ordering moves which candidate's
+   error class surfaces on total failure — in the evidence's
+   direction (sunk dead tail reads fault, live head reads budget).
+   Learning happens in `fetch`, so any attempt trains the memory —
+   walk or single-route: dial reachability is provider-level,
+   independent of the representation asked for, and fulfillment
+   clears from either path.
 3. **Cross-pass resume — deferred behind this note.** No
    `BulkSource` trait change, no partial-buffer ledger, no
    ranged-fetch implementation until the questions below are

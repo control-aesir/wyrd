@@ -33,7 +33,7 @@
 //! `seal::open_manifest` still enforces it as AAD before the record is
 //! trusted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -176,6 +176,102 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
     if !candidates.contains(&blob) {
         candidates.push(blob);
     }
+}
+
+/// How long a provider's failure mark sinks it to the walk's tail:
+/// judgment, not measurement. Long enough to span consecutive passes
+/// (a dead route stays sunk while the pass that observed it is still
+/// recent), short enough that a restarted peer recovers without
+/// operator action. Revisit when the attempt forensics show flapping
+/// (marks re-laid every pass) or sticking (live routes sunk for the
+/// whole TTL).
+const PROVIDER_BAD_MARK_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// One provider's last completed failure observation: when it
+/// happened. Only failures live here — a fulfilled attempt removes
+/// the provider's mark, and a provider with no mark (never tried, or
+/// last tried successfully) orders ahead of marked ones. Wall-clock,
+/// not pass-counted: the memory belongs to the source and spans
+/// passes, while pass numbering belongs to the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderMark {
+    failed_at: std::time::Instant,
+}
+
+/// Order one walk's candidates from the provider memory: marked
+/// providers sink behind unmarked ones, publication order stable
+/// within each tier, nobody dropped. The walk still tries every
+/// candidate — sinking only spends the dead route's dial later, so a
+/// live alternate is reached before the tail burns budget. Expired
+/// marks prune here, so the map holds only live evidence. Pure over
+/// the map so tests pin the tiers without a network; the live walk
+/// passes its own memory with the current instant.
+fn order_candidates(
+    candidates: &[IrohBlobRef],
+    memory: &mut HashMap<[u8; 32], ProviderMark>,
+    now: std::time::Instant,
+) -> Vec<IrohBlobRef> {
+    memory.retain(|_, mark| now.duration_since(mark.failed_at) < PROVIDER_BAD_MARK_TTL);
+    let mut live = Vec::with_capacity(candidates.len());
+    let mut sunk = Vec::new();
+    for blob in candidates {
+        if memory.contains_key(blob.provider.id.as_bytes()) {
+            sunk.push(blob.clone());
+        } else {
+            live.push(blob.clone());
+        }
+    }
+    live.extend(sunk);
+    live
+}
+
+/// One attempt's lesson for the provider memory: fulfillment
+/// clears whatever came before (liveness observed beats failure
+/// remembered); a dial-phase transport failure lays (or refreshes)
+/// the mark — route evidence, independent of which representation
+/// was asked for, since the dial never reached the provider;
+/// everything else teaches nothing. In particular transfer-phase
+/// failures never mark: a live member's legitimate "not found" for
+/// one representation must not sink it for others it does serve.
+/// Sliced-deadline expiries (budget evidence) and oversize (a
+/// representation property) never mark either. Pure so tests pin
+/// the rule without a network; `fetch` applies it where phase and
+/// error class meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderLesson {
+    Clear,
+    Mark,
+    Ignore,
+}
+
+fn provider_lesson(
+    result: &Result<Vec<u8>, BulkError>,
+    outcome: &AttemptOutcome,
+) -> ProviderLesson {
+    match result {
+        Ok(_) => ProviderLesson::Clear,
+        Err(error) => match outcome.phase() {
+            AttemptPhase::Dial if matches!(error, BulkError::Transport(_)) => ProviderLesson::Mark,
+            _ => ProviderLesson::Ignore,
+        },
+    }
+}
+
+/// Lay (or refresh) one provider's failure mark. Only `fetch` calls
+/// this, only for the lesson above — never directly for an error.
+fn mark_provider_failed(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &[u8; 32]) {
+    memory.insert(
+        *provider,
+        ProviderMark {
+            failed_at: std::time::Instant::now(),
+        },
+    );
+}
+
+/// A fulfilled attempt clears whatever the walk learned about this
+/// provider before: liveness observed beats failure remembered.
+fn clear_provider_mark(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &[u8; 32]) {
+    memory.remove(provider);
 }
 
 /// One candidate's share of the pass budget: the fair division of the
@@ -549,6 +645,14 @@ pub struct IrohBulkSource {
     /// [`IrohBulkSource::fetch_stats`]. Source configuration, never
     /// plan-run state — the counters span passes.
     stats: BulkFetchStats,
+    /// Per-provider failure memory for the candidate walk: the last
+    /// dial-phase failure observation per provider id, laid by
+    /// [`IrohBulkSource::fetch`] and read back as walk order on
+    /// later attempts. Transient like the plan's strike ledgers; a
+    /// fulfilled attempt clears the provider's mark, and marks
+    /// expire after [`PROVIDER_BAD_MARK_TTL`]. Spans passes and
+    /// addresses — plan-run state never resets it.
+    provider_memory: HashMap<[u8; 32], ProviderMark>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -560,6 +664,7 @@ impl std::fmt::Debug for IrohBulkSource {
             .field("sealed", &self.sealed.len())
             .field("transport", &self.transport.len())
             .field("stats", &self.stats.snapshot())
+            .field("provider_memory", &self.provider_memory.len())
             .finish()
     }
 }
@@ -580,6 +685,7 @@ impl IrohBulkSource {
             attempt_deadline: None,
             attempt_bound: None,
             stats: BulkFetchStats::default(),
+            provider_memory: HashMap::new(),
         }
     }
 
@@ -622,6 +728,13 @@ impl IrohBulkSource {
     /// diagnostics surface adopts the snapshot.
     pub fn fetch_stats(&self) -> BulkFetchStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// This provider's failure mark, if any: tests pin the record
+    /// rules through it.
+    #[cfg(test)]
+    fn provider_mark(&self, provider: &[u8; 32]) -> Option<ProviderMark> {
+        self.provider_memory.get(provider).copied()
     }
 
     /// Publish the transport address for a snapshot body.
@@ -691,15 +804,29 @@ impl IrohBulkSource {
         }
     }
 
-    /// Fetch a representation by trying each recorded provider in
-    /// publication order. Absence and transport failure fall through to
-    /// the next candidate; oversize is terminal because every provider
-    /// serves the same immutable bytes, so the size is a property of the
-    /// representation, not of the route. With no provider serving it,
-    /// the last transport error is returned; no candidates at all is
-    /// absence; candidates with no completed attempt (a budget spent
-    /// before anything could be asked) is a deadline, never a
-    /// fabricated absence.
+    /// Fetch a representation by trying each recorded provider,
+    /// freshness-ordered: providers with a live failure mark sink
+    /// behind unmarked ones ([`order_candidates`]), publication order
+    /// stable within each tier. Absence and transport failure fall
+    /// through to the next candidate; oversize is terminal because
+    /// every provider serves the same immutable bytes, so the size is
+    /// a property of the representation, not of the route. With no
+    /// provider serving it, the last transport error is returned; no
+    /// candidates at all is absence; candidates with no completed
+    /// attempt (a budget spent before anything could be asked) is a
+    /// deadline, never a fabricated absence.
+    ///
+    /// Ordering moves which candidate holds the last (usually
+    /// full-share) slot, so on total failure the surfaced error may
+    /// differ from publication order's — in the direction of the
+    /// evidence: a sunk dead tail's expiry reads as fault evidence
+    /// (struck), a live head's sliced expiry as budget evidence
+    /// (counted, not struck). Publication order had it backwards: the
+    /// dead-first expiry escaped as a deadline while the live last
+    /// candidate's expiry struck for being last. Strike counting
+    /// itself is untouched — per run, per representation, above this
+    /// walk — and no candidate is ever skipped, so a dead route still
+    /// cannot displace a live alternate.
     ///
     /// Under a pass budget each remaining candidate gets a fair share
     /// of the time left, floored so an early slow-but-live provider
@@ -719,8 +846,21 @@ impl IrohBulkSource {
     ) -> Result<Option<Vec<u8>>, BulkError> {
         let budget = self.attempt_deadline;
         let mut last_error = None;
-        let total = candidates.len();
-        for (index, blob) in candidates.iter().enumerate() {
+        // Freshness first: the memory orders this pass from what the
+        // earlier ones learned, so a known-dead route's dial burns
+        // tail budget instead of head budget. The maps keep
+        // publication order — the walk re-derives the order per walk
+        // instead, so intake (publication replaces per pass) is
+        // untouched and republication stays a dedup no-op that clears
+        // nothing: an announcement attests addressing, never liveness,
+        // so only a completed attempt lays or clears a mark.
+        let ordered = order_candidates(
+            candidates,
+            &mut self.provider_memory,
+            std::time::Instant::now(),
+        );
+        let total = ordered.len();
+        for (index, blob) in ordered.iter().enumerate() {
             if let Some(deadline) = budget {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let share = candidate_share(remaining, index, total);
@@ -768,6 +908,9 @@ impl IrohBulkSource {
                         error = %error,
                         "bulk candidate failed"
                     );
+                    // Learning lives in `fetch` (dial-phase route
+                    // evidence only): the walk orders from the memory
+                    // but never writes it.
                     last_error = Some(error)
                 }
             }
@@ -818,7 +961,7 @@ impl IrohBulkSource {
         }
     }
 
-    fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
+    fn fetch(&mut self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
         // The ceiling is enforced twice: the verified size rejects an
         // oversize blob before anything transfers, and the bounded
         // accumulator below pre-sizes from that verified size and
@@ -833,6 +976,7 @@ impl IrohBulkSource {
         // hex ids, so a served-but-uncounted blob and a repeatedly
         // restarted one both trace to provider and representation.
         let provider_hex = hex32(provider.id.as_bytes());
+        let provider_id = *provider.id.as_bytes();
         let hash_hex = hex32(hash.as_bytes());
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
@@ -961,6 +1105,16 @@ impl IrohBulkSource {
         });
         stats.record(&outcome);
         trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
+        // The memory learns here, where phase and error class meet:
+        // dial-phase route evidence only (see provider_lesson). The
+        // walk orders from it but never writes it — single-route
+        // fetches train the same memory, since dial reachability is
+        // provider-level, independent of the representation asked for.
+        match provider_lesson(&result, &outcome) {
+            ProviderLesson::Clear => clear_provider_mark(&mut self.provider_memory, &provider_id),
+            ProviderLesson::Mark => mark_provider_failed(&mut self.provider_memory, &provider_id),
+            ProviderLesson::Ignore => {}
+        }
         result
     }
 }
@@ -1043,15 +1197,11 @@ impl BulkSource for IrohBulkSource {
         snapshot: &SnapshotId,
         max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
-        let Some((content_id, blob)) = self.roots.get(snapshot) else {
+        let Some((content_id, blob)) = self.roots.get(snapshot).cloned() else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(|sealed| {
-            Some(SealedManifest {
-                content_id: *content_id,
-                sealed,
-            })
-        })
+        self.fetch(&blob, max)
+            .map(|sealed| Some(SealedManifest { content_id, sealed }))
     }
 
     fn fetch_snapshot(
@@ -1059,10 +1209,10 @@ impl BulkSource for IrohBulkSource {
         snapshot: &SnapshotId,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(blob) = self.snapshots.get(snapshot) else {
+        let Some(blob) = self.snapshots.get(snapshot).cloned() else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(Some)
+        self.fetch(&blob, max).map(Some)
     }
 
     fn fetch_sealed(

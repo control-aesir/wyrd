@@ -548,6 +548,36 @@ before it is ready, so it can never inherit the dead instance's
 readiness. Operator `stop` stays the supervisor's job (`systemctl
 stop` delivers SIGTERM and waits for the documented teardown).
 
+### `update` — upgrade from a local archive, quiesced and verified
+
+One command that replaces this installation's binary from a local
+release archive the operator supplies — no download, no signed
+manifest (those are post-v1 distribution work). Quiescence is a
+precondition update checks, never a state it produces: the old
+process must already be stopped, and a held store lock refuses
+with `stop the service first`. The full sequence — stage, swap,
+verify against the actual store, commit or roll back, hand back
+to the supervisor — is specified in `docs/update.md`; what ships
+today is step 1, the artifact contract:
+
+```text
+update
+    = resolve `--archive` before anything is stopped: the path
+      must be a regular file under its canonical name
+      (`wyrd-<version>-<os>-<arch>.tar.gz`); anything else is a
+      usage error naming the expected shape
+    = report the artifact identity (version, target, blake3,
+      bytes) plus an honestly unverified compatibility line —
+      the resolve step runs no checks, and says so
+    = touch nothing: no process stopped, no store opened, no
+      lock taken (the drive directory gets an existence check
+      only)
+```
+
+The blake3 digest names the artifact in reports; it is an
+identity, never trust — a locally supplied archive is verified
+structurally, and integrity stays separate from compatibility.
+
 ### `pin` / `unpin` / `evict` / `cache` — local materialization policy
 
 What this device intends to retain, declared per subtree and stored

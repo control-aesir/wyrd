@@ -1,9 +1,10 @@
 use super::codec::{encode_commit, TAG_SNAPSHOT_BODY, TAG_TRANSITION};
 use super::store::{atomic_write, commit_name, DurableStore};
 use super::{
-    reconciliation_statement_digest, AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot,
-    CrashStage, DurableError, Fact, LoadedFacts, ReconciliationError, ReconciliationEvidence,
-    ReconciliationView, SealedCapabilityFactId, ViewProvenance,
+    probe_lock, reconciliation_statement_digest, AuthorizeSnapshot, AuthorizedCapability,
+    AuthorizedSnapshot, CrashStage, DurableError, Fact, LoadedFacts, LockProbe,
+    ReconciliationError, ReconciliationEvidence, ReconciliationView, SealedCapabilityFactId,
+    ViewProvenance,
 };
 use crate::authorization::test_util::sign_snapshot;
 use crate::authorization::{Classification, Rejection, SnapshotDag};
@@ -85,6 +86,23 @@ fn lock_releases_on_drop() {
     // openable again.
     let reopened = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     assert_eq!(reopened.current(), 0);
+}
+
+/// The update quiescence probe agrees with the lock in both states
+/// and leaves nothing behind: no state read, no key minted, no lock
+/// held after it returns — so `wyrd update` can fail fast on a live
+/// drive without disturbing it.
+#[test]
+fn lock_probe_agrees_with_the_lock_and_holds_nothing() {
+    let dir = TestDir::new("lock-probe");
+    assert_eq!(probe_lock(&dir.path).unwrap(), LockProbe::Free);
+    // The probe created the lock file but holds no lock: the store
+    // still opens, and no DRIVE was written by the probe.
+    assert!(!dir.path.join("DRIVE").exists());
+    let holder = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
+    assert_eq!(probe_lock(&dir.path).unwrap(), LockProbe::Held);
+    drop(holder);
+    assert_eq!(probe_lock(&dir.path).unwrap(), LockProbe::Free);
 }
 
 fn owner() -> DeviceId {

@@ -258,6 +258,48 @@ pub(crate) fn restrict_dir_owner_only(
     Ok(())
 }
 
+/// Advisory store-ownership probe for `wyrd update`
+/// (`docs/update.md` §3): create-owner-only-if-missing, `try_lock`,
+/// release immediately. Held means a live process owns the drive;
+/// Free means nothing holds it *right now* — advisory only, the
+/// verification open is the authority. Reads no state and writes
+/// nothing but the lock file's creation; in particular it never
+/// runs `DurableStore::open`, which mints keys and writes DRIVE on
+/// fresh directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockProbe {
+    Free,
+    Held,
+}
+
+pub fn probe_lock(dir: &Path) -> Result<LockProbe, DurableError> {
+    let lock = open_lock_file(dir)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(LockProbe::Free),
+        // Definite contention, same authority as the open path.
+        Err(std::fs::TryLockError::WouldBlock) => Ok(LockProbe::Held),
+        Err(std::fs::TryLockError::Error(error)) => Err(DurableError::Io(error)),
+    }
+}
+
+/// Claim the LOCK file handle; the flock itself happens at the call
+/// site so `open` (exclusive, held for life) and `probe_lock`
+/// (advisory, released immediately) share the creation semantics.
+fn open_lock_file(dir: &Path) -> Result<File, DurableError> {
+    // LOCK is created owner-only: a world-writable lock lets another
+    // local user interfere with the exclusive-ownership guarantee.
+    // An existing lock keeps its mode.
+    let mut lock_opts = File::options();
+    lock_opts
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false);
+    #[cfg(unix)]
+    lock_opts.mode(SECRET_FILE_MODE);
+    lock_opts.open(dir.join("LOCK")).map_err(DurableError::Io)
+}
+
 impl DurableStore {
     /// The drive directory the store lives in.
     pub(crate) fn dir(&self) -> &Path {
@@ -292,15 +334,7 @@ impl DurableStore {
         // LOCK is created owner-only: a world-writable lock lets another
         // local user interfere with the exclusive-ownership guarantee
         // this open exists to provide. An existing lock keeps its mode.
-        let mut lock_opts = File::options();
-        lock_opts
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false);
-        #[cfg(unix)]
-        lock_opts.mode(SECRET_FILE_MODE);
-        let lock = lock_opts.open(dir.join("LOCK"))?;
+        let lock = open_lock_file(&dir)?;
         match lock.try_lock() {
             Ok(()) => {}
             // Definite contention: another holder owns the directory.

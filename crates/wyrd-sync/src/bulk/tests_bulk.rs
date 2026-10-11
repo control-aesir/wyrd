@@ -1144,6 +1144,112 @@ fn fetch_candidates_tries_providers_in_order_and_falls_through() {
     );
 }
 
+/// One candidate addressed to a routeless provider key: dialing it
+/// fails fast without packets (no addresses, no lookup), so walk
+/// tests below prove record behavior with no network traffic.
+fn dead_ref(seed: u8) -> IrohBlobRef {
+    IrohBlobRef {
+        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public()),
+        hash: [0xAA; 32],
+    }
+}
+
+fn ordered_ids(blobs: &[IrohBlobRef]) -> Vec<iroh::PublicKey> {
+    blobs.iter().map(|blob| blob.provider.id).collect()
+}
+
+#[test]
+fn order_candidates_keeps_publication_order_without_marks() {
+    let (a, b, c) = (dead_ref(0xA1), dead_ref(0xB2), dead_ref(0xC3));
+    let mut memory = HashMap::new();
+    let now = std::time::Instant::now();
+    assert_eq!(
+        ordered_ids(&order_candidates(
+            &[a.clone(), b.clone(), c.clone()],
+            &mut memory,
+            now
+        )),
+        vec![a.provider.id, b.provider.id, c.provider.id],
+        "no evidence means publication order"
+    );
+}
+
+#[test]
+fn order_candidates_sinks_marked_providers_stably() {
+    let (a, b, c) = (dead_ref(0xA1), dead_ref(0xB2), dead_ref(0xC3));
+    let mut memory = HashMap::new();
+    let now = std::time::Instant::now();
+    // Failures observed out of order: the sunk tier still walks in
+    // publication order behind the unmarked.
+    record_provider_failure(
+        &mut memory,
+        c.provider.id.as_bytes(),
+        &BulkError::Transport("down".into()),
+    );
+    record_provider_failure(
+        &mut memory,
+        a.provider.id.as_bytes(),
+        &BulkError::Transport("down".into()),
+    );
+    assert_eq!(
+        ordered_ids(&order_candidates(
+            &[a.clone(), b.clone(), c.clone()],
+            &mut memory,
+            now
+        )),
+        vec![b.provider.id, a.provider.id, c.provider.id],
+        "marked providers sink stably behind unmarked ones"
+    );
+}
+
+#[test]
+fn order_candidates_prunes_expired_marks() {
+    let (a, b) = (dead_ref(0xA1), dead_ref(0xB2));
+    let mut memory = HashMap::new();
+    let now = std::time::Instant::now();
+    memory.insert(
+        *a.provider.id.as_bytes(),
+        ProviderMark {
+            failed_at: now - PROVIDER_BAD_MARK_TTL - std::time::Duration::from_secs(1),
+        },
+    );
+    assert_eq!(
+        ordered_ids(&order_candidates(&[a.clone(), b.clone()], &mut memory, now)),
+        vec![a.provider.id, b.provider.id],
+        "an expired mark recovers publication order"
+    );
+    assert!(
+        memory.is_empty(),
+        "ordering prunes what it no longer believes"
+    );
+}
+
+#[test]
+fn record_provider_failure_keeps_only_completed_observations() {
+    let id = *dead_ref(0xA1).provider.id.as_bytes();
+    let mut memory = HashMap::new();
+    // A sliced-deadline expiry is budget evidence: the walk
+    // subdivided the attempt, so it says nothing about the route.
+    record_provider_failure(
+        &mut memory,
+        &id,
+        &BulkError::Deadline {
+            slice: std::time::Duration::from_secs(1),
+        },
+    );
+    assert!(memory.is_empty(), "deadline lays no mark");
+    // Oversize is a property of the representation, identical from
+    // every provider.
+    record_provider_failure(&mut memory, &id, &BulkError::Oversize { bytes: 5, max: 1 });
+    assert!(memory.is_empty(), "oversize lays no mark");
+    // An instant transport failure completed its observation.
+    record_provider_failure(&mut memory, &id, &BulkError::Transport("refused".into()));
+    assert_eq!(memory.len(), 1, "transport failure marks");
+    // Liveness observed beats failure remembered.
+    clear_provider_mark(&mut memory, &id);
+    assert!(memory.is_empty(), "fulfillment clears the mark");
+}
+
 #[test]
 fn iroh_source_falls_back_across_providers_for_one_root() {
     use iroh::{endpoint::presets, protocol::Router, Endpoint};
@@ -1230,6 +1336,114 @@ fn iroh_source_falls_back_across_providers_for_one_root() {
     runtime.block_on(async {
         router_a.shutdown().await.unwrap();
         server_a.close().await;
+    });
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn failed_walk_marks_every_completed_provider() {
+    use iroh::{endpoint::presets, Endpoint};
+
+    // Two routeless providers: both dials fail fast without packets,
+    // and both failures are completed observations — instant
+    // transport errors, never sliced-deadline expiries.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = runtime
+        .block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+        })
+        .unwrap();
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime);
+    let (a, b) = (dead_ref(0xD1), dead_ref(0xD2));
+    let root = BaoRoot::from_bytes(a.hash);
+    source.publish_transport(a.clone());
+    source.publish_transport(b.clone());
+    let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        matches!(error, BulkError::Transport(_)),
+        "instant dial failures stay transport errors: {error:?}"
+    );
+    assert!(
+        source.provider_mark(a.provider.id.as_bytes()).is_some()
+            && source.provider_mark(b.provider.id.as_bytes()).is_some(),
+        "the walk trains the memory from what it attempted"
+    );
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn fulfilled_walk_clears_the_mark_and_never_skips() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+    // Dead-first publication with the LIVE provider pre-marked: the
+    // worst case for the order (both sunk, publication order kept)
+    // still reaches the live route, and fulfillment clears its mark
+    // while the dead one stays sunk.
+    let content = b"sunk live routes are still tried";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router, hash) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let store = MemStore::new();
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+            .spawn();
+        let tag = store.add_slice(content).await.unwrap();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router, tag.hash)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let root = BaoRoot::from_bytes(*hash.as_bytes());
+    let mut dead = dead_ref(0xD3);
+    // Same representation, or the walk files it under another root
+    // and never attempts it.
+    dead.hash = *hash.as_bytes();
+    let live = IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: *hash.as_bytes(),
+    };
+    source.publish_transport(dead.clone());
+    source.publish_transport(live.clone());
+    source.provider_memory.insert(
+        *live.provider.id.as_bytes(),
+        ProviderMark {
+            failed_at: std::time::Instant::now(),
+        },
+    );
+    assert_eq!(
+        source.fetch_transport(&root, usize::MAX).unwrap(),
+        Some(content.to_vec())
+    );
+    assert!(
+        source.provider_mark(live.provider.id.as_bytes()).is_none(),
+        "fulfillment clears the live provider's mark"
+    );
+    assert!(
+        source.provider_mark(dead.provider.id.as_bytes()).is_some(),
+        "the dead provider's completed failure stays learned"
+    );
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
     });
     source.shutdown(std::time::Duration::from_secs(10));
 }

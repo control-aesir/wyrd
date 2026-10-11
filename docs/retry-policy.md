@@ -43,8 +43,10 @@ walk in `wyrd-sync`.
    position sets the bound, so ordering moves which candidate's
    error class surfaces on total failure — in the evidence's
    direction (sunk dead tail reads fault, live head reads budget).
-   Walk-only learning: single-route fetches neither lay nor clear
-   marks.
+   Learning happens in `fetch`, so any attempt trains the memory —
+   walk or single-route: dial reachability is provider-level,
+   independent of the representation asked for, and fulfillment
+   clears from either path.
 3. **Cross-pass resume — deferred behind this note.** No
    `BulkSource` trait change, no partial-buffer ledger, no
    ranged-fetch implementation until the questions below are

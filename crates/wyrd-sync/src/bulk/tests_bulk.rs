@@ -1407,13 +1407,38 @@ fn failed_walk_marks_every_completed_provider() {
             && source.provider_mark(b.provider.id.as_bytes()).is_some(),
         "the walk trains the memory from what it attempted"
     );
-    // A second walk finds the same marks: memory spans passes, and
-    // re-attempting refreshes rather than duplicates.
-    let _ = source.fetch_transport(&root, usize::MAX).unwrap_err();
-    assert!(
-        source.provider_mark(a.provider.id.as_bytes()).is_some()
-            && source.provider_mark(b.provider.id.as_bytes()).is_some(),
-        "marks persist across walks"
+    // Marks laid by one walk survive an unrelated walk: a
+    // different root with no routes attempts nothing (absence), so
+    // a memory that reset per walk would come back empty while a
+    // persisting one keeps the same timestamps. Re-walking the same
+    // root would prove nothing — re-attempting refreshes the marks
+    // either way.
+    let marked_a = source
+        .provider_mark(a.provider.id.as_bytes())
+        .map(|mark| mark.failed_at);
+    let marked_b = source
+        .provider_mark(b.provider.id.as_bytes())
+        .map(|mark| mark.failed_at);
+    assert_eq!(
+        source
+            .fetch_transport(&BaoRoot::from_bytes([0xBB; 32]), usize::MAX)
+            .unwrap(),
+        None,
+        "unrouted root is absence"
+    );
+    assert_eq!(
+        source
+            .provider_mark(a.provider.id.as_bytes())
+            .map(|mark| mark.failed_at),
+        marked_a,
+        "walk-one marks survive unrelated walks"
+    );
+    assert_eq!(
+        source
+            .provider_mark(b.provider.id.as_bytes())
+            .map(|mark| mark.failed_at),
+        marked_b,
+        "walk-one marks survive unrelated walks"
     );
     source.shutdown(std::time::Duration::from_secs(10));
 }
@@ -1546,6 +1571,83 @@ fn sunk_dead_provider_is_tried_last() {
             .map(|mark| mark.failed_at),
         Some(laid_at),
         "the sunk dead route was never attempted"
+    );
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
+    });
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn single_route_failure_marks_for_later_walks() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+    // The mark's other write path: a single-route fetch (no walk
+    // involved) lays it through the same `fetch`, and a later walk
+    // for another address reads it — the dead route sinks there
+    // too. Same refresh trick as the walk-laid case: serving first
+    // leaves the backdated... here freshly-laid, mark untouched.
+    let content = b"single-route marks sink later walks";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router, hash) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let store = MemStore::new();
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+            .spawn();
+        let tag = store.add_slice(content).await.unwrap();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router, tag.hash)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    // One routeless provider on the single-route address: the dial
+    // fails fast without packets, laying the mark with no walk.
+    let snapshot = SnapshotId::from_bytes([0xE4; 32]);
+    let mut dead = dead_ref(0xD5);
+    source.snapshots.insert(snapshot, dead.clone());
+    let error = source.fetch_snapshot(&snapshot, usize::MAX).unwrap_err();
+    assert!(
+        matches!(error, BulkError::Transport(_)),
+        "instant dial failure stays a transport error: {error:?}"
+    );
+    let laid_at = source
+        .provider_mark(dead.provider.id.as_bytes())
+        .map(|mark| mark.failed_at);
+    assert!(laid_at.is_some(), "single-route failure lays the mark");
+    // The same provider on a walked address, published dead-first
+    // beside the live route: the walk serves first and never
+    // refreshes the single-route mark.
+    dead.hash = *hash.as_bytes();
+    let root = BaoRoot::from_bytes(*hash.as_bytes());
+    source.publish_transport(dead.clone());
+    source.publish_transport(IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: *hash.as_bytes(),
+    });
+    assert_eq!(
+        source.fetch_transport(&root, usize::MAX).unwrap(),
+        Some(content.to_vec())
+    );
+    assert_eq!(
+        source
+            .provider_mark(dead.provider.id.as_bytes())
+            .map(|mark| mark.failed_at),
+        laid_at,
+        "the single-route mark sank the later walk"
     );
     runtime.block_on(async {
         router.shutdown().await.unwrap();

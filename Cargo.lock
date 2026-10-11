@@ -5194,6 +5194,7 @@ dependencies = [
 name = "wyrd-cli"
 version = "0.2.0-alpha"
 dependencies = [
+ "blake3",
  "clap",
  "fuser",
  "getrandom 0.2.17",

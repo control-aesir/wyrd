@@ -462,3 +462,64 @@ fn vault_start_is_default_and_status_queries() {
         other => panic!("vault start must parse, got: {other:?}"),
     }
 }
+
+/// `wyrd update` takes a drive and a local archive path (U1=B): no
+/// download source, no credentials at the resolve stage. Resolution
+/// reports the artifact identity and touches nothing else.
+#[test]
+fn update_resolves_a_canonical_archive() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    let archive = temp.0.join("wyrd-0.3.0-alpha-linux-aarch64.tar.gz");
+    fs::write(&archive, b"fake-archive").unwrap();
+
+    let cli = Cli::try_parse_from([
+        "wyrd",
+        "update",
+        drive.to_str().unwrap(),
+        "--archive",
+        archive.to_str().unwrap(),
+    ])
+    .unwrap();
+    let Command::Update {
+        drive_dir,
+        archive: parsed,
+    } = cli.command
+    else {
+        panic!("update must parse");
+    };
+    assert_eq!(drive_dir, drive);
+    assert_eq!(parsed, archive);
+    command(vec![
+        "update".into(),
+        drive.display().to_string(),
+        "--archive".into(),
+        archive.display().to_string(),
+    ])
+    .unwrap();
+}
+
+/// A noncanonical archive name stops the update before anything is
+/// disturbed, and the error names the expected shape.
+#[test]
+fn update_rejects_a_noncanonical_archive() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    let archive = temp.0.join("abc123-wyrd-dist.tar.gz");
+    fs::write(&archive, b"fake-archive").unwrap();
+
+    let error = command(vec![
+        "update".into(),
+        drive.display().to_string(),
+        "--archive".into(),
+        archive.display().to_string(),
+    ])
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("wyrd-<version>-<os>-<arch>.tar.gz"),
+        "{message}"
+    );
+}

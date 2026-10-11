@@ -12,6 +12,7 @@ use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
 use crate::probes::TeardownStatus;
+use crate::update::{check_drive_dir, resolve_archive};
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
@@ -262,6 +263,22 @@ enum Command {
         action: CacheAction,
         #[command(flatten)]
         credentials: Credentials,
+    },
+    /// Upgrade this installation from a local release archive:
+    /// quiesce, flush, stop, swap the binary atomically, verify the
+    /// new build against the actual store, and hand back to the
+    /// supervisor (U1=B: the operator supplies the archive; U3=B:
+    /// this command never supervises). Step 1 resolves and validates
+    /// the archive only — no process is stopped and no store is
+    /// opened — and reports the artifact identity.
+    Update {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Local release archive under its canonical name
+        /// (`wyrd-<version>-<os>-<arch>.tar.gz`): resolved and
+        /// validated before anything is stopped.
+        #[arg(long, value_name = "PATH")]
+        archive: PathBuf,
     },
 }
 
@@ -667,6 +684,11 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Err(error) => return Err(CliError::Usage(error.to_string())),
     };
     let (identity, passphrase) = match &cli.command {
+        // Update resolves its archive before anything else:
+        // validation must run before the running service is
+        // disturbed, it needs no secrets, and its failures are usage
+        // errors — never a half-started transaction.
+        Command::Update { drive_dir, archive } => return update_resolve(drive_dir, archive),
         Command::Init { credentials, .. } => read_credentials(credentials)?,
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
@@ -682,6 +704,10 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
     };
 
     match cli.command {
+        // Dead by construction: the credentials match above returns
+        // from update before secrets load. The arm exists only
+        // because the match is exhaustive.
+        Command::Update { .. } => unreachable!("update resolves before credential loading"),
         Command::Init { drive_dir, .. } => {
             Engine::create(drive_dir, &passphrase, identity)?;
             Ok(())
@@ -784,6 +810,28 @@ fn read_credentials(
     // plain `String`. Callers pass `&passphrase` as `&str` through
     // deref coercion.
     Ok((identity, Zeroizing::new(passphrase.to_owned())))
+}
+
+/// Step 1 of `wyrd update` (U1): resolve and validate the archive and
+/// report its identity. No process is stopped, no store is opened,
+/// no lock is taken — the drive directory gets an existence check
+/// only. The compatibility line is honestly unverified: the resolve
+/// step runs no checks, and step 3 replaces it with the real
+/// invariant report. The swap transaction (U2/U3) builds on this
+/// identity later.
+fn update_resolve(drive_dir: &Path, archive: &Path) -> Result<(), CliError> {
+    check_drive_dir(drive_dir)?;
+    let identity = resolve_archive(archive)?;
+    println!("update archive: {}", identity.canonical_name);
+    println!("update version: {}", identity.version);
+    println!("update target: {}-{}", identity.os, identity.arch);
+    println!("update blake3: {}", identity.blake3);
+    println!("update bytes: {}", identity.bytes);
+    println!(
+        "{}",
+        update::render_compatibility(&update::CompatibilityStatus::Unverified)
+    );
+    Ok(())
 }
 
 /// Read a bounded credential file without following symlinks. On Unix the
@@ -4269,6 +4317,7 @@ fn main() {
 mod logging;
 mod posture;
 mod probes;
+mod update;
 
 #[cfg(test)]
 mod tests_cli;

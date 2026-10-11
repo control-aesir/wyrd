@@ -161,10 +161,14 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
         // The posture sidecar (22c) adds three deliberate edges, all
         // confined to the binary: `serde`/`serde_json` for the
         // schema-versioned sidecar file, `getrandom` for the fresh
-        // per-process instance id. No other crate may follow.
+        // per-process instance id. `wyrd update` (29) adds `blake3`:
+        // the artifact digest that names the archive in reports and
+        // the transaction log — an identity, never trust. No other
+        // crate may follow.
         "wyrd-cli" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format", "wyrd-sync", "wyrd-core", "wyrd-daemon"],
             external_allow: &[
+                "blake3",
                 "clap",
                 "fuser",
                 "getrandom",

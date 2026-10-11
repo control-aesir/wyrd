@@ -32,7 +32,15 @@ version say exactly what changed.
   sink other representations, fulfillment clears); marks expire
   after 5 minutes and republication clears nothing. Strike
   counting and engine cooldowns unchanged.
-
+- `wyrd update <drive> --archive <path>` (29, step 1: artifact
+  contract only): resolves a local release archive under its
+  canonical name (`wyrd-<version>-<os>-<arch>.tar.gz`), validates
+  the name before anything is stopped, and reports the artifact
+  identity (version, target, blake3, bytes) with an honestly
+  unverified compatibility line — the resolve step runs no checks.
+  Noncanonical names (including hash-prefixed nix store basenames)
+  are usage errors naming the expected shape. No process is
+  stopped, no store is opened, no lock is taken.
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault
@@ -349,6 +357,12 @@ version say exactly what changed.
   --serve` re-park) exiting degraded within a second of startup,
   including runs that attached and delivered mid-run before any
   supervisor tick observed the attachment.
+- Release `dist/` archives are copied under canonical names
+  (`wyrd-<version>-<os>-<arch>.tar.gz`): one mapping serves the
+  build copy, `--verify`, and the `--strict` gate, so the gate can
+  no longer drift from what the copy step produces. Unblocks
+  archive resolution by name for `wyrd update` and every `--strict`
+  release cut.
 
 ### Added
 

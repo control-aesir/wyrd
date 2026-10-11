@@ -14,6 +14,10 @@ wyrd-format.workspace = true
 wyrd-sync.workspace = true
 wyrd-core.workspace = true
 wyrd-daemon.workspace = true
+# Archive identity for `wyrd update`: blake3 names the artifact in
+# reports and the transaction log. The digest is an identity, never
+# trust — a locally supplied archive is verified structurally.
+blake3.workspace = true
 clap.workspace = true
 fuser = "0.18"
 getrandom.workspace = true

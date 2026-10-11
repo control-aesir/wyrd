@@ -427,3 +427,38 @@ fn every_src_file_is_a_declared_module() {
     }
     assert!(orphaned.is_empty(), "uncompiled modules: {orphaned:?}");
 }
+
+/// Bare `wyrd vault <drive>` keeps starting the process (the 22b
+/// surface); the subcommand selects the 22c query. Both shapes parse
+/// through one optional subcommand, not two commands.
+#[test]
+fn vault_start_is_default_and_status_queries() {
+    let creds = ["--identity-file", "/tmp/id", "--passphrase-file", "/tmp/pp"];
+    let parse = |extra: &[&str]| {
+        Cli::try_parse_from(
+            ["wyrd", "vault", "/srv/drive"]
+                .into_iter()
+                .chain(creds)
+                .chain(extra.iter().copied()),
+        )
+        .unwrap()
+    };
+    match parse(&[]).command {
+        Command::Vault { action: None, .. } => {}
+        other => panic!("bare vault must default to start, got: {other:?}"),
+    }
+    match parse(&["status"]).command {
+        Command::Vault {
+            action: Some(VaultAction::Status),
+            ..
+        } => {}
+        other => panic!("vault status must parse, got: {other:?}"),
+    }
+    match parse(&["start"]).command {
+        Command::Vault {
+            action: Some(VaultAction::Start),
+            ..
+        } => {}
+        other => panic!("vault start must parse, got: {other:?}"),
+    }
+}

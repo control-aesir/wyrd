@@ -887,6 +887,11 @@ leg_headless_setup() {
 #   rebuilt from the vault) → E fetches against the replacement →
 #   TERM → host admits D → serve#3 → D fetches pre-kill content →
 #   TERM, clean exit 0.
+# Issue 22c probes sit at the same joints: status against running
+# serve#1 (fresh posture without opening the store), status after
+# fetch-c (last-pass verdict present), status against serve#2 (new
+# instance, no inherited readiness), status after serve#2's TERM
+# (durable state back, last posture retained as last-recorded).
 # E is admitted before the leg (alongside C) so its obligations are
 # fresh for serve#2's route: E proves the replacement re-announced
 # (E reconciles over the new route) AND serves content (pre-kill
@@ -918,11 +923,38 @@ leg_headless_serve() {
     || die "serve#1 never bound its endpoint"
   pass "serve#1 reports ready with its route and keeps syncing"
   touch "$E2E_ROOT/headless-serve-ready"
+  # 22c: status against the running vault reads the sidecar without
+  # opening the store — exit 0, fresh posture, ready named, durable
+  # unavailable (never guessed). No last-pass verdict yet: posture
+  # publishes on loop events, and only the ready event has fired.
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-1.out" \
+    || die "vault status failed against running serve#1 (see headless-status-1.out)"
+  grep -q "^process: fresh posture" "$LOGDIR/headless-status-1.out" \
+    || die "status missed fresh posture on serve#1"
+  grep -q "^process: ready: [0-9][0-9]*$" "$LOGDIR/headless-status-1.out" \
+    || die "status missed serve#1's ready stamp"
+  grep -q "^process: liveness: unverified" "$LOGDIR/headless-status-1.out" \
+    || die "status claimed liveness it cannot see"
+  grep -q "^durable: unavailable (drive held by a running process" "$LOGDIR/headless-status-1.out" \
+    || die "status guessed durable state under the lock"
+  grep "^process: instance: " "$LOGDIR/headless-status-1.out" | head -n 1 > "$E2E_ROOT/headless-serve1-instance"
+  pass "status reads fresh ready posture off the running vault without opening the store"
   # C fetches the whole drive headless; only then is the kill
   # mid-flight (residency, not startup).
   poll_until 300 test -f "$E2E_ROOT/headless-fetch-c-done" \
     || die "fetch-c never finished against serve#1"
   pass "fetch-c converged against the serving headless peer"
+  # 22c: minutes in, posture events have published — the verdict
+  # line is populated (ok or failed with its class, whatever the
+  # loop observed) under the same instance. "None observed" here
+  # would mean the loop wedged without publishing.
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-2.out" \
+    || die "vault status failed against running serve#1 late (see headless-status-2.out)"
+  grep -Eq "^process: last pass: (ok at|failed \()" "$LOGDIR/headless-status-2.out" \
+    || die "status missed serve#1's last-pass verdict"
+  diff "$E2E_ROOT/headless-serve1-instance" <(grep "^process: instance: " "$LOGDIR/headless-status-2.out" | head -n 1) \
+    || die "serve#1's instance changed without a restart"
+  pass "status names the last-pass verdict on the long-running vault"
   local pid
   pid="$(cat "$PIDDIR/headless-serve.pid")"
   kill -KILL "$pid" 2>/dev/null || die "serve#1 pid already gone before KILL"
@@ -949,6 +981,20 @@ leg_headless_serve() {
     || die "serve#2 never reported ready after KILL (see headless-serve-2.err)"
   pass "serve#2 reports ready after KILL: the mirror rebuilt from the vault"
   touch "$E2E_ROOT/headless-serve2-ready"
+  # 22c: the replacement publishes under a new instance from its
+  # first write — status must name that instance with its own
+  # readiness, never the dead instance's file as its own.
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-3.out" \
+    || die "vault status failed against serve#2 (see headless-status-3.out)"
+  grep -q "^process: fresh posture" "$LOGDIR/headless-status-3.out" \
+    || die "status missed fresh posture on serve#2"
+  grep -q "^process: ready: [0-9][0-9]*$" "$LOGDIR/headless-status-3.out" \
+    || die "status missed serve#2's ready stamp"
+  grep "^process: instance: " "$LOGDIR/headless-status-3.out" | head -n 1 > "$E2E_ROOT/headless-serve2-instance"
+  if diff -q "$E2E_ROOT/headless-serve1-instance" "$E2E_ROOT/headless-serve2-instance" >/dev/null; then
+    die "serve#2 inherited serve#1's instance"
+  fi
+  pass "status names the replacement instance with its own readiness"
   # E fetches the whole drive against the replacement: E was
   # admitted before the leg so its obligations are fresh for
   # serve#2's route, and E starts empty so every object it pulls is
@@ -975,6 +1021,15 @@ leg_headless_serve() {
   rm -f "$PIDDIR/headless-serve.pid"
   pass "serve#2 shuts down clean on TERM"
   touch "$E2E_ROOT/headless-serve-stopped"
+  # 22c: drive free — durable state renders again beside serve#2's
+  # retained last posture (last-recorded, explicitly not live).
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-4.out" \
+    || die "vault status failed on the stopped drive (see headless-status-4.out)"
+  grep -q "^durable: stopped drive" "$LOGDIR/headless-status-4.out" \
+    || die "durable state missing on the stopped drive"
+  diff "$E2E_ROOT/headless-serve2-instance" <(grep "^process: instance: " "$LOGDIR/headless-status-4.out" | head -n 1) \
+    || die "serve#2's last posture did not survive its shutdown"
+  pass "status renders durable state beside the retained last posture"
   # The host admits D while the drive is free; serve#3 announces
   # D's fresh obligations with its own route.
   poll_until 300 test -f "$E2E_ROOT/headless-d-invited" \
@@ -1007,6 +1062,12 @@ leg_headless_serve() {
   check_no_leaks "$LOGDIR/headless-serve-1.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-serve-2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-serve-3.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  # The status surface carries serving ids and timestamps only, but
+  # it runs against live credentials — same leak bar as the logs.
+  check_no_leaks "$LOGDIR/headless-status-1.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-status-2.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-status-3.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-status-4.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 # leg_headless_fetch <drive> <creds> <relay> <tag> <ready-file> <done-file>:

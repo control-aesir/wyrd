@@ -16,9 +16,12 @@ wyrd-core.workspace = true
 wyrd-daemon.workspace = true
 clap.workspace = true
 fuser = "0.18"
+getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true
 nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 # Mount diagnostics: structured events to stderr plus a per-mount file,
 # and a bridge so fuser's log records land in the same record.

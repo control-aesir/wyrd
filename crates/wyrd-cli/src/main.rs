@@ -193,7 +193,9 @@ enum Command {
     /// (OD-22-B option A) — `sync now` stays the bounded one-shot,
     /// this never stops syncing until SIGINT/SIGTERM. Needs at least
     /// one `--relay`; states what the device is doing, never what it
-    /// guarantees (OD-22-E: retention promises wait for DG-4).
+    /// guarantees (OD-22-E: retention promises wait for DG-4). Bare
+    /// `wyrd vault <drive>` starts the process (the 22b surface);
+    /// `wyrd vault <drive> status` queries it (22c).
     Vault {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -201,9 +203,15 @@ enum Command {
         relays: RelayArgs,
         /// Optional log file, appended (never truncated): stderr
         /// always carries the ready line and failures for the
-        /// supervisor to capture (OD-22-D option A+C).
+        /// supervisor to capture (OD-22-D option A+C). Start-only:
+        /// status never writes diagnostics.
         #[arg(long, value_name = "PATH")]
         log_file: Option<PathBuf>,
+        /// Start (default) or query the vault. Relay and log-file
+        /// flags are start-only; on status the relays only label the
+        /// mailbox line, exactly as on `sync status`.
+        #[command(subcommand)]
+        action: Option<VaultAction>,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -452,6 +460,24 @@ enum DeviceAction {
         /// The sealed invitation file.
         invitation: PathBuf,
     },
+}
+
+/// One vault action. `Start` is the 22b process; `Status` is the 22c
+/// operator query: process posture from the sidecar (never the
+/// store) beside durable state when the drive is stopped. The two
+/// sections stay separate in the output — a fresh posture is not
+/// convergence, and durable state is unavailable (not guessed) while
+/// the vault holds the lock.
+#[derive(Debug, Subcommand)]
+enum VaultAction {
+    /// Start the persistent vault process. The default when no
+    /// subcommand is given, so the shipped `wyrd vault <drive>`
+    /// keeps starting.
+    Start,
+    /// Report the running process's posture and, when the drive is
+    /// stopped, its durable state. Never opens the store for the
+    /// process section; never claims liveness.
+    Status,
 }
 
 /// One headless sync action. Status observes durable state only;
@@ -708,8 +734,16 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             drive_dir,
             relays,
             log_file,
+            action,
             ..
-        } => vault(drive_dir, relays.relay, log_file, &passphrase, identity),
+        } => match action {
+            None | Some(VaultAction::Start) => {
+                vault(drive_dir, relays.relay, log_file, &passphrase, identity)
+            }
+            Some(VaultAction::Status) => {
+                vault_status(drive_dir, relays.relay, &passphrase, identity)
+            }
+        },
         Command::Pin {
             drive_dir, path, ..
         } => pin(drive_dir, &path, &passphrase, identity),
@@ -3055,13 +3089,36 @@ fn vault(
     // as mail lands.
     mailbox.attach_waker(Arc::clone(live.waker()));
     let bulk = bind_bulk_source()?;
+    // The posture sidecar (22c, decision B): this process claims it
+    // only now that the lock is held — a lock-refused starter never
+    // reaches here, so it can never clobber the winner's posture —
+    // and announces itself as starting, never ready. The first write
+    // carries the new instance id with no ready stamp, so a
+    // crash-then-restart cannot leave the dead instance looking
+    // current, and this instance cannot inherit its readiness.
+    // Entropy failure fails the start openly (see the recorder):
+    // without an instance id there is no honest posture to publish.
+    let recorder = Arc::new(
+        posture::PostureRecorder::new(&drive_dir, serving_id.clone()).map_err(|source| {
+            CliError::Io {
+                path: drive_dir.clone(),
+                source,
+            }
+        })?,
+    );
+    recorder.note_startup();
     // The observer's events are the operator surface (SD-2 option A):
     // one ready line after the first routed pass, periodic posture
     // while it runs, failures with the mount's reporting shape. All
     // three go to stderr (the supervisor captures them) and the event
-    // stream the log file carries.
+    // stream the log file carries — and each also publishes one
+    // sidecar generation, so `vault status` sees what the logs see.
     let emit: Arc<dyn Fn(VaultEvent) + Send + Sync> = Arc::new(move |event| match event {
+        // The recorder runs before the prints in every arm: the log
+        // line then implies its sidecar generation already landed, so
+        // a watcher that sees "ready" never reads a pre-ready file.
         VaultEvent::Ready { serving_id } => {
+            recorder.note_ready();
             eprintln!("vault ready: serving {serving_id}");
             tracing::info!(stage = "ready", iroh_id = %serving_id, "vault ready");
         }
@@ -3071,6 +3128,7 @@ fn vault(
             sent,
             uptime_secs,
         } => {
+            recorder.note_posture(passes, errors, sent, uptime_secs);
             eprintln!(
                 "vault posture: {passes} passes, {errors} errors retried, {sent} sends, uptime {uptime_secs}s"
             );
@@ -3088,6 +3146,7 @@ fn vault(
             consecutive,
             error,
         } => {
+            recorder.note_failure(class.clone(), consecutive);
             eprintln!("live sync pass failed ({class} class, {consecutive} consecutive): {error}");
             tracing::warn!(
                 stage = "sync",
@@ -3134,6 +3193,54 @@ fn vault(
         session_result: Ok(()),
         serving_result: outcome.transport.serving.map_err(CliError::Serving),
     })
+}
+
+/// `vault status`: process posture from the sidecar beside durable
+/// state, the two strictly separated. The process section never opens
+/// the store — a running vault's exclusivity is undisturbed by the
+/// query — and never claims liveness: fresh means recent, stale means
+/// last-recorded, and both say liveness unverified. The durable
+/// section reuses `sync status`'s observation verbatim when the drive
+/// is stopped (nothing new is revealed), and reports unavailable —
+/// never guessed — while the vault holds the lock. The relay list
+/// only labels the mailbox line, exactly as on `sync status`.
+fn vault_status(
+    drive_dir: PathBuf,
+    relays: Vec<String>,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    print!(
+        "{}",
+        vault_status_report(drive_dir, relays, passphrase, identity)?
+    );
+    Ok(())
+}
+
+/// Build the status report as a string (the printer above is the
+/// only stdout edge): process posture from the sidecar beside
+/// durable state, the two strictly separated.
+fn vault_status_report(
+    drive_dir: PathBuf,
+    relays: Vec<String>,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<String, CliError> {
+    let sidecar = posture::sidecar_path(&drive_dir);
+    let process = posture::read_posture(&sidecar);
+    let mut out = posture::render_process_section(&process, &sidecar);
+    match Engine::open_keystore(drive_dir, passphrase, identity) {
+        Ok(engine) => {
+            let status = observe(&engine, relays.len())?;
+            out.push_str("durable: stopped drive (same facts `sync status` reports)\n");
+            out.push_str(&sync_status_render(&status));
+        }
+        Err(EngineError::Durable(DurableError::StoreLocked)) => {
+            out.push_str("durable: unavailable (drive held by a running process: the lock is exclusive, so durable state needs a stopped drive)\n");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(out)
 }
 
 /// Administer drive membership offline over the keystore: reads
@@ -4070,6 +4177,7 @@ fn main() {
 }
 
 mod logging;
+mod posture;
 mod probes;
 
 #[cfg(test)]

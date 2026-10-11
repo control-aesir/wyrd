@@ -14,6 +14,9 @@ One page. Read this, then the focused docs:
   authorization, classification, recovery
 - `fetch-on-open.md` — **normative** demand-driven fetch design:
   announcement endpoints, daemon serving, want channel, blocking open
+- `retry-policy.md` — retry policy (roadmap item 2): dial/transfer
+  split, provider freshness ordering, deferred cross-pass resume
+  with its evidence threshold
 - `write-path.md` — **normative** mounted write design: write session,
   mutation queue, commit pipeline and durability ordering, namespace
   operations, conflicted-drive policy

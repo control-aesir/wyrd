@@ -520,6 +520,17 @@ fn fetch_classifies_expiry_by_bound_not_budget() {
 }
 
 #[test]
+fn hex32_renders_64_lowercase_zero_padded_chars() {
+    // The join key every forensics correlation depends on: exact
+    // width, lowercase, zero-padded — a mis-render would silently
+    // break the provider/hash joins across the route, candidate,
+    // and attempt lines.
+    assert_eq!(hex32(&[0xAB; 32]), "ab".repeat(32));
+    assert_eq!(hex32(&[0x00; 32]), "00".repeat(32));
+    assert_eq!(hex32(&[0x0F; 32]).len(), 64);
+}
+
+#[test]
 fn split_allowances_tile_the_attempt_budget() {
     use std::time::Duration;
 

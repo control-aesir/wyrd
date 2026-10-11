@@ -496,8 +496,10 @@ fn trace_attempt(
 /// Render 32 bytes as lowercase hex: the fetch forensics lines need
 /// provider and hash ids, and `hex` stays inside `wyrd-format` by the
 /// crate rules, so this preallocated manual form is the cheapest
-/// available. One allocation per id, never one per byte.
-fn hex32(bytes: &[u8; 32]) -> String {
+/// available. One allocation per id, never one per byte. Crate-visible
+/// so the route-publication line (`transport::routes`) renders the
+/// same join key the same way.
+pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(64);
     for byte in bytes {

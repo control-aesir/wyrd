@@ -23,6 +23,12 @@ version say exactly what changed.
 
 ### Added
 
+- Step-15 unknown-parent legs report per-probe section timings
+  (`step15 probe <name>=<Ns>` in the leg logs): instrument-first
+  evidence for the last uninstrumented e2e chunk, no probe behavior
+  changed; helper grammar still pinned by
+  `tests/test-probe-mark.sh`, which now also pins the step-13 and
+  step-15 legs' overrides and exact mark counts.
 - Step-13 crash-injection legs report per-probe section timings
   (`step13 probe <name>=<Ns>` in the leg logs, attempt counts where a
   loop retries): instrument-first evidence for the crash-budget work,

@@ -503,8 +503,8 @@ vault
       retried, sends, uptime): proof of life, never a health claim
     = failures with the mount's reporting shape
     = one posture sidecar per drive at `<drive_dir>/vault.posture`
-      (see `status` below): published atomically on every loop
-      event, best-effort, never failing the vault
+      (see `status` below): published atomically with fsync on every
+      loop event, best-effort, never failing the vault
     = SIGTERM exits 0 when the loop stopped clean and every
       transport closed; a transport close that times out exits
       non-zero, after everything else still shut down. Exit 0 is
@@ -651,7 +651,8 @@ Both are read and hardened by wyrd code, never by clap:
   file under `--log-file` — never a drive-resident default, never
   truncated: a restart must not destroy the previous run's record.
   Separately, the running vault publishes `<drive_dir>/vault.posture`
-  (schema v1, atomic rename, best-effort): instance id, serving id,
+  (schema v1, temp write plus file and directory fsync plus atomic
+  rename, best-effort): instance id, serving id,
   startup/ready timestamps, last-pass timestamp and verdict, run
   counters, posture timestamp. Rebuildable runtime state, never
   authoritative — see `upgrade-contract.md`.

@@ -594,7 +594,9 @@ fn sync_status_refuses_a_locked_drive() {
 fn vault_status_reports_durable_state_on_stopped_drive() {
     let fixture = Fixture::new();
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let report = vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity).unwrap();
+    let (report, outcome) =
+        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    outcome.unwrap();
     assert!(
         report.contains("process: no posture recorded"),
         "no vault ever ran here:\n{report}"
@@ -602,6 +604,78 @@ fn vault_status_reports_durable_state_on_stopped_drive() {
     assert!(
         report.contains("durable: stopped drive"),
         "stopped drive, durable facts expected:\n{report}"
+    );
+}
+
+/// A timestamp-fresh sidecar on a provably stopped drive renders
+/// as retained history, never as a live process disagreeing with
+/// the durable section (finding 3's report-level pin).
+#[test]
+fn vault_status_on_stopped_drive_marks_fresh_posture_retained() {
+    let fixture = Fixture::new();
+    let recorder = super::posture::PostureRecorder::new(&fixture.drive, "aa".into()).unwrap();
+    recorder.note_startup();
+    recorder.note_ready();
+    recorder.note_posture(41, 0, 7, 312);
+    let identity = read_identity(&fixture.identity_file).unwrap();
+    let (report, outcome) =
+        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    outcome.unwrap();
+    assert!(
+        report.contains("process: retained posture"),
+        "proven-free drive reclassifies the file:\n{report}"
+    );
+    assert!(
+        report.contains("durable: stopped drive"),
+        "durable facts beside it:\n{report}"
+    );
+}
+
+/// A durable failure (wrong passphrase) still renders the process
+/// section: the sidecar needs no credentials. The outcome stays an
+/// error (fail closed) with the detail on stderr; stdout keeps only
+/// the bland durable line, never the error text.
+#[test]
+fn vault_status_renders_process_beside_durable_failure() {
+    let fixture = Fixture::new();
+    let recorder = super::posture::PostureRecorder::new(&fixture.drive, "aa".into()).unwrap();
+    recorder.note_startup();
+    recorder.note_ready();
+    recorder.note_posture(41, 0, 7, 312);
+    let identity = read_identity(&fixture.identity_file).unwrap();
+    let (report, outcome) =
+        vault_status_report(fixture.drive.clone(), vec![], "wrong-pass", identity);
+    assert!(outcome.is_err(), "a durable failure still fails closed");
+    assert!(
+        report.contains("process: fresh posture"),
+        "the credential-free section survives:\n{report}"
+    );
+    assert!(
+        report.contains("durable: unavailable (durable state unreadable; detail on stderr)"),
+        "the failure folds into its own line:\n{report}"
+    );
+}
+
+/// `--log-file` is start-only: status writes no diagnostics, so
+/// passing it with status is a usage error, not a silent ignore.
+#[test]
+fn vault_status_refuses_log_file() {
+    let fixture = Fixture::new();
+    let error = command(vec![
+        "vault".into(),
+        fixture.drive.display().to_string(),
+        "--identity-file".into(),
+        fixture.identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        fixture.passphrase_file.display().to_string(),
+        "--log-file".into(),
+        "/tmp/vault-ignored.log".into(),
+        "status".into(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(ref message) if message.contains("--log-file is start-only")),
+        "expected a start-only refusal, got: {error:?}"
     );
 }
 
@@ -621,7 +695,9 @@ fn vault_status_succeeds_while_locked_without_opening_the_store() {
     recorder.note_ready();
     recorder.note_posture(41, 0, 7, 312);
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let report = vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity).unwrap();
+    let (report, outcome) =
+        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    outcome.unwrap();
     assert!(
         report.contains("process: fresh posture"),
         "the sidecar reads through the lock:\n{report}"
@@ -648,7 +724,9 @@ fn vault_status_shows_replacement_instance_never_inherited_readiness() {
     let replacement = super::posture::PostureRecorder::new(&fixture.drive, "bb".into()).unwrap();
     replacement.note_startup();
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let report = vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity).unwrap();
+    let (report, outcome) =
+        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    outcome.unwrap();
     assert!(
         report.contains("serving: bb"),
         "the replacement instance speaks:\n{report}"

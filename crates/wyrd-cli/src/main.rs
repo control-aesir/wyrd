@@ -740,6 +740,12 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             None | Some(VaultAction::Start) => {
                 vault(drive_dir, relays.relay, log_file, &passphrase, identity)
             }
+            // `--log-file` lives on the parent command so clap cannot
+            // express this (same shape as `sync now`'s `--offline`
+            // guard above): refuse here rather than silently ignore.
+            Some(VaultAction::Status) if log_file.is_some() => Err(CliError::Usage(
+                "--log-file is start-only: status writes no diagnostics".into(),
+            )),
             Some(VaultAction::Status) => {
                 vault_status(drive_dir, relays.relay, &passphrase, identity)
             }
@@ -3210,37 +3216,63 @@ fn vault_status(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    print!(
-        "{}",
-        vault_status_report(drive_dir, relays, passphrase, identity)?
-    );
-    Ok(())
+    let (out, outcome) = vault_status_report(drive_dir, relays, passphrase, identity);
+    print!("{out}");
+    outcome
 }
 
-/// Build the status report as a string (the printer above is the
-/// only stdout edge): process posture from the sidecar beside
-/// durable state, the two strictly separated.
+/// Build the status report as a string beside its outcome (the
+/// printer above is the only stdout edge): process posture from the
+/// sidecar beside durable state, the two strictly separated. The
+/// outcome stays non-zero when durable state was unreadable, but the
+/// string still carries the process section — a durable failure must
+/// not take down what the sidecar read needs no credentials for.
 fn vault_status_report(
     drive_dir: PathBuf,
     relays: Vec<String>,
     passphrase: &str,
     identity: DeviceIdentitySecret,
-) -> Result<String, CliError> {
+) -> (String, Result<(), CliError>) {
     let sidecar = posture::sidecar_path(&drive_dir);
-    let process = posture::read_posture(&sidecar);
-    let mut out = posture::render_process_section(&process, &sidecar);
-    match Engine::open_keystore(drive_dir, passphrase, identity) {
-        Ok(engine) => {
-            let status = observe(&engine, relays.len())?;
+    // The durable probe first: its outcome classifies the sidecar. A
+    // successful open proves no process holds the lock, so a
+    // timestamp-fresh file renders as retained history instead of a
+    // live process disagreeing with a stopped drive. `None` is the
+    // held drive; any other failure keeps its error for the tail.
+    let durable: Result<Option<SyncStatus>, EngineError> =
+        match Engine::open_keystore(drive_dir, passphrase, identity) {
+            Ok(engine) => observe(&engine, relays.len()).map(Some),
+            Err(EngineError::Durable(DurableError::StoreLocked)) => Ok(None),
+            Err(error) => Err(error),
+        };
+    match durable {
+        Ok(Some(status)) => {
+            let process = posture::read_posture(&sidecar);
+            let mut out = posture::render_process_section(&process, true);
             out.push_str("durable: stopped drive (same facts `sync status` reports)\n");
             out.push_str(&sync_status_render(&status));
+            (out, Ok(()))
         }
-        Err(EngineError::Durable(DurableError::StoreLocked)) => {
+        Ok(None) => {
+            let process = posture::read_posture(&sidecar);
+            let mut out = posture::render_process_section(&process, false);
             out.push_str("durable: unavailable (drive held by a running process: the lock is exclusive, so durable state needs a stopped drive)\n");
+            (out, Ok(()))
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            // The sidecar needs no credentials, so a durable failure
+            // must not take the process section down with it: render
+            // what was readable, keep the failure detail on stderr
+            // (stdout stays within the no-paths surface), and still
+            // fail closed.
+            let failure: CliError = error.into();
+            eprintln!("durable state unreadable: {failure}");
+            let process = posture::read_posture(&sidecar);
+            let mut out = posture::render_process_section(&process, false);
+            out.push_str("durable: unavailable (durable state unreadable; detail on stderr)\n");
+            (out, Err(failure))
+        }
     }
-    Ok(out)
 }
 
 /// Administer drive membership offline over the keystore: reads

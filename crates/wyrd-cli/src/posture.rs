@@ -21,9 +21,9 @@
 //! - Authority: the sidecar is never authoritative for convergence,
 //!   membership, quota, or durable content. Durable queries stay under
 //!   the flock; when the vault runs, they report unavailable instead.
-//! - Lifecycle: atomic publish (temp file plus rename, so a crash can
-//!   only leave a stale previous generation or an ignored temp file,
-//!   never a torn read); instance-scoped (a fresh random id per
+//! - Lifecycle: atomic, fsync'd publish (temp write, file sync,
+//!   rename, directory sync, so a power loss lands the previous
+//!   generation or nothing); instance-scoped (a fresh random id per
 //!   process, written only after this process claims the lock, so a
 //!   restart can never inherit the previous instance's ready state);
 //!   best-effort (a failed write warns to the log and never fails the
@@ -54,6 +54,15 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// promptly. Explicit and documented (`docs/cli.md`): the threshold
 /// is part of the status contract, not a tuning knob.
 pub(crate) const POSTURE_FRESHNESS: Duration = Duration::from_secs(POSTURE_INTERVAL.as_secs() * 3);
+
+// The threshold is a whole-seconds multiple of a whole-seconds
+// interval today; if the interval ever goes sub-second this fails
+// the build instead of silently installing a 0s threshold that
+// marks every posture stale on arrival.
+const _: () = assert!(
+    POSTURE_FRESHNESS.as_secs() > 0,
+    "freshness threshold must stay positive"
+);
 
 /// Deterministic per-drive sidecar path. Reading it opens no store
 /// and takes no lock.
@@ -225,11 +234,16 @@ impl PostureRecorder {
         self.publish();
     }
 
-    /// One atomic generation: serialize under the lock, write the
-    /// temp file, rename over the sidecar. A crash lands either the
-    /// previous generation (rename never happened) or an ignored temp
-    /// file — never a torn read. Lock poisoning (a panicking holder)
-    /// publishes nothing rather than a half-updated file.
+    /// One atomic, durable generation: serialize under the lock,
+    /// write the temp file, fsync the file, rename over the sidecar,
+    /// fsync the directory. A crash or power loss lands either the
+    /// previous generation (rename never reached the journal) or an
+    /// ignored temp file — never a torn read, which is why the
+    /// reader trusts any complete file it finds. Lock poisoning (a
+    /// panicking holder) publishes nothing rather than a half-updated
+    /// file. Bounded by construction: fixed schema, fixed-length
+    /// ids, verdict class from a finite enum — no pass-through text
+    /// ever reaches the file.
     fn publish(&self) {
         let bytes = match self.state.lock() {
             Ok(state) => serde_json::to_vec_pretty(&PostureFile {
@@ -258,7 +272,18 @@ impl PostureRecorder {
         // the vault. One throttled-by-cadence warning (publishes only
         // happen on loop events) keeps the failure visible without
         // spamming the supervisor's capture.
-        if fs::write(&self.tmp, &bytes).is_err() || fs::rename(&self.tmp, &self.path).is_err() {
+        let durable = (|| -> io::Result<()> {
+            let mut tmp = fs::File::create(&self.tmp)?;
+            io::Write::write_all(&mut tmp, &bytes)?;
+            tmp.sync_all()?;
+            drop(tmp);
+            fs::rename(&self.tmp, &self.path)?;
+            if let Some(parent) = self.path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if durable.is_err() {
             tracing::warn!(
                 stage = "posture",
                 "posture sidecar publish failed; continuing without it"
@@ -316,8 +341,12 @@ pub(crate) fn read_posture(path: &Path) -> ProcessPosture {
 
 /// Render the process section: flat `process:` lines, greppable and
 /// strictly process facts. The liveness disclaimer is unconditional —
-/// even a fresh posture only proves recency.
-pub(crate) fn render_process_section(posture: &ProcessPosture, sidecar: &Path) -> String {
+/// even a fresh posture only proves recency. `proven_free` is true
+/// exactly when the durable probe already opened the store, which
+/// proves no process holds the lock: a timestamp-fresh file is then
+/// retained history, and the header says so instead of agreeing with
+/// a durable section that shows a stopped drive.
+pub(crate) fn render_process_section(posture: &ProcessPosture, proven_free: bool) -> String {
     fn age_line(posture_unix: u64) -> String {
         let age = now_unix().saturating_sub(posture_unix);
         format!("{posture_unix} ({age}s ago)")
@@ -325,12 +354,20 @@ pub(crate) fn render_process_section(posture: &ProcessPosture, sidecar: &Path) -
     let mut out = String::new();
     match posture {
         ProcessPosture::Fresh(file) => {
-            out.push_str(&format!(
-                "process: fresh posture {} (threshold {}s; liveness unverified)\n",
-                age_line(file.posture_unix),
-                POSTURE_FRESHNESS.as_secs()
-            ));
-            render_posture_facts(&mut out, file, sidecar);
+            if proven_free {
+                out.push_str(&format!(
+                    "process: retained posture {} (threshold {}s; drive not held by any process: last recorded state, not a live process; liveness unverified)\n",
+                    age_line(file.posture_unix),
+                    POSTURE_FRESHNESS.as_secs()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "process: fresh posture {} (threshold {}s; liveness unverified)\n",
+                    age_line(file.posture_unix),
+                    POSTURE_FRESHNESS.as_secs()
+                ));
+            }
+            render_posture_facts(&mut out, file);
         }
         ProcessPosture::Stale(file, _) => {
             out.push_str(&format!(
@@ -338,7 +375,7 @@ pub(crate) fn render_process_section(posture: &ProcessPosture, sidecar: &Path) -
                 age_line(file.posture_unix),
                 POSTURE_FRESHNESS.as_secs()
             ));
-            render_posture_facts(&mut out, file, sidecar);
+            render_posture_facts(&mut out, file);
         }
         ProcessPosture::Absent => {
             out.push_str(
@@ -357,8 +394,10 @@ pub(crate) fn render_process_section(posture: &ProcessPosture, sidecar: &Path) -
 /// The facts every fresh or stale file carries. Counts and
 /// timestamps only — the same surface the ready/posture log lines
 /// already print, so status reveals nothing log-reading does not.
-fn render_posture_facts(out: &mut String, file: &PostureFile, sidecar: &Path) {
-    out.push_str(&format!("process: source: {}\n", sidecar.display()));
+/// Deliberately no source path: the operator passed the drive
+/// directory, the file name is fixed, and the status surface never
+/// prints filesystem paths (`docs/cli.md`).
+fn render_posture_facts(out: &mut String, file: &PostureFile) {
     out.push_str(&format!("process: instance: {}\n", file.instance));
     out.push_str(&format!("process: serving: {}\n", file.serving_id));
     out.push_str(&format!("process: started: {}\n", file.started_unix));
@@ -519,7 +558,7 @@ mod tests {
             ProcessPosture::Stale(_, age) => assert!(age > threshold),
             other => panic!("expected stale past the threshold, got: {other:?}"),
         }
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("STALE"),
             "staleness must be unmissable:\n{rendered}"
@@ -531,6 +570,37 @@ mod tests {
     }
 
     #[test]
+    fn proven_free_renders_fresh_as_retained_history() {
+        // Finding 3's pin: the same timestamp-fresh file reads as a
+        // live-process posture while the drive may be held and as
+        // retained history once the open proved it free. The two
+        // readings must never agree with a stopped drive.
+        let dir = TempDir::new();
+        let recorder = PostureRecorder::new(&dir.0, "aa".into()).unwrap();
+        recorder.note_startup();
+        recorder.note_ready();
+        recorder.note_posture(41, 0, 7, 312);
+        let held = render_process_section(&read_posture(&sidecar(&dir)), false);
+        assert!(
+            held.contains("process: fresh posture"),
+            "held drive keeps the live reading:\n{held}"
+        );
+        let free = render_process_section(&read_posture(&sidecar(&dir)), true);
+        assert!(
+            free.contains("process: retained posture"),
+            "proven-free drive reclassifies:\n{free}"
+        );
+        assert!(
+            !free.contains("process: fresh posture"),
+            "no live-process claim beside a stopped drive:\n{free}"
+        );
+        assert!(
+            free.contains("not a live process"),
+            "the retained header disclaims aliveness:\n{free}"
+        );
+    }
+
+    #[test]
     fn future_posture_saturates_instead_of_wrapping() {
         let dir = TempDir::new();
         forge(&dir, now_unix() + 3600, serde_json::json!({}));
@@ -538,7 +608,7 @@ mod tests {
             ProcessPosture::Fresh(view) => assert_eq!(view.posture_unix, now_unix() + 3600),
             other => panic!("clock skew must not wrap the age math, got: {other:?}"),
         }
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("0s ago"),
             "skewed age saturates at zero:\n{rendered}"
@@ -549,7 +619,7 @@ mod tests {
     fn absent_and_malformed_fail_safe() {
         let dir = TempDir::new();
         assert_eq!(read_posture(&sidecar(&dir)), ProcessPosture::Absent);
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("no posture recorded"),
             "absence is a fact, not a verdict:\n{rendered}"
@@ -569,7 +639,7 @@ mod tests {
                 "must fail safe: {bad:?}"
             );
         }
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("not as healthy"),
             "malformed must never read healthy:\n{rendered}"
@@ -600,7 +670,7 @@ mod tests {
             read_posture(&sidecar(&dir)),
             ProcessPosture::Fresh(_)
         ));
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         for leaked in ["hunter2", "deadbeef", "retention_promise"] {
             assert!(
                 !rendered.contains(leaked),
@@ -616,7 +686,7 @@ mod tests {
         recorder.note_startup();
         recorder.note_ready();
         recorder.note_failure("Mailbox".into(), 3);
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("failed (Mailbox class, 3 consecutive)"),
             "verdict names the class and streak:\n{rendered}"
@@ -630,7 +700,7 @@ mod tests {
         recorder.note_startup();
         recorder.note_ready();
         recorder.note_posture(41, 0, 7, 312);
-        let rendered = render_process_section(&read_posture(&sidecar(&dir)), &sidecar(&dir));
+        let rendered = render_process_section(&read_posture(&sidecar(&dir)), false);
         assert!(
             rendered.contains("liveness unverified"),
             "even fresh is recency, not aliveness:\n{rendered}"

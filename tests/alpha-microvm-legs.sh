@@ -885,13 +885,16 @@ leg_headless_setup() {
 # fetch legs rendezvous on:
 #   serve#1 → C fetches → KILL (mid-flight) → serve#2 (mirror
 #   rebuilt from the vault) → E fetches against the replacement →
-#   TERM → host admits D → serve#3 → D fetches pre-kill content →
-#   TERM, clean exit 0.
+# TERM → host admits D → serve#3 → D fetches pre-kill content →
+# TERM, clean exit 0, then outwait the freshness threshold for the
+# STALE pin.
 # Issue 22c probes sit at the same joints: status against running
 # serve#1 (fresh posture without opening the store), status after
 # fetch-c (last-pass verdict present), status against serve#2 (new
 # instance, no inherited readiness), status after serve#2's TERM
-# (durable state back, last posture retained as last-recorded).
+# (durable state back, last posture retained as last-recorded),
+# status against serve#3 (its instance), and status 200s after
+# serve#3's TERM (STALE under its own instance).
 # E is admitted before the leg (alongside C) so its obligations are
 # fresh for serve#2's route: E proves the replacement re-announced
 # (E reconciles over the new route) AND serves content (pre-kill
@@ -1041,6 +1044,13 @@ leg_headless_serve() {
     || die "serve#3 never reported ready (see headless-serve-3.err)"
   pass "serve#3 reports ready with D's obligations announced"
   touch "$E2E_ROOT/headless-serve3-ready"
+  # 22c: serve#3's own instance, for the stale-transition pin below.
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-5.out" \
+    || die "vault status failed against serve#3 (see headless-status-5.out)"
+  grep -q "^process: fresh posture" "$LOGDIR/headless-status-5.out" \
+    || die "status missed fresh posture on serve#3"
+  grep "^process: instance: " "$LOGDIR/headless-status-5.out" | head -n 1 > "$E2E_ROOT/headless-serve3-instance"
+  pass "status names serve#3's instance while it runs"
   # D fetches content announced before the kill, served after it:
   # the vault-persisted representations outlive the endpoint.
   poll_until 300 test -f "$E2E_ROOT/headless-fetch-d-done" \
@@ -1059,6 +1069,20 @@ leg_headless_serve() {
   [[ "$status" == "0" ]] || die "serve#3 TERM shutdown exit $status, want clean 0"
   rm -f "$PIDDIR/headless-serve.pid"
   pass "serve#3 shuts down clean on TERM"
+  # 22c: the fresh-to-stale transition for real — outwait the 180s
+  # threshold (slow on purpose: the threshold is the contract, and
+  # forging the clock would test nothing). The last publish predates
+  # the TERM (teardown runs no passes), so 200s of quiet guarantees
+  # an age past the threshold, and serve#3's last posture must read
+  # STALE under its own instance.
+  sleep 200 || die "sleep past the freshness threshold failed"
+  with_creds "$c" vault "$d" status >"$LOGDIR/headless-status-6.out" \
+    || die "vault status failed long after serve#3's TERM (see headless-status-6.out)"
+  grep -q "^process: STALE posture" "$LOGDIR/headless-status-6.out" \
+    || die "posture still fresh past the 180s threshold"
+  diff "$E2E_ROOT/headless-serve3-instance" <(grep "^process: instance: " "$LOGDIR/headless-status-6.out" | head -n 1) \
+    || die "stale posture lost serve#3's instance"
+  pass "posture goes STALE past the threshold under its own instance"
   check_no_leaks "$LOGDIR/headless-serve-1.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-serve-2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-serve-3.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1068,6 +1092,8 @@ leg_headless_serve() {
   check_no_leaks "$LOGDIR/headless-status-2.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-status-3.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/headless-status-4.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-status-5.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/headless-status-6.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 # leg_headless_fetch <drive> <creds> <relay> <tag> <ready-file> <done-file>:

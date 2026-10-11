@@ -25,12 +25,13 @@ version say exactly what changed.
 
 - Freshness ordering in bulk fetch (`docs/retry-policy.md`,
   `crates/wyrd-sync/src/bulk.rs`): the candidate walk orders each
-  pass from a per-provider outcome memory — recently failed
+  attempt from a per-provider outcome memory — recently failed
   providers sink behind unmarked ones, stably, nobody dropped. Only
-  completed observations train the memory (transport failures mark,
-  sliced-deadline expiries and oversize do not, fulfillment
-  clears); marks expire after 5 minutes and republication clears
-  nothing. Strike counting and engine cooldowns unchanged.
+  dial-phase failures train the memory (transport failures mark,
+  sliced-deadline expiries do not, transfer-phase failures never
+  sink other representations, fulfillment clears); marks expire
+  after 5 minutes and republication clears nothing. Strike
+  counting and engine cooldowns unchanged.
 
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)

@@ -225,31 +225,47 @@ fn order_candidates(
     live
 }
 
-/// Learn one walk attempt's provider evidence: a transport failure
-/// lays (or refreshes) the provider's mark, sinking it on later
-/// passes. A sliced-deadline expiry records nothing — budget
-/// evidence, never provider evidence: the walk subdivided the
-/// attempt, so the expiry says nothing about the route. Oversize
-/// records nothing — a property of the representation every
-/// provider serves identically. Fulfillment clears through
-/// [`clear_provider_mark`]. Walk-only learning: single-route
-/// fetches cannot reorder, so they neither lay nor clear marks —
-/// their evidence still lands in the cumulative stats and the
-/// per-attempt forensics. Free function over the map so tests pin
-/// the rules without an endpoint.
-fn record_provider_failure(
-    memory: &mut HashMap<[u8; 32], ProviderMark>,
-    provider: &[u8; 32],
-    error: &BulkError,
-) {
-    if matches!(error, BulkError::Transport(_)) {
-        memory.insert(
-            *provider,
-            ProviderMark {
-                failed_at: std::time::Instant::now(),
-            },
-        );
+/// One attempt's lesson for the provider memory: fulfillment
+/// clears whatever came before (liveness observed beats failure
+/// remembered); a dial-phase transport failure lays (or refreshes)
+/// the mark — route evidence, independent of which representation
+/// was asked for, since the dial never reached the provider;
+/// everything else teaches nothing. In particular transfer-phase
+/// failures never mark: a live member's legitimate "not found" for
+/// one representation must not sink it for others it does serve.
+/// Sliced-deadline expiries (budget evidence) and oversize (a
+/// representation property) never mark either. Pure so tests pin
+/// the rule without a network; `fetch` applies it where phase and
+/// error class meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderLesson {
+    Clear,
+    Mark,
+    Ignore,
+}
+
+fn provider_lesson(
+    result: &Result<Vec<u8>, BulkError>,
+    outcome: &AttemptOutcome,
+) -> ProviderLesson {
+    match result {
+        Ok(_) => ProviderLesson::Clear,
+        Err(error) => match outcome.phase() {
+            AttemptPhase::Dial if matches!(error, BulkError::Transport(_)) => ProviderLesson::Mark,
+            _ => ProviderLesson::Ignore,
+        },
     }
+}
+
+/// Lay (or refresh) one provider's failure mark. Only `fetch` calls
+/// this, only for the lesson above — never directly for an error.
+fn mark_provider_failed(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &[u8; 32]) {
+    memory.insert(
+        *provider,
+        ProviderMark {
+            failed_at: std::time::Instant::now(),
+        },
+    );
 }
 
 /// A fulfilled attempt clears whatever the walk learned about this
@@ -630,11 +646,11 @@ pub struct IrohBulkSource {
     /// plan-run state — the counters span passes.
     stats: BulkFetchStats,
     /// Per-provider failure memory for the candidate walk: the last
-    /// completed failure observation per provider id, laid by
-    /// [`IrohBulkSource::fetch_candidates`] and read back as walk
-    /// order on the next pass. Transient like the plan's strike
-    /// ledgers; a fulfilled attempt clears the provider's mark, and
-    /// marks expire after [`PROVIDER_BAD_MARK_TTL`]. Spans passes and
+    /// dial-phase failure observation per provider id, laid by
+    /// [`IrohBulkSource::fetch`] and read back as walk order on
+    /// later attempts. Transient like the plan's strike ledgers; a
+    /// fulfilled attempt clears the provider's mark, and marks
+    /// expire after [`PROVIDER_BAD_MARK_TTL`]. Spans passes and
     /// addresses — plan-run state never resets it.
     provider_memory: HashMap<[u8; 32], ProviderMark>,
 }
@@ -833,7 +849,7 @@ impl IrohBulkSource {
         // Freshness first: the memory orders this pass from what the
         // earlier ones learned, so a known-dead route's dial burns
         // tail budget instead of head budget. The maps keep
-        // publication order — the walk re-derives the order per pass
+        // publication order — the walk re-derives the order per walk
         // instead, so intake (publication replaces per pass) is
         // untouched and republication stays a dedup no-op that clears
         // nothing: an announcement attests addressing, never liveness,
@@ -862,8 +878,6 @@ impl IrohBulkSource {
                 Ok(bytes) => {
                     self.attempt_deadline = budget;
                     self.attempt_bound = None;
-                    // Liveness observed beats failure remembered.
-                    clear_provider_mark(&mut self.provider_memory, blob.provider.id.as_bytes());
                     // Forensics for headless stalls: which provider
                     // served, joining the route-publication line
                     // above on the hex endpoint id. The hash names
@@ -894,14 +908,9 @@ impl IrohBulkSource {
                         error = %error,
                         "bulk candidate failed"
                     );
-                    // Completed observations train the memory;
-                    // sliced-deadline expiries and oversize do not
-                    // (see record_provider_failure).
-                    record_provider_failure(
-                        &mut self.provider_memory,
-                        blob.provider.id.as_bytes(),
-                        &error,
-                    );
+                    // Learning lives in `fetch` (dial-phase route
+                    // evidence only): the walk orders from the memory
+                    // but never writes it.
                     last_error = Some(error)
                 }
             }
@@ -952,7 +961,7 @@ impl IrohBulkSource {
         }
     }
 
-    fn fetch(&self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
+    fn fetch(&mut self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
         // The ceiling is enforced twice: the verified size rejects an
         // oversize blob before anything transfers, and the bounded
         // accumulator below pre-sizes from that verified size and
@@ -967,6 +976,7 @@ impl IrohBulkSource {
         // hex ids, so a served-but-uncounted blob and a repeatedly
         // restarted one both trace to provider and representation.
         let provider_hex = hex32(provider.id.as_bytes());
+        let provider_id = *provider.id.as_bytes();
         let hash_hex = hex32(hash.as_bytes());
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
@@ -1095,6 +1105,16 @@ impl IrohBulkSource {
         });
         stats.record(&outcome);
         trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
+        // The memory learns here, where phase and error class meet:
+        // dial-phase route evidence only (see provider_lesson). The
+        // walk orders from it but never writes it — single-route
+        // fetches train the same memory, since dial reachability is
+        // provider-level, independent of the representation asked for.
+        match provider_lesson(&result, &outcome) {
+            ProviderLesson::Clear => clear_provider_mark(&mut self.provider_memory, &provider_id),
+            ProviderLesson::Mark => mark_provider_failed(&mut self.provider_memory, &provider_id),
+            ProviderLesson::Ignore => {}
+        }
         result
     }
 }
@@ -1177,15 +1197,11 @@ impl BulkSource for IrohBulkSource {
         snapshot: &SnapshotId,
         max: usize,
     ) -> Result<Option<SealedManifest>, BulkError> {
-        let Some((content_id, blob)) = self.roots.get(snapshot) else {
+        let Some((content_id, blob)) = self.roots.get(snapshot).cloned() else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(|sealed| {
-            Some(SealedManifest {
-                content_id: *content_id,
-                sealed,
-            })
-        })
+        self.fetch(&blob, max)
+            .map(|sealed| Some(SealedManifest { content_id, sealed }))
     }
 
     fn fetch_snapshot(
@@ -1193,10 +1209,10 @@ impl BulkSource for IrohBulkSource {
         snapshot: &SnapshotId,
         max: usize,
     ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(blob) = self.snapshots.get(snapshot) else {
+        let Some(blob) = self.snapshots.get(snapshot).cloned() else {
             return Ok(None);
         };
-        self.fetch(blob, max).map(Some)
+        self.fetch(&blob, max).map(Some)
     }
 
     fn fetch_sealed(

@@ -23,13 +23,16 @@ walk in `wyrd-sync`.
    records its phase outcome, dial latency, and bytes streamed
    before failure (see Metrics below).
 2. **Freshness ordering — implemented.** The walk orders each
-   pass's candidates from a per-provider outcome memory on the
+   attempt's candidates from a per-provider outcome memory on the
    source: providers with a live failure mark sink behind unmarked
    ones, publication order stable within each tier, nobody dropped.
-   Only completed observations train the memory — transport
-   failures lay a mark, sliced-deadline expiries and oversize do
-   not, fulfillment clears. Marks expire after 5 minutes (judgment:
-   spans passes, recovers restarted peers without operator action).
+   Only dial-phase failures train the memory — transport failures
+   from the dial lay a mark, sliced-deadline expiries do not, and
+   transfer-phase failures (including a live member's legitimate
+   "not found" for one representation) never sink the provider for
+   others it serves. Fulfillment clears. Marks expire after 5
+   minutes (judgment: spans passes, recovers restarted peers
+   without operator action).
    Rulings on the open questions: re-announcement clears nothing
    (an announcement attests addressing, never liveness — otherwise
    a dead route re-announced every pass would never sink);

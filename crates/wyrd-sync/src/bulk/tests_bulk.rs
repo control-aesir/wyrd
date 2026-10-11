@@ -1181,16 +1181,8 @@ fn order_candidates_sinks_marked_providers_stably() {
     let now = std::time::Instant::now();
     // Failures observed out of order: the sunk tier still walks in
     // publication order behind the unmarked.
-    record_provider_failure(
-        &mut memory,
-        c.provider.id.as_bytes(),
-        &BulkError::Transport("down".into()),
-    );
-    record_provider_failure(
-        &mut memory,
-        a.provider.id.as_bytes(),
-        &BulkError::Transport("down".into()),
-    );
+    mark_provider_failed(&mut memory, c.provider.id.as_bytes());
+    mark_provider_failed(&mut memory, a.provider.id.as_bytes());
     assert_eq!(
         ordered_ids(&order_candidates(
             &[a.clone(), b.clone(), c.clone()],
@@ -1225,29 +1217,69 @@ fn order_candidates_prunes_expired_marks() {
 }
 
 #[test]
-fn record_provider_failure_keeps_only_completed_observations() {
-    let id = *dead_ref(0xA1).provider.id.as_bytes();
-    let mut memory = HashMap::new();
+fn provider_lesson_marks_only_dial_phase_transport_failures() {
+    let transport = BulkError::Transport("refused".into());
+    let deadline = BulkError::Deadline {
+        slice: std::time::Duration::from_secs(1),
+    };
+    let oversize = BulkError::Oversize { bytes: 5, max: 1 };
+    // Fulfillment clears whatever came before.
+    assert_eq!(
+        provider_lesson(&Ok(Vec::new()), &AttemptOutcome::Fulfilled { bytes: 3 }),
+        ProviderLesson::Clear
+    );
+    // Dial-phase transport failures mark: an instant refusal and a
+    // full-share dial timeout are both route evidence.
+    assert_eq!(
+        provider_lesson(
+            &Err(transport.clone()),
+            &AttemptOutcome::Failed {
+                phase: AttemptPhase::Dial,
+                streamed_bytes: 0
+            }
+        ),
+        ProviderLesson::Mark
+    );
+    assert_eq!(
+        provider_lesson(&Err(transport.clone()), &AttemptOutcome::DialTimeout),
+        ProviderLesson::Mark
+    );
     // A sliced-deadline expiry is budget evidence: the walk
     // subdivided the attempt, so it says nothing about the route.
-    record_provider_failure(
-        &mut memory,
-        &id,
-        &BulkError::Deadline {
-            slice: std::time::Duration::from_secs(1),
-        },
+    assert_eq!(
+        provider_lesson(&Err(deadline), &AttemptOutcome::DialTimeout),
+        ProviderLesson::Ignore
     );
-    assert!(memory.is_empty(), "deadline lays no mark");
-    // Oversize is a property of the representation, identical from
-    // every provider.
-    record_provider_failure(&mut memory, &id, &BulkError::Oversize { bytes: 5, max: 1 });
-    assert!(memory.is_empty(), "oversize lays no mark");
-    // An instant transport failure completed its observation.
-    record_provider_failure(&mut memory, &id, &BulkError::Transport("refused".into()));
-    assert_eq!(memory.len(), 1, "transport failure marks");
-    // Liveness observed beats failure remembered.
-    clear_provider_mark(&mut memory, &id);
-    assert!(memory.is_empty(), "fulfillment clears the mark");
+    // Transfer-phase failures never sink the provider for other
+    // representations: a live member's legitimate "not found" for
+    // one object says nothing about the rest it serves.
+    assert_eq!(
+        provider_lesson(
+            &Err(transport.clone()),
+            &AttemptOutcome::Failed {
+                phase: AttemptPhase::Transfer,
+                streamed_bytes: 7
+            }
+        ),
+        ProviderLesson::Ignore
+    );
+    assert_eq!(
+        provider_lesson(
+            &Err(transport),
+            &AttemptOutcome::TransferTimeout { streamed_bytes: 7 }
+        ),
+        ProviderLesson::Ignore
+    );
+    assert_eq!(
+        provider_lesson(
+            &Err(oversize),
+            &AttemptOutcome::Failed {
+                phase: AttemptPhase::Transfer,
+                streamed_bytes: 0
+            }
+        ),
+        ProviderLesson::Ignore
+    );
 }
 
 #[test]
@@ -1375,6 +1407,14 @@ fn failed_walk_marks_every_completed_provider() {
             && source.provider_mark(b.provider.id.as_bytes()).is_some(),
         "the walk trains the memory from what it attempted"
     );
+    // A second walk finds the same marks: memory spans passes, and
+    // re-attempting refreshes rather than duplicates.
+    let _ = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        source.provider_mark(a.provider.id.as_bytes()).is_some()
+            && source.provider_mark(b.provider.id.as_bytes()).is_some(),
+        "marks persist across walks"
+    );
     source.shutdown(std::time::Duration::from_secs(10));
 }
 
@@ -1440,6 +1480,72 @@ fn fulfilled_walk_clears_the_mark_and_never_skips() {
     assert!(
         source.provider_mark(dead.provider.id.as_bytes()).is_some(),
         "the dead provider's completed failure stays learned"
+    );
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
+    });
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn sunk_dead_provider_is_tried_last() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+    // Dead-first publication with the DEAD provider pre-marked: the
+    // walk must reach the live route first, so the dead dial never
+    // runs and its backdated mark is never refreshed. A refreshed
+    // mark would prove the dead route was attempted.
+    let content = b"sunk dead routes lose the head of the walk";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router, hash) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let store = MemStore::new();
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+            .spawn();
+        let tag = store.add_slice(content).await.unwrap();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router, tag.hash)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let root = BaoRoot::from_bytes(*hash.as_bytes());
+    let mut dead = dead_ref(0xD4);
+    dead.hash = *hash.as_bytes();
+    let live = IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: *hash.as_bytes(),
+    };
+    source.publish_transport(dead.clone());
+    source.publish_transport(live.clone());
+    let laid_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    source.provider_memory.insert(
+        *dead.provider.id.as_bytes(),
+        ProviderMark { failed_at: laid_at },
+    );
+    assert_eq!(
+        source.fetch_transport(&root, usize::MAX).unwrap(),
+        Some(content.to_vec())
+    );
+    assert_eq!(
+        source
+            .provider_mark(dead.provider.id.as_bytes())
+            .map(|mark| mark.failed_at),
+        Some(laid_at),
+        "the sunk dead route was never attempted"
     );
     runtime.block_on(async {
         router.shutdown().await.unwrap();

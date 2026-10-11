@@ -61,15 +61,25 @@ pass "PROBE_STEP overrides the prefix"
 # Every instrumented leg keeps its marks: a leg that silently loses
 # its instrumentation must fail here, not in an odin log. The legs
 # file is not sourceable, so bodies are sliced textually from the
-# function header to its closing brace.
-for leg in leg_crash_owner leg_steady_member leg_crash_member leg_steady_owner leg_uparent_owner leg_uparent_member; do
-  BODY="$(awk "/^$leg\(\) \{/{f=1} f{print} /^\}$/{if (f) exit}" "$LEGS")"
-  [[ -n "$BODY" ]] || die "leg body not found: $leg"
-  grep -q 'PROBE_STEP=1[35]' <<<"$BODY" \
-    || die "$leg lost its PROBE_STEP override"
-  [[ "$(grep -c 'probe_mark ' <<<"$BODY")" -ge 1 ]] \
-    || die "$leg lost its probe marks"
-done
-pass "all six instrumented legs keep their step override and marks"
+# function header to its closing brace. Each leg is pinned to its own
+# step and exact mark count, so a weakened leg fails loudly and an
+# intentional change updates the number beside the leg name.
+check_leg() { # <func> <step> <marks>
+  local leg="$1" want_step="$2" want_marks="$3" body n
+  body="$(awk "/^$leg\(\) \{/{f=1} f{print} /^\}$/{if (f) exit}" "$LEGS")"
+  [[ -n "$body" ]] || die "leg body not found: $leg"
+  grep -q "PROBE_STEP=$want_step" <<<"$body" \
+    || die "$leg lost its PROBE_STEP=$want_step override"
+  n="$(grep -c 'probe_mark ' <<<"$body")"
+  [[ "$n" -eq "$want_marks" ]] \
+    || die "$leg has $n probe marks, want $want_marks"
+  pass "$leg keeps its step-$want_step override and $want_marks marks"
+}
+check_leg leg_crash_owner 13 6
+check_leg leg_steady_member 13 3
+check_leg leg_crash_member 13 7
+check_leg leg_steady_owner 13 3
+check_leg leg_uparent_owner 15 5
+check_leg leg_uparent_member 15 8
 
 echo "probe-mark: $PASS checks passed"

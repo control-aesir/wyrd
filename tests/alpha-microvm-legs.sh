@@ -20,13 +20,13 @@ source /etc/wyrd-tests/alpha-common.sh
 # pids must not be. (alpha-common.sh sources the env file itself.)
 PIDDIR="$E2E_ROOT/pids/$(hostname -s)"
 
-# Per-probe section timing for the long legs (step 9 today): each mark
-# prints the wall seconds since the previous mark, so the breakdown is
-# greppable in the leg log (`step<PROBE_STEP> probe <name>=<Ns>`)
-# without changing any probe. Marks sit beside the passes they follow;
-# the pass deltas stay the check-level view. The step prefix defaults
-# to 9; a future caller on another step sets PROBE_STEP instead of
-# emitting a false step.
+# Per-probe section timing for the long legs (steps 9 and 13 today):
+# each mark prints the wall seconds since the previous mark, so the
+# breakdown is greppable in the leg log
+# (`step<PROBE_STEP> probe <name>=<Ns>`) without changing any probe.
+# Marks sit beside the passes they follow; the pass deltas stay the
+# check-level view. The step prefix defaults to 9; a leg on another
+# step sets PROBE_STEP first instead of emitting a false step.
 PROBE_STEP="${PROBE_STEP:-9}"
 PROBE_MARK=$SECONDS
 probe_mark() { # <name>
@@ -1082,6 +1082,7 @@ leg_headless_fetch() {
 leg_crash_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection owner leg"
+  PROBE_STEP=13
   start_mount xcrash-o "$c" "$d" "$MNTS/xcrash-o" --relay "$relay"
   # Converge the member's readiness signal first: this fetch settles
   # the sync engine (the closure gate blocks mutations until the
@@ -1090,6 +1091,7 @@ leg_crash_owner() {
   # gets bounded retries as insurance against a straggler pass.
   poll_until 180 converged "$MNTS/xcrash-o/member-ready.txt" "member-ready" \
     || die "member never published readiness"
+  probe_mark ready_converged
   local attempt=0 anchored=0
   while (( attempt < 6 )); do
     attempt=$((attempt + 1))
@@ -1109,6 +1111,7 @@ leg_crash_owner() {
     || die "anchor write failed in $attempt attempts (closure never drained)"
   poll_until 120 test -f "$E2E_ROOT/crash-o-steady-ready" \
     || die "witness never converged the anchor write"
+  probe_mark "anchor(attempts=$attempt)"
   pass "anchor converged before the burst"
   # Each burst write gets bounded retries: after the anchor the sync
   # engine may still be publishing, and a bare echo to the FUSE mount
@@ -1141,6 +1144,7 @@ leg_crash_owner() {
     i=$((i + 1))
   done
   pass "40 burst writes acknowledged (fence: post-ack, pre-reopen — the rename/CURRENT window)"
+  probe_mark burst_done
   local pid kstatus=0
   pid="$(cat "$PIDDIR/mount-xcrash-o.pid")"
   kill -KILL "$pid" 2>/dev/null || die "owner mount pid already gone before KILL"
@@ -1149,6 +1153,7 @@ leg_crash_owner() {
   kill -0 "$pid" 2>/dev/null && die "owner mount pid survived KILL"
   rm -f "$PIDDIR/mount-xcrash-o.pid"
   fusermount3 -uz "$MNTS/xcrash-o" 2>/dev/null || true
+  probe_mark killed
   pass "owner mount died on KILL"
   start_mount xcrash-o2 "$c" "$d" "$MNTS/xcrash-o2" --relay "$relay"
   [[ "$(timeout 120 cat "$MNTS/xcrash-o2/anchor.txt")" == "anchor-v1" ]] \
@@ -1168,12 +1173,14 @@ leg_crash_owner() {
     [[ "$got" == "burst-$i" ]] || torn=$((torn + 1))
   done
   [[ "$torn" == 0 ]] || die "$torn burst survivors are torn after the KILL"
+  probe_mark reopen_verified
   pass "burst survivors ($n files) are byte-complete, never torn"
   timeout 35 bash -c "echo 'after-crash' > '$MNTS/xcrash-o2/after-crash.txt'" 2>/dev/null \
     || die "post-crash write failed after remount"
   touch "$E2E_ROOT/crash-o-back"
   poll_until 180 test -f "$E2E_ROOT/crash-o-member-done" \
     || die "witness never converged the post-crash head"
+  probe_mark postcrash_converged
   stop_mount xcrash-o2 INT
   check_no_leaks "$LOGDIR/mount-xcrash-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/mount-xcrash-o2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1188,6 +1195,7 @@ leg_crash_owner() {
 leg_steady_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness member leg"
+  PROBE_STEP=13
   start_mount xsteady-m "$c" "$d" "$MNTS/xsteady-m" --relay "$relay"
   # Publish readiness before waiting for the anchor: the owner
   # converges this first, which triggers the fetch that settles its
@@ -1199,14 +1207,17 @@ leg_steady_member() {
   poll_until 180 converged "$MNTS/xsteady-m/anchor.txt" "anchor-v1" \
     || die "witness never converged the anchor write"
   pass "witness converges the anchor before the crash"
+  probe_mark anchor_witnessed
   touch "$E2E_ROOT/crash-o-steady-ready"
   # 300s: instrumentation shows 40 burst writes take ~200s (some
   # hit 21s when the sync engine is mid-publish), plus KILL + remount
   # + verify ~30s. The old 120s expired at burst[18].
   poll_until 300 test -f "$E2E_ROOT/crash-o-back" \
     || die "owner never came back after the KILL"
+  probe_mark owner_back
   poll_until 180 converged "$MNTS/xsteady-m/after-crash.txt" "after-crash" \
     || die "witness never converged the post-crash head"
+  probe_mark head_converged
   pass "post-crash head converges without remount"
   touch "$E2E_ROOT/crash-o-member-done"
   stop_mount xsteady-m TERM
@@ -1238,6 +1249,7 @@ leg_steady_member() {
 leg_crash_member() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash-injection member leg"
+  PROBE_STEP=13
   # Debug for this mount only, Lima step-6 style (see leg_fetch_member):
   # the scratch commit below is under investigation — if it outwaits
   # its deadline again, the daemon log must show what the commit
@@ -1248,6 +1260,7 @@ leg_crash_member() {
   if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   poll_until 120 bash -c "ls '$MNTS/xcrash-m' | grep -qx 'cold-u.txt'" \
     || die "member never listed the cold file"
+  probe_mark cold_listed
   touch "$E2E_ROOT/crash-m-listed"
   # Body-path gate BEFORE any authorship: a held mutation gets 30s
   # (max_mutation_wait) before it fails TimedOut, and this drive
@@ -1259,6 +1272,7 @@ leg_crash_member() {
   poll_until 300 converged "$MNTS/xcrash-m/cold-u.txt" "cold-bytes-u" \
     || die "member never converged the cold bytes before authoring"
   pass "cold bytes flow before the member authors"
+  probe_mark cold_converged
   # Tree localization BEFORE the partition, with bounded retries:
   # this drive joined fresh and its initial closure drains slowly
   # (observed: single objects per pass while pending_heads=1), so a
@@ -1284,6 +1298,7 @@ leg_crash_member() {
   [[ "$localized" == 1 ]] \
     || die "scratch never committed in $attempt attempts: the head tree never localized"
   pass "scratch commit localizes the head tree over the live relay (attempt $attempt)"
+  probe_mark "scratch(attempts=$attempt)"
   touch "$E2E_ROOT/crash-m-ready"
   poll_until 180 test -f "$E2E_ROOT/crash-m-partitioned" \
     || die "host never partitioned the relay"
@@ -1305,6 +1320,7 @@ leg_crash_member() {
   [[ "$obligated" == 1 ]] \
     || die "obligation never acknowledged in $oattempt attempts under partition"
   pass "obligation acknowledged while the relay is down (fence: pending-outbox window)"
+  probe_mark "obligation(attempts=$oattempt)"
   local pid kstatus=0
   pid="$(cat "$PIDDIR/mount-xcrash-m.pid")"
   kill -KILL "$pid" 2>/dev/null || die "member mount pid already gone before KILL"
@@ -1314,6 +1330,7 @@ leg_crash_member() {
   rm -f "$PIDDIR/mount-xcrash-m.pid"
   fusermount3 -uz "$MNTS/xcrash-m" 2>/dev/null || true
   touch "$E2E_ROOT/crash-m-killed"
+  probe_mark killed
   pass "member mount died on KILL with the obligation pending"
   poll_until 180 test -f "$E2E_ROOT/crash-m-healed" \
     || die "host never healed the relay"
@@ -1325,9 +1342,11 @@ leg_crash_member() {
   poll_until 300 converged "$MNTS/xcrash-m2/cold-u.txt" "cold-bytes-u" \
     || die "cold want never re-demanded after the KILL"
   pass "admitted want survives the KILL and serves after heal"
+  probe_mark cold_redemanded
   touch "$E2E_ROOT/crash-m-done"
   poll_until 300 test -f "$E2E_ROOT/crash-m-witness-done" \
     || die "witness never converged the obligation"
+  probe_mark obligation_witnessed
   stop_mount xcrash-m2 TERM
   check_no_leaks "$LOGDIR/mount-xcrash-m.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/mount-xcrash-m2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -1342,18 +1361,22 @@ leg_crash_member() {
 leg_steady_owner() {
   local d="$1" c="$2" relay="$3"
   step 13 "crash witness owner leg"
+  PROBE_STEP=13
   start_mount xsteady-o "$c" "$d" "$MNTS/xsteady-o" --relay "$relay"
   timeout 35 bash -c "echo 'cold-bytes-u' > '$MNTS/xsteady-o/cold-u.txt'" 2>/dev/null \
     || die "cold announcement write failed"
   poll_until 120 test -f "$E2E_ROOT/crash-m-listed" \
     || die "member never listed the cold file"
   pass "cold announcement published before the partition"
+  probe_mark announced
   poll_until 180 converged "$MNTS/xsteady-o/obligation.txt" "obligation-v1" \
     || die "member obligation never replayed after the KILL"
+  probe_mark obligation_replayed
   pass "killed member's obligation replays after heal"
   touch "$E2E_ROOT/crash-m-witness-done"
   poll_until 120 test -f "$E2E_ROOT/crash-m-done" \
     || die "member leg never finished"
+  probe_mark member_done
   stop_mount xsteady-o INT
   check_no_leaks "$LOGDIR/mount-xsteady-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }

@@ -23,6 +23,11 @@ version say exactly what changed.
 
 ### Added
 
+- Step-13 crash-injection legs report per-probe section timings
+  (`step13 probe <name>=<Ns>` in the leg logs, attempt counts where a
+  loop retries): instrument-first evidence for the crash-budget work,
+  no probe behavior changed; helper grammar still pinned by
+  `tests/test-probe-mark.sh`.
 - Step-9 fetch-plane legs report per-probe section timings
   (`step<PROBE_STEP> probe <name>=<Ns>` in the leg logs, with the
   recovery attempt count): instrument-first evidence for the

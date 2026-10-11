@@ -89,7 +89,7 @@ fn bounded_accumulator_aborts_past_ceiling_without_consuming_tail() {
         leaf(10, Bytes::from_static(b"0123456789")),
         leaf(20, Bytes::from_static(b"0123456789")),
     ]);
-    let result = runtime.block_on(bounded_blob_bytes(&mut items, 15, 15));
+    let result = runtime.block_on(bounded_blob_bytes(&mut items, 15, 15, None));
     assert_eq!(result, Err(BulkError::Oversize { bytes: 20, max: 15 }));
     // The third leaf was never pulled: allocation stopped at the
     // ceiling instead of draining the stream.
@@ -114,7 +114,7 @@ fn bounded_accumulator_rejects_single_leaf_over_remaining_budget() {
         leaf(0, Bytes::from(vec![0xAA; 1024])),
         leaf(1024, Bytes::from_static(b"tail")),
     ]);
-    let result = runtime.block_on(bounded_blob_bytes(&mut items, 16, 16));
+    let result = runtime.block_on(bounded_blob_bytes(&mut items, 16, 16, None));
     assert_eq!(
         result,
         Err(BulkError::Oversize {
@@ -144,12 +144,12 @@ fn bounded_accumulator_holds_exact_boundary_and_zero_max() {
         leaf(20, Bytes::from_static(b"x")),
     ]);
     assert_eq!(
-        runtime.block_on(bounded_blob_bytes(items, 20, 20)),
+        runtime.block_on(bounded_blob_bytes(items, 20, 20, None)),
         Err(BulkError::Oversize { bytes: 21, max: 20 })
     );
     let items = stream::iter(vec![leaf(0, Bytes::from_static(b"x"))]);
     assert_eq!(
-        runtime.block_on(bounded_blob_bytes(items, 0, 0)),
+        runtime.block_on(bounded_blob_bytes(items, 0, 0, None)),
         Err(BulkError::Oversize { bytes: 1, max: 0 })
     );
 }
@@ -164,7 +164,12 @@ fn bounded_accumulator_rejects_stream_without_completion() {
         .enable_all()
         .build()
         .unwrap();
-    let result = runtime.block_on(bounded_blob_bytes(stream::iter(vec![]), usize::MAX, 0));
+    let result = runtime.block_on(bounded_blob_bytes(
+        stream::iter(vec![]),
+        usize::MAX,
+        0,
+        None,
+    ));
     assert!(matches!(result, Err(BulkError::Transport(_))));
 }
 
@@ -511,6 +516,410 @@ fn fetch_classifies_expiry_by_bound_not_budget() {
     );
     source.attempt_deadline = None;
     source.attempt_bound = None;
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn hex32_renders_64_lowercase_zero_padded_chars() {
+    // The join key every forensics correlation depends on: exact
+    // width, lowercase, zero-padded — a mis-render would silently
+    // break the provider/hash joins across the route, candidate,
+    // and attempt lines.
+    assert_eq!(hex32(&[0xAB; 32]), "ab".repeat(32));
+    assert_eq!(hex32(&[0x00; 32]), "00".repeat(32));
+    assert_eq!(hex32(&[0x0F; 32]).len(), 64);
+}
+
+#[test]
+fn split_allowances_tile_the_attempt_budget() {
+    use std::time::Duration;
+
+    // The dial allowance is the dial bound capped to the attempt
+    // budget: a full share holds it at the dial bound, a subdivided
+    // share shrinks it with the share — never above either, so a
+    // dead dial costs at most this constant.
+    assert_eq!(
+        dial_allowance(Duration::from_secs(90)),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        dial_allowance(Duration::from_secs(30)),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        dial_allowance(Duration::from_secs(5)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(dial_allowance(Duration::ZERO), Duration::ZERO);
+    // The transfer allowance is whatever the dial left: the two
+    // phases tile the budget exactly, saturating when the dial ate
+    // everything — a starved transfer gets nothing, never a loan
+    // from the next attempt.
+    assert_eq!(
+        transfer_allowance(Duration::from_secs(90), Duration::from_secs(25)),
+        Duration::from_secs(65)
+    );
+    assert_eq!(
+        transfer_allowance(Duration::from_secs(5), Duration::from_secs(5)),
+        Duration::ZERO
+    );
+    assert_eq!(
+        transfer_allowance(Duration::from_secs(5), Duration::from_secs(30)),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn dial_timed_out_recognizes_only_firing_deadlines() {
+    use std::time::Duration;
+
+    // Both timeout shapes `dial` promises: Deadline under a slice,
+    // the dial-timed-out transport error on a full share.
+    assert!(dial_timed_out(&BulkError::Deadline {
+        slice: Duration::from_millis(100)
+    }));
+    assert!(dial_timed_out(&BulkError::Transport(
+        DIAL_TIMED_OUT.to_string()
+    )));
+    // Instant failures completed their observation: refused dials,
+    // protocol errors, and oversize are fault evidence, never phase
+    // timeouts — even when the message mentions timing.
+    assert!(!dial_timed_out(&BulkError::Transport(
+        "connection refused".to_string()
+    )));
+    assert!(!dial_timed_out(&BulkError::Transport(
+        "dial took too long, probably".to_string()
+    )));
+    assert!(!dial_timed_out(&BulkError::Oversize { bytes: 9, max: 8 }));
+}
+
+#[test]
+fn fetch_stats_accumulate_phase_outcomes_and_waste() {
+    // Pure accumulation: every attempt counts, timeouts count by
+    // phase, fulfillment banks its bytes, every failed attempt banks
+    // its partial progress as waste — including instant failures,
+    // whose streamed bytes are just as lost to a restart.
+    let stats = BulkFetchStats::default();
+    stats.record(&AttemptOutcome::DialTimeout);
+    stats.record(&AttemptOutcome::TransferTimeout {
+        streamed_bytes: 500,
+    });
+    stats.record(&AttemptOutcome::Failed {
+        phase: AttemptPhase::Transfer,
+        streamed_bytes: 300,
+    });
+    stats.record(&AttemptOutcome::Failed {
+        phase: AttemptPhase::Dial,
+        streamed_bytes: 0,
+    });
+    stats.record(&AttemptOutcome::Fulfilled { bytes: 1000 });
+    assert_eq!(
+        stats.snapshot(),
+        BulkFetchStatsSnapshot {
+            attempts: 5,
+            dial_timeouts: 1,
+            transfer_timeouts: 1,
+            fulfilled: 1,
+            fulfilled_bytes: 1000,
+            // Waste sums every failed attempt's partial progress:
+            // the 800 bytes two restarts would re-transfer from
+            // zero — the resume threshold's numerator.
+            wasted_bytes: 800,
+        }
+    );
+}
+
+#[test]
+fn progress_probe_counts_accepted_leaf_bytes_only() {
+    use n0_future::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Two accepted leaves then a truncated stream: the error stands,
+    // but the probe kept the 20 bytes that flowed before it.
+    let progress = AtomicUsize::new(0);
+    let items = stream::iter(vec![
+        leaf(0, Bytes::from_static(b"0123456789")),
+        leaf(10, Bytes::from_static(b"0123456789")),
+    ]);
+    let result = runtime.block_on(bounded_blob_bytes(items, usize::MAX, 20, Some(&progress)));
+    assert!(matches!(result, Err(BulkError::Transport(_))));
+    assert_eq!(progress.load(Ordering::Relaxed), 20);
+    // A refused leaf counts nothing: the probe measures bytes the
+    // accumulator accepted, never bytes the ceiling rejected.
+    let progress = AtomicUsize::new(0);
+    let items = stream::iter(vec![
+        leaf(0, Bytes::from_static(b"0123456789")),
+        leaf(10, Bytes::from_static(b"0123456789")),
+    ]);
+    let result = runtime.block_on(bounded_blob_bytes(items, 15, 15, Some(&progress)));
+    assert_eq!(result, Err(BulkError::Oversize { bytes: 20, max: 15 }));
+    assert_eq!(progress.load(Ordering::Relaxed), 10);
+    // No probe, no counting: passing None leaves the bound
+    // exactly as before — bytes without completion still fail.
+    let items = stream::iter(vec![leaf(0, Bytes::from_static(b"0123456789"))]);
+    assert!(matches!(
+        runtime.block_on(bounded_blob_bytes(items, usize::MAX, 10, None)),
+        Err(BulkError::Transport(_))
+    ));
+}
+
+#[test]
+fn cancelled_transfer_keeps_partial_progress_on_the_probe() {
+    use n0_future::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The probe's whole point: a transfer cancelled mid-stream must
+    // still report the bytes that landed. One leaf flows, then the
+    // stream stalls forever; the timeout fires and the probe holds
+    // the leaf — the cancellation-survives-the-counter property the
+    // resume numerator depends on, without any iroh rig. The stall
+    // is a pending stream, so the timeout is the only possible
+    // outcome: nothing here can flake on timing.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let progress = AtomicUsize::new(0);
+    let stalled =
+        stream::iter(vec![leaf(0, Bytes::from_static(b"0123456789"))]).chain(stream::pending());
+    // The timeout is built inside the runtime: timer construction
+    // needs the reactor context `block_on` provides.
+    let result = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            bounded_blob_bytes(stalled, usize::MAX, 10, Some(&progress)),
+        )
+        .await
+    });
+    assert!(result.is_err(), "the stalled stream must hit the timeout");
+    assert_eq!(progress.load(Ordering::Relaxed), 10);
+}
+
+#[test]
+fn split_success_records_fulfilled_stats() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+    // One live provider serving small content over loopback: the
+    // attempt fulfills in the transfer phase, banking attempts,
+    // fulfillment, and bytes — with zero timeouts and zero waste.
+    let content = b"split records fulfillment";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router, hash) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let store = MemStore::new();
+        let blobs = BlobsProtocol::new(&store, None);
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, blobs)
+            .spawn();
+        let tag = store.add_slice(content).await.unwrap();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router, tag.hash)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let root = BaoRoot::from_bytes(*hash.as_bytes());
+    source.publish_transport(IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: *hash.as_bytes(),
+    });
+    let bytes = source.fetch_transport(&root, usize::MAX).unwrap().unwrap();
+    assert_eq!(bytes, content);
+    assert_eq!(
+        source.fetch_stats(),
+        BulkFetchStatsSnapshot {
+            attempts: 1,
+            dial_timeouts: 0,
+            transfer_timeouts: 0,
+            fulfilled: 1,
+            fulfilled_bytes: content.len() as u64,
+            wasted_bytes: 0,
+        }
+    );
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
+    });
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn split_dial_timeout_records_phase_and_preserves_class() {
+    use iroh::{endpoint::presets, Endpoint, RelayUrl};
+    use std::time::{Duration, Instant};
+
+    // Same silent relay as the unsliced dial test: the handshake
+    // stalls, so the dial allowance fires in phase 1 — Deadline
+    // under a slice, Transport on a full share, exactly as before
+    // the split, now counted as dial-phase timeouts with zero
+    // bytes streamed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // The forgotten listener is the load-bearing silence: dropping
+    // it would free the port and the dial would refuse fast instead
+    // of stalling into the timeout this test pins.
+    std::mem::forget(listener);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = runtime.block_on(async {
+        Endpoint::builder(presets::N0)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap()
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
+    let blob = IrohBlobRef {
+        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x79; 32]).public())
+            .with_relay_url(relay),
+        hash: [0xBD; 32],
+    };
+    source.attempt_deadline = Some(Instant::now() + Duration::from_millis(100));
+    source.attempt_bound = Some(AttemptBound::Shared);
+    assert!(
+        matches!(
+            source.fetch(&blob, usize::MAX),
+            Err(BulkError::Deadline { .. })
+        ),
+        "a subdivided dial expiry is budget evidence"
+    );
+    assert_eq!(
+        source.fetch_stats(),
+        BulkFetchStatsSnapshot {
+            attempts: 1,
+            dial_timeouts: 1,
+            transfer_timeouts: 0,
+            fulfilled: 0,
+            fulfilled_bytes: 0,
+            wasted_bytes: 0,
+        }
+    );
+    source.attempt_deadline = Some(Instant::now() + Duration::from_millis(100));
+    source.attempt_bound = Some(AttemptBound::Full);
+    assert!(
+        matches!(
+            source.fetch(&blob, usize::MAX),
+            Err(BulkError::Transport(_))
+        ),
+        "a full-share dial expiry is fault evidence"
+    );
+    let stats = source.fetch_stats();
+    assert_eq!(
+        (stats.attempts, stats.dial_timeouts, stats.wasted_bytes),
+        (2, 2, 0)
+    );
+    source.attempt_deadline = None;
+    source.attempt_bound = None;
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn split_transfer_timeout_records_phase_and_preserves_slice() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use std::time::{Duration, Instant};
+
+    /// A provider that completes the handshake and then never
+    /// speaks: the dial succeeds, size discovery stalls, so the
+    /// transfer allowance fires in phase 2 — the timeout the old
+    /// shared deadline would have reported, with the same class.
+    #[derive(Debug, Clone)]
+    struct StallProtocol;
+    impl iroh::protocol::ProtocolHandler for StallProtocol {
+        async fn accept(
+            &self,
+            _connection: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            std::future::pending().await
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, StallProtocol)
+            .spawn();
+        let client = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let blob = IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: [0xBE; 32],
+    };
+    source.attempt_deadline = Some(Instant::now() + Duration::from_millis(300));
+    source.attempt_bound = Some(AttemptBound::Shared);
+    match source.fetch(&blob, usize::MAX) {
+        Err(BulkError::Deadline { slice }) => assert!(
+            !slice.is_zero(),
+            "a starved transfer still reports the attempt's whole share, never a zero grant"
+        ),
+        other => panic!("a subdivided transfer expiry is budget evidence, got {other:?}"),
+    }
+    assert_eq!(
+        source.fetch_stats(),
+        BulkFetchStatsSnapshot {
+            attempts: 1,
+            dial_timeouts: 0,
+            transfer_timeouts: 1,
+            fulfilled: 0,
+            fulfilled_bytes: 0,
+            // Nothing flowed before the stall: a transfer timeout
+            // with zero waste, not a restart that lost bytes.
+            wasted_bytes: 0,
+        }
+    );
+    source.attempt_deadline = Some(Instant::now() + Duration::from_millis(300));
+    source.attempt_bound = Some(AttemptBound::Full);
+    assert!(
+        matches!(
+            source.fetch(&blob, usize::MAX),
+            Err(BulkError::Transport(_))
+        ),
+        "a full-share transfer expiry is fault evidence"
+    );
+    let stats = source.fetch_stats();
+    assert_eq!(
+        (stats.attempts, stats.transfer_timeouts, stats.dial_timeouts),
+        (2, 2, 0)
+    );
+    source.attempt_deadline = None;
+    source.attempt_bound = None;
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
+    });
     source.shutdown(std::time::Duration::from_secs(10));
 }
 

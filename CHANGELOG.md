@@ -209,6 +209,17 @@ version say exactly what changed.
   identity-free durable metadata). The implementation distinguishes
   a single genuine rejection class, so no cause-taxonomy extension
   was warranted.
+- Dial/transfer split in bulk fetch (`docs/retry-policy.md`,
+  roadmap item 2): each attempt now runs the dial under its own
+  allowance and size discovery plus streaming under the leftover,
+  with identical timeout instants and error classes — the split
+  adds measurement, not new timeout behavior. `IrohBulkSource`
+  keeps cumulative `BulkFetchStats` (attempts, dial/transfer
+  timeouts, fulfilled bytes, wasted bytes) and every attempt emits
+  a forensics line (provider, hash, phase, dial latency, streamed
+  bytes), so restart waste is measurable for the deferred resume
+  decision. Cross-pass resume stays deferred behind the design
+  note; no `BulkSource` trait change.
 
 ### Changed
 

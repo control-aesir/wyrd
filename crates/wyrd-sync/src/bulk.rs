@@ -34,6 +34,7 @@
 //! trusted.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bao_tree::io::BaoContentItem;
@@ -279,10 +280,232 @@ async fn dial(
             if bound == AttemptBound::Shared {
                 BulkError::Deadline { slice: timeout }
             } else {
-                BulkError::Transport("provider dial timed out".to_string())
+                BulkError::Transport(DIAL_TIMED_OUT.to_string())
             }
         })?
         .map_err(|error| BulkError::Transport(error.to_string()))
+}
+
+/// The dial deadline firing, as an error message: [`dial`] reports a
+/// cut-short dial as [`BulkError::Deadline`] under a subdivided share
+/// and as this transport error on a full share. Shared here so the
+/// split's phase attribution (`dial_timed_out`) matches on exactly
+/// the shapes `dial` promises, never on re-derived strings.
+const DIAL_TIMED_OUT: &str = "provider dial timed out";
+
+/// Upper bound for the dial phase of one attempt: the dial runs under
+/// its own allowance — the dial bound capped to the attempt budget —
+/// never borrowing from the transfer's share of the same budget. A
+/// dead candidate's dial costs at most this constant: on a
+/// subdivided share the allowance shrinks with the share, on a full
+/// share it holds at the dial bound. Pure so tests pin the boundary
+/// without a network.
+fn dial_allowance(blob_timeout: std::time::Duration) -> std::time::Duration {
+    FETCH_DIAL_TIMEOUT.min(blob_timeout)
+}
+
+/// Upper bound for the transfer phase (size discovery plus
+/// streaming): whatever the dial left of the attempt budget. The two
+/// phases tile the attempt exactly — dial elapsed plus transfer
+/// allowance equals the attempt budget — so the split fires its
+/// timeouts at the same instants the old shared deadline did, and
+/// every classification in `fetch` is unchanged. Saturating: a dial
+/// that consumed the whole budget leaves the transfer nothing to
+/// spend. Pure so tests pin the boundary without a network.
+fn transfer_allowance(
+    blob_timeout: std::time::Duration,
+    dial_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    blob_timeout.saturating_sub(dial_elapsed)
+}
+
+/// Whether a dial error is the dial deadline firing rather than an
+/// instant failure (refused, unreachable): only the firing deadline
+/// is timeout evidence by phase; instant failures completed their
+/// observation. Structural companion to [`dial`]'s contract —
+/// timeouts report exactly these two shapes.
+fn dial_timed_out(error: &BulkError) -> bool {
+    matches!(error, BulkError::Deadline { .. })
+        || matches!(error, BulkError::Transport(message) if message == DIAL_TIMED_OUT)
+}
+
+/// Which phase of a split attempt produced an outcome: connection
+/// establishment, or size discovery plus streaming. Forensics and
+/// stats attribute every attempt outcome to its phase, so a budget
+/// eaten by dialing reads as dial cost, never as transfer trouble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptPhase {
+    Dial,
+    Transfer,
+}
+
+/// One attempt's report for the telemetry below: timeouts carry
+/// their phase, failures carry the phase plus the content bytes that
+/// flowed before the failure (partial progress — the resume
+/// decision's numerator), fulfillment carries its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    Fulfilled {
+        bytes: usize,
+    },
+    DialTimeout,
+    TransferTimeout {
+        streamed_bytes: usize,
+    },
+    Failed {
+        phase: AttemptPhase,
+        streamed_bytes: usize,
+    },
+}
+
+impl AttemptOutcome {
+    /// The phase that produced this outcome: fulfillment means the
+    /// dial succeeded and the transfer completed.
+    fn phase(&self) -> AttemptPhase {
+        match self {
+            AttemptOutcome::Fulfilled { .. } => AttemptPhase::Transfer,
+            AttemptOutcome::DialTimeout => AttemptPhase::Dial,
+            AttemptOutcome::TransferTimeout { .. } => AttemptPhase::Transfer,
+            AttemptOutcome::Failed { phase, .. } => *phase,
+        }
+    }
+
+    /// Content bytes that flowed in this attempt: the fulfilled
+    /// total on success, the partial progress on failure, zero when
+    /// the dial never connected.
+    fn streamed_bytes(&self) -> usize {
+        match *self {
+            AttemptOutcome::Fulfilled { bytes } => bytes,
+            AttemptOutcome::DialTimeout => 0,
+            AttemptOutcome::TransferTimeout { streamed_bytes } => streamed_bytes,
+            AttemptOutcome::Failed { streamed_bytes, .. } => streamed_bytes,
+        }
+    }
+
+    /// The outcome name for the per-attempt forensics line.
+    fn outcome_str(&self) -> &'static str {
+        match self {
+            AttemptOutcome::Fulfilled { .. } => "fulfilled",
+            AttemptOutcome::DialTimeout => "dial-timeout",
+            AttemptOutcome::TransferTimeout { .. } => "transfer-timeout",
+            AttemptOutcome::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// Cumulative fetch telemetry for one network source, exposed so the
+/// resume pressure is measurable instead of anecdotal: attempts and
+/// their phase outcomes, fulfilled bytes, and wasted bytes — content
+/// bytes that flowed in attempts which then failed, the direct cost
+/// of restarting from byte zero. Fixed-size counters (no per-hash
+/// retention): per-representation repeats stay computable from the
+/// per-attempt forensics lines, which carry provider and hash.
+/// Atomics so `fetch` (which runs on `&self`) records without a
+/// lock; [`IrohBulkSource::fetch_stats`] snapshots them for
+/// diagnostics and tests.
+#[derive(Debug, Default)]
+pub struct BulkFetchStats {
+    attempts: AtomicU64,
+    dial_timeouts: AtomicU64,
+    transfer_timeouts: AtomicU64,
+    fulfilled: AtomicU64,
+    fulfilled_bytes: AtomicU64,
+    wasted_bytes: AtomicU64,
+}
+
+/// A point-in-time copy of [`BulkFetchStats`]: plain counters for
+/// diagnostics, tests, and the resume threshold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkFetchStatsSnapshot {
+    pub attempts: u64,
+    pub dial_timeouts: u64,
+    pub transfer_timeouts: u64,
+    pub fulfilled: u64,
+    pub fulfilled_bytes: u64,
+    pub wasted_bytes: u64,
+}
+
+impl BulkFetchStats {
+    /// Fold one attempt's outcome into the counters: every attempt
+    /// counts; timeouts count by phase; fulfillment banks its bytes;
+    /// every failed attempt banks its streamed bytes as waste —
+    /// including instant failures, whose partial progress is just as
+    /// lost to a restart as a timeout's.
+    fn record(&self, outcome: &AttemptOutcome) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        match *outcome {
+            AttemptOutcome::Fulfilled { bytes } => {
+                self.fulfilled.fetch_add(1, Ordering::Relaxed);
+                self.fulfilled_bytes
+                    .fetch_add(bytes as u64, Ordering::Relaxed);
+            }
+            AttemptOutcome::DialTimeout => {
+                self.dial_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            AttemptOutcome::TransferTimeout { streamed_bytes } => {
+                self.transfer_timeouts.fetch_add(1, Ordering::Relaxed);
+                self.wasted_bytes
+                    .fetch_add(streamed_bytes as u64, Ordering::Relaxed);
+            }
+            AttemptOutcome::Failed { streamed_bytes, .. } => {
+                self.wasted_bytes
+                    .fetch_add(streamed_bytes as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> BulkFetchStatsSnapshot {
+        BulkFetchStatsSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            dial_timeouts: self.dial_timeouts.load(Ordering::Relaxed),
+            transfer_timeouts: self.transfer_timeouts.load(Ordering::Relaxed),
+            fulfilled: self.fulfilled.load(Ordering::Relaxed),
+            fulfilled_bytes: self.fulfilled_bytes.load(Ordering::Relaxed),
+            wasted_bytes: self.wasted_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One forensics line per attempt, joining the candidate lines in
+/// `fetch_candidates`: which provider served or failed, in which
+/// phase, after how much dial latency, with how many content bytes
+/// streamed. Debug-level like the rest of the fetch forensics;
+/// per-representation repeats across attempts are computable from
+/// these lines (provider plus hash) without retaining per-hash
+/// state in the source.
+fn trace_attempt(
+    provider_hex: &str,
+    hash_hex: &str,
+    outcome: &AttemptOutcome,
+    dial_latency: std::time::Duration,
+) {
+    tracing::debug!(
+        provider = provider_hex,
+        hash = hash_hex,
+        phase = match outcome.phase() {
+            AttemptPhase::Dial => "dial",
+            AttemptPhase::Transfer => "transfer",
+        },
+        dial_latency_ms = dial_latency.as_millis(),
+        streamed_bytes = outcome.streamed_bytes(),
+        outcome = outcome.outcome_str(),
+        "bulk attempt finished"
+    );
+}
+
+/// Render 32 bytes as lowercase hex: the fetch forensics lines need
+/// provider and hash ids, and `hex` stays inside `wyrd-format` by the
+/// crate rules, so this preallocated manual form is the cheapest
+/// available. One allocation per id, never one per byte. Crate-visible
+/// so the route-publication line (`transport::routes`) renders the
+/// same join key the same way.
+pub(crate) fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 /// A synchronous [`BulkSource`] backed by iroh-blobs' verified streaming API.
@@ -321,6 +544,11 @@ pub struct IrohBulkSource {
     /// single-route fetches are never subdivided. Plan-run state like
     /// the deadline, restored on the same exits.
     attempt_bound: Option<AttemptBound>,
+    /// Cumulative fetch telemetry for the split's failure modes (see
+    /// [`BulkFetchStats`]): recorded by every attempt, read through
+    /// [`IrohBulkSource::fetch_stats`]. Source configuration, never
+    /// plan-run state — the counters span passes.
+    stats: BulkFetchStats,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -331,6 +559,7 @@ impl std::fmt::Debug for IrohBulkSource {
             .field("snapshots", &self.snapshots.len())
             .field("sealed", &self.sealed.len())
             .field("transport", &self.transport.len())
+            .field("stats", &self.stats.snapshot())
             .finish()
     }
 }
@@ -350,6 +579,7 @@ impl IrohBulkSource {
             transport: BTreeMap::new(),
             attempt_deadline: None,
             attempt_bound: None,
+            stats: BulkFetchStats::default(),
         }
     }
 
@@ -381,6 +611,17 @@ impl IrohBulkSource {
     /// Publish the transport address for a snapshot's root manifest.
     pub fn publish_root(&mut self, snapshot: SnapshotId, content_id: ContentId, blob: IrohBlobRef) {
         self.roots.insert(snapshot, (content_id, blob));
+    }
+
+    /// Cumulative fetch telemetry for the split's failure modes (see
+    /// [`BulkFetchStats`]): attempts, phase outcomes, fulfilled bytes,
+    /// and wasted bytes — the resume pressure, measured. A snapshot:
+    /// later attempts keep accumulating underneath it. No production
+    /// consumer yet: test and diagnostics surface only — the resume
+    /// threshold reads the per-attempt debug forensics until a
+    /// diagnostics surface adopts the snapshot.
+    pub fn fetch_stats(&self) -> BulkFetchStatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// Publish the transport address for a snapshot body.
@@ -504,8 +745,8 @@ impl IrohBulkSource {
                     // transport), so a served-but-uncounted blob can
                     // be traced to its fetch kind.
                     tracing::debug!(
-                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        provider = %hex32(blob.provider.id.as_bytes()),
+                        hash = %hex32(&blob.hash),
                         "bulk candidate served"
                     );
                     return Ok(Some(bytes));
@@ -522,8 +763,8 @@ impl IrohBulkSource {
                     // message carries the failure class; the provider
                     // joins the route-publication line.
                     tracing::debug!(
-                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        provider = %hex32(blob.provider.id.as_bytes()),
+                        hash = %hex32(&blob.hash),
                         error = %error,
                         "bulk candidate failed"
                     );
@@ -587,6 +828,12 @@ impl IrohBulkSource {
         let endpoint = self.endpoint.clone();
         let provider = blob.provider.clone();
         let hash = blob.hash();
+        // Forensics for headless stalls: the per-attempt line below
+        // joins the route-publication and candidate lines on these
+        // hex ids, so a served-but-uncounted blob and a repeatedly
+        // restarted one both trace to provider and representation.
+        let provider_hex = hex32(provider.id.as_bytes());
+        let hash_hex = hex32(hash.as_bytes());
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
         // to the live remaining. How an expiry classifies comes from
@@ -610,14 +857,48 @@ impl IrohBulkSource {
                     .min(FETCH_BLOB_TIMEOUT)
             })
             .unwrap_or(FETCH_BLOB_TIMEOUT);
-        let dial_timeout = FETCH_DIAL_TIMEOUT.min(blob_timeout);
-        self.runtime.block_on(async move {
-            // One deadline for the whole attempt: dial, size discovery,
-            // and streaming share it, so a peer that connects but never
-            // streams cannot outlast a peer that never answers. Slow
-            // passes still complete; the plan retries what they miss.
-            tokio::time::timeout(blob_timeout, async move {
-                let connection = dial(&endpoint, provider, dial_timeout, bound).await?;
+        // The split: the dial runs first under its own allowance,
+        // then size discovery and streaming run under whatever the
+        // dial left of the attempt budget. The allowances tile the
+        // budget exactly, so both phases fire at the same instants
+        // the old shared deadline did and every error below
+        // classifies exactly as before — the split adds measurement
+        // (phase, dial latency, bytes streamed), never new timeout
+        // behavior.
+        let dial_allowance = dial_allowance(blob_timeout);
+        let stats = &self.stats;
+        // One observe site for every exit: the block reports its
+        // result alongside the outcome (and the dial latency the
+        // trace needs), so a future exit cannot forget to count —
+        // there is nowhere else to return from.
+        let (result, outcome, dial_latency) = self.runtime.block_on(async move {
+            // Phase 1: dial. A firing dial deadline reports exactly
+            // as a dial timeout always has; an instant failure stays
+            // a transport error with zero bytes streamed.
+            let dial_start = std::time::Instant::now();
+            let connection = dial(&endpoint, provider, dial_allowance, bound).await;
+            let dial_latency = dial_start.elapsed();
+            let connection = match connection {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let outcome = if dial_timed_out(&error) {
+                        AttemptOutcome::DialTimeout
+                    } else {
+                        AttemptOutcome::Failed {
+                            phase: AttemptPhase::Dial,
+                            streamed_bytes: 0,
+                        }
+                    };
+                    return (Err(error), outcome, dial_latency);
+                }
+            };
+            // Phase 2: size discovery plus streaming under the
+            // leftover. The byte probe survives the timeout below:
+            // on expiry the partial progress reads off it instead of
+            // dying with the cancelled stream.
+            let transfer_allowance = transfer_allowance(blob_timeout, dial_latency);
+            let progress = AtomicUsize::new(0);
+            let transfer = tokio::time::timeout(transfer_allowance, async {
                 let (size, _) = get_verified_size(&connection, &hash)
                     .await
                     .map_err(|error| BulkError::Transport(error.to_string()))?;
@@ -627,19 +908,60 @@ impl IrohBulkSource {
                         max,
                     });
                 }
-                bounded_blob_bytes(get_blob(connection, hash), max, size as usize).await
+                bounded_blob_bytes(
+                    get_blob(connection, hash),
+                    max,
+                    size as usize,
+                    Some(&progress),
+                )
+                .await
             })
-            .await
-            .map_err(|_| {
-                if bound == AttemptBound::Shared {
-                    BulkError::Deadline {
-                        slice: blob_timeout,
-                    }
-                } else {
-                    BulkError::Transport("blob fetch timed out".to_string())
+            .await;
+            let streamed_bytes = progress.load(Ordering::Relaxed);
+            match transfer {
+                Ok(Ok(bytes)) => {
+                    let outcome = AttemptOutcome::Fulfilled { bytes: bytes.len() };
+                    (Ok(bytes), outcome, dial_latency)
                 }
-            })?
-        })
+                Ok(Err(error)) => {
+                    // An instant transfer failure (size error,
+                    // oversize, protocol error) completed its
+                    // observation: fault evidence, with whatever
+                    // partial progress banked as waste.
+                    (
+                        Err(error),
+                        AttemptOutcome::Failed {
+                            phase: AttemptPhase::Transfer,
+                            streamed_bytes,
+                        },
+                        dial_latency,
+                    )
+                }
+                Err(_) => {
+                    // The transfer deadline fired: same instants and
+                    // same classes as the old shared deadline — the
+                    // reported slice stays the attempt's whole share,
+                    // never the leftover, so a starved transfer still
+                    // reads as budget pressure on a real attempt, not
+                    // as a walk that never granted anything.
+                    let error = if bound == AttemptBound::Shared {
+                        BulkError::Deadline {
+                            slice: blob_timeout,
+                        }
+                    } else {
+                        BulkError::Transport("blob fetch timed out".to_string())
+                    };
+                    (
+                        Err(error),
+                        AttemptOutcome::TransferTimeout { streamed_bytes },
+                        dial_latency,
+                    )
+                }
+            }
+        });
+        stats.record(&outcome);
+        trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
+        result
     }
 }
 
@@ -663,8 +985,16 @@ impl crate::runtime::RoutePublishing for MemoryBulkSource {
 /// and the bytes return only after `Done` — transport verification
 /// completes before the engine sees anything. Generic over the item
 /// stream so tests can prove the bound without a network; the live
-/// path passes the real `GetBlobResult`.
-async fn bounded_blob_bytes<S>(stream: S, max: usize, reserve: usize) -> Result<Vec<u8>, BulkError>
+/// path passes the real `GetBlobResult`. The optional progress probe
+/// counts accepted leaf bytes as they land, so a caller whose timeout
+/// cancels this future still learns the partial progress — the resume
+/// decision's numerator. `None` skips the counting.
+async fn bounded_blob_bytes<S>(
+    stream: S,
+    max: usize,
+    reserve: usize,
+    progress: Option<&AtomicUsize>,
+) -> Result<Vec<u8>, BulkError>
 where
     S: Stream<Item = GetBlobItem>,
 {
@@ -680,6 +1010,9 @@ where
                         bytes: out.len().saturating_add(leaf.data.len()),
                         max,
                     });
+                }
+                if let Some(progress) = progress {
+                    progress.fetch_add(leaf.data.len(), Ordering::Relaxed);
                 }
                 out.extend_from_slice(&leaf.data);
             }

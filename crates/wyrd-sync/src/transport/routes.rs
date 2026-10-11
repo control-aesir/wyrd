@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use wyrd_format::{BaoRoot, SnapshotId};
 
-use crate::bulk::{IrohBlobRef, IrohBulkSource};
+use crate::bulk::{hex32, IrohBlobRef, IrohBulkSource};
 use crate::runtime::{EngineError, RoutePublishing, RouteReport, RuntimeState};
 use crate::transport::decode_node_addr;
 
@@ -54,7 +54,7 @@ pub fn publish_recorded_routes(state: &RuntimeState, bulk: &mut IrohBulkSource) 
         // identities, no relay URLs.
         tracing::debug!(
             snapshot = ?snapshot,
-            provider = %provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            provider = %hex32(provider.id.as_bytes()),
             "route published"
         );
         bulk.publish_root(

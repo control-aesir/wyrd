@@ -15,10 +15,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use wyrd_format::envelope::VERSION as ENVELOPE_VERSION;
 use wyrd_sync::control::{ControlError, CONTROL_VERSION};
-use wyrd_sync::durable::DurableError;
+use wyrd_sync::durable::{probe_lock, DurableError, LockProbe};
 use wyrd_sync::keys::DeviceIdentitySecret;
 use wyrd_sync::runtime::{Engine, EngineError};
 use zeroize::Zeroizing;
@@ -424,6 +426,784 @@ pub(crate) fn run_update_verify(
     Ok(())
 }
 
+/// Transaction phases (`docs/update.md` §4). `Committed` needs no
+/// variant: commit removes the state file, so a present record is
+/// always an interrupted transaction converging back or forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum Phase {
+    /// New binary staged at `<exe>.next`, old binary untouched.
+    Staged,
+    /// Renames done, verification not yet passed.
+    Swapped,
+    /// Verification passed, prev-removal and state-removal pending.
+    Verified,
+}
+
+/// The transaction record beside the target executable: which drive
+/// the swap serves, which archive it came from, and how far it got.
+/// Presence alone means "interrupted" — every `wyrd update`
+/// invocation converges it before starting anything new.
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdateState {
+    version: u8,
+    drive: PathBuf,
+    archive_name: String,
+    archive_version: String,
+    archive_blake3: String,
+    phase: Phase,
+}
+
+/// What converging a leftover record did. All three leave the
+/// installation runnable: the only unwinding is deletion and the
+/// one atomic restore rename.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Converged {
+    /// No record: nothing to converge.
+    Clean,
+    /// Rolled back to the pre-swap binary, with the reason.
+    RolledBack(String),
+    /// Completed a verified commit's cleanup, with the version kept.
+    Committed(String),
+}
+
+/// Sibling paths of the target executable. Same directory means
+/// same filesystem, so every swap step is one atomic rename.
+/// `OsString` push keeps the full file name (`wyrd.next`, never
+/// `wyrd.next` vs `wyrd` extension surgery across toolchains).
+fn sibling(exe: &Path, suffix: &str) -> PathBuf {
+    let mut name = exe.as_os_str().to_owned();
+    name.push(suffix);
+    exe.with_file_name(name)
+}
+
+fn next_path(exe: &Path) -> PathBuf {
+    sibling(exe, ".next")
+}
+
+fn prev_path(exe: &Path) -> PathBuf {
+    sibling(exe, ".prev")
+}
+
+fn state_path(exe: &Path) -> PathBuf {
+    sibling(exe, ".update-state")
+}
+
+fn stage_dir(exe: &Path) -> PathBuf {
+    sibling(exe, ".stage")
+}
+
+fn read_state(exe: &Path) -> Result<Option<UpdateState>, CliError> {
+    let path = state_path(exe);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let state: UpdateState = serde_json::from_slice(&bytes).map_err(|_| {
+                CliError::Usage(format!(
+                    "{}: unreadable update state; remove it only when no update is running",
+                    path.display()
+                ))
+            })?;
+            if state.version != 1 {
+                return Err(CliError::Usage(format!(
+                    "{}: unknown update state version {}",
+                    path.display(),
+                    state.version
+                )));
+            }
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io { path, source }),
+    }
+}
+
+fn write_state(exe: &Path, state: &UpdateState) -> Result<(), CliError> {
+    let path = state_path(exe);
+    let bytes = serde_json::to_vec_pretty(state).expect("state serializes");
+    let tmp = sibling(exe, ".update-state.tmp");
+    fs::write(&tmp, bytes).map_err(|source| CliError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, &path).map_err(|source| CliError::Io { path, source })?;
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), CliError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn remove_dir_if_present(path: &Path) -> Result<(), CliError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Converge a leftover transaction record before starting anything
+/// new (`docs/update.md` §4 recovery rule). The rule is one line:
+/// only a passed verification commits — everything else rolls
+/// back to the pre-swap binary.
+///
+/// Crash-window ordering bounds the states. The live transaction
+/// writes `Swapped` between the two renames, so a record always
+/// matches reality except in one window — crash after the first
+/// rename, before the record — where the executable is missing
+/// with prev present. The unwind prefix below converges exactly
+/// that window for every phase; rename atomicity covers the rest.
+pub(crate) fn converge(exe: &Path) -> Result<Converged, CliError> {
+    let Some(state) = read_state(exe)? else {
+        return Ok(Converged::Clean);
+    };
+    let next = next_path(exe);
+    let prev = prev_path(exe);
+    // Unwind prefix: an interrupted swap may have removed the
+    // executable before recording it. Restoring prev first
+    // converges that window whatever the recorded phase; the
+    // flag tells the Swapped arm the restore already happened.
+    let prefix_restored = if !exe.is_file() {
+        if !prev.is_file() {
+            return Err(CliError::Usage(format!(
+                "interrupted update of {} left no binary and no {} to restore; \
+                 reinstall {} and remove {}",
+                state.archive_name,
+                prev.display(),
+                state.archive_name,
+                state_path(exe).display(),
+            )));
+        }
+        fs::rename(&prev, exe).map_err(|source| CliError::Io {
+            path: exe.to_path_buf(),
+            source,
+        })?;
+        true
+    } else {
+        false
+    };
+    match state.phase {
+        // Never swapped: the old binary is in place by
+        // construction. Drop the staging and the record.
+        Phase::Staged => {
+            remove_if_present(&next)?;
+            remove_dir_if_present(&stage_dir(exe))?;
+            remove_if_present(&state_path(exe))?;
+            Ok(Converged::RolledBack(format!(
+                "removed unstaged {}",
+                state.archive_name
+            )))
+        }
+        // Swapped but never verified: restore the old binary. The
+        // unwind prefix above already repaired the between-renames
+        // window (flagged: prev is spent, the executable is the
+        // restored old binary, nothing more to move). Prev present
+        // means the new binary is in place and gets replaced. Prev
+        // missing with no prefix restore means an operator removed
+        // the rollback copy — the one catastrophic case, named as
+        // manual recovery instead of implied rollback.
+        Phase::Swapped => {
+            if prev.is_file() {
+                fs::rename(&prev, exe).map_err(|source| CliError::Io {
+                    path: exe.to_path_buf(),
+                    source,
+                })?;
+            } else if !prefix_restored {
+                return Err(CliError::Usage(format!(
+                    "interrupted update of {} has no {} to restore; \
+                     the binary in place is unverified — reinstall {} and remove {}",
+                    state.archive_name,
+                    prev.display(),
+                    state.archive_name,
+                    state_path(exe).display(),
+                )));
+            }
+            remove_if_present(&next)?;
+            remove_dir_if_present(&stage_dir(exe))?;
+            remove_if_present(&state_path(exe))?;
+            Ok(Converged::RolledBack(format!(
+                "restored pre-update binary after interrupted {}",
+                state.archive_name
+            )))
+        }
+        // Verified but cleanup pending: the binary in place passed.
+        // Complete the commit — remove the rollback copy and the
+        // record — rather than downgrading a verified binary. If
+        // the prefix restored, the verified binary itself is gone
+        // (only the old rollback copy survived): committing that
+        // as verified would be a lie, so this refuses with the
+        // reinstall path instead.
+        Phase::Verified => {
+            if prefix_restored {
+                return Err(CliError::Usage(format!(
+                    "verified update of {} lost its binary; only the pre-update copy survived — \
+                     reinstall {} and remove {}",
+                    state.archive_version,
+                    state.archive_name,
+                    state_path(exe).display(),
+                )));
+            }
+            if !exe.is_file() {
+                return Err(CliError::Usage(format!(
+                    "verified update of {} left no binary in place; \
+                     reinstall {} and remove {}",
+                    state.archive_name,
+                    state.archive_name,
+                    state_path(exe).display(),
+                )));
+            }
+            remove_if_present(&prev)?;
+            remove_if_present(&state_path(exe))?;
+            Ok(Converged::Committed(state.archive_version))
+        }
+    }
+}
+
+/// Extract the new binary from the archive into `<exe>.next` and
+/// record the staged phase. The archive holds `*/bin/wyrd` (the
+/// shape `build.sh --verify` checks); extraction runs the system
+/// `tar`, the same prerequisite the release script assumes. A
+/// broken archive fails here — pure, before anything is staged —
+/// so the state file is written only on success.
+pub(crate) fn stage_archive(
+    exe: &Path,
+    drive: &Path,
+    archive: &Path,
+    identity: &ArchiveIdentity,
+) -> Result<(), CliError> {
+    let stage = stage_dir(exe);
+    remove_dir_if_present(&stage)?;
+    fs::create_dir_all(&stage).map_err(|source| CliError::Io {
+        path: stage.clone(),
+        source,
+    })?;
+    let tar = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(&stage)
+        .output()
+        .map_err(|source| {
+            CliError::Usage(format!(
+                "tar extraction failed ({source}); tar is required to unpack release archives"
+            ))
+        })?;
+    if !tar.status.success() {
+        remove_dir_if_present(&stage)?;
+        return Err(CliError::Usage(format!(
+            "{}: not an unpackable release archive (tar: {})",
+            archive.display(),
+            String::from_utf8_lossy(&tar.stderr).trim(),
+        )));
+    }
+    let binary = find_staged_binary(&stage).ok_or_else(|| {
+        CliError::Usage(format!(
+            "{}: no */bin/wyrd inside; release archives carry the binary at <top>/bin/wyrd",
+            archive.display(),
+        ))
+    })?;
+    let next = next_path(exe);
+    remove_if_present(&next)?;
+    fs::rename(&binary, &next).map_err(|source| CliError::Io {
+        path: next.clone(),
+        source,
+    })?;
+    ensure_executable(&next)?;
+    remove_dir_if_present(&stage)?;
+    write_state(
+        exe,
+        &UpdateState {
+            version: 1,
+            drive: drive.to_path_buf(),
+            archive_name: identity.canonical_name.clone(),
+            archive_version: identity.version.clone(),
+            archive_blake3: identity.blake3.clone(),
+            phase: Phase::Staged,
+        },
+    )
+}
+
+/// Locate `<top>/bin/wyrd` under the extraction dir: exactly one
+/// top-level directory, exactly the documented shape. Anything
+/// else is a foreign tarball, not a release archive.
+fn find_staged_binary(stage: &Path) -> Option<PathBuf> {
+    let mut tops: Vec<PathBuf> = fs::read_dir(stage)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    if tops.len() != 1 {
+        return None;
+    }
+    let candidate = tops.pop()?.join("bin").join("wyrd");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(unix)]
+fn ensure_executable(path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .map_err(|source| CliError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions).map_err(|source| CliError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) -> Result<(), CliError> {
+    Ok(())
+}
+
+/// The two swap renames, split so the live transaction records
+/// `Swapped` between them (`set_phase`): a crash in either half
+/// is what `converge` exists for. The old binary survives by
+/// construction — deletion waits for a passed verification.
+pub(crate) fn swap_first(exe: &Path) -> Result<(), CliError> {
+    let prev = prev_path(exe);
+    remove_if_present(&prev)?;
+    fs::rename(exe, &prev).map_err(|source| CliError::Io {
+        path: exe.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+pub(crate) fn swap_second(exe: &Path) -> Result<(), CliError> {
+    let next = next_path(exe);
+    if !next.is_file() {
+        return Err(CliError::Usage(format!(
+            "{}: no staged binary; stage before swapping",
+            next.display()
+        )));
+    }
+    fs::rename(&next, exe).map_err(|source| CliError::Io {
+        path: exe.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn set_phase(
+    exe: &Path,
+    drive: &Path,
+    identity: &ArchiveIdentity,
+    phase: Phase,
+) -> Result<(), CliError> {
+    write_state(
+        exe,
+        &UpdateState {
+            version: 1,
+            drive: drive.to_path_buf(),
+            archive_name: identity.canonical_name.clone(),
+            archive_version: identity.version.clone(),
+            archive_blake3: identity.blake3.clone(),
+            phase,
+        },
+    )
+}
+
+/// How long the verification child may run before the transaction
+/// calls it wedged: opening, replaying, and re-authorizing a
+/// dogfood-scale drive takes seconds; five minutes bounds a hung
+/// child without hurrying a slow disk. A timeout rolls back like
+/// any other unverified outcome.
+pub(crate) const VERIFY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// What the verification child reported. The child's own stdout
+/// (forwarded through) carries the U4 lines; this carries the
+/// branch the transaction takes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VerifyOutcome {
+    Verified,
+    Rejected,
+}
+
+/// Run the swapped-in binary's `__update_verify` against the drive
+/// and wait for it. The child's report lines pass straight through
+/// to our stdout/stderr — they are the operator's evidence — and
+/// the verdict is read back from them: exit 0 plus the verified
+/// line means verified, anything else means rejected. Output is
+/// bounded (a report is lines, not a dump), so collecting after
+/// exit cannot wedge on a full pipe.
+pub(crate) fn run_verify_child(
+    exe: &Path,
+    drive: &Path,
+    identity_file: &Path,
+    passphrase_file: &Path,
+    timeout: Duration,
+) -> Result<VerifyOutcome, CliError> {
+    let mut child = std::process::Command::new(exe)
+        .arg("__update_verify")
+        .arg(drive)
+        .arg("--identity-file")
+        .arg(identity_file)
+        .arg("--passphrase-file")
+        .arg(passphrase_file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|source| {
+            CliError::Usage(format!("verification child failed to start ({source})"))
+        })?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|source| CliError::Usage(format!("verification wait failed ({source})")))?
+        {
+            Some(_) => break,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CliError::Usage(format!(
+                        "verification timed out after {}s; the swapped binary never reported",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| CliError::Usage(format!("verification output failed ({source})")))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains("update compatibility: verified")
+    {
+        Ok(VerifyOutcome::Verified)
+    } else {
+        Ok(VerifyOutcome::Rejected)
+    }
+}
+
+/// Commit a verified swap: the rollback copy and the record go
+/// away, and only then is rollback impossible (condition 1).
+pub(crate) fn commit(exe: &Path) -> Result<(), CliError> {
+    remove_if_present(&prev_path(exe))?;
+    remove_if_present(&state_path(exe))?;
+    Ok(())
+}
+
+/// Roll back a swap verification never passed: restore the old
+/// binary over whatever is in place, drop staging and the record.
+/// A missing rollback copy is the catastrophic case from
+/// `converge` — named as manual recovery, never implied.
+pub(crate) fn rollback(exe: &Path, archive_name: &str) -> Result<(), CliError> {
+    let prev = prev_path(exe);
+    if !prev.is_file() {
+        return Err(CliError::Usage(format!(
+            "verification failed for {archive_name} and no {} to restore; \
+             the binary in place is unverified — reinstall {archive_name} and remove {}",
+            prev.display(),
+            state_path(exe).display(),
+        )));
+    }
+    fs::rename(&prev, exe).map_err(|source| CliError::Io {
+        path: exe.to_path_buf(),
+        source,
+    })?;
+    remove_if_present(&next_path(exe))?;
+    remove_dir_if_present(&stage_dir(exe))?;
+    remove_if_present(&state_path(exe))?;
+    Ok(())
+}
+
+/// The full `wyrd update` transaction (`docs/update.md` §§1–4):
+/// converge leftovers, resolve, require quiescence, stage,
+/// preflight, swap (recording `Swapped` between the renames),
+/// verify, commit or roll back, hand back. Credential paths are
+/// forwarded to the verification child, never read here: the
+/// parent's failures stay usage errors, and secrets stay in the
+/// child that opens custody.
+///
+/// `exe` is a parameter (not `current_exe`) so tests run the whole
+/// transaction against scratch binaries without touching the test
+/// runner itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_run(
+    drive_dir: &Path,
+    archive: &Path,
+    identity_file: &Path,
+    passphrase_file: &Path,
+    relays: &[String],
+    restart: bool,
+    exe: &Path,
+) -> Result<(), CliError> {
+    if restart && relays.is_empty() {
+        return Err(CliError::Usage(
+            "--restart needs at least one --relay: the vault refuses relay-less runs".into(),
+        ));
+    }
+    if !restart && !relays.is_empty() {
+        return Err(CliError::Usage(
+            "--relay is --restart-only: the supervised handoff leaves starting to the owner".into(),
+        ));
+    }
+    match converge(exe)? {
+        Converged::Clean => {}
+        Converged::RolledBack(reason) => println!("update recovery: {reason}"),
+        Converged::Committed(version) => {
+            println!("update recovery: completed commit of {version}");
+        }
+    }
+    check_drive_dir(drive_dir)?;
+    let identity = resolve_archive(archive)?;
+    println!("update archive: {}", identity.canonical_name);
+    println!("update version: {}", identity.version);
+    println!("update target: {}-{}", identity.os, identity.arch);
+    println!("update blake3: {}", identity.blake3);
+    println!("update bytes: {}", identity.bytes);
+    println!("{}", render_compatibility(&CompatibilityStatus::Unverified));
+    match probe_lock(drive_dir).map_err(|source| CliError::Store(source.to_string()))? {
+        LockProbe::Held => {
+            return Err(CliError::Usage(format!(
+                "{} is held by a running process; stop it first",
+                drive_dir.display()
+            )));
+        }
+        LockProbe::Free => {}
+    }
+    let own = own_build_info().app;
+    stage_archive(exe, drive_dir, archive, &identity)?;
+    println!("update staged: {}", next_path(exe).display());
+    run_preflight(&next_path(exe))?;
+    swap_first(exe)?;
+    set_phase(exe, drive_dir, &identity, Phase::Swapped)?;
+    swap_second(exe)?;
+    println!(
+        "update swapped: {} in place, verification next",
+        exe.display()
+    );
+    match run_verify_child(
+        exe,
+        drive_dir,
+        identity_file,
+        passphrase_file,
+        VERIFY_TIMEOUT,
+    )? {
+        VerifyOutcome::Verified => {}
+        VerifyOutcome::Rejected => {
+            rollback(exe, &identity.canonical_name)?;
+            println!("update rollback: restored {own}");
+            return Err(CliError::Verification(format!(
+                "new build {} rejected the drive; restored {own}",
+                identity.version
+            )));
+        }
+    }
+    set_phase(exe, drive_dir, &identity, Phase::Verified)?;
+    commit(exe)?;
+    println!("update done: {} in place and verified", identity.version);
+    if restart {
+        supervise(exe, drive_dir, relays, identity_file, passphrase_file)?;
+    } else {
+        println!(
+            "update handoff: start the service to run {}",
+            identity.version
+        );
+    }
+    Ok(())
+}
+
+/// `--restart` supervision: run the new vault as our child and wait
+/// on it, forwarding SIGINT/SIGTERM for a graceful shutdown with a
+/// bounded SIGKILL fallback. The child inherits our stdio, so its
+/// ready line and diagnostics read exactly like a bare vault run.
+/// The child's exit status propagates (Ctrl-C behaves like a bare
+/// vault); a wedged child that survives the grace period exits the
+/// parent non-zero. Unix-only: supervision without signals is
+/// guessing, and update never guesses (U3).
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn supervise(
+    exe: &Path,
+    drive: &Path,
+    relays: &[String],
+    identity_file: &Path,
+    passphrase_file: &Path,
+) -> Result<(), CliError> {
+    crate::install_shutdown_handler()?;
+    let mut command = std::process::Command::new(exe);
+    command.arg("vault").arg(drive);
+    for relay in relays {
+        command.arg("--relay").arg(relay);
+    }
+    command
+        .arg("--identity-file")
+        .arg(identity_file)
+        .arg("--passphrase-file")
+        .arg(passphrase_file);
+    let mut child = command
+        .spawn()
+        .map_err(|source| CliError::Usage(format!("restart child failed to start ({source})")))?;
+    // Grace mirrors the vault's own teardown horizon: its TERM
+    // path drains transports under a 60s endpoint bound, so hurrying
+    // it turns clean shutdowns into kills.
+    const GRACE: Duration = Duration::from_secs(90);
+    let mut termed: Option<Instant> = None;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| CliError::Usage(format!("restart wait failed ({source})")))?
+        {
+            std::process::exit(status.code().unwrap_or(2));
+        }
+        if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) && termed.is_none() {
+            // Best-effort forward: the child likely shares our
+            // signal disposition already (same process group under
+            // a terminal), so a failed forward still shuts down —
+            // it hurries nothing.
+            unsafe {
+                libc::kill(child.id() as i32, libc::SIGTERM);
+            }
+            termed = Some(Instant::now());
+        }
+        if let Some(since) = termed {
+            if Instant::now() - since >= GRACE {
+                let _ = child.kill();
+                let _ = child.wait();
+                std::process::exit(2);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Advisory preflight against the staged binary: run its
+/// lock-free self-report and compare with this build's. A staged
+/// binary that cannot report is broken — refuse before the swap.
+/// Anything it reports is advisory per [`preflight_report`]: the
+/// lines print, and the transaction proceeds.
+pub(crate) fn run_preflight(next: &Path) -> Result<(), CliError> {
+    let output = std::process::Command::new(next)
+        .arg("__build_info")
+        .output()
+        .map_err(|source| {
+            CliError::Usage(format!(
+                "staged binary failed to execute ({source}); refusing the swap"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Usage(
+            "staged binary refused its self-report; refusing the swap".to_string(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let staged = parse_build_info(&text).ok_or_else(|| {
+        CliError::Usage(format!(
+            "staged binary reported unparsable versions ({text:?}); refusing the swap"
+        ))
+    })?;
+    for line in preflight_report(&own_build_info(), &staged) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// A binary's lock-free self-report for the advisory preflight
+/// (U2-A): compiled format versions, comparable without opening
+/// any store. `__build_info` prints exactly these lines; the
+/// preflight compares them across the running and staged builds.
+pub(crate) struct BuildInfo {
+    pub app: String,
+    pub envelope: u8,
+    pub control: u8,
+}
+
+pub(crate) fn own_build_info() -> BuildInfo {
+    BuildInfo {
+        app: env!("CARGO_PKG_VERSION").to_owned(),
+        envelope: ENVELOPE_VERSION,
+        control: CONTROL_VERSION,
+    }
+}
+
+pub(crate) fn render_build_info(info: &BuildInfo) -> String {
+    format!(
+        "update build: {}\nupdate envelope: 0x{:02x}\nupdate control: 0x{:02x}",
+        info.app, info.envelope, info.control
+    )
+}
+
+/// Parse the three lines `__build_info` prints. `None` means the
+/// staged binary is broken — itself a refusal, since a binary that
+/// cannot report its versions cannot be verified either.
+pub(crate) fn parse_build_info(output: &str) -> Option<BuildInfo> {
+    let mut lines = output.lines();
+    let app = lines.next()?.strip_prefix("update build: ")?.to_owned();
+    let envelope =
+        u8::from_str_radix(lines.next()?.strip_prefix("update envelope: 0x")?, 16).ok()?;
+    let control = u8::from_str_radix(lines.next()?.strip_prefix("update control: 0x")?, 16).ok()?;
+    if app.is_empty() {
+        return None;
+    }
+    Some(BuildInfo {
+        app,
+        envelope,
+        control,
+    })
+}
+
+/// Numeric-prefix app-version ordering for the downgrade warning:
+/// compare leading `major.minor.patch` numerically, ignore the
+/// prerelease tail. Unparsable versions compare equal — no warning
+/// on what cannot be ordered.
+fn app_version_older(staged: &str, current: &str) -> bool {
+    fn numeric(prefix: &str) -> Vec<u64> {
+        prefix
+            .split(['.', '-'])
+            .take_while(|part| part.bytes().all(|b| b.is_ascii_digit()))
+            .filter_map(|part| part.parse().ok())
+            .collect()
+    }
+    let (mut a, mut b) = (numeric(staged), numeric(current));
+    a.resize(3, 0);
+    b.resize(3, 0);
+    a < b
+}
+
+/// The advisory preflight: compare the staged binary's self-report
+/// against this build's. Today's format versions are single values
+/// with no minimum-readable concept, so no version inequality is
+/// structurally impossible — the report is printed and the
+/// transaction proceeds, except for a downgrade, which warns
+/// (older alphas may not read stores newer ones wrote; the
+/// verification in the gap decides). Advisory means exactly this:
+/// cheap, lock-free, and never the load-bearing check.
+pub(crate) fn preflight_report(own: &BuildInfo, staged: &BuildInfo) -> Vec<String> {
+    let mut lines = vec![
+        format!("update preflight: staged build {}", staged.app),
+        format!(
+            "update preflight: envelope 0x{:02x} -> 0x{:02x}, control 0x{:02x} -> 0x{:02x}",
+            own.envelope, staged.envelope, own.control, staged.control
+        ),
+    ];
+    if app_version_older(&staged.app, &own.app) {
+        lines.push(format!(
+            "update preflight: warning: staged {} is older than running {}; verification decides",
+            staged.app, own.app
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +1406,424 @@ mod tests {
         assert!(diffs.iter().any(|d| d == "keystore changed"), "{diffs:?}");
         assert!(diffs.iter().any(|d| d.contains("authored")), "{diffs:?}");
         assert!(diffs.iter().any(|d| d.contains("vanished")), "{diffs:?}");
+    }
+
+    #[test]
+    fn build_info_round_trips_through_its_own_lines() {
+        let info = BuildInfo {
+            app: "0.3.0-alpha".into(),
+            envelope: 0x00,
+            control: 0x02,
+        };
+        let parsed = parse_build_info(&render_build_info(&info)).unwrap();
+        assert_eq!(parsed.app, "0.3.0-alpha");
+        assert_eq!(parsed.envelope, 0x00);
+        assert_eq!(parsed.control, 0x02);
+        for broken in [
+            "",
+            "update build: \nupdate envelope: 0x00\nupdate control: 0x00",
+            "garbage",
+        ] {
+            assert!(parse_build_info(broken).is_none(), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn preflight_reports_versions_and_warns_on_downgrade_only() {
+        let own = BuildInfo {
+            app: "0.3.0-alpha".into(),
+            envelope: 0x00,
+            control: 0x00,
+        };
+        let same = preflight_report(&own, &own);
+        assert_eq!(same.len(), 2);
+        assert!(
+            same.iter().all(|line| !line.contains("warning")),
+            "{same:?}"
+        );
+        let newer = BuildInfo {
+            app: "0.4.0-alpha".into(),
+            envelope: 0x01,
+            control: 0x00,
+        };
+        let upgrade = preflight_report(&own, &newer);
+        assert!(
+            upgrade.iter().any(|line| line.contains("0x00 -> 0x01")),
+            "{upgrade:?}"
+        );
+        assert!(
+            upgrade.iter().all(|line| !line.contains("warning")),
+            "{upgrade:?}"
+        );
+        let older = BuildInfo {
+            app: "0.2.0-alpha".into(),
+            envelope: 0x00,
+            control: 0x00,
+        };
+        let downgrade = preflight_report(&own, &older);
+        assert!(
+            downgrade.iter().any(|line| line.contains("warning")),
+            "{downgrade:?}"
+        );
+        // Numeric, not lexicographic: 0.10 is newer than 0.9.
+        assert!(!app_version_older("0.10.0", "0.9.0"));
+        assert!(app_version_older("0.9.0", "0.10.0"));
+    }
+
+    fn fake_exe(dir: &Path) -> PathBuf {
+        let exe = dir.join("wyrd");
+        fs::write(&exe, b"old-binary").unwrap();
+        exe
+    }
+
+    fn record(exe: &Path, phase: Phase) {
+        write_state(
+            exe,
+            &UpdateState {
+                version: 1,
+                drive: PathBuf::from("/srv/drive"),
+                archive_name: "wyrd-0.4.0-alpha-linux-aarch64.tar.gz".into(),
+                archive_version: "0.4.0-alpha".into(),
+                archive_blake3: "ab".into(),
+                phase,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn converge_is_clean_with_no_record() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        assert_eq!(converge(&exe).unwrap(), Converged::Clean);
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn converge_staged_drops_staging_and_keeps_the_binary() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::write(next_path(&exe), b"staged").unwrap();
+        record(&exe, Phase::Staged);
+        match converge(&exe).unwrap() {
+            Converged::RolledBack(reason) => assert!(reason.contains("unstaged"), "{reason}"),
+            other => panic!("staged must roll back, got: {other:?}"),
+        }
+        assert!(!next_path(&exe).exists());
+        assert!(!state_path(&exe).exists());
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn converge_swapped_restores_the_old_binary() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::write(&exe, b"new-binary").unwrap();
+        fs::write(prev_path(&exe), b"old-binary").unwrap();
+        record(&exe, Phase::Swapped);
+        match converge(&exe).unwrap() {
+            Converged::RolledBack(reason) => assert!(reason.contains("restored"), "{reason}"),
+            other => panic!("swapped must restore, got: {other:?}"),
+        }
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+        assert!(!prev_path(&exe).exists());
+        assert!(!state_path(&exe).exists());
+    }
+
+    #[test]
+    fn converge_crash_between_renames_still_unwinds() {
+        // Crash after exe->prev but before next->exe: the
+        // executable is missing, prev and next both present.
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::rename(&exe, prev_path(&exe)).unwrap();
+        fs::write(next_path(&exe), b"new-binary").unwrap();
+        record(&exe, Phase::Swapped);
+        assert!(matches!(converge(&exe).unwrap(), Converged::RolledBack(_)));
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+        assert!(!state_path(&exe).exists());
+    }
+
+    #[test]
+    fn converge_swapped_without_prev_names_manual_recovery() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        record(&exe, Phase::Swapped);
+        let error = converge(&exe).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("reinstall"), "{message}");
+        assert!(message.contains(".update-state"), "{message}");
+    }
+
+    #[test]
+    fn converge_verified_completes_the_commit() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::write(&exe, b"new-binary").unwrap();
+        fs::write(prev_path(&exe), b"old-binary").unwrap();
+        record(&exe, Phase::Verified);
+        assert_eq!(
+            converge(&exe).unwrap(),
+            Converged::Committed("0.4.0-alpha".into())
+        );
+        assert_eq!(fs::read(&exe).unwrap(), b"new-binary");
+        assert!(!prev_path(&exe).exists());
+        assert!(!state_path(&exe).exists());
+    }
+
+    fn make_tarball(dir: &Path, name: &str, payload: &[u8]) -> PathBuf {
+        let top = dir.join("top");
+        fs::create_dir_all(top.join("bin")).unwrap();
+        fs::write(top.join("bin").join("wyrd"), payload).unwrap();
+        let archive = dir.join(name);
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir)
+            .arg("top")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(&top).unwrap();
+        archive
+    }
+
+    fn test_identity(name: &str, version: &str) -> ArchiveIdentity {
+        ArchiveIdentity {
+            canonical_name: name.to_owned(),
+            version: version.to_owned(),
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            blake3: "ab".into(),
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stage_extracts_top_bin_wyrd_and_records() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        let archive = make_tarball(
+            &temp.0,
+            "wyrd-0.4.0-alpha-linux-aarch64.tar.gz",
+            b"new-binary",
+        );
+        let identity = test_identity("wyrd-0.4.0-alpha-linux-aarch64.tar.gz", "0.4.0-alpha");
+        stage_archive(&exe, Path::new("/srv/drive"), &archive, &identity).unwrap();
+        assert_eq!(fs::read(next_path(&exe)).unwrap(), b"new-binary");
+        assert_eq!(read_state(&exe).unwrap().unwrap().phase, Phase::Staged);
+    }
+
+    #[test]
+    fn stage_rejects_a_foreign_tarball_with_no_record() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        let archive = temp.0.join("wyrd-0.4.0-alpha-linux-aarch64.tar.gz");
+        fs::write(&archive, b"not a tarball").unwrap();
+        let identity = test_identity("wyrd-0.4.0-alpha-linux-aarch64.tar.gz", "0.4.0-alpha");
+        let error = stage_archive(&exe, Path::new("/srv/drive"), &archive, &identity).unwrap_err();
+        assert!(error.to_string().contains("unpackable"), "{error}");
+        assert!(read_state(&exe).unwrap().is_none());
+        assert!(!next_path(&exe).exists());
+    }
+
+    #[test]
+    fn swap_moves_old_aside_and_staged_into_place() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::write(next_path(&exe), b"new-binary").unwrap();
+        swap_first(&exe).unwrap();
+        // Between the renames the executable is missing: exactly
+        // the window converge unwinds.
+        assert!(!exe.exists());
+        swap_second(&exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"new-binary");
+        assert_eq!(fs::read(prev_path(&exe)).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn swap_refuses_without_a_staged_binary() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        swap_first(&exe).unwrap();
+        let error = swap_second(&exe).unwrap_err();
+        assert!(error.to_string().contains("no staged binary"), "{error}");
+        // First rename already moved old aside: converge would
+        // restore it; the test cleans up by hand.
+        fs::rename(prev_path(&exe), &exe).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn converge_staged_with_missing_exe_restores_first() {
+        // Crash after the first rename but before the Swapped
+        // record: the phase still reads Staged, yet the
+        // executable is gone. The unwind prefix restores prev
+        // before the phase cleanup runs.
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        fs::rename(&exe, prev_path(&exe)).unwrap();
+        fs::write(next_path(&exe), b"new-binary").unwrap();
+        record(&exe, Phase::Staged);
+        assert!(matches!(converge(&exe).unwrap(), Converged::RolledBack(_)));
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+        assert!(!state_path(&exe).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_runs_the_staged_self_report() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new();
+        let script = temp.0.join("wyrd.next");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'update build: 0.4.0-alpha\\nupdate envelope: 0x00\\nupdate control: 0x00\\n'",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        run_preflight(&script).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_refuses_a_broken_staged_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new();
+        let script = temp.0.join("wyrd.next");
+        fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_preflight(&script).unwrap_err();
+        assert!(error.to_string().contains("refusing the swap"), "{error}");
+    }
+
+    /// A staged binary double: a shell script answering the two
+    /// internal subcommands. `verify_exit` decides the
+    /// `__update_verify` outcome, so the same double drives the
+    /// commit and rollback paths with zero mocks.
+    #[cfg(unix)]
+    fn script_binary(dir: &Path, verify_exit: u8) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("script-wyrd");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"__build_info\" ]; then\n\
+                   printf 'update build: 0.4.0-alpha\\nupdate envelope: 0x00\\nupdate control: 0x00\\n'\n\
+                   exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = \"__update_verify\" ]; then\n\
+                   printf 'update compatibility: verified (1 checks)\\nupdate check: script\\n'\n\
+                   exit {verify_exit}\n\
+                 fi\n\
+                 exit 9\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn script_archive(dir: &Path, script: &Path) -> PathBuf {
+        let top = dir.join("top");
+        fs::create_dir_all(top.join("bin")).unwrap();
+        fs::copy(script, top.join("bin").join("wyrd")).unwrap();
+        let archive = dir.join("wyrd-0.4.0-alpha-linux-aarch64.tar.gz");
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir)
+            .arg("top")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(&top).unwrap();
+        archive
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_run_commits_a_verified_swap() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        let drive = temp.0.join("drive");
+        fs::create_dir_all(&drive).unwrap();
+        let script = script_binary(&temp.0, 0);
+        let archive = script_archive(&temp.0, &script);
+        let script_bytes = fs::read(&script).unwrap();
+        update_run(
+            &drive,
+            &archive,
+            Path::new("/tmp/id"),
+            Path::new("/tmp/pp"),
+            &[],
+            false,
+            &exe,
+        )
+        .unwrap();
+        // The staged script is the binary in place; the rollback
+        // copy and the record are gone — rollback impossible.
+        assert_eq!(fs::read(&exe).unwrap(), script_bytes);
+        assert!(!prev_path(&exe).exists());
+        assert!(!state_path(&exe).exists());
+        assert!(!next_path(&exe).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_run_rolls_back_a_rejected_swap() {
+        let temp = TempDir::new();
+        let exe = fake_exe(&temp.0);
+        let drive = temp.0.join("drive");
+        fs::create_dir_all(&drive).unwrap();
+        let script = script_binary(&temp.0, 3);
+        let archive = script_archive(&temp.0, &script);
+        let error = update_run(
+            &drive,
+            &archive,
+            Path::new("/tmp/id"),
+            Path::new("/tmp/pp"),
+            &[],
+            false,
+            &exe,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, CliError::Verification(message) if message.contains("rejected")),
+            "rejected swap must fail verified-shaped, got: {error}"
+        );
+        assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+        assert!(!prev_path(&exe).exists());
+        assert!(!state_path(&exe).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verify_child_timeout_is_an_operational_rollback() {
+        let temp = TempDir::new();
+        let script = temp.0.join("hang");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_verify_child(
+            &script,
+            Path::new("/srv/drive"),
+            Path::new("/tmp/id"),
+            Path::new("/tmp/pp"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        // A timeout never claims incompatibility: usage error, no
+        // verdict — the caller rolls back on it like any
+        // unverified outcome.
+        assert!(
+            matches!(&error, CliError::Usage(message) if message.contains("timed out")),
+            "timeout must be operational, got: {error}"
+        );
     }
 }

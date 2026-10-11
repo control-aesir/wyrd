@@ -12,7 +12,6 @@ use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
 use crate::probes::macos_preflight;
 use crate::probes::TeardownStatus;
-use crate::update::{check_drive_dir, resolve_archive};
 use clap::{Args, Parser, Subcommand};
 use fuser::{Config, MountOption};
 use wyrd_core::export::export_tree;
@@ -268,9 +267,8 @@ enum Command {
     /// quiesce, flush, stop, swap the binary atomically, verify the
     /// new build against the actual store, and hand back to the
     /// supervisor (U1=B: the operator supplies the archive; U3=B:
-    /// this command never supervises). Step 1 resolves and validates
-    /// the archive only — no process is stopped and no store is
-    /// opened — and reports the artifact identity.
+    /// this command never supervises). Credential paths are
+    /// forwarded to the verification child, never read here.
     Update {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -279,6 +277,18 @@ enum Command {
         /// validated before anything is stopped.
         #[arg(long, value_name = "PATH")]
         archive: PathBuf,
+        /// Control-plane relays, forwarded to the vault child under
+        /// `--restart` only; refused otherwise.
+        #[command(flatten)]
+        relays: RelayArgs,
+        /// After a committed swap, run the new vault as our child
+        /// and wait on it (the explicit foreground mode) instead of
+        /// handing back to the supervisor. Needs at least one
+        /// `--relay`.
+        #[arg(long)]
+        restart: bool,
+        #[command(flatten)]
+        credentials: Credentials,
     },
     /// Verify a drive with this binary and report compatibility:
     /// the update transaction's authoritative check, run by the
@@ -296,6 +306,14 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
+    /// Report this binary's compiled format versions, lock-free: app
+    /// version, envelope version, control version. Internal and
+    /// unstable (double underscore): the update preflight runs it
+    /// on the staged binary and compares against its own. Three
+    /// `update <key>: <value>` lines on stdout, exit 0, no store
+    /// touched.
+    #[command(name = "__build_info", hide = true)]
+    BuildInfo,
 }
 
 /// One membership administration action. Only an owner authors
@@ -708,11 +726,36 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Err(error) => return Err(CliError::Usage(error.to_string())),
     };
     let (identity, passphrase) = match &cli.command {
-        // Update resolves its archive before anything else:
-        // validation must run before the running service is
-        // disturbed, it needs no secrets, and its failures are usage
-        // errors — never a half-started transaction.
-        Command::Update { drive_dir, archive } => return update_resolve(drive_dir, archive),
+        // Update runs the whole transaction below without secrets
+        // (credential paths forward to the verification child, who
+        // opens custody), so it returns before credential loading.
+        // Quiescence, staging, swap, verify, commit-or-rollback,
+        // hand back: `update::update_run`.
+        Command::Update {
+            drive_dir,
+            archive,
+            relays,
+            restart,
+            credentials,
+        } => {
+            let exe = std::env::current_exe().map_err(|source| CliError::Io {
+                path: PathBuf::from("<current executable>"),
+                source,
+            })?;
+            return update::update_run(
+                drive_dir,
+                archive,
+                &credentials.identity_file,
+                &credentials.passphrase_file,
+                &relays.relay,
+                *restart,
+                &exe,
+            );
+        }
+        Command::BuildInfo => {
+            println!("{}", update::render_build_info(&update::own_build_info()));
+            return Ok(());
+        }
         Command::Init { credentials, .. } => read_credentials(credentials)?,
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
@@ -730,9 +773,11 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
 
     match cli.command {
         // Dead by construction: the credentials match above returns
-        // from update before secrets load. The arm exists only
-        // because the match is exhaustive.
-        Command::Update { .. } => unreachable!("update resolves before credential loading"),
+        // from update and build-info before secrets load. The arm
+        // exists only because the match is exhaustive.
+        Command::Update { .. } | Command::BuildInfo => {
+            unreachable!("update and build-info resolve before credential loading")
+        }
         Command::UpdateVerify { drive_dir, .. } => {
             update::run_update_verify(&drive_dir, identity, &passphrase)
         }
@@ -838,28 +883,6 @@ fn read_credentials(
     // plain `String`. Callers pass `&passphrase` as `&str` through
     // deref coercion.
     Ok((identity, Zeroizing::new(passphrase.to_owned())))
-}
-
-/// Step 1 of `wyrd update` (U1): resolve and validate the archive and
-/// report its identity. No process is stopped, no store is opened,
-/// no lock is taken — the drive directory gets an existence check
-/// only. The compatibility line is honestly unverified: the resolve
-/// step runs no checks, and step 3 replaces it with the real
-/// invariant report. The swap transaction (U2/U3) builds on this
-/// identity later.
-fn update_resolve(drive_dir: &Path, archive: &Path) -> Result<(), CliError> {
-    check_drive_dir(drive_dir)?;
-    let identity = resolve_archive(archive)?;
-    println!("update archive: {}", identity.canonical_name);
-    println!("update version: {}", identity.version);
-    println!("update target: {}-{}", identity.os, identity.arch);
-    println!("update blake3: {}", identity.blake3);
-    println!("update bytes: {}", identity.bytes);
-    println!(
-        "{}",
-        update::render_compatibility(&update::CompatibilityStatus::Unverified)
-    );
-    Ok(())
 }
 
 /// Read a bounded credential file without following symlinks. On Unix the
@@ -985,7 +1008,7 @@ const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 /// pre-existing default-disposition behavior, never memory unsafety.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn install_shutdown_handler() -> Result<(), CliError> {
+pub(crate) fn install_shutdown_handler() -> Result<(), CliError> {
     // SAFETY: the handler stores to an AtomicBool (lock-free,
     // async-signal-safe) and touches nothing else. sigaction itself
     // runs at startup on the main thread.

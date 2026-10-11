@@ -555,13 +555,17 @@ release archive the operator supplies — no download, no signed
 manifest (those are post-v1 distribution work). Quiescence is a
 precondition update checks, never a state it produces: the old
 process must already be stopped, and a held store lock refuses
-with `stop the service first`. The full sequence — stage, swap,
+with `stop the service first`. The full sequence — converge any
+interrupted transaction, resolve, require quiescence, stage,
+preflight, swap (recording `Swapped` between the two renames),
 verify against the actual store, commit or roll back, hand back
-to the supervisor — is specified in `docs/update.md`; what ships
-today is step 1, the artifact contract:
+to the supervisor — is specified in `docs/update.md`:
 
 ```text
 update
+    = converge a leftover `<exe>.update-state` first: only a
+      passed verification ever commits, everything else rolls
+      back to the pre-swap binary
     = resolve `--archive` before anything is stopped: the path
       must be a regular file under its canonical name
       (`wyrd-<version>-<os>-<arch>.tar.gz`); anything else is a
@@ -569,9 +573,20 @@ update
     = report the artifact identity (version, target, blake3,
       bytes) plus an honestly unverified compatibility line —
       the resolve step runs no checks, and says so
-    = touch nothing: no process stopped, no store opened, no
-      lock taken (the drive directory gets an existence check
-      only)
+    = refuse a held lock with `stop the service first` (a
+      lock-only probe: no state read, no key minted, nothing
+      held afterwards)
+    = extract `*/bin/wyrd` to `<exe>.next`, run its lock-free
+      self-report as the advisory preflight, swap by two atomic
+      renames with the old binary kept at `<exe>.prev`
+    = spawn the new binary's hidden `__update_verify` against
+      the drive: replay, authorize, restore epoch keys, prove
+      byte-identical durable state — commit on verified, restore
+      on anything else
+    = hand back: exit 0 with the new binary in place (start the
+      service to run it), or `--restart` to run the new vault as
+      our child instead; on failure the old binary is restored
+      first and the exit names which binary is in place
 ```
 
 The blake3 digest names the artifact in reports; it is an

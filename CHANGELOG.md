@@ -54,6 +54,14 @@ version say exactly what changed.
   Object payload bytes are the documented residual (no public
   store-enumeration API); the two upgrade-contract gaps ride
   every report as unverified.
+- `wyrd update` runs the full transaction (29, step 4): converge
+  leftovers, resolve, lock-probe quiescence (`stop the service
+  first` on held), stage to `<exe>.next`, advisory preflight,
+  two-rename swap with `<exe>.prev` kept, `__update_verify` in
+  the gap with a 300s bound, commit or atomic rollback, handoff
+  (`start the service`) or `--restart` foreground supervision
+  with signal forwarding and exit propagation. Credential paths
+  forward to the verification child, never read by the parent.
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault

@@ -463,16 +463,15 @@ fn vault_start_is_default_and_status_queries() {
     }
 }
 
-/// `wyrd update` takes a drive and a local archive path (U1=B): no
-/// download source, no credentials at the resolve stage. Resolution
-/// reports the artifact identity and touches nothing else.
+/// `wyrd update` takes a drive, a local archive path, and the
+/// credential paths to forward (U1=B): no download source, and the
+/// parent never reads secrets — only the verification child opens
+/// custody.
 #[test]
-fn update_resolves_a_canonical_archive() {
+fn update_parses_drive_archive_and_forwarded_credentials() {
     let temp = TempDir::new();
     let drive = temp.0.join("drive");
-    fs::create_dir_all(&drive).unwrap();
     let archive = temp.0.join("wyrd-0.3.0-alpha-linux-aarch64.tar.gz");
-    fs::write(&archive, b"fake-archive").unwrap();
 
     let cli = Cli::try_parse_from([
         "wyrd",
@@ -480,24 +479,24 @@ fn update_resolves_a_canonical_archive() {
         drive.to_str().unwrap(),
         "--archive",
         archive.to_str().unwrap(),
+        "--identity-file",
+        "/tmp/id",
+        "--passphrase-file",
+        "/tmp/pp",
     ])
     .unwrap();
     let Command::Update {
         drive_dir,
         archive: parsed,
+        restart,
+        ..
     } = cli.command
     else {
         panic!("update must parse");
     };
     assert_eq!(drive_dir, drive);
     assert_eq!(parsed, archive);
-    command(vec![
-        "update".into(),
-        drive.display().to_string(),
-        "--archive".into(),
-        archive.display().to_string(),
-    ])
-    .unwrap();
+    assert!(!restart);
 }
 
 /// A noncanonical archive name stops the update before anything is
@@ -515,12 +514,50 @@ fn update_rejects_a_noncanonical_archive() {
         drive.display().to_string(),
         "--archive".into(),
         archive.display().to_string(),
+        "--identity-file".into(),
+        "/tmp/id".into(),
+        "--passphrase-file".into(),
+        "/tmp/pp".into(),
     ])
     .unwrap_err();
     let message = error.to_string();
     assert!(
         message.contains("wyrd-<version>-<os>-<arch>.tar.gz"),
         "{message}"
+    );
+}
+
+/// Relay and restart flags belong together: relays without
+/// `--restart` have no consumer, and `--restart` without a relay
+/// cannot start the vault child.
+#[test]
+fn update_refuses_mismatched_restart_flags() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    let base = || {
+        vec![
+            "update".into(),
+            drive.display().to_string(),
+            "--archive".into(),
+            "wyrd-0.4.0-alpha-linux-aarch64.tar.gz".into(),
+            "--identity-file".into(),
+            "/tmp/id".into(),
+            "--passphrase-file".into(),
+            "/tmp/pp".into(),
+        ]
+    };
+    let mut relayed = base();
+    relayed.push("--relay".into());
+    relayed.push("ws://localhost:9".into());
+    let error = command(relayed).unwrap_err();
+    assert!(error.to_string().contains("--restart-only"), "{error}");
+    let mut restarted = base();
+    restarted.push("--restart".into());
+    let error = command(restarted).unwrap_err();
+    assert!(
+        error.to_string().contains("needs at least one --relay"),
+        "{error}"
     );
 }
 

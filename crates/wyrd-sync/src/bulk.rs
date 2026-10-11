@@ -493,6 +493,19 @@ fn trace_attempt(
     );
 }
 
+/// Render 32 bytes as lowercase hex: the fetch forensics lines need
+/// provider and hash ids, and `hex` stays inside `wyrd-format` by the
+/// crate rules, so this preallocated manual form is the cheapest
+/// available. One allocation per id, never one per byte.
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
+}
+
 /// A synchronous [`BulkSource`] backed by iroh-blobs' verified streaming API.
 ///
 /// The address maps are populated by the control/runtime layer. Root manifests
@@ -601,7 +614,10 @@ impl IrohBulkSource {
     /// Cumulative fetch telemetry for the split's failure modes (see
     /// [`BulkFetchStats`]): attempts, phase outcomes, fulfilled bytes,
     /// and wasted bytes — the resume pressure, measured. A snapshot:
-    /// later attempts keep accumulating underneath it.
+    /// later attempts keep accumulating underneath it. No production
+    /// consumer yet: test and diagnostics surface only — the resume
+    /// threshold reads the per-attempt debug forensics until a
+    /// diagnostics surface adopts the snapshot.
     pub fn fetch_stats(&self) -> BulkFetchStatsSnapshot {
         self.stats.snapshot()
     }
@@ -727,8 +743,8 @@ impl IrohBulkSource {
                     // transport), so a served-but-uncounted blob can
                     // be traced to its fetch kind.
                     tracing::debug!(
-                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        provider = %hex32(blob.provider.id.as_bytes()),
+                        hash = %hex32(&blob.hash),
                         "bulk candidate served"
                     );
                     return Ok(Some(bytes));
@@ -745,8 +761,8 @@ impl IrohBulkSource {
                     // message carries the failure class; the provider
                     // joins the route-publication line.
                     tracing::debug!(
-                        provider = %blob.provider.id.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        hash = %blob.hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        provider = %hex32(blob.provider.id.as_bytes()),
+                        hash = %hex32(&blob.hash),
                         error = %error,
                         "bulk candidate failed"
                     );
@@ -814,13 +830,8 @@ impl IrohBulkSource {
         // joins the route-publication and candidate lines on these
         // hex ids, so a served-but-uncounted blob and a repeatedly
         // restarted one both trace to provider and representation.
-        let provider_hex: String = provider
-            .id
-            .as_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let hash_hex: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let provider_hex = hex32(provider.id.as_bytes());
+        let hash_hex = hex32(hash.as_bytes());
         // The plan may cap this attempt at the time remaining to its
         // deadline, re-read here so every attempt in the pass clamps
         // to the live remaining. How an expiry classifies comes from
@@ -854,7 +865,11 @@ impl IrohBulkSource {
         // behavior.
         let dial_allowance = dial_allowance(blob_timeout);
         let stats = &self.stats;
-        self.runtime.block_on(async move {
+        // One observe site for every exit: the block reports its
+        // result alongside the outcome (and the dial latency the
+        // trace needs), so a future exit cannot forget to count —
+        // there is nowhere else to return from.
+        let (result, outcome, dial_latency) = self.runtime.block_on(async move {
             // Phase 1: dial. A firing dial deadline reports exactly
             // as a dial timeout always has; an instant failure stays
             // a transport error with zero bytes streamed.
@@ -872,9 +887,7 @@ impl IrohBulkSource {
                             streamed_bytes: 0,
                         }
                     };
-                    stats.record(&outcome);
-                    trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
-                    return Err(error);
+                    return (Err(error), outcome, dial_latency);
                 }
             };
             // Phase 2: size discovery plus streaming under the
@@ -906,22 +919,21 @@ impl IrohBulkSource {
             match transfer {
                 Ok(Ok(bytes)) => {
                     let outcome = AttemptOutcome::Fulfilled { bytes: bytes.len() };
-                    stats.record(&outcome);
-                    trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
-                    Ok(bytes)
+                    (Ok(bytes), outcome, dial_latency)
                 }
                 Ok(Err(error)) => {
                     // An instant transfer failure (size error,
                     // oversize, protocol error) completed its
                     // observation: fault evidence, with whatever
                     // partial progress banked as waste.
-                    let outcome = AttemptOutcome::Failed {
-                        phase: AttemptPhase::Transfer,
-                        streamed_bytes,
-                    };
-                    stats.record(&outcome);
-                    trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
-                    Err(error)
+                    (
+                        Err(error),
+                        AttemptOutcome::Failed {
+                            phase: AttemptPhase::Transfer,
+                            streamed_bytes,
+                        },
+                        dial_latency,
+                    )
                 }
                 Err(_) => {
                     // The transfer deadline fired: same instants and
@@ -937,13 +949,17 @@ impl IrohBulkSource {
                     } else {
                         BulkError::Transport("blob fetch timed out".to_string())
                     };
-                    let outcome = AttemptOutcome::TransferTimeout { streamed_bytes };
-                    stats.record(&outcome);
-                    trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
-                    Err(error)
+                    (
+                        Err(error),
+                        AttemptOutcome::TransferTimeout { streamed_bytes },
+                        dial_latency,
+                    )
                 }
             }
-        })
+        });
+        stats.record(&outcome);
+        trace_attempt(&provider_hex, &hash_hex, &outcome, dial_latency);
+        result
     }
 }
 

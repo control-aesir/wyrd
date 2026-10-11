@@ -657,6 +657,38 @@ fn progress_probe_counts_accepted_leaf_bytes_only() {
 }
 
 #[test]
+fn cancelled_transfer_keeps_partial_progress_on_the_probe() {
+    use n0_future::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The probe's whole point: a transfer cancelled mid-stream must
+    // still report the bytes that landed. One leaf flows, then the
+    // stream stalls forever; the timeout fires and the probe holds
+    // the leaf — the cancellation-survives-the-counter property the
+    // resume numerator depends on, without any iroh rig. The stall
+    // is a pending stream, so the timeout is the only possible
+    // outcome: nothing here can flake on timing.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let progress = AtomicUsize::new(0);
+    let stalled =
+        stream::iter(vec![leaf(0, Bytes::from_static(b"0123456789"))]).chain(stream::pending());
+    // The timeout is built inside the runtime: timer construction
+    // needs the reactor context `block_on` provides.
+    let result = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            bounded_blob_bytes(stalled, usize::MAX, 10, Some(&progress)),
+        )
+        .await
+    });
+    assert!(result.is_err(), "the stalled stream must hit the timeout");
+    assert_eq!(progress.load(Ordering::Relaxed), 10);
+}
+
+#[test]
 fn split_success_records_fulfilled_stats() {
     use iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
@@ -727,6 +759,9 @@ fn split_dial_timeout_records_phase_and_preserves_class() {
     // bytes streamed.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    // The forgotten listener is the load-bearing silence: dropping
+    // it would free the port and the dial would refuse fast instead
+    // of stalling into the timeout this test pins.
     std::mem::forget(listener);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

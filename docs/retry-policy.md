@@ -40,28 +40,32 @@ intake (publication replaces per pass), single-route bypass
 behavior (pinned by
 `full_share_sliced_attempts_strike_like_master`).
 
-## Resume feasibility (spike result, not a plan)
+## Resume feasibility (spike premises, not run code)
 
-Resume is buildable without a protocol fork:
+Resume looks buildable without a protocol fork, on premises read
+from the pinned registry sources (`iroh-blobs =0.103.0`) during
+the spike — none of them exercised by a ranged fetch in this
+repository:
 
-- The protocol speaks ranges (`GetRequest::blob_ranges`, plus a
-  builder with `root`/`offset` ranges); chunk probes already use
-  them, so servers honor them.
-- `iroh_blobs::get::fsm` is public low-level API, so a
-  ranged-request stream can be built beside `get_blob` (~mirror
-  `get_blob_impl` with a ranged request). No high-level
-  `get_blob_ranges` exists today.
+- The protocol source defines range constructors
+  (`GetRequest::blob_ranges`, plus a builder with `root`/`offset`
+  ranges) alongside range helpers for hash sequences and chunk
+  probes. No high-level ranged getter exists beside `get_blob`,
+  so a ranged stream would mirror `get_blob`'s internals.
+- `iroh_blobs::get::fsm` is a public module (`low level API for
+  getting data from a peer`), so that mirror needs no fork.
 - Leaves arrive with offsets and the parents for requested ranges
-  arrive inline, so a partial range verifies independently against
-  the same root hash — and remaining ranges may come from a
-  different provider. Size discovery already runs first, so
-  missing ranges are computable.
+  arrive inline per the Bao protocol, so a partial range should
+  verify independently against the same root hash — and remaining
+  ranges may come from a different provider. Size discovery
+  already runs first, so missing ranges are computable.
 
-Feasibility is established; worth is not. A partial-state
-implementation is the most invasive of the three items (trait
-change, cross-call state, ledger interaction, a second fake) for
-a pressure that has never been observed — lists are short, no
-hanging tails on record.
+The source reading establishes feasibility; only a prototype
+fetch would establish it as run code. Worth is not established
+either way: a partial-state implementation is the most invasive
+of the three items (trait change, cross-call state, ledger
+interaction, a second fake) for a pressure that has never been
+observed — lists are short, no hanging tails on record.
 
 ## What the resume note must settle before implementation
 
@@ -97,7 +101,10 @@ the complexity pre-emptively.
 dial-phase timeouts, transfer-phase timeouts, fulfilled fetches
 with their bytes, and **wasted bytes** — content bytes streamed in
 attempts that then failed, the direct measure of restart waste
-and the numerator for the resume threshold. Every attempt also
+and the numerator for the resume threshold. The snapshot has no
+production consumer yet: it is a test and diagnostics surface,
+and the threshold reads the debug forensics below until a
+diagnostics surface adopts it. Every attempt also
 emits a forensics line (provider, hash, phase, dial latency,
 streamed bytes, outcome) so per-representation repeats are
 computable from logs without new retained state. `MemoryBulkSource`

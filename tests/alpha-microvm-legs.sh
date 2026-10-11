@@ -22,13 +22,16 @@ PIDDIR="$E2E_ROOT/pids/$(hostname -s)"
 
 # Per-probe section timing for the long legs (step 9 today): each mark
 # prints the wall seconds since the previous mark, so the breakdown is
-# greppable in the leg log (`step9 probe <name>=<Ns>`) without changing
-# any probe. Marks sit beside the passes they follow; the pass deltas
-# stay the check-level view.
-STEP9_MARK=$SECONDS
+# greppable in the leg log (`step<PROBE_STEP> probe <name>=<Ns>`)
+# without changing any probe. Marks sit beside the passes they follow;
+# the pass deltas stay the check-level view. The step prefix defaults
+# to 9; a future caller on another step sets PROBE_STEP instead of
+# emitting a false step.
+PROBE_STEP="${PROBE_STEP:-9}"
+PROBE_MARK=$SECONDS
 probe_mark() { # <name>
-  echo "step9 probe $1=$(( SECONDS - STEP9_MARK ))s"
-  STEP9_MARK=$SECONDS
+  printf 'step%s probe %s=%ss\n' "$PROBE_STEP" "$1" "$(( SECONDS - PROBE_MARK ))"
+  PROBE_MARK=$SECONDS
 }
 
 # leg_converge_owner <drive> <creds> <relay>: mount, write shared.txt,
@@ -124,6 +127,7 @@ leg_fetch_owner() {
   local d="$1" c="$2" relay="$3"
   step 9 "fetch-plane owner leg"
   start_mount xowner-f "$c" "$d" "$MNTS/xowner-f" --relay "$relay"
+  probe_mark owner_mount
   echo "cold-bytes" > "$MNTS/xowner-f/cold-2.txt"
   poll_until 120 test -f "$E2E_ROOT/member-cold-done" \
     || die "member never completed the blocking cold open"
@@ -139,9 +143,9 @@ leg_fetch_owner() {
   # trees for the later delete runs against the fresh endpoint
   # instead; same drive, same lineage, so nothing forks.
   stop_mount xowner-f INT
-  check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   touch "$E2E_ROOT/owner-stopped"
   probe_mark stopped
+  check_no_leaks "$LOGDIR/mount-xowner-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   poll_until 240 test -f "$E2E_ROOT/member-probed-done" \
     || die "member never finished the dead-route probes"
   pass "owner stayed down while the member probed the dead route"
@@ -164,6 +168,7 @@ leg_fetch_owner() {
   # later also localizes its bytes: phase 6 exports this drive
   # offline and fails closed on remote-only content.
   start_mount xowner-f2 "$c" "$d" "$MNTS/xowner-f2" --relay "$relay"
+  probe_mark owner_remount
   echo "owner-back" > "$MNTS/xowner-f2/owner-back-1.txt"
   touch "$E2E_ROOT/owner-back"
   # The member created its scratch file and deleted stale-1 on the
@@ -192,8 +197,8 @@ leg_fetch_owner() {
   poll_until 700 test -f "$E2E_ROOT/member-recovered-done" \
     || die "member never recovered the stale identity"
   stop_mount xowner-f2 INT
-  check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   probe_mark recovery_wait
+  check_no_leaks "$LOGDIR/mount-xowner-f2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
 # leg_fetch_member <drive> <creds> <relay>: mount, wait for the cold
@@ -285,6 +290,7 @@ leg_fetch_member() {
   probe_mark stale_listed
   poll_until 180 test -f "$E2E_ROOT/owner-stopped" \
     || die "owner never stopped for the dead-route probes"
+  probe_mark route_down
   # Window start for the class assertion below: only passes logged
   # after the owner stopped can be about the dead-route probes — a
   # whole-log grep would also match pre-window passes.
@@ -499,7 +505,7 @@ leg_fetch_member() {
   [[ "$attempt" -lt 10 ]] \
     || die "stale identity never recovered without remount after $attempt bounded opens"
   pass "failed fetch recovers after re-announcement without remount"
-  probe_mark "recovery attempts=$attempt"
+  probe_mark "recovery(attempts=$((attempt + 1)))"
   # Stay up until the owner confirms convergence: shutting down
   # here would outrun the outbox drain and strand the scratch and
   # delete announcements this leg's owner polls wait for. Short
@@ -576,6 +582,7 @@ leg_fetch_member() {
   check_no_leaks "$LOGDIR/mount-xmember-f.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$E2E_ROOT/sync-now-member.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$E2E_ROOT/sync-now-member.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  probe_mark tail_checks
 }
 
 # leg_conflict_owner <drive> <creds> <relay>: mount, drive the rename

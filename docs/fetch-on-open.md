@@ -218,12 +218,17 @@ Decided properties:
    slices back the representation off on the separate burn ledger —
    while a full-share attempt (the only or last candidate, or any
    single-route fetch outside a walk, which is the production case)
-   expires as a transport failure exactly as before, so a hanging
-   route with no one behind it still backs off. A zero-grant
-   deadline (the walk stopped before attempting) counts — when it
-   is the representation's whole story; a fallback zero grant
-   masked by a primary outcome is not counted — but never backs
-   off: a provider never asked carries no evidence.
+    expires as a transport failure exactly as before, so a hanging
+    route with no one behind it still backs off. A zero-grant
+    deadline (the walk stopped before attempting) counts — when it
+    is the representation's whole story; a fallback zero grant
+    masked by a primary outcome is not counted — but never backs
+    off: a provider never asked carries no evidence. Within one
+    attempt the dial runs under its own allowance and size
+    discovery plus streaming under the leftover, firing at the same
+    instants with the same classes; attempts record phase, dial
+    latency, and streamed bytes for the resume threshold
+    (`docs/retry-policy.md`).
 
 ## What open() materializes vs what read() demands
 

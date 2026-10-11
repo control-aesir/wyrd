@@ -58,18 +58,18 @@ GOT="$(PROBE_STEP=12 probe_mark scratch)"
   || die "step override mismatch, got '$GOT'"
 pass "PROBE_STEP overrides the prefix"
 
-# Every instrumented phase-13 leg keeps its marks: a leg that silently
-# loses its instrumentation must fail here, not in an odin log. The
-# legs file is not sourceable, so bodies are sliced textually from the
+# Every instrumented leg keeps its marks: a leg that silently loses
+# its instrumentation must fail here, not in an odin log. The legs
+# file is not sourceable, so bodies are sliced textually from the
 # function header to its closing brace.
-for leg in leg_crash_owner leg_steady_member leg_crash_member leg_steady_owner; do
+for leg in leg_crash_owner leg_steady_member leg_crash_member leg_steady_owner leg_uparent_owner leg_uparent_member; do
   BODY="$(awk "/^$leg\(\) \{/{f=1} f{print} /^\}$/{if (f) exit}" "$LEGS")"
   [[ -n "$BODY" ]] || die "leg body not found: $leg"
-  grep -q 'PROBE_STEP=13' <<<"$BODY" \
-    || die "$leg lost its PROBE_STEP=13 override"
+  grep -q 'PROBE_STEP=1[35]' <<<"$BODY" \
+    || die "$leg lost its PROBE_STEP override"
   [[ "$(grep -c 'probe_mark ' <<<"$BODY")" -ge 1 ]] \
     || die "$leg lost its probe marks"
 done
-pass "all four phase-13 legs keep their step override and marks"
+pass "all six instrumented legs keep their step override and marks"
 
 echo "probe-mark: $PASS checks passed"

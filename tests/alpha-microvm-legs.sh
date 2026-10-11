@@ -20,13 +20,15 @@ source /etc/wyrd-tests/alpha-common.sh
 # pids must not be. (alpha-common.sh sources the env file itself.)
 PIDDIR="$E2E_ROOT/pids/$(hostname -s)"
 
-# Per-probe section timing for the long legs (steps 9 and 13 today):
-# each mark prints the wall seconds since the previous mark, so the
+# Per-probe section timing for the long legs (steps 9, 13, and 15
+# today): each mark prints the wall seconds since the previous mark, so the
 # breakdown is greppable in the leg log
 # (`step<PROBE_STEP> probe <name>=<Ns>`) without changing any probe.
 # Marks sit beside the passes they follow; the pass deltas stay the
 # check-level view. The step prefix defaults to 9; a leg on another
-# step sets PROBE_STEP first instead of emitting a false step.
+# step sets a local PROBE_STEP first instead of emitting a false step
+# (local: the dispatch runs one leg per process, and a global would
+# leak a false step into any later leg in the same shell).
 PROBE_STEP="${PROBE_STEP:-9}"
 PROBE_MARK=$SECONDS
 probe_mark() { # <name>
@@ -1497,6 +1499,7 @@ leg_exhaustion() {
 leg_uparent_owner() {
   local d="$1" c="$2" relay="$3"
   step 15 "unknown-parent owner leg"
+  local PROBE_STEP=15
   local old_e2e_log="${E2E_RUST_LOG-__unset}"
   # wyrd_daemon=debug for the FUSE backend's per-opcode lines
   # (errno, latency_us, queue_depth): the hung open's dispatch
@@ -1513,6 +1516,7 @@ leg_uparent_owner() {
   [[ "$(timeout 60 cat "$MNTS/xup-o/up-2.txt" 2>/dev/null)" == "up-2-bytes" ]] \
     || die "up-2 never committed on top of up-1"
   pass "chained snapshots published (up-2 strictly on up-1)"
+  probe_mark published
   # Wait for the member to converge both announcements BEFORE
   # stopping: announcements leave via the async outbox, and after
   # 13b's forty-snapshot history the publish pipeline drains slowly
@@ -1527,15 +1531,19 @@ leg_uparent_owner() {
     || die "member never converged the announcements"
   stop_mount xup-o INT
   check_no_leaks "$LOGDIR/mount-xup-o.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  probe_mark owner_stopped
   touch "$E2E_ROOT/uparent-owner-gone"
   poll_until 300 test -f "$E2E_ROOT/uparent-member-probed" \
     || die "member never finished the unknown-parent probes"
+  probe_mark member_probed
   start_mount xup-o2 "$c" "$d" "$MNTS/xup-o2" --relay "$relay"
   timeout 35 bash -c "echo 'up-3-bytes' > '$MNTS/xup-o2/up-3.txt'" 2>/dev/null \
     || die "up-3 write failed"
   touch "$E2E_ROOT/uparent-owner-back"
+  probe_mark owner_back
   poll_until 300 test -f "$E2E_ROOT/uparent-member-healed" \
     || die "member never healed after the bodies arrived"
+  probe_mark member_healed
   stop_mount xup-o2 INT
   check_no_leaks "$LOGDIR/mount-xup-o2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
@@ -1561,6 +1569,7 @@ leg_uparent_member() {
   local d="$1" c="$2" relay="$3"
   local rc=0
   step 15 "unknown-parent member leg"
+  local PROBE_STEP=15
   local old_e2e_log="${E2E_RUST_LOG-__unset}"
   # wyrd_daemon=debug for the FUSE backend's per-opcode lines
   # (errno, latency_us, queue_depth): the hung open's dispatch
@@ -1573,6 +1582,7 @@ leg_uparent_member() {
   poll_until 120 bash -c "ls '$MNTS/xup-m' | grep -qx 'up-2.txt'" \
     || die "member never listed up-2"
   pass "both announcements listed; owner holds until this signal"
+  probe_mark announced
   # Signal BEFORE waiting for the stop: the owner must not stop
   # until both announcements are relay-visible (see the owner leg).
   # Race-free: fetch is strictly demand-driven (fetch-on-open.md —
@@ -1582,6 +1592,7 @@ leg_uparent_member() {
   touch "$E2E_ROOT/uparent-announced"
   poll_until 180 test -f "$E2E_ROOT/uparent-owner-gone" \
     || die "owner never stopped before the probes"
+  probe_mark owner_gone
   # Control first, on pristine state: a never-announced name is
   # ENOENT instantly, proving the mount is alive and resolving names
   # — so the EIOs below mean unfetchable bodies, not a dead mount.
@@ -1593,6 +1604,7 @@ leg_uparent_member() {
   [[ ! -s "$E2E_ROOT/up-9.got" ]] \
     || die "unannounced-name read captured bytes it must not have"
   pass "unannounced names are ENOENT, instantly (control)"
+  probe_mark control_enoent
   # The child: live head (its manifest converged, and so did its
   # parent's — neither classifies UnknownParent), body unfetchable
   # with the owner down. The open resolves; the read waits on the
@@ -1613,6 +1625,7 @@ leg_uparent_member() {
   [[ ! -s "$E2E_ROOT/up-2.got" ]] \
     || die "withheld-child read captured bytes it must not have"
   pass "withheld child body fails EIO bounded"
+  probe_mark child_eio
   # The parent, same shape: announced with its manifest, body
   # unfetchable with the owner down. Same EIO at the same deadline.
   rc=0
@@ -1629,16 +1642,20 @@ leg_uparent_member() {
   [[ ! -s "$E2E_ROOT/up-1.got" ]] \
     || die "withheld-body read captured bytes it must not have"
   pass "withheld parent body fails EIO bounded (control)"
+  probe_mark parent_eio
   touch "$E2E_ROOT/uparent-member-probed"
   poll_until 300 test -f "$E2E_ROOT/uparent-owner-back" \
     || die "owner never returned after the probes"
+  probe_mark owner_back
   poll_until 300 converged "$MNTS/xup-m/up-1.txt" "up-1-bytes" \
     || die "up-1 never healed once the body arrived"
   poll_until 300 converged "$MNTS/xup-m/up-2.txt" "up-2-bytes" \
     || die "up-2 never healed once the body arrived"
   pass "withheld bodies heal without remount"
+  probe_mark healed
   poll_until 300 converged "$MNTS/xup-m/up-3.txt" "up-3-bytes" \
     || die "member never converged the post-return write"
+  probe_mark postreturn_converged
   pass "post-return head converges"
   touch "$E2E_ROOT/uparent-member-healed"
   stop_mount xup-m TERM

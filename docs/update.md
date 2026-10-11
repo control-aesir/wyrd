@@ -166,9 +166,31 @@ on). Unknown envelopes refuse loudly with their names (invariant
 10); the two named gaps (fact-payload replay, version matrix)
 ride every report as unverified, never omitted.
 
-Which invariants map to which checks is step 3's report
-definition; this section pins the boundary the mapping must
-respect.
+### Invariant-to-check mapping (step 3)
+
+Each `update check:` line ties to exactly one upgrade-contract
+invariant; anything else the report prints is data (versions),
+never a claim:
+
+| Invariant | Check |
+| --- | --- |
+| 1 — immutable data stays readable | `N commits replay` (history loads) plus `M live heads authorize` (snapshots verify). Object *payload* bytes are the one residual: no public store-enumeration API exists, and the CLI must not reconstruct the object layout beside the store — so payload framing is not sampled here. Payload bytes are immutable CAS served hash-verified; a framing break there fails at serve time, loudly, and never corrupts. |
+| 2 — explicit versions | Any explicitly-versioned format that fails to decode is `incompatible (invariant 2: <error>)`. The payload clause is the named fact-payload-replay gap. |
+| 3 — read window | The replay is this drive's own history under the new readers. |
+| 4 — derived rebuilds | The byte-identity proof: derived state lives outside the snapshotted files, so anything load-bearing the verify wrote would show as a difference. |
+| 5 — capability negotiation | Named gap, never claimed. |
+| 6 — no transition emitted | Keystore plus observed membership set byte-identical. |
+| 7 — additive crypto | Epoch keys restored inside the open; the open fails closed otherwise. |
+| 8 — permanent history | Commit set and CURRENT unchanged. |
+| 9 — interrupted reopen | The transaction protocol (§4), covered by its own failure-injection tests — not by the verify child. |
+| 10 — fail closed | Unknown control versions/kinds are `incompatible (invariant 10: unknown control version 0x..)` with the byte named. |
+
+A `verified` report therefore claims exactly: this build opens
+the store, replays its history, authorizes its heads, restores
+its epochs, and leaves every durable byte identical — with the
+two named gaps plus the payload-bytes residual outside the
+claim. Anything narrower is not verified; anything broader is
+not this report.
 
 ## 6. Output and exit contract (condition 5, U3, U4)
 

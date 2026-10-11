@@ -523,3 +523,118 @@ fn update_rejects_a_noncanonical_archive() {
         "{message}"
     );
 }
+
+/// `__update_verify` on a drive this build created verifies: open,
+/// replay, heads, epochs, and byte-identical durable state — and a
+/// second run proves idempotence (verification authors nothing, so
+/// there is nothing to accumulate).
+#[test]
+fn update_verify_passes_a_compatible_drive_twice() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    let init = || {
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap()
+    };
+    let verify = || {
+        command(vec![
+            "__update_verify".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap()
+    };
+    init();
+    verify();
+    verify();
+}
+
+/// `__update_verify` against a held drive refuses with no verdict:
+/// contention is operator-fixable (stop it first), never an
+/// incompatibility claim.
+#[test]
+fn update_verify_refuses_a_held_drive_without_a_verdict() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+
+    let identity = read_identity(&identity_file).unwrap();
+    let _holder = Engine::open_keystore(drive.clone(), "test-pass", identity).unwrap();
+    let error = command(vec![
+        "__update_verify".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(&error, CliError::Usage(message) if message.contains("stop it first")),
+        "held drive must refuse without a verdict, got: {error}"
+    );
+}
+
+/// `__update_verify` against a torn commit marker fails the
+/// verification with the invariant named.
+#[test]
+fn update_verify_names_the_invariant_on_a_torn_store() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+    // Tear the commit marker: CURRENT must be sequence plus hash,
+    // so garbage refuses at decode, not at open.
+    fs::write(drive.join("CURRENT"), b"torn").unwrap();
+
+    let error = command(vec![
+        "__update_verify".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(&error, CliError::Verification(message) if message.contains("invariant 2")),
+        "torn store must fail with invariant 2, got: {error}"
+    );
+}

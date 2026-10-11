@@ -41,6 +41,19 @@ version say exactly what changed.
   Noncanonical names (including hash-prefixed nix store basenames)
   are usage errors naming the expected shape. No process is
   stopped, no store is opened, no lock is taken.
+- `wyrd __update_verify` (29, step 3: hidden internal subcommand,
+  the transaction's authoritative check): opens the store with
+  this binary, replays every commit through its readers,
+  authorizes the live heads, restores epoch keys, and proves
+  byte-identical durable state afterwards (keystore, CURRENT,
+  DRIVE, commit set — no transition emitted, no commit authored).
+  Prints the U4 report and exits 0 if and only if verified;
+  unknown control versions fail as invariant 10 with the byte
+  named, undecodable versioned formats as invariant 2, while a
+  held lock or wrong passphrase refuses with no verdict at all.
+  Object payload bytes are the documented residual (no public
+  store-enumeration API); the two upgrade-contract gaps ride
+  every report as unverified.
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault

@@ -280,6 +280,22 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         archive: PathBuf,
     },
+    /// Verify a drive with this binary and report compatibility:
+    /// the update transaction's authoritative check, run by the
+    /// staged new binary against the actual store. Internal and
+    /// unstable (double underscore): operators use `wyrd update`,
+    /// never this directly. Opens the store, replays every commit
+    /// through this build's readers, authorizes the live heads,
+    /// restores epoch keys, and proves byte-identical durable
+    /// state afterwards — then prints the U4 report and exits 0
+    /// if and only if it is verified.
+    #[command(name = "__update_verify", hide = true)]
+    UpdateVerify {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
 }
 
 /// One membership administration action. Only an owner authors
@@ -659,6 +675,14 @@ pub(crate) enum CliError {
     /// inheriting a fabricated posture.
     #[error("sync unverified: mailbox posture was never recorded")]
     Unobserved,
+    /// `__update_verify` refused the drive: the U4 report on stdout
+    /// names the invariant; this carries the verdict to the exit
+    /// path. Operational failures (held lock, wrong passphrase)
+    /// never reach it — they print no verdict at all, so a verdict
+    /// without completed checks cannot exist. Exits non-zero like
+    /// any other failure.
+    #[error("update verification failed: {0}")]
+    Verification(String),
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -701,6 +725,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Unpin { credentials, .. } => read_credentials(credentials)?,
         Command::Evict { credentials, .. } => read_credentials(credentials)?,
         Command::Cache { credentials, .. } => read_credentials(credentials)?,
+        Command::UpdateVerify { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
@@ -708,6 +733,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         // from update before secrets load. The arm exists only
         // because the match is exhaustive.
         Command::Update { .. } => unreachable!("update resolves before credential loading"),
+        Command::UpdateVerify { drive_dir, .. } => {
+            update::run_update_verify(&drive_dir, identity, &passphrase)
+        }
         Command::Init { drive_dir, .. } => {
             Engine::create(drive_dir, &passphrase, identity)?;
             Ok(())

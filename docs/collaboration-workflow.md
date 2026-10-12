@@ -36,7 +36,7 @@ Apply exactly one label from each category:
 ```bash
 ngit issue label <issue> --label enhancement --json
 ngit issue label <issue> --label P2 --json
-ngit issue label <issue> --label release:v0.1.0-alpha --json
+ngit issue label <issue> --label release:v0.3.0-alpha --json
 ```
 
 Do not stack milestones. Swap deliberately with
@@ -45,9 +45,10 @@ priority changes. Keep the issue open while work is in progress.
 
 These three categories are a closed set: do not invent labels outside them
 (`test`, `docs`, component names, and the like are Conventional Commit
-scopes for the subject line, not labels). Creation labels cannot be removed,
-so a wrong label is permanent — when in doubt, list existing issues first to
-see the labels in use rather than guessing a new one. Capture the created
+scopes for the subject line, not labels). Creation labels cannot be removed
+through a later ngit label event, so prefer creating bare — when in doubt,
+list existing issues first to see the labels in use rather than guessing a
+new one. Capture the created
 issue's id from the `create --json` output and reuse it; never run `create`
 again to "check" something, and verify any unfamiliar subcommand flag with
 `--help` before running a command that writes.

@@ -25,8 +25,10 @@ in any mode. Three reasons, in order:
    correctness depend on incidental timing (forbidden by condition
    4 below).
 3. Quiesce/flush/unmount already exists as tested behavior on the
-   vault's own SIGINT/SIGTERM path (`main.rs:949` arms the signals;
-   SIGTERM after readiness exits 0 per `main.rs:3231`, pinned by
+   vault's own SIGINT/SIGTERM path (the `SHUTDOWN` latch at
+   `main.rs:1007`, armed by `install_shutdown_handler` at
+   `main.rs:1043`; SIGTERM exits 0 on a clean stop per the
+   teardown at `main.rs:3314`, pinned by
    `crates/wyrd-cli/tests/vault_process.rs`). Re-implementing that
    teardown inside the updater duplicates it badly.
 
@@ -103,50 +105,79 @@ means same filesystem, so every swap step is one atomic rename.
   archive, executable bit ensured).
 - `<exe>.prev` — the old binary, kept until commit.
 - `<exe>.update-state` — JSON transaction record
-  `{version: 1, drive, archive: {name, version, blake3}, phase}`.
+  `{version: 1, drive, archive_name, archive_version,
+  archive_blake3, phase}` (`version` guards forward reads:
+  anything but 1 refuses rather than reinterprets).
+- `<exe>.stage/` — extraction scratch, removed after staging.
+- `<exe>.update-state.tmp` — the record's atomic-write temp,
+  synced before rename like the store's own `atomic_write`.
 
 Phases, in order:
 
-1. **Resolve.** Validate the archive (name, regularity, digest);
-   refuse ambiguities before anything is disturbed. Pure; no
-   state file yet.
+1. **Resolve.** Validate the archive (name, regularity, digest,
+   host platform); refuse ambiguities before anything is
+   disturbed. Pure; no state file yet.
 2. **Require quiescence.** Lock probe (§3); held means stop here.
 3. **Stage.** Extract `*/bin/wyrd` from the archive into a
    same-directory staging dir, move to `<exe>.next`, write state
    `{phase: staged}`. Crash here: old binary untouched; next
    update removes `.next` and resumes.
 4. **Preflight (U2-A, advisory).** Run the staged binary's
-   lock-free self-report and compare against this binary's own:
-   if the new build's minimum envelope version exceeds what this
-   build writes, refuse before the swap. Advisory means exactly
-   this: it catches binary-level impossibilities, never
-   per-drive truth.
-5. **Swap.** Rename `<exe>` to `<exe>.prev`, `<exe>.next` to
-   `<exe>` — two atomic renames, state `{phase: swapped}` between
-   them. Crash between the renames: reality is one side or the
-   other (rename is atomic); the state record plus a digest
-   comparison of what's in place converges to either
-   complete-the-swap or restore-and-`staged`. No third outcome.
-6. **Verify (U2-B/C, authoritative).** Spawn `<exe>
+   lock-free self-report and compare against this binary's own.
+   Today's format versions are single values with no
+   minimum-readable concept, so no version inequality is
+   structurally impossible: the comparison prints and the
+   transaction proceeds, except a downgrade warns (older alphas
+   may not read stores newer ones wrote — verification decides).
+   Advisory means exactly this: cheap, lock-free, never the
+   load-bearing check. A staged binary that cannot report at
+   all is broken and refuses before the swap.
+5. **Early verify (refusal only).** Run the staged binary's
+   `__update_verify` before anything is swapped. An
+   incompatible drive stops here with staging rolled back;
+   the post-swap verify below stays authoritative for the race
+   window, but the common failure never mutates the
+   installation.
+6. **Swap.** Rename `<exe>` to `<exe>.prev`, record
+   `{phase: swapped}`, rename `<exe>.next` to `<exe>` — two
+   atomic renames with the record between them. Crash anywhere
+   in this window: the unwind prefix restores `prev` when the
+   executable is missing, and the recorded phase converges the
+   rest — rollback unless verification passed. No third outcome.
+   Every rename is followed by a directory fsync, and the
+   record by file-plus-directory fsync, so a power loss cannot
+   leave a rename described-but-not-durable.
+7. **Verify (U2-B/C, authoritative).** Spawn `<exe>
    __update_verify <drive>` (hidden internal subcommand, §5) and
-   wait with a timeout. Exit 0 with a `verified` report commits;
-   anything else — nonzero, timeout, signal, or a report that is
-   not verified — restores `<exe>.prev` over `<exe>` and exits
-   nonzero. The old binary is never deleted before this verdict.
-7. **Commit / hand back.** State `{phase: committed}`, remove
+   wait with a timeout, draining both pipes while waiting. Exit
+   0 commits; anything else — nonzero, timeout, signal —
+   restores `<exe>.prev` over `<exe>` and exits nonzero. The
+   old binary is never deleted before this verdict.
+8. **Commit / hand back.** Record `{phase: verified}`, remove
    `<exe>.prev` and the state file — only now is rollback
    impossible. Supervised: print the binary in place and exit 0.
-   `--restart`: spawn it as the vault child (§1).
+   `--restart`: hand the binary to supervision (§1).
 
 Recovery rule: **every `wyrd update` invocation first reads
 `<exe>.update-state`.** A leftover record means the previous run
 died mid-transaction; the invocation converges reality to a clean
-state (complete or roll back per §5's table) before starting
-anything new. There is no separate recovery command and no
-recovery migration (upgrade invariant 9): the protocol is
-complete-the-rename or undo-the-rename, decided by digests, and a
-drive that never saw a verified new binary is byte-identical to
-before.
+state (complete or roll back per the phase) before starting
+anything new. With no record, a missing executable beside a
+present `<exe>.prev` still unwinds (the crash between the first
+rename and the record write has exactly that shape). There is no
+separate recovery command and no recovery migration (upgrade
+invariant 9): the protocol is complete-the-rename or
+undo-the-rename, decided by the recorded phase plus file
+presence — the archived digest rides the record as identity for
+reports, never as a convergence input. A drive that never saw a
+verified new binary is byte-identical to before.
+
+A trust note, because "we execute a binary we just unpacked"
+reads as alarming without it: the archive is operator-supplied
+over a local path — no fetch, no network, no unpacking of
+anything the operator did not stage. Executing the staged
+binary runs operator bytes at operator privilege: not an
+escalation, the same trust as the currently running binary.
 
 ## 5. Verification boundary (condition 2)
 
@@ -177,7 +208,7 @@ never a claim:
 | 1 — immutable data stays readable | `N commits replay` (history loads) plus `M live heads authorize` (snapshots verify). Object *payload* bytes are the one residual: no public store-enumeration API exists, and the CLI must not reconstruct the object layout beside the store — so payload framing is not sampled here. Payload bytes are immutable CAS served hash-verified; a framing break there fails at serve time, loudly, and never corrupts. |
 | 2 — explicit versions | Any explicitly-versioned format that fails to decode is `incompatible (invariant 2: <error>)`. The payload clause is the named fact-payload-replay gap. |
 | 3 — read window | The replay is this drive's own history under the new readers. |
-| 4 — derived rebuilds | The byte-identity proof: derived state lives outside the snapshotted files, so anything load-bearing the verify wrote would show as a difference. |
+| 4 — derived rebuilds | The verify child addresses no derived content: it opens no object store and no serving mirror, so no materialization cache or serving map is even reachable. Its only filesystem effects are idempotent creates (LOCK file, empty vault dir). The byte-identity proof covers every durable file it does touch (keystore, CURRENT, DRIVE, commit set). |
 | 5 — capability negotiation | Named gap, never claimed. |
 | 6 — no transition emitted | Keystore plus observed membership set byte-identical. |
 | 7 — additive crypto | Epoch keys restored inside the open; the open fails closed otherwise. |

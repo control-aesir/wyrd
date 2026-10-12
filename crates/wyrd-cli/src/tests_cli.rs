@@ -472,6 +472,13 @@ fn update_parses_drive_archive_and_forwarded_credentials() {
     let temp = TempDir::new();
     let drive = temp.0.join("drive");
     let archive = temp.0.join("wyrd-0.3.0-alpha-linux-aarch64.tar.gz");
+    // Parse-only, but real temp paths: the values forward to the
+    // verification child, so they must always be openable paths —
+    // never literals that silently stop exercising forwarding.
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
 
     let cli = Cli::try_parse_from([
         "wyrd",
@@ -480,9 +487,9 @@ fn update_parses_drive_archive_and_forwarded_credentials() {
         "--archive",
         archive.to_str().unwrap(),
         "--identity-file",
-        "/tmp/id",
+        identity.to_str().unwrap(),
         "--passphrase-file",
-        "/tmp/pp",
+        passphrase.to_str().unwrap(),
     ])
     .unwrap();
     let Command::Update {
@@ -508,6 +515,10 @@ fn update_rejects_a_noncanonical_archive() {
     fs::create_dir_all(&drive).unwrap();
     let archive = temp.0.join("abc123-wyrd-dist.tar.gz");
     fs::write(&archive, b"fake-archive").unwrap();
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
 
     let error = command(vec![
         "update".into(),
@@ -515,9 +526,9 @@ fn update_rejects_a_noncanonical_archive() {
         "--archive".into(),
         archive.display().to_string(),
         "--identity-file".into(),
-        "/tmp/id".into(),
+        identity.display().to_string(),
         "--passphrase-file".into(),
-        "/tmp/pp".into(),
+        passphrase.display().to_string(),
     ])
     .unwrap_err();
     let message = error.to_string();
@@ -535,6 +546,10 @@ fn update_refuses_mismatched_restart_flags() {
     let temp = TempDir::new();
     let drive = temp.0.join("drive");
     fs::create_dir_all(&drive).unwrap();
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
     let base = || {
         vec![
             "update".into(),
@@ -542,9 +557,9 @@ fn update_refuses_mismatched_restart_flags() {
             "--archive".into(),
             "wyrd-0.4.0-alpha-linux-aarch64.tar.gz".into(),
             "--identity-file".into(),
-            "/tmp/id".into(),
+            identity.display().to_string(),
             "--passphrase-file".into(),
-            "/tmp/pp".into(),
+            passphrase.display().to_string(),
         ]
     };
     let mut relayed = base();

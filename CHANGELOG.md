@@ -57,11 +57,16 @@ version say exactly what changed.
 - `wyrd update` runs the full transaction (29, step 4): converge
   leftovers, resolve, lock-probe quiescence (`stop the service
   first` on held), stage to `<exe>.next`, advisory preflight,
-  two-rename swap with `<exe>.prev` kept, `__update_verify` in
+  early verification refusal before any swap, two-rename swap
+  with `<exe>.prev` kept, authoritative `__update_verify` in
   the gap with a 300s bound, commit or atomic rollback, handoff
   (`start the service`) or `--restart` foreground supervision
-  with signal forwarding and exit propagation. Credential paths
-  forward to the verification child, never read by the parent.
+  with signal forwarding and exit propagation. Every report —
+  verified included — names the two blocked upgrade invariants;
+  a post-swap rejection under `--restart` starts the restored
+  binary (rollback with continuity). Credential paths forward
+  to the verification child, never read by the parent. Foreign
+  `os`/`arch` archives refuse with both platforms named.
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault

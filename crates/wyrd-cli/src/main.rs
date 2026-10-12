@@ -742,15 +742,47 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 path: PathBuf::from("<current executable>"),
                 source,
             })?;
-            return update::update_run(
+            let outcome = update::update_run(&update::UpdateRequest {
                 drive_dir,
                 archive,
-                &credentials.identity_file,
-                &credentials.passphrase_file,
-                &relays.relay,
-                *restart,
-                &exe,
-            );
+                identity_file: &credentials.identity_file,
+                passphrase_file: &credentials.passphrase_file,
+                relays: &relays.relay,
+                restart: *restart,
+                exe: &exe,
+            })?;
+            // Supervision diverges by design (the wait loop only
+            // exits the process), so a returned outcome is either
+            // Done or a supervision request — never an Ok from the
+            // supervisor itself.
+            match outcome {
+                update::UpdateOutcome::Done => return Ok(()),
+                update::UpdateOutcome::Supervise {
+                    exe,
+                    drive,
+                    relays,
+                    identity_file,
+                    passphrase_file,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        return update::supervise(
+                            &exe,
+                            &drive,
+                            &relays,
+                            &identity_file,
+                            &passphrase_file,
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (exe, drive, relays, identity_file, passphrase_file);
+                        return Err(CliError::Usage(
+                            "--restart needs Unix signal forwarding".into(),
+                        ));
+                    }
+                }
+            }
         }
         Command::BuildInfo => {
             println!("{}", update::render_build_info(&update::own_build_info()));

@@ -1,5 +1,0 @@
-{
-  "imports": {
-    "@opencode-ai/plugin": "./sdk-stub.ts"
-  }
-}

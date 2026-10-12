@@ -1,10 +1,9 @@
-// Offline tests for the ngit-workflow plugin's pure logic. Run:
-//   devenv shell -- deno test --no-check --import-map=.opencode/plugin-tests/import-map.json .opencode/plugin-tests/
-//
-// --no-check: the "@opencode-ai/plugin" import resolves to the local stub,
-// which carries runtime shape only. Full typechecking of the plugin file
-// happens under opencode (bun install provides the real SDK).
-// No jsr/npm imports: plain Deno.test asserts, runnable with no network.
+// Offline tests for the ngit-triage pure logic (../lib/ngit-triage.ts).
+// Run: devenv shell -- deno test .opencode/plugin-tests/
+// Plain Deno.test asserts, no jsr/npm imports: runnable with no network.
+// The lib module imports nothing, so no stubs or import maps are needed;
+// full typechecking of the plugin entry happens under opencode's bun
+// install, which provides the real SDK.
 
 import {
   buildLabelArgv,
@@ -12,7 +11,7 @@ import {
   validateTriage,
   verifyLabels,
   type TriageInput,
-} from "../plugins/ngit-workflow.ts"
+} from "../lib/ngit-triage.ts"
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) throw new Error(`assert failed: ${msg}`)

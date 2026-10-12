@@ -12,6 +12,15 @@ use crate::membership::{sign_transition, TransitionStatus};
 use crate::runtime::engine::{Engine, EngineError};
 use zeroize::Zeroizing;
 
+/// Announcement obligations committed per admission batch commit.
+/// Small facts (two ids plus framing) far below both per-commit
+/// ceilings (`MAX_RECORDS_PER_COMMIT` records,
+/// `MAX_COMMIT_BYTES` bytes), mirroring the retire/queue chunking
+/// in `runtime::respond` (`RETIRE_COMMIT_BATCH`). The admission
+/// fills the closure in batches of at most this many obligations,
+/// so no single commit's size is a function of recorded history.
+pub(crate) const ADMISSION_OBLIGATION_BATCH: usize = 1024;
+
 /// The authored admission: the signed transition every member must
 /// observe, plus the sealed invitation ferried to the new device
 /// out-of-band (it bootstraps a device with no engine yet, so it
@@ -179,12 +188,15 @@ fn admit(
     let own = Capability::mint(engine.drive, engine.device, &post, &transition, secrets)?;
     let authorized =
         AuthorizedCapability::authorize(own, engine.drive, &staged, &transition.transition_id())?;
-    // Delivery obligations join the same batch: the admission is not
-    // durable without its catch-up. The newcomer gets the chain suffix
-    // after genesis (genesis rode the invitation) plus its admission-
-    // epoch wrap; every existing member gets the new tip plus its
-    // new-epoch wrap, which is also the first production use of
-    // transition gossip — nothing else transports transitions yet.
+    // Delivery obligations join the admission: the newcomer gets the
+    // chain suffix after genesis (genesis rode the invitation) plus
+    // its admission-epoch wrap; every existing member gets the new
+    // tip plus its new-epoch wrap, which is also the first
+    // production use of transition gossip — nothing else transports
+    // transitions yet. This membership half commits atomically with
+    // the transition itself: a failure here commits nothing, so no
+    // phantom tip survives for a retry to trip over (pinned by
+    // `failed_admit_leaves_no_phantom_tip`).
     let tip_id = transition.transition_id();
     let mut batch = vec![
         Fact::Transition(transition.clone()),
@@ -212,55 +224,21 @@ fn admit(
         batch.push(Fact::TransitionQueued(tip_id, *other));
         batch.push(Fact::CapabilityQueued(epoch, *other));
     }
-    // Current heads ride the catch-up: the newcomer learns what exists
-    // before post-admission gossip reaches it. Heads alone are not
-    // enough — a head without its ancestry is unadoptable
-    // (UnknownParent poisons the whole chain), and pre-admission
-    // snapshots were queued for nobody, so the obligation must cover
-    // the lineage closure: each head plus every ancestor reachable
-    // through recorded bodies. Every closure member is at or below
-    // the admission epoch, so the invited keys open all of them.
-    // Sending reuses the announcement outbox; the re-announce send
-    // path (not the authoring one) serves snapshots this engine did
-    // not author. Already-covered pairs stay untouched, and only
-    // snapshots this engine can actually serve get obligations
-    // (authored here, or a recorded announcement the re-announce path
-    // can resend) — anything else could never discharge.
-    //
-    // Known bound (pre-alpha, review-visible): the walk is O(recorded
-    // history) in one admission and commits one obligation per closure
-    // member at the end. A very long append-only history can make a
-    // single admission allocate and commit proportionally; incremental
-    // checkpointing under the resource budget is the fix v0 owes, and
-    // no admission silently truncates the closure until it exists —
-    // partial lineage would be worse (UnknownParent at the newcomer).
-    {
-        use std::collections::BTreeSet;
-        use wyrd_format::SnapshotId;
-
-        let rebuilt = engine.store.rebuild(engine.device)?;
-        let mut stack: Vec<SnapshotId> = engine
-            .live_heads()?
-            .into_iter()
-            .map(|head| head.snapshot().snapshot_id())
-            .collect();
-        let mut seen = BTreeSet::new();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(body) = rebuilt.runtime.snapshot_body(&id) else {
-                continue;
-            };
-            let servable =
-                body.author == engine.device || rebuilt.runtime.announcement(&id).is_some();
-            if servable && !rebuilt.runtime.announcement_covered(id, device) {
-                batch.push(Fact::AnnouncementQueued(id, device));
-            }
-            stack.extend(body.parents.iter().copied());
-        }
-    }
+    // The seeds must be captured before the membership commit:
+    // the commit advances the tip past the admission epoch, after
+    // which the live-head projection no longer sees the
+    // pre-admission closure. The fill loop walks from these seeds
+    // against post-commit bodies (the commit adds no snapshots), so
+    // every chunk sees the same closure.
+    let seeds = engine.live_heads()?;
     engine.commit_facts(&batch)?;
+    // The lineage closure follows in bounded batches (OD-16-1 B):
+    // each obligation is independently durable and idempotent per
+    // (snapshot, recipient), so the batches are the progress record
+    // and a crash between them loses nothing but the uncommitted
+    // suffix — `fill_admission_obligations` re-derives exactly the
+    // missing pairs. See that function for the resume contract.
+    fill_admission_obligations(engine, device, &seeds)?;
     engine.resync()?;
     engine.add_epoch_key(
         epoch,
@@ -276,6 +254,148 @@ fn admit(
         transition,
         invitation,
     })
+}
+
+/// Resume one device's admission catch-up after a crash that
+/// interrupted the fill: recompute the pre-admission seed set at the
+/// pre-admission tip's epoch and commit exactly the missing
+/// obligations. Refuses for a device with no canonical admission.
+/// `admit` never needs this on its own retry (a torn membership
+/// commit leaves the tip untouched, so a plain re-admit re-derives
+/// everything); it exists for the window between a durable
+/// membership commit and a complete fill, where a re-admit would
+/// refuse `AlreadyMember`. Child 2 wires the operator rerun onto
+/// this; child 1 tests drive it explicitly after reopen.
+#[allow(dead_code)] // child 2's continuation call site; tests until then
+pub(crate) fn resume_admission_obligations(
+    engine: &mut Engine,
+    device: DeviceId,
+) -> Result<usize, EngineError> {
+    let (_, id) = canonical_admission_of(engine, &device)?;
+    // The seed horizon is the pre-admission tip's epoch — the view
+    // `admit` walked before its membership commit advanced the tip —
+    // read off the admission's own `prev`, never derived by
+    // arithmetic.
+    let admission = engine
+        .log
+        .transition(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let prev = admission
+        .prev
+        .as_ref()
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let tip = engine
+        .log
+        .transition(prev)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let seeds = engine.live_heads_at_epoch(tip.epoch)?;
+    fill_admission_obligations(engine, device, &seeds)
+}
+
+/// Complete one device's admission catch-up: derive the lineage
+/// closure's missing announcement obligations and commit them in
+/// batches of at most [`ADMISSION_OBLIGATION_BATCH`]. Returns the
+/// number of obligations committed.
+///
+/// Current heads ride the catch-up: the newcomer learns what exists
+/// before post-admission gossip reaches it. Heads alone are not
+/// enough — a head without its ancestry is unadoptable
+/// (UnknownParent poisons the whole chain), and pre-admission
+/// snapshots were queued for nobody, so the obligation covers the
+/// lineage closure: each head plus every ancestor reachable through
+/// recorded bodies. Every closure member is at or below the
+/// admission epoch, so the invited keys open all of them. Sending
+/// reuses the announcement outbox; the re-announce send path (not
+/// the authoring one) serves snapshots this engine did not author.
+/// Already-covered pairs stay untouched, and only snapshots this
+/// engine can actually serve get obligations (authored here, or a
+/// recorded announcement the re-announce path can resend) —
+/// anything else could never discharge.
+///
+/// The walk seeds from the given pre-admission live heads only; a
+/// superseded epoch's chain is not re-walked for later joiners
+/// (OD-16-2 A: the per-epoch horizon stays; the late-joiner
+/// workstream owns the horizon question, not this path). Callers
+/// capture the seeds before the membership commit advances the tip
+/// (`admit`), or recompute them at the admission epoch
+/// (`resume_admission_obligations`).
+///
+/// Resume contract (OD-16-1 B): the derivation skips covered pairs
+/// (queued, delivered, or reconciled), so re-running after a crash
+/// commits exactly the missing suffix — neither lost nor doubled —
+/// with no checkpoint marker: the obligations are the progress
+/// record. The set derives once and drains in order; a torn batch
+/// commit (which returns `Ok` with nothing durable, like power
+/// loss) stops the fill with a partial count instead of assuming
+/// the prefix committed — re-deriving and retrying in the same call
+/// would make the reopen-resume path unreachable in tests, and only
+/// real process death (which never returns) reaches it in
+/// production. `admit` runs this to completion on the normal path;
+/// after a crash that interrupts it, [`resume_admission_obligations`]
+/// (or a plain re-admit, when the membership commit itself tore and
+/// the tip is untouched) completes the set. Returns the committed
+/// count so callers (and, in child 2, the operator surface) can
+/// report progress — a short count after `Ok` means a torn batch,
+/// never a smaller closure.
+pub(crate) fn fill_admission_obligations(
+    engine: &mut Engine,
+    device: DeviceId,
+    seeds: &[crate::durable::AuthorizedSnapshot],
+) -> Result<usize, EngineError> {
+    use std::collections::BTreeSet;
+    use wyrd_format::SnapshotId;
+
+    // One bounded batch per commit: no commit's size is a function
+    // of recorded history, so `check_commit_fits` never refuses the
+    // fill for closure length. (A pathological membership chain can
+    // still overflow the membership commit above; that refusal is
+    // whole-batch by design and child 2 names it.)
+    let derive_missing = |engine: &mut Engine| -> Result<Vec<Fact>, EngineError> {
+        let rebuilt = engine.store.rebuild(engine.device)?;
+        let mut stack: Vec<SnapshotId> = seeds
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut missing = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(body) = rebuilt.runtime.snapshot_body(&id) else {
+                continue;
+            };
+            let servable =
+                body.author == engine.device || rebuilt.runtime.announcement(&id).is_some();
+            if servable && !rebuilt.runtime.announcement_covered(id, device) {
+                missing.push(Fact::AnnouncementQueued(id, device));
+            }
+            stack.extend(body.parents.iter().copied());
+        }
+        Ok(missing)
+    };
+    let mut missing = derive_missing(engine)?;
+    let mut committed = 0;
+    while !missing.is_empty() {
+        let take = missing.len().min(ADMISSION_OBLIGATION_BATCH);
+        let before = engine.current();
+        let seq = engine.commit_facts(&missing[..take])?;
+        if seq == before {
+            // Torn batch commit: `Ok` with nothing durable, like
+            // power loss (test crash hook; production crashes do not
+            // return). The store sequence did not advance, so none
+            // of the batch landed — stop with a partial count and
+            // let resume complete the set, rather than re-deriving
+            // in this call (which would make the reopen-resume path
+            // unreachable in tests). The store is single-writer, so
+            // a forward-moving sequence always means our batch
+            // landed.
+            break;
+        }
+        missing.drain(..take);
+        committed += take;
+    }
+    Ok(committed)
 }
 
 /// The epoch after the tip, checked: the authoring path already treats

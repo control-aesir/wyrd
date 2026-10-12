@@ -92,20 +92,30 @@ same way for mixed batches a record count cannot see — many small
 records alongside one large `SnapshotBody` or `Manifest` meet
 64 MiB before they meet 65,536 records. A pin whose new transitions
 exceed 65,536 is refused whole — nothing commits; address subpaths
-to pin in pieces. The admission lineage batch is the second commit
+to pin in pieces. The admission lineage batch was the second commit
 whose fact count is a function of recorded history rather than a
-live budget: one admission walks the live epoch chain's ancestry
-and queues one announcement obligation per closure member,
-committed atomically with the admission itself (pinned by
-`admission_closure_cost_scales_with_history` in
+live budget; it now fills incrementally (OD-16-1 B): one admission
+walks the live epoch chain's ancestry and queues one announcement
+obligation per closure member, committed as one membership batch
+plus one batch of at most 1,024 obligations per commit
+(`ADMISSION_OBLIGATION_BATCH` in
+`crates/wyrd-sync/src/runtime/author/admission.rs`, pinned by
+`admission_fill_commits_one_batch_per_chunk` and the ceiling-scale
+`admission_commit_is_bounded_by_the_pass_budget` in
 `crates/wyrd-sync/src/runtime/author/tests_admission.rs`). The
-ceiling answers the same way — an admission whose batch exceeds
-65,536 records is refused whole: `check_commit_fits` rejects the
-batch before the encode loop (`DurableError::TooManyRecords`,
-surfaced as `EngineError::Durable` through the single `?` on
-`commit_facts`), so `admit_device` returns `Err`, the newcomer is
-not admitted, and nothing commits — the drive never holds a
-partial lineage. The atomic-failure half (a torn commit leaves no
+ceiling still answers the same way for the membership half — an
+admission whose membership batch exceeds 65,536 records is refused
+whole (`check_commit_fits` rejects the batch before the encode loop,
+`DurableError::TooManyRecords`, surfaced as `EngineError::Durable`
+through `commit_facts`), so the newcomer is not admitted and nothing
+commits — while the obligation fill can never trip the ceiling for
+closure length, because no fill commit's size is a function of
+recorded history. A crash between fill batches loses nothing but
+the uncommitted suffix: obligations are idempotent per
+(snapshot, recipient), so resume re-derives exactly the missing
+pairs (pinned by `crash_torn_fill_chunk_resumes_exactly_once` and
+`crash_mid_incremental_admission_resumes_without_duplicate_obligations`).
+The atomic-failure half (a torn membership commit leaves no
 phantom tip) is pinned by `failed_admit_leaves_no_phantom_tip`;
 the ceiling boundary itself by `commit_fit_boundaries_match_the_load_ceilings`
 in `crates/wyrd-sync/src/durable/tests.rs`.
@@ -117,8 +127,12 @@ the old epoch keys without learning the old snapshot ids; see the
 Known v0.2 limitations in `ROADMAP.md` and
 `docs/fetch-on-open.md`). Not a v0.2
 blocker: it needs a long single-epoch history plus an admission,
-violates no bound in this document, and incremental checkpointing
-under the resource budget is the booked fix.
+violates no bound in this document — and the horizon stays by
+explicit decision (OD-16-2 A), not by default: the late-joiner
+workstream owns whether newcomers should learn superseded-epoch
+snapshot ids, while bounded admission only removes the ceiling
+under the current horizon. The incremental fill this paragraph
+used to book as future work is landed above.
 
 ## Intake computational budgets
 

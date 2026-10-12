@@ -23,6 +23,20 @@ version say exactly what changed.
 
 ### Added
 
+- Bounded incremental admission catch-up (`docs/resource-limits.md`,
+  child 1 of `nostr:nevent1qqsqufuj24ttsndlug9usn904axmy4m2sslgs2hk3u9n592sy0hlvdspz9mhxue69uhkwunpwdczuap49eehg4rsmla`):
+  admitting a device no longer commits one batch proportional to
+  recorded history. The admission commits one membership batch,
+  then fills the lineage-closure announcement obligations in
+  batches of at most 1,024 (`ADMISSION_OBLIGATION_BATCH`), so no
+  commit's size is a function of history and the 65,536-record
+  ceiling can no longer refuse a valid admission for closure
+  length. Each obligation is independently durable and idempotent
+  per (snapshot, recipient) — the batches are the progress record,
+  no checkpoint marker — and a crash between batches resumes to
+  exactly the missing suffix. The per-epoch walk horizon stays by
+  explicit decision (OD-16-2 A). Child 2 (named capacity refusal,
+  progress and continuation) follows on this PR.
 - Observation × trust-position matrix (`docs/trust.md`):
   the 18 hidden/observable disclosure classes as normative rows
   over five trust positions (keyless replica, member-hosted

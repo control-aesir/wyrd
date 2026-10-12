@@ -183,6 +183,24 @@ impl SnapshotDag {
         heads
     }
 
+    /// The live-head projection as of a past epoch: observed
+    /// snapshots that were [`Classification::Eligible`] when the tip
+    /// held `epoch`. Sorted ascending. The one caller is admission
+    /// resume (`classify::classify_at_epoch` carries the contract):
+    /// after the admission commit bumps the tip, this reproduces the
+    /// seed set the admission walked.
+    ///
+    /// [`Classification::Eligible`]: Classification::Eligible
+    pub fn eligible_heads_at_epoch(&self, log: &MembershipLog, epoch: u64) -> Vec<SnapshotId> {
+        let mut heads: Vec<SnapshotId> = classify::classify_at_epoch(log, self, Some(epoch))
+            .into_iter()
+            .filter(|(_, classification)| *classification == Classification::Eligible)
+            .map(|(id, _)| id)
+            .collect();
+        heads.sort();
+        heads
+    }
+
     /// The live-head projection as bodies: the id set of
     /// [`SnapshotDag::eligible_heads`], resolved against the observed
     /// DAG (sorted ascending, like the ids). Eligible ids come from a

@@ -49,8 +49,30 @@ pub(super) fn classify(
     log: &MembershipLog,
     dag: &SnapshotDag,
 ) -> HashMap<SnapshotId, Classification> {
+    let k = log.known_state().map(|ks| ks.epoch);
+    classify_at_epoch(log, dag, k)
+}
+
+/// Classify the DAG as of a past epoch: the same fixed point with
+/// the liveness horizon pinned to `epoch` instead of the log tip.
+/// Snapshots above `epoch` read as pending future work, and only
+/// `epoch` snapshots can be current — so the eligible set is the
+/// live view the tip held when it was at `epoch`.
+///
+/// The one caller is admission resume: the membership commit bumps
+/// the tip past the admission epoch, so the live-head projection no
+/// longer sees the pre-admission closure. Re-running the fixed
+/// point at the admission epoch reproduces the exact seed set the
+/// admission walked, provided later transitions did not change old
+/// verdicts (admission preserves owners and never voids history;
+/// a post-admission freeze is outside this path's contract).
+pub(super) fn classify_at_epoch(
+    log: &MembershipLog,
+    dag: &SnapshotDag,
+    epoch: Option<u64>,
+) -> HashMap<SnapshotId, Classification> {
     let known = log.known_state();
-    let k = known.map(|ks| ks.epoch);
+    let k = epoch.or(known.map(|ks| ks.epoch));
     let tip_owners: Option<BTreeSet<DeviceId>> = known
         .as_ref()
         .and_then(|ks| log.owners_of(&ks.transition_id));

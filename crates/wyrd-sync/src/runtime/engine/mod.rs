@@ -858,6 +858,13 @@ pub struct Engine {
     /// `Complete`; the hook is one-shot.
     #[cfg(test)]
     crash_stage: Option<CrashStage>,
+    /// Test-only crash-injection skip count: this many durable commits
+    /// run to completion before the armed `crash_stage` fires, so a
+    /// test can tear a later commit inside a multi-commit call (the
+    /// admission fill's chunk commits past the membership commit).
+    /// Zero is exactly today's behavior; the hook stays one-shot.
+    #[cfg(test)]
+    crash_skip: usize,
     /// A latched reconnect edge for the reconciliation trigger
     /// (OD-21-4): set by [`Engine::note_reconnected`], consumed by
     /// [`Engine::maybe_request_reconciliation`]. Volatile by design —
@@ -943,6 +950,8 @@ impl Engine {
             refusal_warned: HashSet::new(),
             #[cfg(test)]
             crash_stage: None,
+            #[cfg(test)]
+            crash_skip: 0,
             reconnect_latched: false,
             last_requested_digest: None,
             last_trigger_eval: None,
@@ -1245,13 +1254,27 @@ impl Engine {
         self.crash_stage = Some(stage);
     }
 
+    /// Arm the crash hook to fire after `skip` successful commits
+    /// (test-only): `skip = 0` is [`Engine::crash_after`]. Lets a test
+    /// tear a later commit inside a multi-commit call without
+    /// changing the hook's one-shot semantics.
+    #[cfg(test)]
+    pub(super) fn crash_after_nth_commit(&mut self, skip: usize, stage: CrashStage) {
+        self.crash_skip = skip;
+        self.crash_stage = Some(stage);
+    }
+
     /// Commit one fact batch, honoring the test crash hook. A torn
     /// commit returns `Ok` with nothing durable — exactly like power
     /// loss — so callers proceed and recovery happens on reopen.
     pub(super) fn commit_facts(&mut self, facts: &[Fact]) -> Result<u64, DurableError> {
         #[cfg(test)]
-        if let Some(stage) = self.crash_stage.take() {
-            return self.store.commit_until(facts, stage);
+        if self.crash_stage.is_some() {
+            if self.crash_skip > 0 {
+                self.crash_skip -= 1;
+            } else if let Some(stage) = self.crash_stage.take() {
+                return self.store.commit_until(facts, stage);
+            }
         }
         let seq = self.store.commit(facts)?;
         // The committed-capability projection is a property of the
@@ -1562,6 +1585,30 @@ impl Engine {
         }
         dag.eligible_head_bodies(&rebuilt.log)
             .into_iter()
+            .map(|snapshot| {
+                AuthorizedSnapshot::authorize(snapshot, &self.drive)
+                    .map_err(EngineError::InvalidHead)
+            })
+            .collect()
+    }
+
+    /// The live heads as of a past epoch, over the currently
+    /// recorded bodies. The one caller is admission resume: after
+    /// the admission commit advances the tip, the current projection
+    /// no longer sees the pre-admission closure, so resume pins the
+    /// horizon to the pre-admission tip's epoch (see
+    /// `authorization::classify_at_epoch`). Same verification gate
+    /// as [`Engine::live_heads`]: durable facts carry verified
+    /// bodies only.
+    pub fn live_heads_at_epoch(&self, epoch: u64) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let mut dag = crate::authorization::SnapshotDag::new(self.drive);
+        for body in rebuilt.runtime.snapshot_bodies.values() {
+            dag.observe(body.clone());
+        }
+        dag.eligible_heads_at_epoch(&rebuilt.log, epoch)
+            .into_iter()
+            .filter_map(|id| dag.snapshot(&id).cloned())
             .map(|snapshot| {
                 AuthorizedSnapshot::authorize(snapshot, &self.drive)
                     .map_err(EngineError::InvalidHead)

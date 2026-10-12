@@ -1040,10 +1040,11 @@ pub(crate) fn run_verify_child(
 }
 
 /// Pump one child pipe straight through to the matching parent
-/// stream on a detached thread. ChildStdout and ChildStderr share
-/// no usable common type, so the reader is generic over `Read`.
-/// Stragglers die with the process; nothing joins them, because
-/// the verdict never depends on the bytes.
+/// stream on a thread. ChildStdout and ChildStderr share no
+/// usable common type, so the reader is generic over `Read`.
+/// The caller joins the handle before branching on the verdict,
+/// so no straggler byte can land after the parent's next line;
+/// the verdict itself never depends on the bytes.
 fn pump_child_stream<R: Read + Send + 'static>(
     pipe: R,
     stderr: bool,

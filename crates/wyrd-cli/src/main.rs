@@ -23,8 +23,8 @@ use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::{LiveMailbox, MailboxHealth};
 use wyrd_core::mutation::WriteStats;
 use wyrd_core::policy::{
-    evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
-    RetentionPolicy,
+    evict_subtree, pin_subtree, residency_census_with_role, unpin_subtree, LocalPresence,
+    ResidencyCensus, RetentionPolicy,
 };
 use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::vault::{observe_vault, VaultStatus};
@@ -282,6 +282,21 @@ enum Command {
         drive_dir: PathBuf,
         #[command(subcommand)]
         action: CacheAction,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Device-local materialization role: what this device intends to
+    /// be (`mirror`: prunable participant; `vault`: replicates every
+    /// object, never prunes). A role is retention posture, never
+    /// replicated state — setting one writes one local file, no fact,
+    /// no snapshot. It is not the `vault` process: a device can hold
+    /// the role without running one, and one can run without the
+    /// role.
+    Role {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: RoleAction,
         #[command(flatten)]
         credentials: Credentials,
     },
@@ -626,6 +641,31 @@ enum CacheAction {
     Policy,
 }
 
+/// One role action. `set` names the posture; `status` reports the
+/// configured role, any in-flight narrowing, and the effective
+/// retention posture — the same numbers `cache status` reports,
+/// because there is one effective policy, not two.
+#[derive(Debug, Subcommand)]
+enum RoleAction {
+    /// Set this device's materialization role, durably and offline.
+    /// Widening toward `vault` takes effect immediately. Narrowing
+    /// away from it requires `--yes` and records an acknowledged
+    /// transition: effective posture stays `vault` until withdrawal
+    /// completes, and completion is reported, never assumed.
+    Set {
+        /// The role to hold: `mirror` or `vault`.
+        role: String,
+        /// Acknowledge a narrowing (leaving `vault`). Intent only:
+        /// withdrawal still has to complete before the posture flips.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Report the configured role, transition, and effective
+    /// retention posture. Reads durable state only; never connects,
+    /// never mutates.
+    Status,
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn current_uid() -> u32 {
@@ -913,6 +953,11 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             credentials,
             ..
         } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Role {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
     };
 
     match cli.command {
@@ -1035,6 +1080,9 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 identity,
             )
         }
+        Command::Role {
+            drive_dir, action, ..
+        } => role(drive_dir, action, &passphrase, identity),
     }
 }
 
@@ -1771,6 +1819,12 @@ fn evict(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    if state.effective() == wyrd_core::role::Role::Vault {
+        return Err(CliError::Usage(
+            "role 'vault' forbids eviction: the role promises no pruning. Narrow the role first (role set mirror --yes), or pin explicitly what must stay.".into(),
+        ));
+    }
     let mut node = open_policy_node(drive_dir, passphrase, identity)?;
     let report = {
         let (engine, view) = node.parts_mut();
@@ -1799,6 +1853,106 @@ fn evict_render(path: &str, report: &wyrd_core::policy::EvictReport) -> String {
     out
 }
 
+/// Map role-file failures onto CLI errors. A torn or unreadable
+/// file fails closed: the operator is told, never silently run as
+/// the wrong posture.
+fn role_err(error: wyrd_core::role::RoleError) -> CliError {
+    match error {
+        wyrd_core::role::RoleError::UnknownRole(_)
+        | wyrd_core::role::RoleError::Malformed { .. } => CliError::Usage(error.to_string()),
+        wyrd_core::role::RoleError::Io { path, source } => CliError::Io { path, source },
+    }
+}
+
+/// Set or report this device's materialization role. Setting writes
+/// exactly one local file: no fact, no snapshot, no membership
+/// transition, nothing any other device can observe.
+fn role(
+    drive_dir: PathBuf,
+    action: RoleAction,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    use wyrd_core::role::{Role, RoleState, Transition};
+    match action {
+        RoleAction::Set { role, yes } => {
+            let target = Role::parse(&role).map_err(|error| CliError::Usage(error.to_string()))?;
+            let current = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+            if current.transition == Transition::Settled && current.role == target {
+                println!("role already {target} (settled); no change");
+                return Ok(());
+            }
+            if target == Role::Mirror && current.effective() == Role::Vault {
+                if current.transition == Transition::NarrowingAcknowledged {
+                    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+                    let (engine, view) = node.parts();
+                    let census = residency_census_with_role(engine, view, "", current.effective())?;
+                    print!("{}", role_status_render(&drive_dir, current, &census));
+                    return Ok(());
+                }
+                if !yes {
+                    return Err(CliError::Usage(
+                        "narrowing away from the vault role requires --yes: leaving vault stops being a provider, and that must be explicit. Acknowledgement records intent only; effective posture stays vault until withdrawal completes.".into(),
+                    ));
+                }
+                let state = RoleState {
+                    role: Role::Mirror,
+                    transition: Transition::NarrowingAcknowledged,
+                };
+                wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+                println!(
+                    "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: withdrawal completion (route publication drained, no old-role serve streams) is not yet wired; this device retains like vault"
+                );
+                return Ok(());
+            }
+            let state = RoleState {
+                role: target,
+                transition: Transition::Settled,
+            };
+            wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+            println!("role set to {target}; effective immediately");
+            Ok(())
+        }
+        RoleAction::Status => {
+            let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+            let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+            let (engine, view) = node.parts();
+            let census = residency_census_with_role(engine, view, "", state.effective())?;
+            print!("{}", role_status_render(&drive_dir, state, &census));
+            Ok(())
+        }
+    }
+}
+
+/// The configured role, any in-flight narrowing, and the effective
+/// retention posture with the numbers to back it: the same census
+/// `cache status` reports, because there is one effective policy.
+fn role_status_render(
+    drive_dir: &std::path::Path,
+    state: wyrd_core::role::RoleState,
+    census: &ResidencyCensus,
+) -> String {
+    use wyrd_core::role::Transition;
+    let mut out = format!(
+        "role: {}\ntransition: {}\neffective: {}\n",
+        state.role,
+        state.transition_word(),
+        state.effective(),
+    );
+    if !wyrd_core::role::is_configured(drive_dir) {
+        out.push_str(
+            "note: no role file: mirror names current behavior (prunable), not a choice\n",
+        );
+    }
+    if state.transition == Transition::NarrowingAcknowledged {
+        out.push_str(
+            "note: narrowing acknowledged; retains like vault until withdrawal completes\n",
+        );
+    }
+    out.push_str(&cache_quadrant_summary(census));
+    out
+}
+
 /// Report residency: per-file policy vs presence, or device totals
 /// plus the effective budgets.
 fn cache(
@@ -1810,17 +1964,20 @@ fn cache(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let node = open_policy_node(drive_dir, passphrase, identity)?;
+    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+    let role = wyrd_core::role::load(&drive_dir)
+        .map_err(role_err)?
+        .effective();
     match action {
         CacheAction::Status { path } => {
             let (engine, view) = node.parts();
-            let census = residency_census(engine, view, &path)?;
+            let census = residency_census_with_role(engine, view, &path, role)?;
             print!("{}", cache_status_render(&path, &census));
             Ok(())
         }
         CacheAction::Policy => {
             let (engine, view) = node.parts();
-            let census = residency_census(engine, view, "")?;
+            let census = residency_census_with_role(engine, view, "", role)?;
             // Three walks at report time, never cached: the enforced
             // object-store count plus the two observational dimensions.
             let retained_content = view

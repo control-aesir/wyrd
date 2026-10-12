@@ -70,3 +70,57 @@ fn policy_commits_change_no_replicated_state() {
     drop(node);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A role never enters replicated drive state: changing it writes one
+/// local file beside the keystore — no fact, no snapshot, no
+/// membership transition, nothing a second device could observe.
+#[test]
+fn a_role_change_appends_no_fact_and_no_snapshot() {
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+
+    let (node, dir) = policy_drive();
+    let facts_before = node.engine().fact_log_bytes().unwrap();
+    let heads_before = node.engine().live_heads().unwrap();
+    let membership_before = node.engine().membership_log().known_state();
+    assert!(observe(node.engine(), 0).unwrap().obligations.is_empty());
+
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Vault,
+            transition: Transition::Settled,
+        },
+    )
+    .unwrap();
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        node.engine().fact_log_bytes().unwrap(),
+        facts_before,
+        "the durable fact log is byte-identical: a role is not a fact"
+    );
+    assert_eq!(
+        node.engine().live_heads().unwrap(),
+        heads_before,
+        "no snapshot is authored by a role change"
+    );
+    assert_eq!(
+        node.engine().membership_log().known_state(),
+        membership_before,
+        "a role is not a membership transition"
+    );
+    assert!(
+        observe(node.engine(), 0).unwrap().obligations.is_empty(),
+        "no peer is owed anything for a local posture change"
+    );
+
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}

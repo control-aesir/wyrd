@@ -490,6 +490,72 @@ device's durable log and are never published. The CLI reports two policy
 values, not three — fetched-by-access `CACHED` carries no retention promise
 and collapses into `REMOTE_ONLY`; only an explicit pin promises retention.
 
+### Device roles: persistent, local, and explicit
+
+A peer role is device-local intent, never replicated drive state. It must
+not become a fact-log entry, affect authorization, or alter the replicated
+snapshot model. Roles are not added to the protocol or the membership model,
+and role selection is never an authorization mechanism.
+
+- **Role and process are separate.** `vault` as a role describes a device's
+  replication and retention posture; `vault` as a process (`wyrd vault`) is
+  one way to operate such a device. A device can hold the vault role without
+  running `wyrd vault`, and `wyrd vault` can run on a device without that
+  device holding the vault role. Never use bare `vault` where the
+  distinction matters.
+- **Storage.** The role is one string in a `role` file beside the drive's
+  keystore, read at startup. It is not a fact-log entry and never leaves
+  the device. Policy the role implies flows through the same policy store
+  `pin` / `evict` already use, so `wyrd role set` and `wyrd pin` cannot
+  disagree about what the device intends.
+- **Default.** A device with no role file reports its effective role
+  explicitly and behaves exactly as today: no pins and no quota means
+  prunable, which is the `mirror` posture. The default names current
+  behavior; it must not imply desktop semantics on headless servers and
+  must never promote a fresh unattended server to `vault` by accident.
+  Intended starting combinations: desktop `mirror + full`, phone
+  `on-demand` with a pinned subset, headless server an explicit operator
+  choice.
+
+### Role changes are transitions, not edits
+
+Widening (toward `vault`) takes effect immediately: retention obligations
+only increase, so there is nothing a peer could depend on that disappears.
+Narrowing (away from `vault`) is an explicit, observable transition with
+three states, because leaving `vault` stops being a provider and that must
+never happen silently:
+
+- **Narrowing acknowledged.** The operator's intent is recorded (narrowing
+  requires explicit acknowledgement, e.g. `--yes`). Effective retention
+  posture is unchanged. Acknowledgement establishes intent only — it says
+  nothing about peers.
+- **Withdrawal pending.** The device has stopped publishing itself as a
+  serving peer for new snapshots and serves only in-flight fetches already
+  underway. `role status` names what is outstanding. Obligations retire
+  only through the reconciliation contract (delivered ∪ reconciled) —
+  never because the operator acknowledged.
+- **Withdrawal complete.** No serve streams originated under the old role
+  remain open and route publication no longer names this device for new
+  snapshots. Only then does the effective role flip. A withdrawal that
+  cannot complete reports pending with its reason, never success.
+
+### Role effects on pin, evict, quota, and serving
+
+- A role is a **default**, not an override. `pin` under any role sets the
+  policy for that subtree exactly as today.
+- `evict` under `vault` refuses (and says the role forbids it): the role
+  promises no pruning, and a silent bypass of the pin refusal would be
+  worse than no role. `evict` under `mirror` behaves exactly as today.
+- Quota enforcement is role-aware. A `vault` device with a
+  `retained_bytes_quota` set hits the quota and refuses with `ENOSPC` —
+  "never prunes" and "refuses" are the only permitted behaviours, and
+  silently discarding is neither.
+- The role never gates the serving endpoint: serving answers for bytes the
+  device holds regardless of role (role ≠ process). What the role governs
+  is retention intent and route publication — a narrowing device stops
+  offering itself for new snapshots while draining what it already
+  promised.
+
 ## Encryption and keys
 
 - Objects are encrypted client-side (per-object AEAD, fresh random nonce,

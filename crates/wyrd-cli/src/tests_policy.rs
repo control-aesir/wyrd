@@ -183,3 +183,100 @@ fn policy_renderers_name_counts_and_quadrants() {
         "policy totals name the subtrees they never walked"
     );
 }
+
+#[test]
+fn role_set_status_roundtrip_survives_reinvocation() {
+    use wyrd_core::role::{self, Role};
+
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    // A fresh device names the mirror default explicitly, never silent.
+    let mut status = vec!["role".into(), drive.clone()];
+    status.extend(creds.clone());
+    status.push("status".into());
+    command(status).unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Mirror);
+    assert!(!role::is_configured(std::path::Path::new(&drive)));
+    // Widening is immediate and durable: a second invocation — the
+    // restart equivalent, with no in-memory state carried over —
+    // observes the same role from the file.
+    let mut set = vec!["role".into(), drive.clone()];
+    set.extend(creds.clone());
+    set.extend(["set".into(), "vault".into()]);
+    command(set).unwrap();
+    let mut status = vec!["role".into(), drive.clone()];
+    status.extend(creds.clone());
+    status.push("status".into());
+    command(status).unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Vault);
+    assert_eq!(state.effective(), Role::Vault);
+    drop(temp);
+}
+
+#[test]
+fn role_set_rejects_garbage() {
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    let mut set = vec!["role".into(), drive.clone()];
+    set.extend(creds);
+    set.extend(["set".into(), "archivist".into()]);
+    let error = command(set).unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "unknown roles fail as usage errors, got {error:?}"
+    );
+    drop(temp);
+}
+
+#[test]
+fn narrowing_requires_explicit_acknowledgement() {
+    use wyrd_core::role::{self, Role, Transition};
+
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    let mut set = vec!["role".into(), drive.clone()];
+    set.extend(creds.clone());
+    set.extend(["set".into(), "vault".into()]);
+    command(set).unwrap();
+    // Leaving vault without --yes refuses: stopping being a
+    // provider must be explicit.
+    let mut narrow = vec!["role".into(), drive.clone()];
+    narrow.extend(creds.clone());
+    narrow.extend(["set".into(), "mirror".into()]);
+    let error = command(narrow).unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "unacknowledged narrowing must refuse, got {error:?}"
+    );
+    // Acknowledged narrowing records intent but keeps vault
+    // effective: acknowledgement is not observability.
+    let mut narrow = vec!["role".into(), drive.clone()];
+    narrow.extend(creds);
+    narrow.extend(["set".into(), "mirror".into(), "--yes".into()]);
+    command(narrow).unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Mirror);
+    assert_eq!(state.transition, Transition::NarrowingAcknowledged);
+    assert_eq!(state.effective(), Role::Vault);
+    drop(temp);
+}
+
+#[test]
+fn evict_refuses_under_vault() {
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    let mut set = vec!["role".into(), drive.clone()];
+    set.extend(creds.clone());
+    set.extend(["set".into(), "vault".into()]);
+    command(set).unwrap();
+    let mut evict = vec!["evict".into(), drive.clone(), "a.txt".into()];
+    evict.extend(creds);
+    let error = command(evict).unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "evict under vault must refuse naming the role, got {error:?}"
+    );
+    drop(temp);
+}

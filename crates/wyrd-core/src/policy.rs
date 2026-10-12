@@ -267,6 +267,29 @@ pub fn residency_census<V: NamespaceView>(
     view: &V,
     path: &str,
 ) -> Result<ResidencyCensus, PolicyError> {
+    census_impl(engine, view, path, crate::role::Role::Mirror)
+}
+
+/// Same walk, but every unpinned chunk is measured against the
+/// effective role: under `vault` the baseline promises retention, so
+/// the census reports what the device retains, not just what it
+/// pinned. Stored facts are untouched — effectiveness is computed,
+/// never committed.
+pub fn residency_census_with_role<V: NamespaceView>(
+    engine: &Engine,
+    view: &V,
+    path: &str,
+    role: crate::role::Role,
+) -> Result<ResidencyCensus, PolicyError> {
+    census_impl(engine, view, path, role)
+}
+
+fn census_impl<V: NamespaceView>(
+    engine: &Engine,
+    view: &V,
+    path: &str,
+    role: crate::role::Role,
+) -> Result<ResidencyCensus, PolicyError> {
     let root = view.lookup(path).map_err(|source| PolicyError::View {
         path: path.to_string(),
         source,
@@ -285,8 +308,9 @@ pub fn residency_census<V: NamespaceView>(
                 let mut pinned_chunks = Vec::new();
                 let mut local = LocalPresence::Present;
                 for id in &chunks {
-                    let (file_policy, file_local) =
-                        classify(runtime.materialization(id), runtime.is_local(id));
+                    let stored = runtime.materialization(id);
+                    let file_local = classify(stored, runtime.is_local(id)).1;
+                    let file_policy = crate::role::effective_policy(stored, role);
                     if file_policy == RetentionPolicy::Pinned {
                         pinned_chunks.push(*id);
                     }

@@ -912,6 +912,95 @@ run output's senders are a sender list, never a membership roster
 (OD-17-4 B): any key that mailed the device appears, member or not,
 and membership questions go to the membership surfaces, not here.
 
+### Observation × trust-position matrix (18-privacy-boundary)
+
+The party table says what each party may know; the surface matrix
+says what each surface may show. This matrix is the third leg: it
+says, for each observation class the system can produce, which trust
+positions may receive it through diagnostics. The three compose —
+a surface readable by a party shows nothing that party may not
+know, and shows it only through the column below that names the
+party.
+
+Columns are trust positions, not processes. The two vault columns
+are the OD-18-3 ruling: the keyless replica is the target
+third-party posture; the member-hosted composition is what ships
+today (a serving endpoint opened from a member process holding the
+identity, epoch keys, and the live mailbox). A member-hosted
+process *holds* keys; whether a surface may *disclose* key-derived
+information is a separate property, decided per surface:
+
+- **Vault surfaces** — `wyrd vault status`, the posture sidecar,
+  anything a vault operator ships to a third party — show a subset
+  of the **keyless-replica column only**, on every composition.
+  Possessing keys does not widen a vault surface.
+- **Member surfaces** — `sync status`, `sync now` output, the debug
+  log — show a subset of the **drive-member column**.
+- **Relay surfaces** carry no diagnostics on the wire (surface
+  matrix, "the wire" row); the relay column below binds what a
+  relay-position observer may already learn, so a diagnostic
+  surface never hands the relay something new.
+
+Cell verdicts carry a confidence, because the doc already
+distinguishes strengths: **guaranteed** (the construction upholds
+it — sealed bytes, hash-only addressing, absence from the stored
+representation), **best-effort** (stated and pursued, not
+resisted to the cryptographic level), **accepted exposure**
+(recorded as deliberately unresisted: sizes, counts, timing,
+request patterns, traffic analysis). A matrix that collapses
+these into yes/no loses the only honest statement the doc makes
+about the relay position (`trust.md:44-48`).
+
+| # | Observation class | Vault, keyless replica | Vault, member-hosted composition | Public relay | Drive member | Removed device |
+|---|---|---|---|---|---|---|
+| H1 | plaintext | never (guaranteed) | process holds as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, own epochs) | cached only (guaranteed, no new acquisition) |
+| H2 | paths | never (guaranteed) | process holds as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, own epochs) | cached only (guaranteed) |
+| H3 | tree structure | never (guaranteed) | process holds as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, own epochs) | cached only (guaranteed) |
+| H4 | manifest contents | never (guaranteed, sealed opaquely) | process holds as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, own epochs) | cached only (guaranteed) |
+| H5 | snapshot contents and authorship | never (guaranteed) | process holds as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, own epochs) | cached only (guaranteed) |
+| H6 | ContentIds | never (guaranteed, no equality oracle) | process holds the oracle as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, the equality oracle) | cached only (guaranteed) |
+| H7 | drive identity | never (guaranteed, hash-only addressing; see H10) | process knows as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed) | cached (knew its drive; guaranteed) |
+| H8 | membership (who, epoch boundaries) | never (guaranteed, activity without meaning) | process holds as member; vault surfaces never (guaranteed) | never (guaranteed, no membership graphs) | yes, own epochs (guaranteed) | cached pre-removal (guaranteed) |
+| H9 | control traffic (mailbox, gift wraps, announcements) | never (guaranteed, the Nostr side never reaches a replica) | shares the host's mailbox as member-party traffic, never as vault disclosure (guaranteed) | opaque envelopes only (accepted exposure); contents never (guaranteed) | yes (guaranteed) | cached old traffic (guaranteed) |
+| O1 | opaque blob identifiers (transport hashes) | yes (accepted exposure) | yes | no bulk path (position has no column entry) | yes | held only |
+| O2 | object kinds (cleartext kind byte) | yes (accepted exposure) | yes | no bulk path | yes | held only |
+| O3 | ciphertext sizes (no padding in v0) | yes (accepted exposure) | yes | no bulk path | yes | held only |
+| O4 | counts (blobs, bytes, messages) | yes (accepted exposure) | yes | message counts as routing metadata (accepted exposure) | yes | stale (no new observation) |
+| O5 | timing (import, fetch, delivery) | yes (accepted exposure) | yes | routing timing (accepted exposure) | yes | stale (no new observation) |
+| O6 | request patterns (who asked which hash when, linkable repeats) | yes (accepted exposure) | yes | routing patterns (accepted exposure) | yes | stale (no new observation) |
+| O7 | transport identity (iroh node ids, IPs; chosen-visible pubkeys) | yes, unmapped to devices (accepted exposure) | yes | yes, by choice of visibility (accepted exposure) | yes | stale (no new observation) |
+| O8 | correlation heuristics (co-fetching, size matching) | yes, heuristics only (accepted exposure) | ground truth available as member; vault surfaces heuristics only | yes, heuristics only (accepted exposure) | ground truth, not heuristics | none (no new observation) |
+| H10 | escrow records (cleartext DriveId and epoch framing) | never (guaranteed, decided against; v0 never sends them) | owner-custody sidecars, never vault disclosure (guaranteed) | never (guaranteed) | owner custody only (guaranteed) | never for later epochs (guaranteed) |
+
+Three clauses make the matrix enforceable rather than
+aspirational, per the OD-18 rulings:
+
+1. **Classification governs data flow, not serialization.** A
+   projection for a restricted position is constrained in what it
+   reads and which code paths it enters — it does not read
+   sensitive state and promise not to return it. The
+   `FsStoreError::Corrupt` case is the standard: the vault
+   projection never enters the view path that constructs that
+   error, so no renderer discipline is needed to keep a `ContentId`
+   out of vault diagnostics. Diagnostics read committed durable
+   state only, initiate no networking, and mutate no store state.
+2. **Conformance detects missing and misleading
+   classifications.** Every field of every observation struct maps
+   to exactly one matrix row, and every position's projection
+   follows that row's verdict. A test that checks whether rendered
+   output omits a handful of known-sensitive strings is not
+   conformance: it misses future fields and derived disclosures.
+   An unmapped field fails the build (OD-18-4, `HeadClasses`
+   precedent).
+3. **Derived observations are classified by what they disclose,
+   not by their type.** A count or a timing may be innocuous as a
+   Rust value while exposing membership, content activity, or
+   request patterns through correlation (O4–O8 are accepted
+   exposure for exactly this reason). Aggregation does not
+   automatically make data safe; the matrix classifies the
+   information, and a derived observation that discloses a hidden
+   class is a hidden-class observation whatever its shape.
+
 ### Vault-side metadata confidentiality (stated precisely)
 
 The relay side settles for best-effort metadata confidentiality "exactly
@@ -1026,6 +1115,7 @@ until then no vault-visible bytes carry drive identity.
 | T16 | Mailbox transport: the control envelope travels inside an outer NIP-44 seal addressed directly to the recipient `DeviceId`, and the relay-visible wire format is NIP-59 gift wrap — Wyrd rumor kind 9501 (`p` tag = recipient) inside a kind 13 seal signed by the sender's identity key, inside a kind 1059 wrap signed by a discarded ephemeral key; consumption is a durable FIFO-bounded seen-wrap-event-id log (65,536 entries, fsynced per ack; evicted acks may redeliver and converge through engine inner-id dedupe), terminal poison is memory-only in the bounded session cache (`Disposition::Poison`), never a timestamp cursor; no NIP-09 deletion of wraps is issued; `Mailbox` and `SignerSession` are trait boundaries a concrete relay pool / `nostr-connect` client implements, exercised in this crate only against in-memory fakes | recipient addressing is the same traffic-analysis exposure already accepted as best-effort; the ephemeral wrap key hides sender identity from relays at the cost of never being able to delete (accepted: relay retention is the redelivery backstop and the state machines are set-based); the relay pool and signer session are network/UI wiring outside `wyrd-sync`'s scope (`wyrd-format` must never grow a network dependency; the same discipline applies one layer up) |
 | T17 | Peer addressing and serving authorization: snapshot announcements carry the sender's current iroh `NodeAddr` (`node_addr`) inside the same authenticated sealed plaintext — authenticated routing metadata, never identity, never snapshot content, never durable snapshot fields; announcement history is append-only with no cryptographic invalidation between announcements (freshness is operational, not validity); the serving member answers object-oriented `StorageId` lookups from its local store with ciphertext only, never paths, keys, or plaintext; the serving blobs surface accepts no writes that land — pushes issued through the public client never register in the mirror, pinned end to end by `serving_mount_refuses_push_and_leaves_the_mirror_unchanged` (behavioral pin: upstream declares push disabled by default, but that mask field is not consulted on the request path in iroh-blobs 0.103.0, so the test, not the mask, carries the posture across dependency bumps); authorization = membership, object admission = content verification, no per-object ACLs in v0, so a member who can name a `StorageId` can request its ciphertext from any serving member | a dead address is a stale advertisement, not an invalid snapshot; an unauthenticated address would be a redirection surface even against unforgeable announcements; content-addressed verification is the only admission a transfer needs; the availability/enumeration consequence is accepted because a member already holds the epoch material that makes the ciphertext meaningful |
 | T18 | Retention refusal (DG-4): membership implies the right to read, never the duty to retain — a serving member or vault may decline to admit what an authorized member authored (A) or decline to serve, advertise, or hold as residency what it already holds (B), at the enforcement points decided in `storage-growth.md` (A: before durable admission of received content, so refused bytes are never stored; B: after local durability, before announcement on the authoring device, at mirror admission and serving maps on a peer holding received content, so durably accepted bytes are held but never made resident/servable). A refusal creates no provider claim, satisfies no serving request, and advances no announcement; it never invalidates already-durable content and is never reported as loss, transient failure, or success — the device's state says refused-for-residency under local policy, never damage, never absence. No control-plane refusal signal in v0.3: a retention refusal is a local policy outcome, not a peer-visible protocol event, readable by the local operator. What a member may read is unchanged — content a member is entitled to read stays readable from a holder | the pre-GC bound on the author is a refusal right, not eviction (which would fork provider knowledge) and not a rate limit (which would contradict the durability boundary); a signal naming the refuser would be an enumeration and pressure surface |
+| T19 | Vault/client diagnostics boundary (18-privacy-boundary): the 18 disclosure classes are the normative matrix rows with per-position verdicts at guaranteed / best-effort / accepted-exposure confidence; enforcement is projection-level (each trust position reads only what it may observe; renderer filtering is not the boundary); both serving positions are covered (keyless replica and member-hosted composition; vault surfaces follow the keyless column on every composition); unclassified observations default-deny with compile-time classification pressure | privacy must hold by what a projection can observe, not by what a renderer remembers to hide; possessing keys and being permitted to disclose key-derived information are different properties; aggregation does not automatically make derived data safe |
 
 ## Open questions
 

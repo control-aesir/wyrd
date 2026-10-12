@@ -344,6 +344,10 @@ version say exactly what changed.
   module doc and re-exports. No public path changes and no behavior
   change; the conformance tests stay in one file with explicit imports
   instead of three copies of the loopback/poison/tempdir helpers.
+  `Vault` keeps the mirror attachment slot (`mirror_slot` /
+  `attach_mirror`): the write-through needs an attachment point and
+  removing it would change shutdown-detach semantics, so `vault.rs`
+  names the mirror types without depending on the transport.
 - Issue triage labels (`ROADMAP.md`, `CONTRIBUTING.md`,
   `docs/collaboration-workflow.md`, `AGENTS.md`): `release:backlog` is the
   parked state and every triaged issue carries exactly one `release:*`

@@ -13,6 +13,7 @@ import {
   parseJsonDocument,
   planTriageCall,
   staleLabels,
+  triageSuccessResult,
   validateTriage,
   verifyLabels,
   type TriageInput,
@@ -109,8 +110,23 @@ Deno.test("planTriageCall builds the removal-carrying argv from a stacked view",
           "--remove-label", "bug",
           "--remove-label", "release:v0.2.0-alpha",
           "--json",
-        ]),
+        ]) &&
+      JSON.stringify(planned.removed) === JSON.stringify(["bug", "release:v0.2.0-alpha"]),
     JSON.stringify(planned),
+  )
+})
+
+Deno.test("triageSuccessResult reports exactly the verified end state", () => {
+  assert(
+    JSON.stringify(triageSuccessResult(GOOD, ["bug", "release:v0.2.0-alpha"])) ===
+      JSON.stringify({
+        ok: true,
+        applied: true,
+        id: GOOD.id,
+        labels: ["chore", "P3", "release:v0.3.0-alpha"],
+        removed: ["bug", "release:v0.2.0-alpha"],
+      }),
+    "success shape is pinned in the lib, not the entry",
   )
 })
 

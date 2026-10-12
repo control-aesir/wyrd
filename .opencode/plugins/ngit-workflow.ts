@@ -20,6 +20,7 @@ import { type Plugin, tool } from "@opencode-ai/plugin"
 import {
   parseJsonDocument,
   planTriageCall,
+  triageSuccessResult,
   validateTriage,
   verifyLabels,
 } from "../lib/ngit-triage.js"
@@ -105,13 +106,7 @@ export default (async ({ $ }) => {
           if (gaps.length > 0) {
             return JSON.stringify({ ok: false, applied: true, errors: gaps })
           }
-          return JSON.stringify({
-            ok: true,
-            applied: true,
-            id: input.id,
-            labels: [input.type, input.priority, input.milestone],
-            removed: removals,
-          })
+          return JSON.stringify(triageSuccessResult(input, planned.removed))
         },
       }),
     },

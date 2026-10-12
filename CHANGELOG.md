@@ -306,7 +306,15 @@ version say exactly what changed.
   a forensics line (provider, hash, phase, dial latency, streamed
   bytes), so restart waste is measurable for the deferred resume
   decision. Cross-pass resume stays deferred behind the design
-  note; no `BulkSource` trait change.
+   note; no `BulkSource` trait change.
+
+### Fixed
+
+- ngit-workflow triage tool success result referenced an undefined
+  `removals` binding (every success threw ReferenceError after applying
+  labels): the reported shape is now built by `triageSuccessResult` in
+  `.opencode/lib/ngit-triage.ts`, pinned by the offline suite, and the
+  entry only stringifies it.
 
 ### Changed
 

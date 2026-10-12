@@ -292,6 +292,14 @@ version say exactly what changed.
 
 ### Changed
 
+- Issue triage labels (`ROADMAP.md`, `CONTRIBUTING.md`,
+  `docs/collaboration-workflow.md`, `AGENTS.md`): `release:backlog` is the
+  parked state and every triaged issue carries exactly one `release:*`
+  label — an absent milestone is invisible to the label-filtered queries
+  release planning depends on. Project labels must never be passed at issue
+  creation: creation-time labels are permanent and cannot be retracted
+  through a later `ngit label` event (`--remove-label` only covers
+  triage-applied labels).
 - Wall-clock accounting in the e2e harnesses (`tests/alpha-common.sh`):
   every step header, every check line, and a closing summary now carry
   elapsed seconds, taken from bash's `SECONDS` builtin so no check forks

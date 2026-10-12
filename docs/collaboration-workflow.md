@@ -16,8 +16,10 @@ ngit issue create --subject "feat(format): path-level tree mutation" \
   --body "$(cat issue.md)" --json
 ```
 
-Do not add project labels during creation. Creation-time labels are lowercased
-and embedded permanently in the issue event.
+Never add project labels during creation. Creation-time labels are lowercased,
+embedded permanently in the issue event, and cannot be removed through a
+later `ngit label` event — `--remove-label` only retracts labels applied
+during triage. Create issues bare and label them in triage.
 
 ## 2. Triage The Issue
 
@@ -27,22 +29,26 @@ Apply exactly one label from each category:
 - Priority: `P0` through `P4`.
 - Milestone: one `release:*` label. Match it against the milestone
   thesis in `ROADMAP.md` (including the v0.2 entry test) — never
-  guess from recency or from the current release line.
+  guess from recency or from the current release line. Visible future work
+  with no commitment takes `release:backlog`; no triaged issue is ever
+  without a `release:*` label.
 
 ```bash
 ngit issue label <issue> --label enhancement --json
 ngit issue label <issue> --label P2 --json
-ngit issue label <issue> --label release:v0.1.0-alpha --json
+ngit issue label <issue> --label release:v0.3.0-alpha --json
 ```
 
-Do not stack milestones. Update the labels deliberately when scope or
+Do not stack milestones. Swap deliberately with
+`ngit issue label <issue> --remove-label <old> --label <new>` when scope or
 priority changes. Keep the issue open while work is in progress.
 
 These three categories are a closed set: do not invent labels outside them
 (`test`, `docs`, component names, and the like are Conventional Commit
-scopes for the subject line, not labels). Creation labels cannot be removed,
-so a wrong label is permanent — when in doubt, list existing issues first to
-see the labels in use rather than guessing a new one. Capture the created
+scopes for the subject line, not labels). Creation labels cannot be removed
+through a later ngit label event, so prefer creating bare — when in doubt,
+list existing issues first to see the labels in use rather than guessing a
+new one. Capture the created
 issue's id from the `create --json` output and reuse it; never run `create`
 again to "check" something, and verify any unfamiliar subcommand flag with
 `--help` before running a command that writes.

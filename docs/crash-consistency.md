@@ -55,7 +55,12 @@ head-announcement outbox follows incrementally in bounded batches
 (OD-16-1 B), so a transition CAN be durable while its announcement
 catch-up is incomplete: each obligation is independently durable
 and idempotent, and resume re-derives exactly the missing suffix
-with no checkpoint marker. Pinned by
+with no checkpoint marker. The re-derivation assumes later
+transitions did not change old verdicts — admission preserves
+owners and never voids history, so the pinned pre-admission seed
+set reproduces exactly (pinned by
+`pinned_epoch_survives_admission_and_freeze`; a post-admission
+freeze is outside this path's contract). Pinned by
 `failed_admit_leaves_no_phantom_tip` (atomic membership half),
 `admit_queues_and_delivers_newcomer_catch_up` (restart before
 first send still delivers; `author/tests_admission.rs`), and the

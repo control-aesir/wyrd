@@ -287,10 +287,13 @@ fn snapshot_with_unknown_parent_is_pending() {
 /// verdicts — it does not time-travel the log. An admission and a
 /// later freeze must not move the pinned seed set: the freeze only
 /// contests the new tips, never rewrites canonical history, so the
-/// epoch-1 head stays eligible at the pinned epoch. (Voiding only
-/// ever touches branches that freezing already made ineligible, so
-/// no eligible→voided transition is reachable through the state
-/// machine; this test pins the reachable half.)
+/// epoch-1 head stays eligible at the pinned epoch. (On voiding:
+/// resolution voiding only touches branches freezing already made
+/// ineligible, so no eligible-to-voided transition is reachable
+/// that way. Ancestry-derived voiding — a link voided through a
+/// contested ancestor it never froze itself — is a wider property
+/// this test does not bound; no reachable case is known through
+/// the state machine's real paths.)
 #[test]
 fn pinned_epoch_survives_admission_and_freeze() {
     let mut f = Fixture::new(1);

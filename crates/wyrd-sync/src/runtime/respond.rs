@@ -53,9 +53,17 @@
 //! late-joiner half: a statement from a recipient that never
 //! received an announcement queues the sender's missing set for
 //! that recipient (synthesized obligations — no prior queue fact
-//! needs to exist) and sends them under the same per-statement cap,
-//! so a newcomer learns superseded-epoch snapshots through the one
+//! needs to exist), and the barrier-gated publish pass discharges
+//! the queue — under the live route for first-party snapshots, and
+//! through the resume path for third-party ones — so a newcomer
+//! learns superseded-epoch snapshots through the one
 //! reconciliation mechanism instead of a second one.
+//!
+//! The answer pass itself sends no announcements, deliberately:
+//! announcement discharge stays behind the serving-readiness
+//! barrier, and the answer pass runs before it. Queueing is the
+//! answer's whole announcement half; the sends follow on the
+//! publish pass like every other queued obligation.
 //!
 //! A frozen drive answers nothing: unresolved membership leaves both
 //! the recipient set and the obligations ambiguous, and the
@@ -232,22 +240,6 @@ impl Engine {
                 newest_held_epoch(evidence, requester),
             )?;
             report.sent += sent;
-            // The announcement half shares the statement's send cap:
-            // transitions and capabilities send first, and the
-            // remainder serves the missing set. Whatever does not fit
-            // stays queued for the blind publish pass and the
-            // recipient's next statement — queued, never lost.
-            let mut remaining = MAX_RESPONSE_SENDS_PER_STATEMENT.saturating_sub(sent);
-            let mut a_sent = 0usize;
-            for snapshot in &missing_a {
-                if remaining == 0 {
-                    break;
-                }
-                remaining -= 1;
-                a_sent +=
-                    super::author::reannounce_snapshot_to(self, mailbox, *snapshot, *requester)?;
-            }
-            report.sent += a_sent;
             // "Asked, nothing delivered": obligations were
             // outstanding for this requester, yet the evaluation
             // moved none — the sender-side UnknownEpoch skip is the
@@ -258,7 +250,7 @@ impl Engine {
             // sends follow on the publish pass. Recorded for 21d's
             // stall gauge; liveness is decided at read time, so no
             // clearing belongs here.
-            if retired == 0 && sent == 0 && a_sent == 0 && queued == 0 {
+            if retired == 0 && sent == 0 && queued == 0 {
                 self.stalled_statements.insert((*requester, *digest));
             }
         }
@@ -329,6 +321,13 @@ impl Engine {
     /// `announcement_covered` check inside the derivation is the
     /// second layer, keeping the projection correct even if a
     /// duplicate queue fact ever lands.
+    ///
+    /// The send cap does not bound this queue: one statement can
+    /// queue more than one pass sends. Each pair is deduped (queued
+    /// once however often it is missing), the remainder discharges
+    /// on the publish pass and the recipient's next statement, and
+    /// the per-pair cost is one small fact — the same shape as the
+    /// admission closure's one-obligation-per-member commit.
     fn queue_missing_announcements(
         &mut self,
         requester: &DeviceId,
@@ -484,7 +483,6 @@ fn missing_announcements(
         .collect();
     runtime
         .recorded_announcement_epochs()
-        .into_iter()
         .filter(|(snapshot, epoch)| {
             !evidence.snapshots.contains(snapshot)
                 && installs.contains(epoch)

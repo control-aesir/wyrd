@@ -32,27 +32,7 @@ use crate::runtime::test_util::{
     announcement_msg, announcement_msg_with, body_root, capability_message_for, control_key,
     encryption_key, identity_secret, publish_into, transition_message,
 };
-use crate::transport::mailbox::{
-    seal_for_recipient, Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError,
-    MemoryMailbox, MemoryRelay, SendReport,
-};
-
-/// A mailbox that accepts nothing and retains nothing, like the
-/// response tests' null: sends report zero acceptance, so the queue
-/// half is observable with no send half discharging anything.
-struct NullMailbox;
-
-impl Mailbox for NullMailbox {
-    fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
-        Ok(SendReport { accepted: 0 })
-    }
-    fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
-        Ok(None)
-    }
-    fn settle(&mut self, _id: DeliveryId, _disposition: Disposition) -> Result<(), MailboxError> {
-        Ok(())
-    }
-}
+use crate::transport::mailbox::{seal_for_recipient, MemoryMailbox, MemoryRelay};
 
 /// The world: the owner authors an epoch-1 snapshot announced to A
 /// and B only; J joins at epoch 4 holding keys 1–4 but having heard
@@ -217,9 +197,10 @@ fn state_to(world: &mut World, to: DeviceId, evidence: &ReconciliationEvidence) 
     assert_eq!(report.accepted, 1, "the statement commits through intake");
 }
 
-/// Answer from one sender against the fixture relay: sends are
-/// relay-accepted, so the retransmit half is observable as
-/// `Delivered` facts.
+/// Answer from one sender against the fixture relay. The answer
+/// queues the missing set and retires the covered set; it sends no
+/// announcements itself — the publish pass below discharges the
+/// queue from behind the serving barrier.
 fn answer(world: &mut World, from: DeviceId) -> AnswerReport {
     if from == world.a.device {
         let mut mailbox = MemoryMailbox {
@@ -266,18 +247,30 @@ fn pending_for(world: &mut World, sender: DeviceId) -> Vec<(SnapshotId, DeviceId
         .collect()
 }
 
-/// Answer from A through a refusing mailbox: the queue half runs
-/// with no send half discharging anything, so the obligation stays
-/// pending for the retirement arc below.
-fn answer_a_null(world: &mut World) -> AnswerReport {
-    let mut mailbox = NullMailbox;
-    world.a.engine.answer_reconciliation(&mut mailbox).unwrap()
+/// The barrier-gated publish pass for one sender: discharges its
+/// queued announcement obligations the way the live loop does after
+/// the serving mirror flushes. Returns the relay-accepted sends.
+fn publish(world: &mut World, from: DeviceId) -> usize {
+    if from == world.a.device {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut world.relay,
+            owner: from,
+        };
+        world.a.engine.announce_pending(&mut mailbox, None).unwrap()
+    } else {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut world.relay,
+            owner: from,
+        };
+        world.b.engine.announce_pending(&mut mailbox, None).unwrap()
+    }
 }
 
 /// A late joiner derives superseded-epoch snapshot ids: the full
-/// durable path. J states its gap, B's answer queues and sends the
-/// missing epoch-1 announcement (no queue fact for J existed
-/// before), J intakes it into durable state, enumerates epoch 1
+/// durable path. J states its gap, both members queue the missing
+/// epoch-1 announcement (no queue fact for J existed before), B's
+/// publish pass discharges the pair from behind the serving
+/// barrier, J intakes it into durable state, enumerates epoch 1
 /// from the store alone, fetches the body, and its next statement
 /// retires A's still-pending obligation — A never delivered, yet
 /// stops retrying on durable evidence of possession.
@@ -302,15 +295,21 @@ fn a_late_joiner_derives_superseded_epoch_snapshot_ids() {
     // J states to both members.
     state_to(&mut world, a_dev, &evidence);
     state_to(&mut world, b_dev, &evidence);
-    // A answers refused: the obligation queues and stays pending.
-    let report_a = answer_a_null(&mut world);
+    // Both answer by queueing only — the answer sends nothing
+    // itself; discharge waits for the publish pass.
+    let report_a = answer(&mut world, a_dev);
     assert_eq!(report_a.retired, 0);
     assert_eq!(report_a.sent, 0);
     assert_eq!(pending_for(&mut world, a_dev), vec![(s0, j_dev)]);
-    // B answers through the relay: the same pair queues and sends.
     let report_b = answer(&mut world, b_dev);
     assert_eq!(report_b.retired, 0);
-    assert_eq!(report_b.sent, 1, "exactly the missing announcement sends");
+    assert_eq!(report_b.sent, 0);
+    assert_eq!(pending_for(&mut world, b_dev), vec![(s0, j_dev)]);
+    // B's publish pass discharges the pair from behind the serving
+    // barrier; A's stays queued.
+    let sent_b = publish(&mut world, b_dev);
+    assert_eq!(sent_b, 1, "exactly the missing announcement discharges");
+    assert!(pending_for(&mut world, b_dev).is_empty());
     // J intakes B's send and enumerates epoch 1 from durable state.
     let drained = drain_side(&mut world.relay, &mut world.j);
     assert!(drained.accepted >= 1, "the announcement lands");
@@ -337,7 +336,7 @@ fn a_late_joiner_derives_superseded_epoch_snapshot_ids() {
     let report_a2 = answer(&mut world, a_dev);
     assert_eq!(
         report_a2.retired, 1,
-        "possession retires what refusal kept pending"
+        "possession retires the pair the publish pass never sent"
     );
     assert_eq!(report_a2.sent, 0, "covered needs no send");
     assert!(pending_for(&mut world, a_dev).is_empty());
@@ -390,7 +389,9 @@ fn superseded_epoch_discovery_is_independent_of_the_admitting_device() {
     state_to(&mut world, a_dev, &evidence);
     let report = answer(&mut world, a_dev);
     assert_eq!(report.retired, 0);
-    assert_eq!(report.sent, 1);
+    assert_eq!(report.sent, 0, "the answer queues; the publish pass sends");
+    let sent = publish(&mut world, a_dev);
+    assert_eq!(sent, 1);
     drain_side(&mut world.relay, &mut world.j);
     assert_eq!(
         epoch_one_ids(&world),
@@ -454,8 +455,7 @@ fn announcement_reconciliation_is_epoch_scoped_and_survives_restart() {
         .engine
         .commit_facts(&[Fact::ReconciliationRequestReceived(j_dev, evidence1)])
         .unwrap();
-    let mut null = NullMailbox;
-    let first = world.a.engine.answer_reconciliation(&mut null).unwrap();
+    let first = answer(&mut world, a_dev);
     assert_eq!(first.retired, 0);
     assert_eq!(first.sent, 0);
     let loaded = world.a.engine.store.load().unwrap();
@@ -477,7 +477,7 @@ fn announcement_reconciliation_is_epoch_scoped_and_survives_restart() {
         .engine
         .commit_facts(&[Fact::ReconciliationRequestReceived(j_dev, evidence2)])
         .unwrap();
-    let second = world.a.engine.answer_reconciliation(&mut null).unwrap();
+    let second = answer(&mut world, a_dev);
     assert_eq!(second.retired, 0);
     assert_eq!(second.sent, 0);
     let loaded = world.a.engine.store.load().unwrap();
@@ -500,22 +500,82 @@ fn announcement_reconciliation_is_epoch_scoped_and_survives_restart() {
             evidence3.clone(),
         )])
         .unwrap();
-    let third = world.a.engine.answer_reconciliation(&mut null).unwrap();
+    let third = answer(&mut world, a_dev);
     assert_eq!(third.retired, 2);
     assert_eq!(third.sent, 0);
-    let digest3 = reconciliation_statement_digest(&j_dev, &evidence3);
-    let mut retired = world.a.engine.store.load().unwrap().announcement_reconciled;
-    retired.sort();
+    // The barrier-gated publish pass discharges both queued
+    // pairs through the resume path — with no statement involved,
+    // and with no body recorded for either snapshot. (First-party
+    // discharge of a statement-queued pair reuses the unchanged
+    // `announce()` path its admission-queued siblings take, covered
+    // by the existing authoring tests.)
+    let drained = publish(&mut world, a_dev);
     assert_eq!(
-        retired,
-        vec![(world.s0, j_dev, digest3), (s2, j_dev, digest3)],
-        "both obligations retire against the proving statement"
+        drained, 2,
+        "both statement-queued pairs discharge on the publish pass"
+    );
+    assert!(pending_for(&mut world, a_dev).is_empty());
+    let loaded = world.a.engine.store.load().unwrap();
+    assert!(loaded.announcement_delivered.contains(&(world.s0, j_dev)));
+    assert!(loaded.announcement_delivered.contains(&(s2, j_dev)));
+}
+
+/// A covered statement retires every outstanding announcement
+/// obligation together, and the retirement survives restart: the
+/// durable half of the late-joiner loop.
+#[test]
+fn covered_announcement_obligations_retire_durably() {
+    let mut world = build();
+    let (a_dev, j_dev) = (world.a.device, world.j.device);
+    let chain: BTreeSet<_> = [
+        world.genesis.transition_id(),
+        world.admit_a.transition_id(),
+        world.admit_b.transition_id(),
+        world.admit_j.transition_id(),
+    ]
+    .into_iter()
+    .collect();
+    let evidence = ReconciliationEvidence {
+        transitions: chain,
+        snapshots: BTreeSet::new(),
+        capabilities: BTreeSet::from([(j_dev, 1), (j_dev, 2), (j_dev, 3), (j_dev, 4)]),
+    };
+    world
+        .a
+        .engine
+        .commit_facts(&[Fact::ReconciliationRequestReceived(j_dev, evidence)])
+        .unwrap();
+    let first = answer(&mut world, a_dev);
+    assert_eq!(first.retired, 0);
+    assert_eq!(first.sent, 0, "the answer queues; the publish pass sends");
+    assert_eq!(pending_for(&mut world, a_dev), vec![(world.s0, j_dev)]);
+    let evidence2 = ReconciliationEvidence {
+        transitions: BTreeSet::new(),
+        snapshots: BTreeSet::from([world.s0]),
+        capabilities: BTreeSet::from([(j_dev, 1), (j_dev, 2), (j_dev, 3), (j_dev, 4)]),
+    };
+    world
+        .a
+        .engine
+        .commit_facts(&[Fact::ReconciliationRequestReceived(
+            j_dev,
+            evidence2.clone(),
+        )])
+        .unwrap();
+    let second = answer(&mut world, a_dev);
+    assert_eq!(second.retired, 1);
+    assert_eq!(second.sent, 0);
+    let digest2 = reconciliation_statement_digest(&j_dev, &evidence2);
+    assert_eq!(
+        world.a.engine.store.load().unwrap().announcement_reconciled,
+        vec![(world.s0, j_dev, digest2)],
+        "the obligation retires against the proving statement"
     );
     assert!(pending_for(&mut world, a_dev).is_empty());
     restart(&mut world.a, &world.controls);
-    let fourth = answer(&mut world, a_dev);
-    assert_eq!(fourth.retired, 0);
-    assert_eq!(fourth.sent, 0);
+    let third = answer(&mut world, a_dev);
+    assert_eq!(third.retired, 0);
+    assert_eq!(third.sent, 0);
     assert_eq!(
         world
             .a
@@ -525,25 +585,24 @@ fn announcement_reconciliation_is_epoch_scoped_and_survives_restart() {
             .unwrap()
             .announcement_reconciled
             .len(),
-        2,
+        1,
         "restart re-answer commits nothing"
     );
 }
 
-/// The per-statement send cap covers the announcement half: with
-/// more missing than the cap allows, one statement sends exactly
-/// the cap, queues the rest, and the blind publish pass catches up
-/// the remainder — queued, never lost.
+/// The answer queues without bound and without sending: with more
+/// missing than any single pass would send, one statement queues
+/// the whole set, sends nothing itself, and the barrier-gated
+/// publish pass drains every pair — queued, never lost.
 #[test]
-fn statement_send_cap_shares_with_announcements() {
-    use crate::runtime::respond::MAX_RESPONSE_SENDS_PER_STATEMENT;
+fn statement_queues_unbounded_and_publish_drains() {
     let mut world = build();
     let (a_dev, j_dev) = (world.a.device, world.j.device);
-    // More recorded epoch-1 snapshots than one statement may send.
-    let over: usize = MAX_RESPONSE_SENDS_PER_STATEMENT + 1;
+    // A large missing set: 64 recorded epoch-1 snapshots the joiner
+    // never heard.
     let mut announcements = Vec::new();
-    for i in 1..over {
-        let id = SnapshotId::from_bytes([i as u8; 32]);
+    for i in 1..64u8 {
+        let id = SnapshotId::from_bytes([i; 32]);
         let Message::SnapshotAnnouncement(ann) =
             announcement_msg(&world.a.identity_sk, id, 1, world.genesis.transition_id())
         else {
@@ -565,34 +624,19 @@ fn statement_send_cap_shares_with_announcements() {
     let report = answer(&mut world, a_dev);
     assert_eq!(report.retired, 0);
     assert_eq!(
-        report.sent, MAX_RESPONSE_SENDS_PER_STATEMENT,
-        "one statement sends exactly the cap"
+        report.sent, 0,
+        "the answer queues; only the publish pass sends"
     );
     let loaded = world.a.engine.store.load().unwrap();
     assert_eq!(
         loaded.announcement_queued.len(),
-        over,
-        "the whole missing set queues"
+        64,
+        "the whole missing set queues, send cap or not"
     );
-    assert_eq!(
-        world
-            .a
-            .engine
-            .runtime_state()
-            .unwrap()
-            .pending_announcements()
-            .len(),
-        1,
-        "all but the cap's worth stay pending"
-    );
-    // The blind publish pass discharges the remainder through the
-    // same outbox — the cap defers, never strands.
-    let mut mailbox = MemoryMailbox {
-        relay: &mut world.relay,
-        owner: a_dev,
-    };
-    let caught = world.a.engine.announce_pending(&mut mailbox, None).unwrap();
-    assert_eq!(caught, 1, "the remainder drains on the publish pass");
+    // The barrier-gated publish pass discharges every pair through
+    // the same outbox — queueing defers, never strands.
+    let drained = publish(&mut world, a_dev);
+    assert_eq!(drained, 64, "the queue drains on the publish pass");
     assert!(world
         .a
         .engine

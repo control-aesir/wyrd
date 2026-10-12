@@ -317,12 +317,20 @@ the keys land first). Announcements follow the same epoch rule per
 snapshot — a snapshot whose epoch the recipient evidences no
 install for is neither queued nor sent until a later statement
 evidences it — and retire on direct statement evidence of the
-snapshot itself, with no ancestry widening. The announcement sends
-forward the author's signed statement byte-identically under its
-own epoch (pending-only, no route record, like the resume path),
-so they carry no local serving promise for the flush barrier to
-gate; first-party announcements still discharge through the
-barrier-gated publish loop only.
+snapshot itself, with no ancestry widening. The announcement half
+queues but never sends inside the answer pass: the synthesized
+queue discharges on the barrier-gated publish pass (under the live
+route for first-party snapshots, through the resume path for
+third-party ones), because the answer pass runs before the
+serving-readiness barrier and only the publish pass may promise a
+local route. Two stated limits: a relay-accepted send that the
+recipient never ingested stays outside the missing set (pending
+derives as queued minus delivered, and retirement must stay
+sound), so reconciliation covers recipients with no queue fact at
+all, not sends accepted and lost; and the synthesized queue is not
+re-gated against current membership — the seal is under the
+epoch's control key the recipient already holds, so it learns
+nothing it could not decrypt, exactly like the outbox it joins.
 
 Surfaced as 21d: `sync status` carries a `reconciliation` row —
 statements received plus transitions and capabilities retired,

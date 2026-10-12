@@ -24,14 +24,17 @@ version say exactly what changed.
 ### Added
 
 - Announcement-class reconciliation for late joiners
-  (`docs/sync-and-peers.md`, `planning/v0.3/issues/38-late-joiners-superseded-epochs.md`):
+  (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the
   recipient's missing announcements (recorded announcements minus
   evidenced snapshots, installed epochs only — synthesized
-  obligations, no prior queue fact needed) and sends them under the
-  same per-statement cap, so a device admitted epochs later learns
+  obligations, no prior queue fact needed) for the barrier-gated
+  publish pass, so a device admitted epochs later learns
   superseded-epoch snapshot ids through the one reconciliation
-  mechanism. Retirement commits the new `AnnouncementReconciled`
+  mechanism. The answer pass itself sends no announcements:
+  discharge stays behind the serving-readiness barrier like every
+  other queued obligation. Retirement commits the new
+  `AnnouncementReconciled`
   fact (tag `0x1D`, fixed triple like the other classes) on direct
   statement evidence of the snapshot — no ancestry widening — and
   pending derives as queued minus (delivered ∪ reconciled) for all

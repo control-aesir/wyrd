@@ -8,7 +8,7 @@ use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::endpoint_id;
 use crate::transport::mailbox::Mailbox;
-use wyrd_format::{DeviceId, SnapshotId};
+use wyrd_format::SnapshotId;
 
 /// Announce an authored snapshot to every other admitted device of the
 /// snapshot's bound transition — members and readers alike — over the
@@ -493,10 +493,7 @@ fn reannounce_one(
 /// against the obligation, exactly as the resume path does), else
 /// seal the author's statement fresh under its own epoch. Returns
 /// the bytes to send, or `None` when the sealing key is not held
-/// (the obligation stays pending for a later pass). Shared by the
-/// resume path above and the statement-triggered send below: both
-/// forward the author's signed statement byte-identically, never
-/// re-authored.
+/// (the obligation stays pending for a later pass).
 fn reannounce_sealed_bytes(
     engine: &mut Engine,
     rebuilt: &Rebuilt,
@@ -559,57 +556,6 @@ fn reannounce_sealed_bytes(
             Ok(Some(bytes))
         }
     }
-}
-
-/// Send one snapshot's announcement to one recipient only: the
-/// statement-triggered half of the late-joiner path. The obligation
-/// must already be queued (the answer path queues the statement's
-/// missing set first); this seals and sends exactly that pair,
-/// recording one delivered marker per relay-accepted send. Returns
-/// the relay-accepted sends (0 or 1), or 0 when the pair is no
-/// longer pending or the sealing key is not held.
-///
-/// Pending-only and route-free, like the resume path: the resent
-/// bytes carry the author's route, not this engine's, so no route
-/// record commits and nothing already discharged resends.
-///
-/// No barrier check here, deliberately: these bytes are the author's
-/// signed statement forwarded byte-identically under its own epoch —
-/// they carry no local serving promise for the flush barrier to
-/// gate. First-party announcements still discharge through the
-/// barrier-gated publish loop only.
-pub(crate) fn reannounce_snapshot_to(
-    engine: &mut Engine,
-    mailbox: &mut impl Mailbox,
-    snapshot: SnapshotId,
-    recipient: DeviceId,
-) -> Result<usize, EngineError> {
-    let rebuilt = engine.store.rebuild(engine.device)?;
-    if !rebuilt
-        .runtime
-        .pending_announcements()
-        .contains(&(snapshot, recipient))
-    {
-        return Ok(0);
-    }
-    let Some(known) = rebuilt.runtime.announcement(&snapshot).cloned() else {
-        // Unknown snapshots are skipped orphan-tolerant — the
-        // obligation stays pending for a later pass.
-        return Ok(0);
-    };
-    let Some(sealed_bytes) = reannounce_sealed_bytes(engine, &rebuilt, snapshot, &known)? else {
-        return Ok(0);
-    };
-    let obligation = announcement_obligation(&snapshot);
-    send_sealed_to(
-        engine,
-        mailbox,
-        "announcement",
-        &obligation,
-        &sealed_bytes,
-        [recipient],
-        |recipient| vec![Fact::AnnouncementDelivered(snapshot, recipient)],
-    )
 }
 
 /// Send the sealed bytes to every send-eligible recipient of one

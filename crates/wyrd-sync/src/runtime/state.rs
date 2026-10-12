@@ -929,12 +929,13 @@ impl RuntimeState {
     /// catch-up. Recorded announcements only — a snapshot with a
     /// body but no signed announcement cannot be forwarded (only
     /// the author authors; everyone else re-sends the author's
-    /// statement).
-    pub fn recorded_announcement_epochs(&self) -> Vec<(SnapshotId, u64)> {
+    /// statement). An iterator, not a snapshot: statements are
+    /// event-driven and rare, but there is no reason to heap-
+    /// allocate the whole recorded set per answered statement.
+    pub fn recorded_announcement_epochs(&self) -> impl Iterator<Item = (SnapshotId, u64)> + '_ {
         self.announcements
             .iter()
             .map(|(snapshot, announcement)| (*snapshot, announcement.epoch))
-            .collect()
     }
 
     /// The record for one manifest id, if recorded.

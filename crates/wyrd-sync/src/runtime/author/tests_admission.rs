@@ -1,6 +1,6 @@
 use super::admission::{
-    admission_capacity_refusal, admit_device, next_epoch, resume_admission_obligations,
-    ADMISSION_OBLIGATION_BATCH,
+    admission_capacity_refusal, admit_device, membership_commit_error, next_epoch,
+    resume_admission_obligations, ADMISSION_OBLIGATION_BATCH,
 };
 use super::tests_harness::{device_of, owner_engine};
 use crate::runtime::engine::UnqueuedClosure;
@@ -1955,13 +1955,72 @@ fn admission_capacity_refusal_carries_counts_ceiling_and_continuation() {
             "refusal tells the operator why rerunning cannot help: {rendered}"
         );
     }
-
     // The defined fallback when the closure cannot even be counted:
     // the refusal still carries the batch and the ceiling.
     let fallback = admission_capacity_refusal(70_000, UnqueuedClosure::Uncounted).to_string();
     assert!(
         fallback.contains("could not be computed"),
         "uncounted closure degrades the message, never the refusal: {fallback}"
+    );
+}
+
+/// Child-2 mapping pin: the record-ceiling failure of the
+/// membership commit becomes the named variant — with the
+/// diagnostic closure count read off the live view — while any
+/// other durable failure passes through generic. The trigger
+/// itself is not manufactured (that needs a 65,536-record
+/// membership batch); the match arms are.
+#[test]
+fn membership_commit_error_maps_ceiling_refusal_to_named_variant() {
+    use crate::durable::DurableError;
+    use wyrd_format::MemoryObjectStore;
+
+    let (_dir, mut engine, genesis_id) = owner_engine("admission-map-refusal");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    mint_bare_chain(&mut engine, genesis_id, tree, 3);
+    let seeds = engine.live_heads().unwrap();
+    let device = identity(0x5A).1;
+
+    let mapped = membership_commit_error(
+        &engine,
+        70_000,
+        &seeds,
+        device,
+        DurableError::TooManyRecords {
+            count: 70_000,
+            max: 65_536,
+        },
+    );
+    let EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    } = mapped
+    else {
+        panic!("ceiling refusal maps to the named variant, got {mapped:?}");
+    };
+    assert_eq!(records, 70_000, "the variant carries the batch length");
+    assert_eq!(max, 65_536);
+    assert_eq!(
+        closure,
+        UnqueuedClosure::Counted(3),
+        "the diagnostic count reads the live closure"
+    );
+
+    let passthrough = membership_commit_error(
+        &engine,
+        70_000,
+        &seeds,
+        device,
+        DurableError::SequenceExhausted,
+    );
+    assert!(
+        matches!(
+            passthrough,
+            EngineError::Durable(DurableError::SequenceExhausted)
+        ),
+        "other durable failures pass through unchanged: {passthrough:?}"
     );
 }
 
@@ -2087,5 +2146,71 @@ fn member_invite_rerun_resumes_interrupted_fill() {
     assert!(
         matches!(refused, Err(EngineError::NotMember)),
         "strangers refuse"
+    );
+}
+
+/// Multi-batch resume through the operator API (slow profile):
+/// three chunks with the middle torn, resumed via the guarded
+/// `resume_admission` (not the fill directly) — batches counted,
+/// invitation reissued, survivors never doubled. The single-chunk
+/// shape lives in the default profile above.
+#[test]
+fn member_invite_rerun_resumes_across_batches() {
+    use crate::control::bootstrap::open_bootstrap;
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::key;
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 2 * ADMISSION_OBLIGATION_BATCH + 452;
+
+    let (dir, mut engine, genesis_id) = owner_engine("admission-rerun-batches");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+    let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let newcomer_key = encryption_key(&newcomer_encryption);
+    // Tear the middle chunk: the membership commit and the first
+    // chunk land, then the process "dies".
+    engine.crash_after_nth_commit(2, CrashStage::AfterRenameCommit);
+    engine.admit_device(newcomer_id, newcomer_key).unwrap();
+    drop(engine);
+    let (owner_sk, owner_id) = key(10);
+    let mut engine = Engine::open(
+        dir.path.clone(),
+        crate::membership::test_util::drive(),
+        owner_id,
+        "test-pass",
+        identity_secret(&owner_sk),
+        DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+    )
+    .unwrap();
+
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(matches!(rerun, Err(EngineError::AlreadyMember)));
+    let resume = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(
+        resume.committed,
+        CHAIN_LEN - ADMISSION_OBLIGATION_BATCH,
+        "resume fills exactly the torn middle and trailing chunks"
+    );
+    assert_eq!(resume.batches, 2, "two batches spent");
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(queued, want, "multi-batch resume completes exactly once");
+    let invitation = open_bootstrap(&newcomer_encryption, &resume.invitation).unwrap();
+    assert_eq!(
+        invitation.invitee, newcomer_id,
+        "reissued invitation names the newcomer"
     );
 }

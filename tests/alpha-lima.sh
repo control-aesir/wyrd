@@ -236,10 +236,20 @@ step4_member() {
   [[ "$held_after" == "$held_before 3" ]] || die "held secrets did not grow: $held_after"
   pass "held secrets grow across rotate ($held_after)"
 
-  expect_fail2 step4-reinvite \
-    with_creds "$oc" member "$od" invite "$dev" "$key" "$E2E_ROOT/invitation-dup"
-  grep -qi "already a member" "$LOGDIR/step4-reinvite.stderr" \
-    || die "re-invite did not report AlreadyMember"
+  # Deliberate replacement (bound-admission-closure child 2):
+  # re-inviting an admitted device resumes its catch-up instead of
+  # refusing. Assert the resume output, the reissued file, and no
+  # duplicate admission below.
+  local reinvite_out
+  reinvite_out="$(expect_exit 0 step4-reinvite-ok \
+    with_creds "$oc" member "$od" invite "$dev" "$key" "$E2E_ROOT/invitation-dup")"
+  [[ -f "$E2E_ROOT/invitation-dup" ]] || die "re-invite wrote no file"
+  echo "$reinvite_out" | grep -qi "already a member" \
+    || die "re-invite did not report resume: $reinvite_out"
+  local log_after
+  log_after="$(with_creds "$oc" member "$od" log)"
+  [[ "$(echo "$log_after" | wc -l)" == 3 ]] || die "re-invite authored a duplicate admission: $log_after"
+  pass "re-invite resumes instead of refusing"
 
   expect_fail2 step4-remove-sole-owner \
     with_creds "$oc" member "$od" remove "$owner_id"

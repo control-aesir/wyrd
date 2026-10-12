@@ -721,3 +721,35 @@ fn admission_capacity_refusal_renders_counts_and_continuation() {
         );
     }
 }
+
+/// The three invite outcomes render distinctly: a fresh admission
+/// names obligations and batches, a resumed interruption names the
+/// resumed count, and an already-complete rerun says so — so an
+/// automatic recovery can never be mistaken for a fresh admission.
+#[test]
+fn invite_outcomes_render_distinctly() {
+    use std::path::PathBuf;
+    use wyrd_format::DeviceId;
+
+    let device = DeviceId::from_bytes([0x11; 32]);
+    let out = PathBuf::from("invitation");
+    let fresh = render_invited(&device, false, 2, &out, 5, 1, 0);
+    let resumed = render_resumed(5, 1, &out, 0);
+    let complete = render_resumed(0, 0, &out, 0);
+    assert!(
+        fresh.contains("invited") && fresh.contains("5 obligations in 1 batches"),
+        "fresh admission headline: {fresh}"
+    );
+    assert!(
+        resumed.contains("already a member; resumed 5 obligations"),
+        "resumed interruption: {resumed}"
+    );
+    assert!(
+        complete.contains("catch-up already complete; 0 obligations"),
+        "already-complete rerun: {complete}"
+    );
+    assert!(
+        !resumed.contains("invited ") && !complete.contains("invited "),
+        "reruns never read as fresh admissions"
+    );
+}

@@ -117,9 +117,9 @@ history. Interruption is the distinct case: a crash between fill
 batches leaves a durable transition with a partial fill, and
 rerunning `member invite` resumes exactly the missing obligations
 (verifying key and role against the recorded admission first),
-never duplicating work. — while the obligation fill can never trip the ceiling for
-closure length, because no fill commit's size is a function of
-recorded history. A crash between fill batches loses nothing but
+never duplicating work. The obligation fill itself can never trip
+the ceiling for closure length, because no fill commit's size is a
+function of recorded history. A crash between fill batches loses nothing but
 the uncommitted suffix: obligations are idempotent per
 (snapshot, recipient), so resume re-derives exactly the missing
 pairs (pinned by `crash_torn_fill_chunk_resumes_exactly_once` and

@@ -247,18 +247,9 @@ fn admit(
     // against post-commit bodies (the commit adds no snapshots), so
     // every chunk sees the same closure.
     let seeds = engine.live_heads()?;
-    engine.commit_facts(&batch).map_err(|error| match error {
-        // The only commit in `admit` whose size is a function of
-        // recorded history: a pathological membership chain can
-        // overflow it. The fill chunks cannot (bounded by
-        // `ADMISSION_OBLIGATION_BATCH`), so a refusal here is always
-        // the membership half — map it to the named capacity refusal
-        // rather than a generic durable failure.
-        DurableError::TooManyRecords { .. } => {
-            admission_capacity_refusal(batch.len(), count_unqueued_closure(engine, &seeds, device))
-        }
-        other => EngineError::Durable(other),
-    })?;
+    engine
+        .commit_facts(&batch)
+        .map_err(|error| membership_commit_error(engine, batch.len(), &seeds, device, error))?;
     // The lineage closure follows in bounded batches (OD-16-1 B):
     // each obligation is independently durable and idempotent per
     // (snapshot, recipient), so the batches are the progress record
@@ -297,6 +288,31 @@ pub(crate) fn admission_capacity_refusal(records: usize, closure: UnqueuedClosur
         records,
         max: MAX_RECORDS_PER_COMMIT,
         closure,
+    }
+}
+
+/// Map a membership-commit failure: the record-ceiling refusal
+/// becomes the named capacity variant (with the diagnostic closure
+/// count); every other durable failure passes through unchanged.
+/// The only commit in `admit` whose size is a function of recorded
+/// history is the membership half — a pathological membership chain
+/// can overflow it, while the fill chunks cannot (bounded by
+/// `ADMISSION_OBLIGATION_BATCH`) — so a refusal here is always the
+/// membership half. Named (not inline) so the mapping itself is
+/// pinnable without manufacturing a 65,536-record membership
+/// history.
+pub(crate) fn membership_commit_error(
+    engine: &Engine,
+    batch_len: usize,
+    seeds: &[crate::durable::AuthorizedSnapshot],
+    device: DeviceId,
+    error: DurableError,
+) -> EngineError {
+    match error {
+        DurableError::TooManyRecords { .. } => {
+            admission_capacity_refusal(batch_len, count_unqueued_closure(engine, seeds, device))
+        }
+        other => EngineError::Durable(other),
     }
 }
 
@@ -423,8 +439,12 @@ pub(crate) fn resume_admission(
     if recorded != *expected_key {
         return Err(EngineError::AdmissionKeyMismatch { device });
     }
-    let committed = resume_admission_obligations(engine, device)?;
+    // Validate before writing: reissue reads durable state only and
+    // fails closed (non-owner caller, device without active
+    // membership) with nothing committed, so a device that lost
+    // membership refuses before the fill advances any obligation.
     let invitation = reissue_invitation(engine, device)?;
+    let committed = resume_admission_obligations(engine, device)?;
     Ok(ResumeOutcome {
         committed,
         batches: committed.div_ceil(ADMISSION_OBLIGATION_BATCH),

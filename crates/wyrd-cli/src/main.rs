@@ -3543,6 +3543,47 @@ fn vault_status_report(
 /// catch-up obligations through the engine (which enforces
 /// owner-only). Catch-up delivery to other devices happens on the
 /// next mounted sync via the mailbox, not here.
+///
+/// Invite outcome renderers, built as strings so tests assert the
+/// rendering without capturing stdout (same pattern as
+/// `sync_status_render`). The three outcomes must stay
+/// distinguishable: a fresh admission, a resumed interruption, and
+/// an already-complete rerun report different actions.
+fn render_invited(
+    device: &wyrd_format::DeviceId,
+    reader: bool,
+    epoch: u64,
+    out: &std::path::Path,
+    obligations: usize,
+    batches: usize,
+    carried: usize,
+) -> String {
+    format!(
+        "invited {device}{} at epoch {epoch} -> {} ({obligations} obligations in {batches} batches, {carried} carried)",
+        if reader { " as reader" } else { "" },
+        out.display(),
+    )
+}
+
+fn render_resumed(
+    committed: usize,
+    batches: usize,
+    out: &std::path::Path,
+    carried: usize,
+) -> String {
+    if committed == 0 {
+        format!(
+            "catch-up already complete; 0 obligations, invitation re-issued -> {} ({carried} carried)",
+            out.display(),
+        )
+    } else {
+        format!(
+            "already a member; resumed {committed} obligations in {batches} batches, invitation re-issued -> {} ({carried} carried)",
+            out.display(),
+        )
+    }
+}
+
 fn member(
     drive_dir: PathBuf,
     action: MemberAction,
@@ -3641,13 +3682,16 @@ fn member(
                     let carried = carry_pending(&mut engine, &drive_dir)?;
                     write_invitation(&out, &mut file, &outcome.invitation.encode())?;
                     println!(
-                        "invited {device}{} at epoch {} -> {} ({} obligations in {} batches, {} carried)",
-                        if reader { " as reader" } else { "" },
-                        outcome.transition.epoch,
-                        out.display(),
-                        outcome.obligations_queued,
-                        outcome.batches,
-                        carried
+                        "{}",
+                        render_invited(
+                            &device,
+                            reader,
+                            outcome.transition.epoch,
+                            &out,
+                            outcome.obligations_queued,
+                            outcome.batches,
+                            carried
+                        )
                     );
                     return Ok(());
                 }
@@ -3673,21 +3717,10 @@ fn member(
             };
             let carried = carry_pending(&mut engine, &drive_dir)?;
             write_invitation(&out, &mut file, &resume.invitation.encode())?;
-            if resume.committed == 0 {
-                println!(
-                    "catch-up already complete; 0 obligations, invitation re-issued -> {} ({} carried)",
-                    out.display(),
-                    carried
-                );
-            } else {
-                println!(
-                    "already a member; resumed {} obligations in {} batches, invitation re-issued -> {} ({} carried)",
-                    resume.committed,
-                    resume.batches,
-                    out.display(),
-                    carried
-                );
-            }
+            println!(
+                "{}",
+                render_resumed(resume.committed, resume.batches, &out, carried)
+            );
             Ok(())
         }
         MemberAction::ReissueInvitation { device, out } => {

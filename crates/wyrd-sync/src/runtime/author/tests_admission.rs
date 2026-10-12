@@ -2150,10 +2150,12 @@ fn member_invite_rerun_resumes_interrupted_fill() {
 }
 
 /// Multi-batch resume through the operator API (slow profile):
-/// three chunks with the middle torn, resumed via the guarded
-/// `resume_admission` (not the fill directly) — batches counted,
-/// invitation reissued, survivors never doubled. The single-chunk
-/// shape lives in the default profile above.
+/// the membership batch and the first chunk land, the middle chunk
+/// tears, and the trailing chunk is never attempted — 1,476
+/// obligations missing across the last two chunks — resumed via the
+/// guarded `resume_admission` (not the fill directly): batches
+/// counted, invitation reissued, survivors never doubled. The
+/// single-chunk shape lives in the default profile above.
 #[test]
 fn member_invite_rerun_resumes_across_batches() {
     use crate::control::bootstrap::open_bootstrap;

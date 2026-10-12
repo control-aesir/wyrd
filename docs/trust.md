@@ -961,16 +961,16 @@ about the relay position (`trust.md:44-48`).
 | H6 | ContentIds | never (guaranteed, no equality oracle) | process holds the oracle as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed, the equality oracle) | cached only (guaranteed) |
 | H7 | drive identity | never (guaranteed, hash-only addressing; see H10) | process knows as member; vault surfaces never (guaranteed) | never from payload (guaranteed) | yes (guaranteed) | cached (knew its drive; guaranteed) |
 | H8 | membership (who, epoch boundaries) | never (guaranteed, activity without meaning) | process holds as member; vault surfaces never (guaranteed) | never (guaranteed, no membership graphs) | yes, own epochs (guaranteed) | cached pre-removal (guaranteed) |
-| H9 | control traffic (mailbox, gift wraps, announcements) | never (guaranteed, the Nostr side never reaches a replica) | shares the host's mailbox as member-party traffic, never as vault disclosure (guaranteed) | opaque envelopes only (accepted exposure); contents never (guaranteed) | yes (guaranteed) | cached old traffic (guaranteed) |
-| O1 | opaque blob identifiers (transport hashes) | yes (accepted exposure) | yes | no bulk path (position has no column entry) | yes | held only |
-| O2 | object kinds (cleartext kind byte) | yes (accepted exposure) | yes | no bulk path | yes | held only |
-| O3 | ciphertext sizes (no padding in v0) | yes (accepted exposure) | yes | no bulk path | yes | held only |
-| O4 | counts (blobs, bytes, messages) | yes (accepted exposure) | yes | message counts as routing metadata (accepted exposure) | yes | stale (no new observation) |
-| O5 | timing (import, fetch, delivery) | yes (accepted exposure) | yes | routing timing (accepted exposure) | yes | stale (no new observation) |
-| O6 | request patterns (who asked which hash when, linkable repeats) | yes (accepted exposure) | yes | routing patterns (accepted exposure) | yes | stale (no new observation) |
-| O7 | transport identity (iroh node ids, IPs; chosen-visible pubkeys) | yes, unmapped to devices (accepted exposure) | yes | yes, by choice of visibility (accepted exposure) | yes | stale (no new observation) |
-| O8 | correlation heuristics (co-fetching, size matching) | yes, heuristics only (accepted exposure) | ground truth available as member; vault surfaces heuristics only | yes, heuristics only (accepted exposure) | ground truth, not heuristics | none (no new observation) |
+| H9 | control traffic (mailbox, gift wraps, announcements) | never (guaranteed, the Nostr side never reaches a replica) | shares the host's mailbox as member-party traffic, never as vault disclosure (guaranteed) | opaque envelopes only (best-effort); contents never (guaranteed) | yes (guaranteed) | cached old traffic (guaranteed) |
 | H10 | escrow records (cleartext DriveId and epoch framing) | never (guaranteed, decided against; v0 never sends them) | owner-custody sidecars, never vault disclosure (guaranteed) | never (guaranteed) | owner custody only (guaranteed) | never for later epochs (guaranteed) |
+| O1 | opaque blob identifiers (transport hashes) | yes (accepted exposure) | yes (guaranteed, as member or replica) | no bulk path (position has no column entry) | yes (guaranteed) | held only (guaranteed) |
+| O2 | object kinds (cleartext kind byte) | yes (accepted exposure) | yes (guaranteed, as member or replica) | no bulk path | yes (guaranteed) | held only (guaranteed) |
+| O3 | ciphertext sizes (no padding in v0) | yes (accepted exposure) | yes (guaranteed, as member or replica) | no bulk path | yes (guaranteed) | held only (guaranteed) |
+| O4 | counts (blobs, bytes, messages) | yes (accepted exposure) | yes (guaranteed, as member or replica) | message counts as routing metadata (best-effort) | yes (guaranteed) | stale, no new observation (guaranteed) |
+| O5 | timing (import, fetch, delivery) | yes (accepted exposure) | yes (guaranteed, as member or replica) | routing timing (best-effort) | yes (guaranteed) | stale, no new observation (guaranteed) |
+| O6 | request patterns (who asked which hash when, linkable repeats) | yes (accepted exposure) | yes (guaranteed, as member or replica) | routing patterns (best-effort) | yes (guaranteed) | stale, no new observation (guaranteed) |
+| O7 | transport identity (iroh node ids, IPs; chosen-visible pubkeys) | yes, unmapped to devices (accepted exposure) | yes (guaranteed, as member or replica) | yes, by choice of visibility (best-effort) | yes (guaranteed) | stale, no new observation (guaranteed) |
+| O8 | correlation heuristics (co-fetching, size matching) | yes, heuristics only (accepted exposure) | ground truth available as member (guaranteed); vault surfaces heuristics only | yes, heuristics only (best-effort) | ground truth, not heuristics (guaranteed) | none, no new observation (guaranteed) |
 
 Three clauses make the matrix enforceable rather than
 aspirational, per the OD-18 rulings:

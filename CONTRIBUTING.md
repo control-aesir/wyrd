@@ -15,21 +15,28 @@ Every open issue should have exactly one label from each category:
 - Priority: `P0`, `P1`, `P2`, `P3`, or `P4`.
 - Milestone: one `release:*` label.
 
-Apply these labels in a deliberate triage pass after creating the issue. Do
-not pass them to `ngit issue create --label`: creation-time labels are
-lowercased and embedded in the issue event. Use `ngit issue label` so priority
-case is preserved and the label is a separate, manageable event.
+Apply these labels in a deliberate triage pass after creating the issue.
+Never pass them to `ngit issue create --label`: creation-time labels are
+lowercased, embedded permanently in the issue event, and cannot be removed
+afterwards — not even with `ngit issue label --remove-label`, which only
+retracts labels applied during triage. A wrong label at creation is forever.
+Use `ngit issue label` so priority case is preserved and the label is a
+separate, manageable event.
 
 The current milestone labels are:
 
-- `release:v0.1.0-alpha`: minimum set required to cut the first Alpha; critical bugs only.
-- `release:v0.2.0-alpha`: non-blocking features and follow-ups for the next Alpha.
+- `release:v0.1.0-alpha`: shipped; retained on its issues for history.
+- `release:v0.2.0-alpha`: shipped; retained on its issues for history.
+- `release:v0.3.0-alpha`: the current milestone (see `ROADMAP.md`).
+- `release:v0.4`, `release:v0.5`, `release:v0.6`, `release:v0.7`,
+  `release:v0.8`: bare, with no qualifier suffix.
 - `release:v0.9.0-beta`: required before entering feature-complete Beta.
-- `release:v1.0.0`: general availability.
-- `release:backlog`: explicitly deferred beyond the immediate roadmap.
+- `release:v1.0`: general availability.
+- `release:backlog`: explicitly deferred beyond the immediate roadmap. This
+  is the parked state: no triaged issue is ever without a `release:*` label.
 
-Do not stack milestone labels. Remove the old milestone before applying a new
-one through the available project tooling.
+Do not stack milestone labels. Swap with `ngit issue label --remove-label`
+before applying the new one through the available project tooling.
 
 ## Code Changes
 

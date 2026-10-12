@@ -16,8 +16,10 @@ ngit issue create --subject "feat(format): path-level tree mutation" \
   --body "$(cat issue.md)" --json
 ```
 
-Do not add project labels during creation. Creation-time labels are lowercased
-and embedded permanently in the issue event.
+Never add project labels during creation. Creation-time labels are lowercased,
+embedded permanently in the issue event, and cannot be removed afterwards —
+not even with `ngit issue label --remove-label`, which only retracts labels
+applied during triage. Create issues bare and label them in triage.
 
 ## 2. Triage The Issue
 
@@ -27,7 +29,9 @@ Apply exactly one label from each category:
 - Priority: `P0` through `P4`.
 - Milestone: one `release:*` label. Match it against the milestone
   thesis in `ROADMAP.md` (including the v0.2 entry test) — never
-  guess from recency or from the current release line.
+  guess from recency or from the current release line. Visible future work
+  with no commitment takes `release:backlog`; no triaged issue is ever
+  without a `release:*` label.
 
 ```bash
 ngit issue label <issue> --label enhancement --json
@@ -35,7 +39,8 @@ ngit issue label <issue> --label P2 --json
 ngit issue label <issue> --label release:v0.1.0-alpha --json
 ```
 
-Do not stack milestones. Update the labels deliberately when scope or
+Do not stack milestones. Swap deliberately with
+`ngit issue label <issue> --remove-label <old> --label <new>` when scope or
 priority changes. Keep the issue open while work is in progress.
 
 These three categories are a closed set: do not invent labels outside them

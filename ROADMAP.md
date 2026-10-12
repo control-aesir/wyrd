@@ -30,14 +30,18 @@ thing; v1.0, ship it.
 
 ## Triage: placing work on the map
 
-Every issue carries exactly one `release:*` milestone. The label scheme is
+Every triaged issue carries exactly one `release:*` milestone. The label scheme is
 `release:v0.2.0-alpha`, `release:v0.3.0-alpha`, and `release:v0.9.0-beta`
 for the existing milestones, then bare `release:v0.4`, `release:v0.5`,
 `release:v0.6`, `release:v0.7`, `release:v0.8`, and `release:v1.0` with no
-qualifier suffix.
+qualifier suffix, plus `release:backlog` for visible future work with no
+commitment.
 
-- Parked issues (visible future work with no commitment) carry no milestone
-  label at all. A parked issue must say so in its body.
+- Backlog issues (deferred beyond the immediate roadmap) carry
+  `release:backlog`. The label is the signal; no body sentence is required.
+  No triaged issue is ever without a `release:*` label: an absent milestone
+  is invisible to every label-filtered query, including the milestone
+  queries release planning depends on.
 
 A new issue matches a milestone thesis below, or it forces a thesis
 discussion first. For v0.2 specifically, the entry test is: does this alter

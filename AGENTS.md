@@ -118,9 +118,12 @@ Lima for macOS dev iteration and as the refactor guard.)
 - Conventional Commits. Nothing commits to `master` directly; use `pr/<name>`
   branches (see the ngit skill).
 - Follow `docs/collaboration-workflow.md` for issue triage, PR review, merge,
-  and issue resolution. Project labels are applied after issue creation:
+  and issue resolution. Project labels are applied after issue creation —
+  never during it (creation-time labels are permanent and unremovable):
   exactly one type (`bug`, `enhancement`, or `chore`), one priority (`P0` to
-  `P4`), and one `release:*` milestone.
+  `P4`), and one `release:*` milestone (`release:backlog` when the work is
+  deferred beyond the immediate roadmap; no triaged issue is ever without
+  one).
 - Comments explain how code is used, not what it does line-by-line. Keep them
   in sync with the code.
 - Run outside an active devenv with `devenv shell -- ...`; bare commands 

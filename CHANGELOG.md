@@ -60,7 +60,7 @@ version say exactly what changed.
   early verification refusal before any swap, two-rename swap
   with `<exe>.prev` kept, authoritative `__update_verify` in
   the gap with a 300s bound, commit or atomic rollback, handoff
-  (`start the service`) or `--restart` foreground supervision
+  (`start the service`) or `--restart` long-running supervision
   with signal forwarding and exit propagation. Every report —
   verified included — names the two blocked upgrade invariants;
   a post-swap rejection under `--restart` starts the restored

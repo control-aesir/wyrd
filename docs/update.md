@@ -120,12 +120,19 @@ means same filesystem, so every swap step is one atomic rename.
   synced before rename like the store's own `atomic_write`.
 - `<exe>.update-verdict` — the durable outcome record
   `{version: 1, outcome, drive, new_version, in_place, at}`:
-  `done`, `rolled-back`, or `refused`. Written (fsync'd) at
-  every terminal outcome before supervision starts or the
-  process exits, overwritten by each run. Stdout lines are the
-  live channel; this file is the durable one for automation
-  that launches the command through a service manager or
-  redirects output somewhere unobserved.
+  `done`, `rolled-back`, `refused`, or `in_progress` (written
+  right after resolve, overwritten by the terminal outcome).
+  Written (fsync'd) before supervision starts or the process
+  exits, overwritten by each run. Stdout lines are the live
+  channel; this file is the durable one for automation that
+  launches the command through a service manager or redirects
+  output somewhere unobserved. A record older than the current
+  invocation's start is the previous run's.
+- `<exe>.update-verdict.tmp` — the record's atomic-write temp.
+  A crash leaves it behind like any temp; the next verdict
+  write truncates and renames over it, so `converge` needs no
+  policy for it (unlike the state record, which decides
+  rollback — the verdict decides nothing).
 
 Phases, in order:
 
@@ -249,6 +256,14 @@ not this report.
   `incompatible (invariant <n>: <detail>)` with the same gap
   lines, or `unverified (<gap>; <gap>)` — never an unqualified
   green.
+- The durable channel is `<exe>.update-verdict` (fsync'd JSON:
+  outcome, drive, versions, timestamp), written at `in_progress`
+  after resolve and at every terminal outcome before
+  supervision or exit. Automation that launches the command
+  through a service manager, or redirects its output somewhere
+  unobserved, reads the outcome here instead of the lines. A
+  record older than the current invocation's start is the
+  previous run's: anything before staging mutates nothing.
 - Supervised (default): exit 0 means exactly the new binary is
   in place and verified. Exit 2 means anything else — with the
   old binary restored whenever restoration was possible, and

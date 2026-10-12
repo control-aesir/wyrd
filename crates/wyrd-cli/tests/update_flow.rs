@@ -121,7 +121,8 @@ impl Drop for Fixture {
 
 /// The issue's named test: a drive the new build cannot read stops
 /// the upgrade BEFORE any swap — the executable byte-identical,
-/// no rollback copy, no staged binary, no record.
+/// no rollback copy, no staged binary — and records the `refused`
+/// verdict for automation that never saw stdout.
 #[test]
 fn an_incompatible_drive_stops_the_upgrade_before_any_swap() {
     let fix = Fixture::new("early-refusal");
@@ -154,7 +155,8 @@ fn an_incompatible_drive_stops_the_upgrade_before_any_swap() {
         combined.contains("update gap: fact-payload replay"),
         "gaps ride every report:\n{combined}"
     );
-    // Nothing replaced, nothing staged, nothing recorded.
+    // Nothing replaced, nothing staged — but the refusal is
+    // recorded durably for automation that never saw stdout.
     assert_eq!(std::fs::read(&fix.exe).unwrap(), before);
     for suffix in [".prev", ".next", ".update-state", ".stage"] {
         assert!(
@@ -163,6 +165,8 @@ fn an_incompatible_drive_stops_the_upgrade_before_any_swap() {
             fix.sibling(suffix).display()
         );
     }
+    let verdict = std::fs::read_to_string(fix.sibling(".update-verdict")).unwrap();
+    assert!(verdict.contains("\"outcome\": \"refused\""), "{verdict}");
 }
 
 /// A healthy drive upgrades for real: early verify passes, the

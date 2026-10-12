@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use wyrd_format::{DeviceId, SnapshotId};
+use wyrd_sync::disclosure::DisclosureRow;
 use wyrd_sync::{
     authorization::Classification,
     membership::KnownState,
@@ -31,6 +32,28 @@ pub struct HeadSummary {
     pub author: DeviceId,
 }
 
+impl HeadSummary {
+    /// Disclosure inventory (matrix conformance): the id is a
+    /// content identifier (H6); epoch and author are snapshot
+    /// authorship (H5). See [`wyrd_sync::disclosure`] for the rules.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            id: _,
+            epoch: _,
+            author: _,
+        } = self;
+        &[
+            ("id", DisclosureRow::H6),
+            ("epoch", DisclosureRow::H5),
+            ("author", DisclosureRow::H5),
+        ]
+    }
+}
+
 /// Authorization classification counts over every DAG head (not just
 /// the live ones): eligible heads advance the view, every other
 /// class is retained history with its reason attached. Named
@@ -47,6 +70,35 @@ pub struct HeadClasses {
     pub rejected: usize,
 }
 
+impl HeadClasses {
+    /// Disclosure inventory (matrix conformance): authorization-class
+    /// counts at H5. Derived-classification rule: the counts disclose
+    /// snapshot-authorship activity at counts grain — no ids, no
+    /// authors — which the member verdict allows and no vault
+    /// projection reads.
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            eligible: _,
+            canonical_history: _,
+            superseded: _,
+            stranded: _,
+            voided: _,
+            pending: _,
+            rejected: _,
+        } = self;
+        use DisclosureRow::H5;
+        &[
+            ("eligible", H5),
+            ("canonical_history", H5),
+            ("superseded", H5),
+            ("stranded", H5),
+            ("voided", H5),
+            ("pending", H5),
+            ("rejected", H5),
+        ]
+    }
+}
+
 /// Mailbox posture as observed without connecting: configured relay
 /// count only. Liveness (connected relays, stream state) requires a
 /// live mailbox, which status deliberately never constructs — the
@@ -57,6 +109,20 @@ pub struct MailboxView {
     /// Relays configured on the command line. Zero means fully
     /// offline: intake stays idle by construction.
     pub configured_relays: usize,
+}
+
+impl MailboxView {
+    /// Disclosure inventory (matrix conformance): relay
+    /// configuration is control-plane state (H9).
+    ///
+    /// The destructure is exhaustive on purpose (see
+    /// [`HeadSummary::disclosure_map`]).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            configured_relays: _,
+        } = self;
+        &[("configured_relays", DisclosureRow::H9)]
+    }
 }
 
 /// One peer as the durable surface sees it (OD-17-4 option A): an
@@ -87,6 +153,28 @@ pub struct PeerHandle {
     pub pending: usize,
 }
 
+impl PeerHandle {
+    /// Disclosure inventory (matrix conformance): the handle is an
+    /// opaque visible-only identifier (O1 — an ordinal, not a
+    /// count); the peer is a device identity (H8); the pending
+    /// count is O4.
+    ///
+    /// The destructure is exhaustive on purpose (see
+    /// [`HeadSummary::disclosure_map`]).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            handle: _,
+            peer: _,
+            pending: _,
+        } = self;
+        &[
+            ("handle", DisclosureRow::O1),
+            ("peer", DisclosureRow::H8),
+            ("pending", DisclosureRow::O4),
+        ]
+    }
+}
+
 /// Backlog as a durable projection (OD-17-3 option C): the number of
 /// currently outstanding durable work items, not the number of
 /// entries resident in the process's mutation or want queue. Both
@@ -114,6 +202,21 @@ pub struct QueueDepth {
 }
 
 impl QueueDepth {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// backlog count at O4.
+    ///
+    /// The destructure is exhaustive on purpose (see
+    /// [`HeadSummary::disclosure_map`]).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            outbox: _,
+            carries: _,
+            fetch: _,
+        } = self;
+        use DisclosureRow::O4;
+        &[("outbox", O4), ("carries", O4), ("fetch", O4)]
+    }
+
     /// Total outstanding durable work items across both halves.
     pub fn total(&self) -> usize {
         self.outbox + self.fetch
@@ -145,6 +248,32 @@ pub struct ConvergenceState {
     pub pending_heads: usize,
     /// Heads classified rejected: terminally unauthorizable.
     pub unfetchable_heads: usize,
+}
+
+impl ConvergenceState {
+    /// Disclosure inventory (matrix conformance): the verdict plus
+    /// head-class counts at H5 — the same authorization-class
+    /// information [`HeadClasses::disclosure_map`] classifies, read
+    /// straight from those counters. Derived-classification rule:
+    /// the booleans summarize backlog and authorization-class state
+    /// at counts grain — no ids, no authors — which the member
+    /// verdict allows and no vault projection reads.
+    ///
+    /// The destructure is exhaustive on purpose (see
+    /// [`HeadSummary::disclosure_map`]).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            converged: _,
+            pending_heads: _,
+            unfetchable_heads: _,
+        } = self;
+        use DisclosureRow::H5;
+        &[
+            ("converged", H5),
+            ("pending_heads", H5),
+            ("unfetchable_heads", H5),
+        ]
+    }
 }
 
 /// Structured sync status: outbox obligations with their
@@ -204,6 +333,54 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
+    /// Disclosure inventory (matrix conformance): the complete
+    /// field-to-row map the conformance tests pin. Identity- and
+    /// membership-bearing fields map to their hidden rows
+    /// (H5/H6/H8/H9); counts map to O4. The `durability` level and
+    /// the `convergence` verdict map to H5: coarse snapshot-activity
+    /// state, which the member verdict allows and no vault
+    /// projection reads. See [`wyrd_sync::disclosure`] for the
+    /// rules.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            tip: _,
+            held_epochs: _,
+            obligations: _,
+            totals: _,
+            live_heads: _,
+            head_classes: _,
+            mailbox: _,
+            known_members: _,
+            peers: _,
+            queue: _,
+            reconciliation: _,
+            convergence: _,
+            materialization: _,
+            durability: _,
+        } = self;
+        use DisclosureRow::{H5, H8, H9, O4};
+        &[
+            ("tip", H8),
+            ("held_epochs", H8),
+            ("obligations", H9),
+            ("totals", O4),
+            ("live_heads", H5),
+            ("head_classes", H5),
+            ("mailbox", H9),
+            ("known_members", H8),
+            ("peers", H8),
+            ("queue", O4),
+            ("reconciliation", O4),
+            ("convergence", H5),
+            ("materialization", O4),
+            ("durability", H5),
+        ]
+    }
+
     /// Opaque handle for a peer identity, or 0 when the identity is
     /// absent. Zero is unreachable by construction — [`observe`]
     /// derives peers from every identity the status carries — so it

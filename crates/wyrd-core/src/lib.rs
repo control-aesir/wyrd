@@ -22,6 +22,7 @@ pub mod quarantine;
 pub mod scrub;
 pub mod session;
 pub mod status;
+pub mod vault;
 pub mod view;
 pub mod wake;
 pub mod want;

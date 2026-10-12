@@ -60,6 +60,24 @@ pub struct MaterializationSummary {
     pub local_objects: usize,
 }
 
+impl MaterializationSummary {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            pinned: _,
+            cached: _,
+            local_objects: _,
+        } = self;
+        use crate::disclosure::DisclosureRow::O4;
+        &[("pinned", O4), ("cached", O4), ("local_objects", O4)]
+    }
+}
+
 /// Queued vs delivered outbox counts per obligation class, as
 /// observed from durable state. Pending is always queued minus
 /// delivered; the three numbers travel together so status consumers
@@ -72,6 +90,34 @@ pub struct OutboxTotals {
     pub transitions_delivered: usize,
     pub capabilities_queued: usize,
     pub capabilities_delivered: usize,
+}
+
+impl OutboxTotals {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            announcements_queued: _,
+            announcements_delivered: _,
+            transitions_queued: _,
+            transitions_delivered: _,
+            capabilities_queued: _,
+            capabilities_delivered: _,
+        } = self;
+        use crate::disclosure::DisclosureRow::O4;
+        &[
+            ("announcements_queued", O4),
+            ("announcements_delivered", O4),
+            ("transitions_queued", O4),
+            ("transitions_delivered", O4),
+            ("capabilities_queued", O4),
+            ("capabilities_delivered", O4),
+        ]
+    }
 }
 
 /// Reconciliation progress as observed from durable state: how many
@@ -102,6 +148,30 @@ pub struct ReconciliationCounters {
     /// late-joiner half — snapshots a recipient evidenced holding
     /// after learning them through an answered statement.
     pub announcements_reconciled: usize,
+}
+
+impl ReconciliationCounters {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            statements_received: _,
+            transitions_reconciled: _,
+            capabilities_reconciled: _,
+            announcements_reconciled: _,
+        } = self;
+        use crate::disclosure::DisclosureRow::O4;
+        &[
+            ("statements_received", O4),
+            ("transitions_reconciled", O4),
+            ("capabilities_reconciled", O4),
+            ("announcements_reconciled", O4),
+        ]
+    }
 }
 
 /// Durably retained runtime sync state: the live view rebuilds from
@@ -534,6 +604,41 @@ impl RuntimeState {
                     && !self.announcement_reconciled_pairs.contains(pair)
             })
             .collect()
+    }
+
+    /// Still-undischarged obligation counts per class: the lengths
+    /// the itemized `pending_*` lists would report, without
+    /// materializing the identity-bearing pairs. Same set
+    /// difference (queued minus delivered ∪ reconciled), counted in
+    /// place — counts only, so this is safe input for
+    /// restricted-position projections (matrix O4). The vault
+    /// projection relies on these agreeing with the lists exactly.
+    pub fn pending_obligation_counts(&self) -> (usize, usize, usize) {
+        let announcements = self
+            .announcement_queued
+            .iter()
+            .filter(|pair| {
+                !self.announcement_delivered.contains(*pair)
+                    && !self.announcement_reconciled_pairs.contains(*pair)
+            })
+            .count();
+        let transitions = self
+            .transition_queued
+            .iter()
+            .filter(|pair| {
+                !self.transition_delivered.contains(pair)
+                    && !self.transition_reconciled_pairs.contains(pair)
+            })
+            .count();
+        let capabilities = self
+            .capability_queued
+            .iter()
+            .filter(|pair| {
+                !self.capability_delivered.contains(pair)
+                    && !self.capability_reconciled_pairs.contains(pair)
+            })
+            .count();
+        (announcements, transitions, capabilities)
     }
 
     /// Whether one obligation is already covered — queued,
@@ -1149,5 +1254,53 @@ impl RuntimeState {
             pending_manifests,
             pending_objects,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrd_format::{DeviceId, DriveId, SnapshotId, TransitionId};
+
+    /// The counts agree with the itemized lists exactly — including
+    /// the reconciled conjunct. Dropping either the delivered or
+    /// the reconciled filter from `pending_obligation_counts` fails
+    /// this test: a retired pair must leave both the list and the
+    /// count, or the vault and member projections print different
+    /// backlogs.
+    #[test]
+    fn pending_counts_match_pending_lists_through_retirement() {
+        let mut state = RuntimeState::new(DriveId::from_bytes([0xD1; 32]));
+        let a = DeviceId::from_bytes([0xA1; 32]);
+        let b = DeviceId::from_bytes([0xB1; 32]);
+        // Two announcements (one later delivered, one later
+        // reconciled), one transition (reconciled), one capability
+        // (delivered): every terminal path represented.
+        state.record_announcement_queued(SnapshotId::from_bytes([0x01; 32]), a);
+        state.record_announcement_queued(SnapshotId::from_bytes([0x02; 32]), b);
+        state.record_transition_queued(TransitionId::from_bytes([0x03; 32]), a);
+        state.record_capability_queued(7, b);
+        assert_eq!(state.pending_obligation_counts(), (2, 1, 1));
+        assert_eq!(state.pending_announcements().len(), 2);
+        assert_eq!(state.pending_transitions().len(), 1);
+        assert_eq!(state.pending_capabilities().len(), 1);
+        state.record_announcement_delivered(SnapshotId::from_bytes([0x01; 32]), a);
+        state.record_transition_reconciled(TransitionId::from_bytes([0x03; 32]), a, [0xCC; 32]);
+        state.record_capability_delivered(7, b);
+        assert_eq!(state.pending_announcements().len(), 1);
+        assert_eq!(state.pending_transitions().len(), 0);
+        assert_eq!(state.pending_capabilities().len(), 0);
+        assert_eq!(
+            state.pending_obligation_counts(),
+            (1, 0, 0),
+            "delivered and reconciled pairs leave both the lists and the counts"
+        );
+        state.record_announcement_reconciled(SnapshotId::from_bytes([0x02; 32]), b, [0xDD; 32]);
+        assert_eq!(state.pending_announcements().len(), 0);
+        assert_eq!(
+            state.pending_obligation_counts(),
+            (0, 0, 0),
+            "a reconciled pair is not pending by either measure"
+        );
     }
 }

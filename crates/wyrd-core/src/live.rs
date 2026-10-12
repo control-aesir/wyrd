@@ -228,6 +228,30 @@ pub struct PendingObligations {
 }
 
 impl PendingObligations {
+    /// Disclosure inventory (matrix conformance): per-recipient
+    /// obligation pairs are control traffic (H9). The announcement
+    /// pairs additionally name snapshot ids — noted, not
+    /// double-mapped: one field, one row, and the member verdict
+    /// allows both classes while no vault projection reads either.
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(
+        &self,
+    ) -> &'static [(&'static str, wyrd_sync::disclosure::DisclosureRow)] {
+        let Self {
+            announcements: _,
+            transitions: _,
+            capabilities: _,
+        } = self;
+        use wyrd_sync::disclosure::DisclosureRow::H9;
+        &[
+            ("announcements", H9),
+            ("transitions", H9),
+            ("capabilities", H9),
+        ]
+    }
     /// True when nothing is owed anywhere: the converged outbox.
     pub fn is_empty(&self) -> bool {
         self.announcements.is_empty() && self.transitions.is_empty() && self.capabilities.is_empty()

@@ -41,6 +41,25 @@ version say exactly what changed.
   are unrepresentable: the tool takes no creation path); pure logic is
   covered by offline deno tests in   `.opencode/plugin-tests/` (run:
   `devenv shell -- deno test --allow-read .opencode/plugin-tests/`).
+- Vault-position diagnostics projection (`wyrd-core::vault`,
+  `wyrd vault status`): the stopped-drive section now shows the
+  keyless-replica subset (outbox/queue counts, reconciliation and
+  materialization counts, backlog predicate) through a dedicated
+  `VaultStatus` type with no identity-bearing field, instead of
+  the member projection's tip, epochs, head authors, peer
+  handles, mailbox line, and durability verdict. Pending counts
+  come from the same delivered-union-reconciled set difference
+  the member projection counts, tallied in the runtime state
+  beside the lists so no identity crosses the boundary. The
+  surface takes no relay configuration (matrix H9).
+- Disclosure conformance inventory (`wyrd-sync::disclosure`,
+  `disclosure_map` on every observation struct): each field of the
+  member and vault projections plus their nested types maps to
+  exactly one matrix row, pinned as golden literals over live
+  values. Every map destructures its struct exhaustively, so an
+  unmapped field fails the build (OD-18-4 default-deny in
+  compile-error form; verified with E0027); a vault-all-observable
+  rule rejects any hidden-row mapping on the vault projection.
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the
@@ -58,7 +77,6 @@ version say exactly what changed.
   pending derives as queued minus (delivered ∪ reconciled) for all
   three classes. `sync status` reports announcements retired
   alongside the other classes.
-
 - Freshness ordering in bulk fetch (`docs/retry-policy.md`,
   `crates/wyrd-sync/src/bulk.rs`): the candidate walk orders each
   attempt from a per-provider outcome memory — recently failed

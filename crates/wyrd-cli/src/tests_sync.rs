@@ -587,15 +587,14 @@ fn sync_status_refuses_a_locked_drive() {
     );
 }
 
-/// `vault status` on a stopped drive reports durable state with the
-/// same facts `sync status` prints (nothing new is revealed) beside
-/// an absent process section.
+/// `vault status` on a stopped drive reports the vault-position
+/// projection (counts only — never the member columns `sync status`
+/// prints) beside an absent process section.
 #[test]
 fn vault_status_reports_durable_state_on_stopped_drive() {
     let fixture = Fixture::new();
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let (report, outcome) =
-        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
     outcome.unwrap();
     assert!(
         report.contains("process: no posture recorded"),
@@ -605,6 +604,75 @@ fn vault_status_reports_durable_state_on_stopped_drive() {
         report.contains("durable: stopped drive"),
         "stopped drive, durable facts expected:\n{report}"
     );
+}
+/// The stopped-drive section is the vault projection, not the
+/// member one: the report carries counts with none
+/// of the member columns (`sync status`'s tip, epochs, heads,
+/// peers, mailbox). Runs against an admission drive — a live head
+/// with an author, two peer identities, queued obligations — so
+/// the negative half is not vacuous: the exact hex of both
+/// identities must be absent, not just the line prefixes. The
+/// positive half pins the vault-only lines (`backlog: active`, no
+/// per-item detail) that prove which renderer ran.
+#[test]
+fn vault_status_stopped_drive_shows_vault_projection_only() {
+    let fixture = Fixture::new();
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let peer_hex = peer.device_id().to_string();
+    let author_hex = read_identity(&fixture.identity_file)
+        .unwrap()
+        .device_id()
+        .to_string();
+    {
+        let mut engine = fixture.open();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store
+            .insert(ObjectKind::Chunk, b"vault-projection-bytes")
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 22, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+        let encryption = DeviceEncryptionSecret::generate().unwrap();
+        engine.stage_carry_heads().unwrap();
+        engine
+            .admit_device(peer.device_id(), encryption.encryption_key())
+            .unwrap();
+        let store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        engine.carry_pending(&store).unwrap();
+    }
+    let identity = read_identity(&fixture.identity_file).unwrap();
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
+    outcome.unwrap();
+    for absent in [
+        peer_hex.as_str(),
+        author_hex.as_str(),
+        "held secrets",
+        "live heads",
+        "author peer-",
+        "peer-",
+        "mailbox",
+        "heads classified",
+        "snapshot ",
+        "transition ",
+        "convergence:",
+    ] {
+        assert!(
+            !report.contains(absent),
+            "member column leaks onto the vault surface: {absent}\n{report}"
+        );
+    }
+    for required in [
+        "outbox announcements: 2 queued",
+        "backlog: active",
+        "materialization: 0 cached, 0 pinned",
+    ] {
+        assert!(
+            report.contains(required),
+            "vault projection line missing: {required}\n{report}"
+        );
+    }
 }
 
 /// A timestamp-fresh sidecar on a provably stopped drive renders
@@ -618,8 +686,7 @@ fn vault_status_on_stopped_drive_marks_fresh_posture_retained() {
     recorder.note_ready();
     recorder.note_posture(41, 0, 7, 312);
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let (report, outcome) =
-        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
     outcome.unwrap();
     assert!(
         report.contains("process: retained posture"),
@@ -643,8 +710,7 @@ fn vault_status_renders_process_beside_durable_failure() {
     recorder.note_ready();
     recorder.note_posture(41, 0, 7, 312);
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let (report, outcome) =
-        vault_status_report(fixture.drive.clone(), vec![], "wrong-pass", identity);
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "wrong-pass", identity);
     assert!(outcome.is_err(), "a durable failure still fails closed");
     assert!(
         report.contains("process: retained posture"),
@@ -670,7 +736,7 @@ fn vault_status_keeps_live_reading_on_prelock_failure() {
     recorder.note_ready();
     recorder.note_posture(41, 0, 7, 312);
     let identity = DeviceIdentitySecret::generate().unwrap();
-    let (report, outcome) = vault_status_report(drive, vec![], "test-pass", identity);
+    let (report, outcome) = vault_status_report(drive, "test-pass", identity);
     assert!(outcome.is_err(), "a missing drive still fails closed");
     assert!(
         report.contains("process: fresh posture"),
@@ -717,8 +783,7 @@ fn vault_status_succeeds_while_locked_without_opening_the_store() {
     recorder.note_ready();
     recorder.note_posture(41, 0, 7, 312);
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let (report, outcome) =
-        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
     outcome.unwrap();
     assert!(
         report.contains("process: fresh posture"),
@@ -746,8 +811,7 @@ fn vault_status_shows_replacement_instance_never_inherited_readiness() {
     let replacement = super::posture::PostureRecorder::new(&fixture.drive, "bb".into()).unwrap();
     replacement.note_startup();
     let identity = read_identity(&fixture.identity_file).unwrap();
-    let (report, outcome) =
-        vault_status_report(fixture.drive.clone(), vec![], "test-pass", identity);
+    let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
     outcome.unwrap();
     assert!(
         report.contains("serving: bb"),

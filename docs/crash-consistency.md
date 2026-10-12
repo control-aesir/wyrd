@@ -241,7 +241,7 @@ Four verdicts, per surface:
 | Materialization state (`Cached` / `Pinned` policies, local objects) | survives | `restart_equivalence_materialization_state_matches` |
 | Pending outbox obligations | survives | `restart_equivalence_pending_obligations_match`; replay is the obligation invariant above |
 | Serving residency: vault files (hex-named sealed roots) | survives | `restart_equivalence_serving_residency_matches` compares `vault().roots()` |
-| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | `maps_for_test` compared across the reopen in `restart_equivalence_serving_residency_matches`; reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving.rs`) |
+| Serving residency: `VaultSource` maps (roots, bodies, sealed) | rebuilt | `maps_for_test` compared across the reopen in `restart_equivalence_serving_residency_matches`; reconstructed from `RuntimeState` on every `VaultSource::from_state` (`sync/serving/source.rs`) |
 | Seen-id log (inbox `seen` set, `mailbox.seen` file) | rebuilt | replayed in `resync`; torn tail truncated on open; behaviorally pinned by `redelivery_after_restart_stays_duplicate` (duplicates still recognized after the reopen) |
 | Route table | rebuilt | pure derivation of the announcement projection (`publish_recorded_routes` reads `state.announcement(&snapshot)` per recorded snapshot); the projection equality in the control-state row IS the pin — no independent test constructs an iroh bulk source for this |
 | Want registry (waiter demand, admission cache) | lost, correctly | `want_registry_loss_is_expected_and_re_demands_from_durable_state` pins the loss half; never persisted (`core/want.rs`). The re-demand half (loop re-registers from surviving `Cached`) follows from the materialization row but has no dedicated pin — follow-up with the materialization work, not claimed here |
@@ -310,13 +310,13 @@ rename + dir-fsync with the rename as publication. A torn import
 leaves a temp file, never a servable root. Fetch imports into the
 vault before marking local, so a record never names a missing
 representation on either the authoring or the fetch path. Pinned by
-the vault rename/dir-sync reconciliation tests (`serving.rs`),
+the vault rename/dir-sync reconciliation tests (`serving/tests_serving.rs`),
 `torn_plan_commit_is_ignored_on_reopen`, and
 `fetched_representations_serve_after_restart_and_reauthoring`.
 
 The vault-to-mirror write-through after the rename runs over a
 bounded queue (64 items / 64 MiB; `MAX_MIRROR_QUEUE_ITEMS` /
-`MAX_MIRROR_QUEUE_BYTES` in `serving.rs`). A crash between the
+`MAX_MIRROR_QUEUE_BYTES` in `serving/mirror.rs`). A crash between the
 rename and the write-through heals via the held-root path
 (`reconcile_held`: re-sync the directory, re-import into the
 mirror), and a full queue is backpressure (`VaultError::MirrorFull`,
@@ -516,6 +516,6 @@ Pinned by
 `live_close_returns_past_a_zero_deadline` (`wyrd-sync/src/bulk.rs`),
 `live_serving_stop_returns_past_a_zero_deadline` and
 `poisoned_mirror_lock_reports_but_still_shuts_down`
-(`wyrd-sync/src/serving.rs`), and
+(`wyrd-sync/src/serving/tests_serving.rs`), and
 `combine_status_reports_transport_shutdown_failures`
 (`wyrd-cli/src/tests_cli.rs`).

@@ -336,6 +336,18 @@ version say exactly what changed.
 
 ### Changed
 
+- Serving surface split (`crates/wyrd-sync/src/serving/`): the 1,145-line
+  `serving.rs` is now `vault.rs` (raw byte CAS, no iroh/tokio dependency),
+  `mirror.rs` (bounded write-through queue, backpressure, readiness
+  barrier), `endpoint.rs` (iroh router, loopback mode, bounded shutdown),
+  and `source.rs` (runtime-state adapter), with `mod.rs` carrying the
+  module doc and re-exports. No public path changes and no behavior
+  change; the conformance tests stay in one file with explicit imports
+  instead of three copies of the loopback/poison/tempdir helpers.
+  `Vault` keeps the mirror attachment slot (`mirror_slot` /
+  `attach_mirror`): the write-through needs an attachment point and
+  removing it would change shutdown-detach semantics, so `vault.rs`
+  names the mirror types without depending on the transport.
 - Issue triage labels (`ROADMAP.md`, `CONTRIBUTING.md`,
   `docs/collaboration-workflow.md`, `AGENTS.md`): `release:backlog` is the
   parked state and every triaged issue carries exactly one `release:*`

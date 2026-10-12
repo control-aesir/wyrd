@@ -268,7 +268,10 @@ enum Command {
     /// new build against the actual store, and hand back to the
     /// supervisor (U1=B: the operator supplies the archive; U3=B:
     /// this command never supervises). Credential paths are
-    /// forwarded to the verification child, never read here.
+    /// forwarded to the verification child, never read here. Every
+    /// terminal outcome records `<exe>.update-verdict` (done,
+    /// rolled-back, or refused) beside the binary, so automation
+    /// that cannot observe stdout still reads the result.
     Update {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
@@ -281,10 +284,15 @@ enum Command {
         /// `--restart` only; refused otherwise.
         #[command(flatten)]
         relays: RelayArgs,
-        /// After a committed swap, run the new vault as our child
-        /// and wait on it (the explicit foreground mode) instead of
-        /// handing back to the supervisor. Needs at least one
-        /// `--relay`.
+        /// After the update resolves, transfer into long-running
+        /// supervision of the vault instead of handing back:
+        /// this process runs the new vault as its child (or the
+        /// restored vault after a rollback) and does not return.
+        /// Exit status then reports the supervised run, not the
+        /// update — the update's own outcome is the `update done:`
+        /// / `update rollback:` / `update refused:` line plus the
+        /// durable `<exe>.update-verdict` record. Needs at least
+        /// one `--relay`.
         #[arg(long)]
         restart: bool,
         #[command(flatten)]

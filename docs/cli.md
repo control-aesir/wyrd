@@ -589,12 +589,13 @@ update
     = every report — verified included — carries the two
       blocked upgrade invariants as `update gap:` lines
     = hand back: exit 0 with the new binary in place (start the
-      service to run it), or `--restart` to run the new vault as
-      our child instead; on failure the old binary is restored
-      first, and under `--restart` the restored binary is
+      service to run it), or `--restart` to transfer into
+      long-running supervision of the resulting vault instead;
+      on failure the old binary is restored first, and under
+      `--restart` the restored (or unchanged) binary is
       supervised — exit status then reports the run, while
-      `update rollback:` / `update refused:` lines report the
-      update
+      `update rollback:` / `update refused:` lines plus the
+      durable `<exe>.update-verdict` record report the update
 ```
 
 The blake3 digest names the artifact in reports; it is an

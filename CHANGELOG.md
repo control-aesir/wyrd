@@ -68,6 +68,12 @@ version say exactly what changed.
   to the verification child, never read by the parent. Foreign
   `os`/`arch` archives refuse with both platforms named (macOS
   cross-arch allowed per the release script's Rosetta policy).
+  Every terminal outcome records `<exe>.update-verdict` (done,
+  rolled-back, or refused) beside the binary, so automation that
+  cannot observe stdout still reads the result; `--restart`
+  explicitly transfers into long-running supervision (exit
+  reports the supervised run, the verdict record and `update`
+  lines report the update).
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault

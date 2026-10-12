@@ -195,6 +195,11 @@ fn a_compatible_drive_upgrades_end_to_end() {
             fix.sibling(suffix).display()
         );
     }
+    // The durable verdict survives the commit for automation
+    // that never saw stdout.
+    let verdict = std::fs::read_to_string(fix.sibling(".update-verdict")).unwrap();
+    assert!(verdict.contains("\"outcome\": \"done\""), "{verdict}");
+    assert!(verdict.contains("0.4.0-alpha"), "{verdict}");
     // And the drive still verifies under the swapped-in binary.
     let verify = Command::new(&fix.exe)
         .arg("__update_verify")

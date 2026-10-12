@@ -48,14 +48,21 @@ Two explicit modes, never guessed (U3):
   and exits: 0 with the new binary in place and verified, nonzero
   with the old binary restored. The owner restarts whichever
   binary is in place; update prints which one it left.
-- **`--restart` (foreground).** Same precondition (the old vault
-  must already be stopped — Ctrl-C first), but after a committed
-  swap update starts the new `wyrd vault` as its own child and
-  waits on it, forwarding SIGINT/SIGTERM and propagating its exit
-  status. On a failed verification it restores the old binary and,
-  under `--restart`, starts the *old* vault instead — rollback
-  with continuity. Update is the supervisor for exactly this run;
-  nothing is inferred about systemd, launchd, or any other owner.
+- **`--restart` (transfer into long-running supervision).**
+  Same precondition (the old vault must already be stopped —
+  Ctrl-C first), but after the update resolves update does not
+  return: it runs the resulting vault as its child and waits on
+  it, forwarding SIGINT/SIGTERM and propagating its exit
+  status. Committed swap → supervise the new vault. Failed
+  verification → restore the old binary and supervise the
+  *old* vault instead (rollback with continuity); early
+  refusal → supervise the unchanged binary. Update is the
+  supervisor for exactly this run; nothing is inferred about
+  systemd, launchd, or any other owner. The name says
+  "restart", the contract is supervision: exit status reports
+  the supervised run, and the update's own outcome is the
+  `update done:` / `update rollback:` / `update refused:`
+  line plus the durable `<exe>.update-verdict` record (§6).
 
 Relay flags ride `--restart` only (forwarded to the vault child);
 without it they are refused as meaningless.
@@ -111,6 +118,14 @@ means same filesystem, so every swap step is one atomic rename.
 - `<exe>.stage/` — extraction scratch, removed after staging.
 - `<exe>.update-state.tmp` — the record's atomic-write temp,
   synced before rename like the store's own `atomic_write`.
+- `<exe>.update-verdict` — the durable outcome record
+  `{version: 1, outcome, drive, new_version, in_place, at}`:
+  `done`, `rolled-back`, or `refused`. Written (fsync'd) at
+  every terminal outcome before supervision starts or the
+  process exits, overwritten by each run. Stdout lines are the
+  live channel; this file is the durable one for automation
+  that launches the command through a service manager or
+  redirects output somewhere unobserved.
 
 Phases, in order:
 

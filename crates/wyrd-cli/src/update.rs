@@ -1195,6 +1195,17 @@ pub(crate) fn update_run(request: &UpdateRequest<'_>) -> Result<UpdateOutcome, C
             // genuine incompatibility — and the child's own lines
             // just above already name the cause.
             rollback_staging(exe)?;
+            write_verdict(
+                exe,
+                &UpdateVerdict {
+                    version: 1,
+                    outcome: "refused".into(),
+                    drive: drive_dir.to_path_buf(),
+                    new_version: identity.version.clone(),
+                    in_place: own.clone(),
+                    at: now_unix(),
+                },
+            )?;
             if *restart {
                 // Same continuity as the post-swap path: the
                 // binary is unchanged, the vault is stopped, and
@@ -1237,6 +1248,17 @@ pub(crate) fn update_run(request: &UpdateRequest<'_>) -> Result<UpdateOutcome, C
         VerifyOutcome::Rejected => {
             rollback(exe, &identity.canonical_name)?;
             println!("update rollback: restored {own}");
+            write_verdict(
+                exe,
+                &UpdateVerdict {
+                    version: 1,
+                    outcome: "rolled-back".into(),
+                    drive: drive_dir.to_path_buf(),
+                    new_version: identity.version.clone(),
+                    in_place: own.clone(),
+                    at: now_unix(),
+                },
+            )?;
             if *restart {
                 // Rollback with continuity: the drive must not sit
                 // unserved with nothing started — hand the restored
@@ -1261,6 +1283,17 @@ pub(crate) fn update_run(request: &UpdateRequest<'_>) -> Result<UpdateOutcome, C
     set_phase(exe, drive_dir, &identity, Phase::Verified)?;
     commit(exe)?;
     println!("update done: {} in place and verified", identity.version);
+    write_verdict(
+        exe,
+        &UpdateVerdict {
+            version: 1,
+            outcome: "done".into(),
+            drive: drive_dir.to_path_buf(),
+            new_version: identity.version.clone(),
+            in_place: identity.version.clone(),
+            at: now_unix(),
+        },
+    )?;
     if *restart {
         Ok(supervise_outcome(
             exe,
@@ -1302,6 +1335,80 @@ fn supervise_outcome(
         identity_file: identity_file.to_path_buf(),
         passphrase_file: passphrase_file.to_path_buf(),
     }
+}
+
+/// The durable update verdict: the update's own outcome, recorded
+/// where automation can read it after the fact. Stdout lines are
+/// the live channel; this file is the durable one — a supervisor
+/// that launches `wyrd update` through a service manager, or
+/// redirects its output anywhere unobserved, reads the outcome
+/// here instead. Written (fsync'd) at every terminal outcome —
+/// committed, rolled back, or refused — before supervision
+/// starts or the process exits, and overwritten by each run, so
+/// it always names the latest update's result. Beside the
+/// executable (not the drive): the verdict concerns which binary
+/// is in place, and the unit file already names that path.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct UpdateVerdict {
+    pub version: u8,
+    /// `done` (new binary in place and verified), `rolled-back`
+    /// (verification failed; the named version restored), or
+    /// `refused` (staged build did not verify; nothing replaced).
+    pub outcome: String,
+    pub drive: PathBuf,
+    pub new_version: String,
+    /// The binary left in place by this outcome.
+    pub in_place: String,
+    /// Seconds since the Unix epoch.
+    pub at: u64,
+}
+
+fn verdict_path(exe: &Path) -> PathBuf {
+    sibling(exe, ".update-verdict")
+}
+
+pub(crate) fn write_verdict(exe: &Path, verdict: &UpdateVerdict) -> Result<(), CliError> {
+    let path = verdict_path(exe);
+    let bytes = serde_json::to_vec_pretty(verdict).expect("verdict serializes");
+    let tmp = sibling(exe, ".update-verdict.tmp");
+    fs::write(&tmp, bytes).map_err(|source| CliError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::File::open(&tmp)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| CliError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+    fs::rename(&tmp, &path).map_err(|source| CliError::Io { path, source })?;
+    fsync_dir(&parent_dir(exe)?)?;
+    Ok(())
+}
+
+/// Read back by operators and by `36-vault-packaging`, never by
+/// this binary today (the transaction writes, supervisors read) —
+/// hence the allowance, not a missing call site.
+#[allow(dead_code)]
+pub(crate) fn read_verdict(exe: &Path) -> Result<Option<UpdateVerdict>, CliError> {
+    let path = verdict_path(exe);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let verdict: UpdateVerdict = serde_json::from_slice(&bytes).map_err(|_| {
+                CliError::Usage(format!("{}: unreadable update verdict", path.display()))
+            })?;
+            Ok(Some(verdict))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io { path, source }),
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// Build the vault child command `--restart` supervises: the same
@@ -2229,6 +2336,13 @@ mod tests {
         assert!(!prev_path(&exe).exists());
         assert!(!state_path(&exe).exists());
         assert!(!next_path(&exe).exists());
+        // The durable verdict names the commit for automation
+        // that never saw stdout.
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "done");
+        assert_eq!(verdict.new_version, "0.4.0-alpha");
+        assert_eq!(verdict.in_place, "0.4.0-alpha");
+        assert_eq!(verdict.drive, drive);
     }
 
     #[test]
@@ -2257,6 +2371,9 @@ mod tests {
         assert!(!prev_path(&exe).exists());
         assert!(!state_path(&exe).exists());
         assert!(!next_path(&exe).exists());
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "refused");
+        assert_eq!(verdict.in_place, own_build_info().app);
     }
 
     #[test]
@@ -2287,6 +2404,8 @@ mod tests {
             } => assert_eq!(supervised, exe),
             UpdateOutcome::Done => panic!("early refusal under restart must supervise, got Done"),
         }
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "refused");
     }
 
     #[test]
@@ -2309,6 +2428,10 @@ mod tests {
         assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
         assert!(!prev_path(&exe).exists());
         assert!(!state_path(&exe).exists());
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "rolled-back");
+        assert_eq!(verdict.new_version, "0.4.0-alpha");
+        assert_eq!(verdict.in_place, own_build_info().app);
     }
 
     #[test]
@@ -2345,6 +2468,8 @@ mod tests {
             }
             UpdateOutcome::Done => panic!("restart rejection must supervise, got Done"),
         }
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "rolled-back");
     }
 
     #[test]
@@ -2369,6 +2494,8 @@ mod tests {
             } => assert_eq!(supervised, exe),
             UpdateOutcome::Done => panic!("restart commit must supervise, got Done"),
         }
+        let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+        assert_eq!(verdict.outcome, "done");
     }
 
     #[test]

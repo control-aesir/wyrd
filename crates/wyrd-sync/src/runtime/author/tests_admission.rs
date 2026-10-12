@@ -1887,11 +1887,12 @@ fn crash_mid_incremental_admission_resumes_without_duplicate_obligations() {
         .unwrap();
         let resumed = resume_admission_obligations(&mut engine, newcomer_id).unwrap();
         // AfterRenameCurrent keeps the torn middle chunk (CURRENT
-        // advanced past it), so only the trailing chunk is missing;
-        // every earlier stage leaves the whole middle missing. See
-        // the single-chunk test for the stage semantics.
+        // advanced past it), so the fill completed on its own and
+        // resume is a no-op; every earlier stage leaves the whole
+        // middle missing. See the single-chunk test for the stage
+        // semantics.
         let expected = if stage == CrashStage::AfterRenameCurrent {
-            CHAIN_LEN - 2 * ADMISSION_OBLIGATION_BATCH
+            0
         } else {
             CHAIN_LEN - ADMISSION_OBLIGATION_BATCH
         };

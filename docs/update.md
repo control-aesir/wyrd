@@ -148,11 +148,13 @@ Phases, in order:
    record by file-plus-directory fsync, so a power loss cannot
    leave a rename described-but-not-durable.
 7. **Verify (U2-B/C, authoritative).** Spawn `<exe>
-   __update_verify <drive>` (hidden internal subcommand, §5) and
-   wait with a timeout, draining both pipes while waiting. Exit
-   0 commits; anything else — nonzero, timeout, signal —
-   restores `<exe>.prev` over `<exe>` and exits nonzero. The
-   old binary is never deleted before this verdict.
+   __update_verify <drive>` (hidden internal subcommand, §5),
+   streaming both pipes while waiting, with a timeout. Exit 0
+   commits; anything else — nonzero, timeout, signal —
+   restores `<exe>.prev` over `<exe>` and hands back per §6
+   (supervised: exit nonzero; `--restart`: supervise the
+   restored binary). The old binary is never deleted before
+   this verdict.
 8. **Commit / hand back.** Record `{phase: verified}`, remove
    `<exe>.prev` and the state file — only now is rollback
    impossible. Supervised: print the binary in place and exit 0.
@@ -227,17 +229,35 @@ not this report.
 
 - Every line is a stable `update <key>: <value>` pair: one format,
   human- and machine-readable. Compatibility is `verified (N
-  checks)` with one `update check:` line per check,
-  `incompatible (invariant <n>: <detail>)`, or `unverified
-  (<gap>; <gap>)` — never an unqualified green.
-- Exit 0 means exactly: the new binary is in place, verified, and
-  (under `--restart`) running as the supervised child. Exit 2
-  means anything else — with the old binary restored whenever
-  restoration was possible, and the message saying which binary
-  is in place and how to resume. A failed restoration is the one
-  catastrophic case: same exit code (the binary-wide convention
-  is 2 for all errors), but the message names manual recovery
-  explicitly instead of implying rollback happened.
-- Under `--restart`, the child's exit status propagates once the
-  child exits; signals forward so Ctrl-C behaves like a bare
-  vault run.
+  check[s])` with one `update check:` line per check plus one
+  `update gap:` line per blocked invariant,
+  `incompatible (invariant <n>: <detail>)` with the same gap
+  lines, or `unverified (<gap>; <gap>)` — never an unqualified
+  green.
+- Supervised (default): exit 0 means exactly the new binary is
+  in place and verified. Exit 2 means anything else — with the
+  old binary restored whenever restoration was possible, and
+  the message saying which binary is in place and how to
+  resume. A failed restoration is the one catastrophic case:
+  same exit code (the binary-wide convention is 2 for all
+  errors), but the message names manual recovery explicitly
+  instead of implying rollback happened.
+- Under `--restart`, exit status reports the supervised run,
+  not the update: a rolled-back update that hands the restored
+  binary to supervision exits with that child's status — a
+  clean stop reads as exit 0 even though the upgrade failed.
+  This is deliberate, not a leak: one exit code cannot carry
+  two outcomes (the update's and the run's), and conflating
+  them the other way would page on healthy runs. Automation
+  must read the update's outcome from its lines, not its code:
+  `update done:` means committed, `update rollback:` and
+  `update refused:` mean the old (or unchanged) binary is in
+  place. The child's exit status propagates once the child
+  exits; signals forward so Ctrl-C behaves like a bare vault
+  run.
+- The verification runs twice per update (early refusal plus
+  authoritative check): two custody opens, two key
+  derivations, two replays. Bounded, linear in the drive, and
+  the price of stopping incompatible drives before any swap —
+  but new enough to read as a hang, so it is stated here: an
+  update spends seconds per verify on dogfood-scale drives.

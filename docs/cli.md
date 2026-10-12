@@ -568,25 +568,33 @@ update
       back to the pre-swap binary
     = resolve `--archive` before anything is stopped: the path
       must be a regular file under its canonical name
-      (`wyrd-<version>-<os>-<arch>.tar.gz`); anything else is a
-      usage error naming the expected shape
+      (`wyrd-<version>-<os>-<arch>.tar.gz`, matching this host
+      except the Rosetta pair); anything else is a usage error
+      naming the expected shape
     = report the artifact identity (version, target, blake3,
       bytes) plus an honestly unverified compatibility line —
       the resolve step runs no checks, and says so
-    = refuse a held lock with `stop the service first` (a
-      lock-only probe: no state read, no key minted, nothing
-      held afterwards)
+    = refuse a held lock with `stop the service first` and a
+      non-drive directory as not-a-drive (a lock-only probe:
+      no state read, no key minted, nothing held afterwards)
     = extract `*/bin/wyrd` to `<exe>.next`, run its lock-free
-      self-report as the advisory preflight, swap by two atomic
-      renames with the old binary kept at `<exe>.prev`
-    = spawn the new binary's hidden `__update_verify` against
-      the drive: replay, authorize, restore epoch keys, prove
-      byte-identical durable state — commit on verified, restore
-      on anything else
+      self-report as the advisory preflight, then run its
+      `__update_verify` as an early refusal: an incompatible
+      drive stops here with staging rolled back, before any swap
+    = swap by two atomic renames with the old binary kept at
+      `<exe>.prev`, then spawn the new binary's hidden
+      `__update_verify` against the drive: replay, authorize,
+      restore epoch keys, prove byte-identical durable state —
+      commit on verified, restore on anything else
+    = every report — verified included — carries the two
+      blocked upgrade invariants as `update gap:` lines
     = hand back: exit 0 with the new binary in place (start the
       service to run it), or `--restart` to run the new vault as
       our child instead; on failure the old binary is restored
-      first and the exit names which binary is in place
+      first, and under `--restart` the restored binary is
+      supervised — exit status then reports the run, while
+      `update rollback:` / `update refused:` lines report the
+      update
 ```
 
 The blake3 digest names the artifact in reports; it is an

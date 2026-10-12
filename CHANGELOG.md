@@ -66,7 +66,8 @@ version say exactly what changed.
   a post-swap rejection under `--restart` starts the restored
   binary (rollback with continuity). Credential paths forward
   to the verification child, never read by the parent. Foreign
-  `os`/`arch` archives refuse with both platforms named.
+  `os`/`arch` archives refuse with both platforms named (macOS
+  cross-arch allowed per the release script's Rosetta policy).
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault

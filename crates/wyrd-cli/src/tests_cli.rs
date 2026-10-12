@@ -513,6 +513,7 @@ fn update_rejects_a_noncanonical_archive() {
     let temp = TempDir::new();
     let drive = temp.0.join("drive");
     fs::create_dir_all(&drive).unwrap();
+    fs::write(drive.join("LOCK"), b"").unwrap();
     let archive = temp.0.join("abc123-wyrd-dist.tar.gz");
     fs::write(&archive, b"fake-archive").unwrap();
     let identity = temp.0.join("id");
@@ -546,6 +547,7 @@ fn update_refuses_mismatched_restart_flags() {
     let temp = TempDir::new();
     let drive = temp.0.join("drive");
     fs::create_dir_all(&drive).unwrap();
+    fs::write(drive.join("LOCK"), b"").unwrap();
     let identity = temp.0.join("id");
     let passphrase = temp.0.join("pp");
     fs::write(&identity, b"forwarded").unwrap();

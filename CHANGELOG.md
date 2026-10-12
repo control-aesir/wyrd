@@ -50,7 +50,48 @@ version say exactly what changed.
   sink other representations, fulfillment clears); marks expire
   after 5 minutes and republication clears nothing. Strike
   counting and engine cooldowns unchanged.
-
+- `wyrd update <drive> --archive <path>` (29, step 1: artifact
+  contract only): resolves a local release archive under its
+  canonical name (`wyrd-<version>-<os>-<arch>.tar.gz`), validates
+  the name before anything is stopped, and reports the artifact
+  identity (version, target, blake3, bytes) with an honestly
+  unverified compatibility line — the resolve step runs no checks.
+  Noncanonical names (including hash-prefixed nix store basenames)
+  are usage errors naming the expected shape. No process is
+  stopped, no store is opened, no lock is taken.
+- `wyrd __update_verify` (29, step 3: hidden internal subcommand,
+  the transaction's authoritative check): opens the store with
+  this binary, replays every commit through its readers,
+  authorizes the live heads, restores epoch keys, and proves
+  byte-identical durable state afterwards (keystore, CURRENT,
+  DRIVE, commit set — no transition emitted, no commit authored).
+  Prints the U4 report and exits 0 if and only if verified;
+  unknown control versions fail as invariant 10 with the byte
+  named, undecodable versioned formats as invariant 2, while a
+  held lock or wrong passphrase refuses with no verdict at all.
+  Object payload bytes are the documented residual (no public
+  store-enumeration API); the two upgrade-contract gaps ride
+  every report as unverified.
+- `wyrd update` runs the full transaction (29, step 4): converge
+  leftovers, resolve, lock-probe quiescence (`stop the service
+  first` on held), stage to `<exe>.next`, advisory preflight,
+  early verification refusal before any swap, two-rename swap
+  with `<exe>.prev` kept, authoritative `__update_verify` in
+  the gap with a 300s bound, commit or atomic rollback, handoff
+  (`start the service`) or `--restart` long-running supervision
+  with signal forwarding and exit propagation. Every report —
+  verified included — names the two blocked upgrade invariants;
+  a post-swap rejection under `--restart` starts the restored
+  binary (rollback with continuity). Credential paths forward
+  to the verification child, never read by the parent. Foreign
+  `os`/`arch` archives refuse with both platforms named (macOS
+  cross-arch allowed per the release script's Rosetta policy).
+  Every terminal outcome records `<exe>.update-verdict` (done,
+  rolled-back, or refused) beside the binary, so automation that
+  cannot observe stdout still reads the result; `--restart`
+  explicitly transfers into long-running supervision (exit
+  reports the supervised run, the verdict record and `update`
+  lines report the update).
 - `wyrd vault <drive> status` (22c): process posture from a
   vault-maintained sidecar (`<drive_dir>/vault.posture`, schema v1)
   beside durable state, strictly separated. The running vault
@@ -367,6 +408,12 @@ version say exactly what changed.
   --serve` re-park) exiting degraded within a second of startup,
   including runs that attached and delivered mid-run before any
   supervisor tick observed the attachment.
+- Release `dist/` archives are copied under canonical names
+  (`wyrd-<version>-<os>-<arch>.tar.gz`): one mapping serves the
+  build copy, `--verify`, and the `--strict` gate, so the gate can
+  no longer drift from what the copy step produces. Unblocks
+  archive resolution by name for `wyrd update` and every `--strict`
+  release cut.
 
 ### Added
 

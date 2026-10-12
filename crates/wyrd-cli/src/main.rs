@@ -263,6 +263,65 @@ enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
+    /// Upgrade this installation from a local release archive:
+    /// quiesce, flush, stop, swap the binary atomically, verify the
+    /// new build against the actual store, and hand back to the
+    /// supervisor (U1=B: the operator supplies the archive; U3=B:
+    /// this command never supervises). Credential paths are
+    /// forwarded to the verification child, never read here. Every
+    /// terminal outcome records `<exe>.update-verdict` (done,
+    /// rolled-back, or refused) beside the binary, so automation
+    /// that cannot observe stdout still reads the result.
+    Update {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        /// Local release archive under its canonical name
+        /// (`wyrd-<version>-<os>-<arch>.tar.gz`): resolved and
+        /// validated before anything is stopped.
+        #[arg(long, value_name = "PATH")]
+        archive: PathBuf,
+        /// Control-plane relays, forwarded to the vault child under
+        /// `--restart` only; refused otherwise.
+        #[command(flatten)]
+        relays: RelayArgs,
+        /// After the update resolves, transfer into long-running
+        /// supervision of the vault instead of handing back:
+        /// this process runs the new vault as its child (or the
+        /// restored vault after a rollback) and does not return.
+        /// Exit status then reports the supervised run, not the
+        /// update — the update's own outcome is the `update done:`
+        /// / `update rollback:` / `update refused:` line plus the
+        /// durable `<exe>.update-verdict` record. Needs at least
+        /// one `--relay`.
+        #[arg(long)]
+        restart: bool,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Verify a drive with this binary and report compatibility:
+    /// the update transaction's authoritative check, run by the
+    /// staged new binary against the actual store. Internal and
+    /// unstable (double underscore): operators use `wyrd update`,
+    /// never this directly. Opens the store, replays every commit
+    /// through this build's readers, authorizes the live heads,
+    /// restores epoch keys, and proves byte-identical durable
+    /// state afterwards — then prints the U4 report and exits 0
+    /// if and only if it is verified.
+    #[command(name = "__update_verify", hide = true)]
+    UpdateVerify {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Report this binary's compiled format versions, lock-free: app
+    /// version, envelope version, control version. Internal and
+    /// unstable (double underscore): the update preflight runs it
+    /// on the staged binary and compares against its own. Three
+    /// `update <key>: <value>` lines on stdout, exit 0, no store
+    /// touched.
+    #[command(name = "__build_info", hide = true)]
+    BuildInfo,
 }
 
 /// One membership administration action. Only an owner authors
@@ -642,6 +701,14 @@ pub(crate) enum CliError {
     /// inheriting a fabricated posture.
     #[error("sync unverified: mailbox posture was never recorded")]
     Unobserved,
+    /// `__update_verify` refused the drive: the U4 report on stdout
+    /// names the invariant; this carries the verdict to the exit
+    /// path. Operational failures (held lock, wrong passphrase)
+    /// never reach it — they print no verdict at all, so a verdict
+    /// without completed checks cannot exist. Exits non-zero like
+    /// any other failure.
+    #[error("update verification failed: {0}")]
+    Verification(String),
     #[error("macOS FUSE preflight failed: {0}")]
     #[cfg(any(test, target_os = "macos"))]
     Preflight(String),
@@ -667,6 +734,68 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Err(error) => return Err(CliError::Usage(error.to_string())),
     };
     let (identity, passphrase) = match &cli.command {
+        // Update runs the whole transaction below without secrets
+        // (credential paths forward to the verification child, who
+        // opens custody), so it returns before credential loading.
+        // Quiescence, staging, swap, verify, commit-or-rollback,
+        // hand back: `update::update_run`.
+        Command::Update {
+            drive_dir,
+            archive,
+            relays,
+            restart,
+            credentials,
+        } => {
+            let exe = std::env::current_exe().map_err(|source| CliError::Io {
+                path: PathBuf::from("<current executable>"),
+                source,
+            })?;
+            let outcome = update::update_run(&update::UpdateRequest {
+                drive_dir,
+                archive,
+                identity_file: &credentials.identity_file,
+                passphrase_file: &credentials.passphrase_file,
+                relays: &relays.relay,
+                restart: *restart,
+                exe: &exe,
+            })?;
+            // Supervision diverges by design (the wait loop only
+            // exits the process), so a returned outcome is either
+            // Done or a supervision request — never an Ok from the
+            // supervisor itself.
+            match outcome {
+                update::UpdateOutcome::Done => return Ok(()),
+                update::UpdateOutcome::Supervise {
+                    exe,
+                    drive,
+                    relays,
+                    identity_file,
+                    passphrase_file,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        return update::supervise(
+                            &exe,
+                            &drive,
+                            &relays,
+                            &identity_file,
+                            &passphrase_file,
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (exe, drive, relays, identity_file, passphrase_file);
+                        return Err(CliError::Usage(
+                            "--restart needs Unix signal forwarding".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Command::BuildInfo => {
+            println!("{}", update::render_build_info(&update::own_build_info()));
+            return Ok(());
+        }
         Command::Init { credentials, .. } => read_credentials(credentials)?,
         Command::Mount { credentials, .. } => read_credentials(credentials)?,
         Command::Export { credentials, .. } => read_credentials(credentials)?,
@@ -679,9 +808,19 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         Command::Unpin { credentials, .. } => read_credentials(credentials)?,
         Command::Evict { credentials, .. } => read_credentials(credentials)?,
         Command::Cache { credentials, .. } => read_credentials(credentials)?,
+        Command::UpdateVerify { credentials, .. } => read_credentials(credentials)?,
     };
 
     match cli.command {
+        // Dead by construction: the credentials match above returns
+        // from update and build-info before secrets load. The arm
+        // exists only because the match is exhaustive.
+        Command::Update { .. } | Command::BuildInfo => {
+            unreachable!("update and build-info resolve before credential loading")
+        }
+        Command::UpdateVerify { drive_dir, .. } => {
+            update::run_update_verify(&drive_dir, identity, &passphrase)
+        }
         Command::Init { drive_dir, .. } => {
             Engine::create(drive_dir, &passphrase, identity)?;
             Ok(())
@@ -909,7 +1048,7 @@ const TRANSPORT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 /// pre-existing default-disposition behavior, never memory unsafety.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn install_shutdown_handler() -> Result<(), CliError> {
+pub(crate) fn install_shutdown_handler() -> Result<(), CliError> {
     // SAFETY: the handler stores to an AtomicBool (lock-free,
     // async-signal-safe) and touches nothing else. sigaction itself
     // runs at startup on the main thread.
@@ -4270,6 +4409,7 @@ fn main() {
 mod logging;
 mod posture;
 mod probes;
+mod update;
 
 #[cfg(test)]
 mod tests_cli;

@@ -462,3 +462,233 @@ fn vault_start_is_default_and_status_queries() {
         other => panic!("vault start must parse, got: {other:?}"),
     }
 }
+
+/// `wyrd update` takes a drive, a local archive path, and the
+/// credential paths to forward (U1=B): no download source, and the
+/// parent never reads secrets — only the verification child opens
+/// custody.
+#[test]
+fn update_parses_drive_archive_and_forwarded_credentials() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    let archive = temp.0.join("wyrd-0.3.0-alpha-linux-aarch64.tar.gz");
+    // Parse-only, but real temp paths: the values forward to the
+    // verification child, so they must always be openable paths —
+    // never literals that silently stop exercising forwarding.
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
+
+    let cli = Cli::try_parse_from([
+        "wyrd",
+        "update",
+        drive.to_str().unwrap(),
+        "--archive",
+        archive.to_str().unwrap(),
+        "--identity-file",
+        identity.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase.to_str().unwrap(),
+    ])
+    .unwrap();
+    let Command::Update {
+        drive_dir,
+        archive: parsed,
+        restart,
+        ..
+    } = cli.command
+    else {
+        panic!("update must parse");
+    };
+    assert_eq!(drive_dir, drive);
+    assert_eq!(parsed, archive);
+    assert!(!restart);
+}
+
+/// A noncanonical archive name stops the update before anything is
+/// disturbed, and the error names the expected shape.
+#[test]
+fn update_rejects_a_noncanonical_archive() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    fs::write(drive.join("LOCK"), b"").unwrap();
+    let archive = temp.0.join("abc123-wyrd-dist.tar.gz");
+    fs::write(&archive, b"fake-archive").unwrap();
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
+
+    let error = command(vec![
+        "update".into(),
+        drive.display().to_string(),
+        "--archive".into(),
+        archive.display().to_string(),
+        "--identity-file".into(),
+        identity.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase.display().to_string(),
+    ])
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("wyrd-<version>-<os>-<arch>.tar.gz"),
+        "{message}"
+    );
+}
+
+/// Relay and restart flags belong together: relays without
+/// `--restart` have no consumer, and `--restart` without a relay
+/// cannot start the vault child.
+#[test]
+fn update_refuses_mismatched_restart_flags() {
+    let temp = TempDir::new();
+    let drive = temp.0.join("drive");
+    fs::create_dir_all(&drive).unwrap();
+    fs::write(drive.join("LOCK"), b"").unwrap();
+    let identity = temp.0.join("id");
+    let passphrase = temp.0.join("pp");
+    fs::write(&identity, b"forwarded").unwrap();
+    fs::write(&passphrase, b"forwarded").unwrap();
+    let base = || {
+        vec![
+            "update".into(),
+            drive.display().to_string(),
+            "--archive".into(),
+            "wyrd-0.4.0-alpha-linux-aarch64.tar.gz".into(),
+            "--identity-file".into(),
+            identity.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase.display().to_string(),
+        ]
+    };
+    let mut relayed = base();
+    relayed.push("--relay".into());
+    relayed.push("ws://localhost:9".into());
+    let error = command(relayed).unwrap_err();
+    assert!(error.to_string().contains("--restart-only"), "{error}");
+    let mut restarted = base();
+    restarted.push("--restart".into());
+    let error = command(restarted).unwrap_err();
+    assert!(
+        error.to_string().contains("needs at least one --relay"),
+        "{error}"
+    );
+}
+
+/// `__update_verify` on a drive this build created verifies: open,
+/// replay, heads, epochs, and byte-identical durable state — and a
+/// second run proves idempotence (verification authors nothing, so
+/// there is nothing to accumulate).
+#[test]
+fn update_verify_passes_a_compatible_drive_twice() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    let init = || {
+        command(vec![
+            "init".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap()
+    };
+    let verify = || {
+        command(vec![
+            "__update_verify".into(),
+            drive.display().to_string(),
+            "--identity-file".into(),
+            identity_file.display().to_string(),
+            "--passphrase-file".into(),
+            passphrase_file.display().to_string(),
+        ])
+        .unwrap()
+    };
+    init();
+    verify();
+    verify();
+}
+
+/// `__update_verify` against a held drive refuses with no verdict:
+/// contention is operator-fixable (stop it first), never an
+/// incompatibility claim.
+#[test]
+fn update_verify_refuses_a_held_drive_without_a_verdict() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+
+    let identity = read_identity(&identity_file).unwrap();
+    let _holder = Engine::open_keystore(drive.clone(), "test-pass", identity).unwrap();
+    let error = command(vec![
+        "__update_verify".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(&error, CliError::Usage(message) if message.contains("stop it first")),
+        "held drive must refuse without a verdict, got: {error}"
+    );
+}
+
+/// `__update_verify` against a torn commit marker fails the
+/// verification with the invariant named.
+#[test]
+fn update_verify_names_the_invariant_on_a_torn_store() {
+    let temp = TempDir::new();
+    let identity_file = temp.0.join("identity");
+    let passphrase_file = temp.0.join("passphrase");
+    let drive = temp.0.join("drive");
+    write_secret(&identity_file, [0x11; 32]);
+    write_secret(&passphrase_file, b"test-pass\n");
+    command(vec![
+        "init".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap();
+    // Tear the commit marker: CURRENT must be sequence plus hash,
+    // so garbage refuses at decode, not at open.
+    fs::write(drive.join("CURRENT"), b"torn").unwrap();
+
+    let error = command(vec![
+        "__update_verify".into(),
+        drive.display().to_string(),
+        "--identity-file".into(),
+        identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        passphrase_file.display().to_string(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(&error, CliError::Verification(message) if message.contains("invariant 2")),
+        "torn store must fail with invariant 2, got: {error}"
+    );
+}

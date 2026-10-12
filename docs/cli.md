@@ -549,6 +549,60 @@ before it is ready, so it can never inherit the dead instance's
 readiness. Operator `stop` stays the supervisor's job (`systemctl
 stop` delivers SIGTERM and waits for the documented teardown).
 
+### `update` — upgrade from a local archive, quiesced and verified
+
+One command that replaces this installation's binary from a local
+release archive the operator supplies — no download, no signed
+manifest (those are post-v1 distribution work). Quiescence is a
+precondition update checks, never a state it produces: the old
+process must already be stopped, and a held store lock refuses
+with `stop the service first`. The full sequence — converge any
+interrupted transaction, resolve, require quiescence, stage,
+preflight, swap (recording `Swapped` between the two renames),
+verify against the actual store, commit or roll back, hand back
+to the supervisor — is specified in `docs/update.md`:
+
+```text
+update
+    = converge a leftover `<exe>.update-state` first: only a
+      passed verification ever commits, everything else rolls
+      back to the pre-swap binary
+    = resolve `--archive` before anything is stopped: the path
+      must be a regular file under its canonical name
+      (`wyrd-<version>-<os>-<arch>.tar.gz`, matching this host
+      except the Rosetta pair); anything else is a usage error
+      naming the expected shape
+    = report the artifact identity (version, target, blake3,
+      bytes) plus an honestly unverified compatibility line —
+      the resolve step runs no checks, and says so
+    = refuse a held lock with `stop the service first` and a
+      non-drive directory as not-a-drive (a lock-only probe:
+      no state read, no key minted, nothing held afterwards)
+    = extract `*/bin/wyrd` to `<exe>.next`, run its lock-free
+      self-report as the advisory preflight, then run its
+      `__update_verify` as an early refusal: an incompatible
+      drive stops here with staging rolled back, before any swap
+    = swap by two atomic renames with the old binary kept at
+      `<exe>.prev`, then spawn the new binary's hidden
+      `__update_verify` against the drive: replay, authorize,
+      restore epoch keys, prove byte-identical durable state —
+      commit on verified, restore on anything else
+    = every report — verified included — carries the two
+      blocked upgrade invariants as `update gap:` lines
+    = hand back: exit 0 with the new binary in place (start the
+      service to run it), or `--restart` to transfer into
+      long-running supervision of the resulting vault instead;
+      on failure the old binary is restored first, and under
+      `--restart` the restored (or unchanged) binary is
+      supervised — exit status then reports the run, while
+      `update rollback:` / `update refused:` lines plus the
+      durable `<exe>.update-verdict` record report the update
+```
+
+The blake3 digest names the artifact in reports; it is an
+identity, never trust — a locally supplied archive is verified
+structurally, and integrity stays separate from compatibility.
+
 ### `pin` / `unpin` / `evict` / `cache` — local materialization policy
 
 What this device intends to retain, declared per subtree and stored

@@ -109,6 +109,26 @@ export function buildLabelArgv(input: TriageInput, removals: string[] = []): str
   return argv
 }
 
+// Decide the single label call from an already-parsed current view. Returns
+// errors (never a call) when the view cannot establish what the triage
+// would displace: a view this tool cannot parse is a triage it must not
+// write. Gives the refusal paths a lib-level test seam.
+export function planTriageCall(view: unknown, input: TriageInput): { argv: string[] } | { errors: string[] } {
+  const labels: unknown =
+    typeof view === "object" && view !== null && "labels" in view
+      ? (view as { labels: unknown }).labels
+      : undefined
+  if (!Array.isArray(labels)) {
+    return {
+      errors: [
+        "current-labels view carries no usable labels array, refusing a blind write: run git fetch origin to refresh the local cache, then triage again",
+      ],
+    }
+  }
+  const current = labels.filter((l): l is string => typeof l === "string")
+  return { argv: buildLabelArgv(input, staleLabels(current, input)) }
+}
+
 export type JsonDocument = { ok: true; value: unknown } | { ok: false; error: string }
 
 export function parseJsonDocument(stdout: string): JsonDocument {

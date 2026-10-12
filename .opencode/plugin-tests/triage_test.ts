@@ -11,6 +11,7 @@ import {
   categoryOf,
   MILESTONES,
   parseJsonDocument,
+  planTriageCall,
   staleLabels,
   validateTriage,
   verifyLabels,
@@ -95,9 +96,32 @@ Deno.test("staleLabels finds displaced closed-set labels, ignores the rest", () 
   )
 })
 
-Deno.test("label argv appends removals in the same call", () => {
-  const argv = buildLabelArgv(GOOD, ["release:v0.2.0-alpha", "bug"])
-  assert(argv.slice(-5).join(" ") === "--remove-label release:v0.2.0-alpha --remove-label bug --json", JSON.stringify(argv))
+Deno.test("planTriageCall builds the removal-carrying argv from a stacked view", () => {
+  const planned = planTriageCall({ labels: ["bug", "P3", "release:v0.2.0-alpha"] }, GOOD)
+  assert(
+    "argv" in planned &&
+      JSON.stringify(planned.argv) ===
+        JSON.stringify([
+          "issue", "label", GOOD.id,
+          "--label", "chore",
+          "--label", "P3",
+          "--label", "release:v0.3.0-alpha",
+          "--remove-label", "bug",
+          "--remove-label", "release:v0.2.0-alpha",
+          "--json",
+        ]),
+    JSON.stringify(planned),
+  )
+})
+
+Deno.test("planTriageCall refuses views it cannot establish removals from", () => {
+  for (const view of [{}, { labels: "chore" }, { labels: null }, null]) {
+    const planned = planTriageCall(view, GOOD)
+    assert(
+      "errors" in planned && planned.errors.some((e) => e.includes("refusing a blind write")),
+      `view ${JSON.stringify(view)} must refuse: ${JSON.stringify(planned)}`,
+    )
+  }
 })
 
 Deno.test("parseJsonDocument accepts a document, refuses noise", () => {

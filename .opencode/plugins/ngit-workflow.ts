@@ -18,9 +18,8 @@
 
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import {
-  buildLabelArgv,
   parseJsonDocument,
-  staleLabels,
+  planTriageCall,
   validateTriage,
   verifyLabels,
 } from "../lib/ngit-triage.js"
@@ -57,7 +56,8 @@ export default (async ({ $ }) => {
           }
           // Read current labels first: ngit label events are additive, so
           // the call below must also remove what the new triage displaces.
-          // A view this tool cannot read is a triage it must not write.
+          // A view this tool cannot read or parse is a triage it must not
+          // write: refuse loudly and name the recovery.
           let currentOut: string
           try {
             currentOut = await run(["issue", "view", input.id, "--json", "--offline"])
@@ -65,21 +65,22 @@ export default (async ({ $ }) => {
             return JSON.stringify({
               ok: false,
               applied: false,
-              errors: [`current-labels view failed, refusing a blind write: ${String(err)}`],
+              errors: [
+                `current-labels view failed, refusing a blind write: ${String(err)}. Run git fetch origin to refresh the local cache, or retry once without --offline, then triage again`,
+              ],
             })
           }
           const currentParsed = parseJsonDocument(currentOut)
           if (!currentParsed.ok) {
             return JSON.stringify({ ok: false, applied: false, errors: [currentParsed.error] })
           }
-          const currentView = currentParsed.value as { labels?: unknown }
-          const currentLabels = Array.isArray(currentView.labels)
-            ? currentView.labels.filter((l): l is string => typeof l === "string")
-            : []
-          const removals = staleLabels(currentLabels, input)
+          const planned = planTriageCall(currentParsed.value, input)
+          if ("errors" in planned) {
+            return JSON.stringify({ ok: false, applied: false, errors: planned.errors })
+          }
           let labelOut: string
           try {
-            labelOut = await run(buildLabelArgv(input, removals))
+            labelOut = await run(planned.argv)
           } catch (err) {
             return JSON.stringify({ ok: false, applied: false, errors: [`ngit issue label failed: ${String(err)}`] })
           }

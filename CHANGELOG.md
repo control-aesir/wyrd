@@ -39,8 +39,8 @@ version say exactly what changed.
   same call, and verifies the end state, so agents stop re-deriving label
   ceremony. Closed label sets are enforced in code (creation-time labels
   are unrepresentable: the tool takes no creation path); pure logic is
-  covered by offline deno tests in `.opencode/plugin-tests/` (run:
-  `deno test --allow-read .opencode/plugin-tests/`).
+  covered by offline deno tests in   `.opencode/plugin-tests/` (run:
+  `devenv shell -- deno test --allow-read .opencode/plugin-tests/`).
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

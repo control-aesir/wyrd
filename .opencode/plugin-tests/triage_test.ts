@@ -1,13 +1,17 @@
 // Offline tests for the ngit-triage pure logic (../lib/ngit-triage.ts).
-// Run: devenv shell -- deno test .opencode/plugin-tests/
-// Plain Deno.test asserts, no jsr/npm imports: runnable with no network.
+// Run: devenv shell -- deno test --allow-read .opencode/plugin-tests/
+// Plain Deno.test asserts, no jsr/npm imports: runnable with no network
+// (--allow-read covers the CONTRIBUTING.md parity test only).
 // The lib module imports nothing, so no stubs or import maps are needed;
 // full typechecking of the plugin entry happens under opencode's bun
 // install, which provides the real SDK.
 
 import {
   buildLabelArgv,
+  categoryOf,
+  MILESTONES,
   parseJsonDocument,
+  staleLabels,
   validateTriage,
   verifyLabels,
   type TriageInput,
@@ -74,6 +78,28 @@ Deno.test("label argv carries all three categories in one call", () => {
   )
 })
 
+Deno.test("staleLabels finds displaced closed-set labels, ignores the rest", () => {
+  assert(
+    JSON.stringify(staleLabels(["bug", "P2", "release:v0.2.0-alpha"], GOOD)) ===
+      JSON.stringify(["bug", "P2", "release:v0.2.0-alpha"]),
+    "all three displaced",
+  )
+  assert(
+    JSON.stringify(staleLabels(["chore", "P3", "release:v0.3.0-alpha"], GOOD)) === JSON.stringify([]),
+    "identical set has no stale labels",
+  )
+  assert(
+    JSON.stringify(staleLabels(["release:alpha", "chore", "P3", "release:v0.3.0-alpha"], GOOD)) ===
+      JSON.stringify([]),
+    "labels outside the closed sets are not this tool's jurisdiction",
+  )
+})
+
+Deno.test("label argv appends removals in the same call", () => {
+  const argv = buildLabelArgv(GOOD, ["release:v0.2.0-alpha", "bug"])
+  assert(argv.slice(-5).join(" ") === "--remove-label release:v0.2.0-alpha --remove-label bug --json", JSON.stringify(argv))
+})
+
 Deno.test("parseJsonDocument accepts a document, refuses noise", () => {
   const good = parseJsonDocument('{"action":"labeled"}\n')
   assert(good.ok && typeof good.value === "object", "valid JSON passes")
@@ -81,15 +107,51 @@ Deno.test("parseJsonDocument accepts a document, refuses noise", () => {
   assert(!parseJsonDocument("Published 1 event to 4 relays").ok, "relay chatter fails loudly")
 })
 
-Deno.test("verifyLabels confirms the triaged set, reports gaps", () => {
+Deno.test("verifyLabels confirms the exact set, reports gaps and surplus", () => {
   assert(
-    verifyLabels({ labels: ["chore", "P3", "release:v0.3.0-alpha", "extra"] }, GOOD).length === 0,
-    "superset verifies",
+    verifyLabels({ labels: ["chore", "P3", "release:v0.3.0-alpha"] }, GOOD).length === 0,
+    "exact set verifies",
+  )
+  assert(
+    verifyLabels({ labels: ["chore", "P3", "release:v0.3.0-alpha", "release:alpha"] }, GOOD).length === 0,
+    "unknown labels outside the closed sets are ignored",
+  )
+  const stacked = verifyLabels({ labels: ["chore", "P3", "release:v0.3.0-alpha", "release:v0.2.0-alpha"] }, GOOD)
+  assert(
+    stacked.length === 1 && stacked[0].includes("release:v0.2.0-alpha") && stacked[0].includes("stacks"),
+    `stacked milestone must fail: ${JSON.stringify(stacked)}`,
   )
   const missing = verifyLabels({ labels: ["chore"] }, GOOD)
   assert(
     missing.length === 2 && missing.some((m) => m.includes("P3")),
     `gaps reported: ${JSON.stringify(missing)}`,
   )
+  assert(
+    JSON.stringify(verifyLabels({ labels: [] }, GOOD).sort()) ===
+      JSON.stringify([
+        "verified view is missing label chore",
+        "verified view is missing label P3",
+        "verified view is missing label release:v0.3.0-alpha",
+      ].sort()),
+    "empty array reports three missing, nothing else",
+  )
   assert(verifyLabels({}, GOOD).length === 1, "missing labels array fails loudly")
+})
+
+Deno.test("categoryOf classifies closed sets, rejects outsiders", () => {
+  assert(categoryOf("bug") === "type", "bug is type")
+  assert(categoryOf("P1") === "priority", "P1 is priority")
+  assert(categoryOf("release:backlog") === "milestone", "backlog is milestone")
+  assert(categoryOf("release:alpha") === null, "retired scheme entry is outside")
+  assert(categoryOf("docs") === null, "scope word is outside")
+})
+
+Deno.test("MILESTONES matches the CONTRIBUTING.md milestone list", async () => {
+  const doc = await Deno.readTextFile(new URL("../../CONTRIBUTING.md", import.meta.url))
+  const section = doc.split("The current milestone labels are:")[1].split("Do not stack")[0]
+  const found = [...section.matchAll(/`(release:(?!\*)[^`]+)`/g)].map((m) => m[1]).sort()
+  assert(
+    JSON.stringify(found) === JSON.stringify([...MILESTONES].sort()),
+    `drift between code and docs: ${JSON.stringify(found)}`,
+  )
 })

@@ -1,4 +1,4 @@
-// .opencode/lib/ngit-triage.ts — pure issue-triage logic for the
+// .opencode/lib/ngit-triage.ts: pure issue-triage logic for the
 // ngit-workflow plugin. Deliberately NOT under .opencode/plugins/:
 // opencode loads every module there as a plugin and treats each export
 // as a plugin factory, so helper exports (especially the const arrays)
@@ -35,6 +35,39 @@ export interface TriageInput {
   milestone: string
 }
 
+export type Category = "type" | "priority" | "milestone"
+
+const CATEGORY_SETS: Record<Category, readonly string[]> = {
+  type: TYPES,
+  priority: PRIORITIES,
+  milestone: MILESTONES,
+}
+
+function wanted(input: TriageInput): Record<Category, string> {
+  return { type: input.type, priority: input.priority, milestone: input.milestone }
+}
+
+// Which closed category a label belongs to, if any. Labels outside the
+// closed sets (stale scheme entries, local experiments) are not this
+// tool's jurisdiction: never removed, never flagged.
+export function categoryOf(label: string): Category | null {
+  for (const category of Object.keys(CATEGORY_SETS) as Category[]) {
+    if (CATEGORY_SETS[category].includes(label)) return category
+  }
+  return null
+}
+
+// Current labels in the closed sets that the new triage displaces. Passed
+// as --remove-label in the same call, so re-triage cannot stack a stale
+// release:* (or stale type/priority) next to the new one.
+export function staleLabels(current: string[], input: TriageInput): string[] {
+  const want = wanted(input)
+  return current.filter((label) => {
+    const category = categoryOf(label)
+    return category !== null && label !== want[category]
+  })
+}
+
 // IDs are interpolated into a shell command (escaped), so reject anything
 // outside the shapes ngit accepts: bech32, hex, or #hex-prefix.
 const ID_PATTERN = /^(nevent1[02-9ac-hj-np-z]+|#?[0-9a-fA-F]{8,64})$/
@@ -57,9 +90,10 @@ export function validateTriage(input: TriageInput): string[] {
 }
 
 // argv for `ngit issue label`, before shell escaping. One call carries all
-// three categories: a triage is all-or-nothing, never a partial label set.
-export function buildLabelArgv(input: TriageInput): string[] {
-  return [
+// three categories plus any displaced labels as --remove-label: a triage is
+// all-or-nothing, never a partial label set and never a stacked one.
+export function buildLabelArgv(input: TriageInput, removals: string[] = []): string[] {
+  const argv = [
     "issue",
     "label",
     input.id,
@@ -69,11 +103,15 @@ export function buildLabelArgv(input: TriageInput): string[] {
     input.priority,
     "--label",
     input.milestone,
-    "--json",
   ]
+  for (const stale of removals) argv.push("--remove-label", stale)
+  argv.push("--json")
+  return argv
 }
 
-export function parseJsonDocument(stdout: string): { ok: boolean; value?: unknown; error?: string } {
+export type JsonDocument = { ok: true; value: unknown } | { ok: false; error: string }
+
+export function parseJsonDocument(stdout: string): JsonDocument {
   const trimmed = stdout.trim()
   if (!trimmed) return { ok: false, error: "ngit printed no JSON document on stdout" }
   try {
@@ -83,15 +121,28 @@ export function parseJsonDocument(stdout: string): { ok: boolean; value?: unknow
   }
 }
 
-// Confirm the verified view carries exactly the triaged set.
+// Confirm the verified view carries exactly the triaged set: every wanted
+// label present, no displaced label left behind. A stacked view (two
+// release:* labels, two types) is an error even when nothing is missing,
+// because ngit label events are additive and ok:true must mean the end
+// state is exactly one label per category.
 export function verifyLabels(view: unknown, input: TriageInput): string[] {
   const labels: unknown =
     typeof view === "object" && view !== null && "labels" in view
       ? (view as { labels: unknown }).labels
       : undefined
   if (!Array.isArray(labels)) return ["verified view carries no labels array"]
-  const missing = [input.type, input.priority, input.milestone].filter(
-    (want) => !labels.includes(want),
-  )
-  return missing.map((want) => `verified view is missing label ${want}`)
+  const want = wanted(input)
+  const errors: string[] = []
+  for (const category of Object.keys(want) as Category[]) {
+    if (!labels.includes(want[category])) {
+      errors.push(`verified view is missing label ${want[category]}`)
+    }
+    for (const label of labels) {
+      if (typeof label === "string" && categoryOf(label) === category && label !== want[category]) {
+        errors.push(`verified view stacks stale label ${label} next to ${want[category]}`)
+      }
+    }
+  }
+  return errors
 }

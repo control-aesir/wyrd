@@ -20,6 +20,7 @@ mod close;
 pub use close::GRACEFUL_CLOSE_DEADLINE;
 pub mod closure;
 pub mod control;
+pub mod disclosure;
 pub mod durable;
 #[cfg(test)]
 mod fuzz;

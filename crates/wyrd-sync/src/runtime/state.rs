@@ -60,6 +60,15 @@ pub struct MaterializationSummary {
     pub local_objects: usize,
 }
 
+impl MaterializationSummary {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        use crate::disclosure::DisclosureRow::O4;
+        &[("pinned", O4), ("cached", O4), ("local_objects", O4)]
+    }
+}
+
 /// Queued vs delivered outbox counts per obligation class, as
 /// observed from durable state. Pending is always queued minus
 /// delivered; the three numbers travel together so status consumers
@@ -72,6 +81,22 @@ pub struct OutboxTotals {
     pub transitions_delivered: usize,
     pub capabilities_queued: usize,
     pub capabilities_delivered: usize,
+}
+
+impl OutboxTotals {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        use crate::disclosure::DisclosureRow::O4;
+        &[
+            ("announcements_queued", O4),
+            ("announcements_delivered", O4),
+            ("transitions_queued", O4),
+            ("transitions_delivered", O4),
+            ("capabilities_queued", O4),
+            ("capabilities_delivered", O4),
+        ]
+    }
 }
 
 /// Reconciliation progress as observed from durable state: how many
@@ -102,6 +127,20 @@ pub struct ReconciliationCounters {
     /// late-joiner half — snapshots a recipient evidenced holding
     /// after learning them through an answered statement.
     pub announcements_reconciled: usize,
+}
+
+impl ReconciliationCounters {
+    /// Disclosure inventory (matrix conformance): every field is a
+    /// count at O4. See [`crate::disclosure`] for the rules.
+    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        use crate::disclosure::DisclosureRow::O4;
+        &[
+            ("statements_received", O4),
+            ("transitions_reconciled", O4),
+            ("capabilities_reconciled", O4),
+            ("announcements_reconciled", O4),
+        ]
+    }
 }
 
 /// Durably retained runtime sync state: the live view rebuilds from

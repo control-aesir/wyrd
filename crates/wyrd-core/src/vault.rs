@@ -38,6 +38,7 @@
 //! drive state at the same coarse grain. No field maps to a hidden
 //! row; PR3's field inventory pins this mapping in a test.
 
+use wyrd_sync::disclosure::DisclosureRow;
 use wyrd_sync::runtime::{
     DurabilityLevel, Engine, EngineError, MaterializationSummary, OutboxTotals,
     ReconciliationCounters,
@@ -70,6 +71,25 @@ pub struct VaultStatus {
     /// backlog predicate only — head-class detail is member-only,
     /// so this is not the member convergence verdict.
     pub backlog_empty: bool,
+}
+
+impl VaultStatus {
+    /// Disclosure inventory (matrix conformance): every field maps
+    /// to O4 (counts) — the durability level at counts grain, noted
+    /// on the struct. No hidden-row mapping is permitted here; the
+    /// conformance test rejects any. Adding a field means adding
+    /// its row here, or the golden test fails.
+    pub fn disclosure_map() -> &'static [(&'static str, DisclosureRow)] {
+        use DisclosureRow::O4;
+        &[
+            ("durability", O4),
+            ("outbox", O4),
+            ("queue", O4),
+            ("reconciliation", O4),
+            ("materialization", O4),
+            ("backlog_empty", O4),
+        ]
+    }
 }
 
 /// Observe vault-position status from durable state. Reads committed
@@ -234,5 +254,144 @@ mod tests {
             observe_vault(&engine).unwrap()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Matrix conformance: the field-to-row inventories pinned as
+/// golden literals. Adding a field to any inventoried struct
+/// without naming its row here fails these tests — that is the
+/// OD-18-4 classification pressure in test-failure form. The
+/// vault-side test below is the teeth: no hidden-row mapping may
+/// appear on the vault projection, so a restricted position can
+/// never gain a field silently.
+#[cfg(test)]
+mod conformance {
+    use wyrd_sync::disclosure::DisclosureRow::{H5, H6, H8, H9, O4};
+
+    use super::VaultStatus;
+    use crate::live::PendingObligations;
+    use crate::status::{
+        ConvergenceState, HeadClasses, HeadSummary, MailboxView, PeerHandle, QueueDepth, SyncStatus,
+    };
+    use wyrd_sync::runtime::{MaterializationSummary, OutboxTotals, ReconciliationCounters};
+
+    /// No hidden-row mapping on the vault projection, ever. This is
+    /// the default-deny rule as code: a future field mapped to any
+    /// H-row fails here even if its golden literal was updated.
+    #[test]
+    fn vault_inventory_is_all_observable() {
+        for (field, row) in VaultStatus::disclosure_map() {
+            assert!(
+                !row.is_hidden(),
+                "vault field {field} maps to hidden row {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_projection_inventory_is_pinned() {
+        assert_eq!(
+            SyncStatus::disclosure_map(),
+            &[
+                ("tip", H8),
+                ("held_epochs", H8),
+                ("obligations", H9),
+                ("totals", O4),
+                ("live_heads", H5),
+                ("head_classes", H5),
+                ("mailbox", H9),
+                ("known_members", H8),
+                ("peers", H8),
+                ("queue", O4),
+                ("reconciliation", O4),
+                ("convergence", O4),
+                ("materialization", O4),
+                ("durability", H5),
+            ]
+        );
+    }
+
+    #[test]
+    fn vault_projection_inventory_is_pinned() {
+        assert_eq!(
+            VaultStatus::disclosure_map(),
+            &[
+                ("durability", O4),
+                ("outbox", O4),
+                ("queue", O4),
+                ("reconciliation", O4),
+                ("materialization", O4),
+                ("backlog_empty", O4),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_observation_inventories_are_pinned() {
+        assert_eq!(
+            HeadSummary::disclosure_map(),
+            &[("id", H6), ("epoch", H5), ("author", H5)]
+        );
+        assert_eq!(
+            HeadClasses::disclosure_map(),
+            &[
+                ("eligible", H5),
+                ("canonical_history", H5),
+                ("superseded", H5),
+                ("stranded", H5),
+                ("voided", H5),
+                ("pending", H5),
+                ("rejected", H5),
+            ]
+        );
+        assert_eq!(
+            PeerHandle::disclosure_map(),
+            &[("handle", O4), ("peer", H8), ("pending", O4)]
+        );
+        assert_eq!(
+            QueueDepth::disclosure_map(),
+            &[("outbox", O4), ("carries", O4), ("fetch", O4)]
+        );
+        assert_eq!(
+            ConvergenceState::disclosure_map(),
+            &[
+                ("converged", O4),
+                ("pending_heads", O4),
+                ("unfetchable_heads", O4)
+            ]
+        );
+        assert_eq!(MailboxView::disclosure_map(), &[("configured_relays", H9)]);
+        assert_eq!(
+            PendingObligations::disclosure_map(),
+            &[
+                ("announcements", H9),
+                ("transitions", H9),
+                ("capabilities", H9)
+            ]
+        );
+        assert_eq!(
+            OutboxTotals::disclosure_map(),
+            &[
+                ("announcements_queued", O4),
+                ("announcements_delivered", O4),
+                ("transitions_queued", O4),
+                ("transitions_delivered", O4),
+                ("capabilities_queued", O4),
+                ("capabilities_delivered", O4),
+            ]
+        );
+        assert_eq!(
+            ReconciliationCounters::disclosure_map(),
+            &[
+                ("statements_received", O4),
+                ("transitions_reconciled", O4),
+                ("capabilities_reconciled", O4),
+                ("announcements_reconciled", O4),
+            ]
+        );
+        assert_eq!(
+            MaterializationSummary::disclosure_map(),
+            &[("pinned", O4), ("cached", O4), ("local_objects", O4)]
+        );
     }
 }

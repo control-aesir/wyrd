@@ -49,6 +49,13 @@ version say exactly what changed.
   field, instead of the member projection's tip, epochs, head
   authors, peer handles, and mailbox line. The surface takes no
   relay configuration (matrix H9).
+- Disclosure conformance inventory (`wyrd-sync::disclosure`,
+  `disclosure_map` on every observation struct): each field of the
+  member and vault projections plus their nested types maps to
+  exactly one matrix row, pinned as golden literals, with a
+  vault-all-observable rule that rejects any hidden-row mapping
+  on the vault projection (OD-18-4 default-deny in test-failure
+  form; verified by mutation).
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

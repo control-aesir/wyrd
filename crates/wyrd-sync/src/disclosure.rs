@@ -5,13 +5,14 @@
 //! Every observation struct in the diagnostics surface carries an
 //! inventory mapping each of its fields to exactly one matrix row.
 //! The inventories live beside their structs as `disclosure_map`
-//! literals; the conformance tests assert them against golden
-//! expectations, so adding a field forces the author to name its
-//! row in the same diff a reviewer reads. That is the OD-18-4
-//! default-deny pressure in its test-failure form: no field reaches
-//! a restricted position unclassified, because the vault-side test
-//! (`vault_inventory_is_all_observable`, in `wyrd-core`) rejects
-//! any hidden-row mapping on the vault projection.
+//! methods; each destructures its struct exhaustively, so adding a
+//! field without extending the map fails the build, and the
+//! conformance tests pin the row each field maps to. That is the
+//! OD-18-4 default-deny pressure in compile-error form: no field
+//! reaches a restricted position unclassified, because the
+//! vault-side test (`vault_inventory_is_all_observable`, in
+//! `wyrd-core`) rejects any hidden-row mapping on the vault
+//! projection.
 //!
 //! Two scoping rules, stated so future inventories stay uniform:
 //!

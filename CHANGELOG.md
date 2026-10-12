@@ -43,19 +43,23 @@ version say exactly what changed.
   `devenv shell -- deno test --allow-read .opencode/plugin-tests/`).
 - Vault-position diagnostics projection (`wyrd-core::vault`,
   `wyrd vault status`): the stopped-drive section now shows the
-  keyless-replica subset (durability, outbox/queue counts,
-  reconciliation and materialization counts, backlog predicate)
-  through a dedicated `VaultStatus` type with no identity-bearing
-  field, instead of the member projection's tip, epochs, head
-  authors, peer handles, and mailbox line. The surface takes no
-  relay configuration (matrix H9).
+  keyless-replica subset (outbox/queue counts, reconciliation and
+  materialization counts, backlog predicate) through a dedicated
+  `VaultStatus` type with no identity-bearing field, instead of
+  the member projection's tip, epochs, head authors, peer
+  handles, mailbox line, and durability verdict. Pending counts
+  come from the same delivered-union-reconciled set difference
+  the member projection counts, tallied inside the engine so no
+  identity crosses the boundary. The surface takes no relay
+  configuration (matrix H9).
 - Disclosure conformance inventory (`wyrd-sync::disclosure`,
   `disclosure_map` on every observation struct): each field of the
   member and vault projections plus their nested types maps to
-  exactly one matrix row, pinned as golden literals, with a
-  vault-all-observable rule that rejects any hidden-row mapping
-  on the vault projection (OD-18-4 default-deny in test-failure
-  form; verified by mutation).
+  exactly one matrix row, pinned as golden literals over live
+  values. Every map destructures its struct exhaustively, so an
+  unmapped field fails the build (OD-18-4 default-deny in
+  compile-error form; verified with E0027); a vault-all-observable
+  rule rejects any hidden-row mapping on the vault projection.
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

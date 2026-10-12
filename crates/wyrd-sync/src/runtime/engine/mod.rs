@@ -1491,6 +1491,46 @@ impl Engine {
         })
     }
 
+    /// Still-undischarged obligation counts per class, rebuilt from
+    /// committed facts: queued pairs minus (delivered ∪ reconciled)
+    /// ones, counted — never materialized — so no recipient or
+    /// snapshot identity crosses this boundary. The same set
+    /// difference the itemized `pending_*` lists compute
+    /// (`RuntimeState::pending_announcements` and siblings); the
+    /// counts agree with those lists' lengths exactly, which the
+    /// vault projection relies on for parity with the member
+    /// projection. Counts only, so this is safe input for
+    /// restricted-position surfaces (matrix O4).
+    pub fn pending_obligation_counts(&self) -> Result<(usize, usize, usize), EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let runtime = &rebuilt.runtime;
+        let announcements = runtime
+            .announcement_queued
+            .iter()
+            .filter(|pair| {
+                !runtime.announcement_delivered.contains(*pair)
+                    && !runtime.announcement_reconciled_pairs.contains(*pair)
+            })
+            .count();
+        let transitions = runtime
+            .transition_queued
+            .iter()
+            .filter(|pair| {
+                !runtime.transition_delivered.contains(pair)
+                    && !runtime.transition_reconciled_pairs.contains(pair)
+            })
+            .count();
+        let capabilities = runtime
+            .capability_queued
+            .iter()
+            .filter(|pair| {
+                !runtime.capability_delivered.contains(pair)
+                    && !runtime.capability_reconciled_pairs.contains(pair)
+            })
+            .count();
+        Ok((announcements, transitions, capabilities))
+    }
+
     /// Received statements this process has not answered yet: the live
     /// reconciliation gap a run reports and exits on. Volatile by
     /// design — answering resets on restart and re-answering is

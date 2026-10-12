@@ -63,7 +63,16 @@ pub struct MaterializationSummary {
 impl MaterializationSummary {
     /// Disclosure inventory (matrix conformance): every field is a
     /// count at O4. See [`crate::disclosure`] for the rules.
-    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            pinned: _,
+            cached: _,
+            local_objects: _,
+        } = self;
         use crate::disclosure::DisclosureRow::O4;
         &[("pinned", O4), ("cached", O4), ("local_objects", O4)]
     }
@@ -86,7 +95,19 @@ pub struct OutboxTotals {
 impl OutboxTotals {
     /// Disclosure inventory (matrix conformance): every field is a
     /// count at O4. See [`crate::disclosure`] for the rules.
-    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            announcements_queued: _,
+            announcements_delivered: _,
+            transitions_queued: _,
+            transitions_delivered: _,
+            capabilities_queued: _,
+            capabilities_delivered: _,
+        } = self;
         use crate::disclosure::DisclosureRow::O4;
         &[
             ("announcements_queued", O4),
@@ -132,7 +153,17 @@ pub struct ReconciliationCounters {
 impl ReconciliationCounters {
     /// Disclosure inventory (matrix conformance): every field is a
     /// count at O4. See [`crate::disclosure`] for the rules.
-    pub fn disclosure_map() -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(&self) -> &'static [(&'static str, crate::disclosure::DisclosureRow)] {
+        let Self {
+            statements_received: _,
+            transitions_reconciled: _,
+            capabilities_reconciled: _,
+            announcements_reconciled: _,
+        } = self;
         use crate::disclosure::DisclosureRow::O4;
         &[
             ("statements_received", O4),

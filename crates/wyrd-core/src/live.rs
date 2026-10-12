@@ -233,7 +233,18 @@ impl PendingObligations {
     /// pairs additionally name snapshot ids — noted, not
     /// double-mapped: one field, one row, and the member verdict
     /// allows both classes while no vault projection reads either.
-    pub fn disclosure_map() -> &'static [(&'static str, wyrd_sync::disclosure::DisclosureRow)] {
+    ///
+    /// The destructure is exhaustive on purpose: adding a field
+    /// without extending both the pattern and the map fails the
+    /// build (OD-18-4 default-deny in compile-error form).
+    pub fn disclosure_map(
+        &self,
+    ) -> &'static [(&'static str, wyrd_sync::disclosure::DisclosureRow)] {
+        let Self {
+            announcements: _,
+            transitions: _,
+            capabilities: _,
+        } = self;
         use wyrd_sync::disclosure::DisclosureRow::H9;
         &[
             ("announcements", H9),

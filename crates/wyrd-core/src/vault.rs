@@ -8,8 +8,8 @@
 //! every one of them a hidden-class observation (matrix H5/H6/H8/H9).
 //!
 //! The boundary is structural, not editorial. [`observe_vault`]
-//! reads only count- and state-producing queries off the engine —
-//! outbox totals, queue depths, durability level, reconciliation
+//! reads only count-producing queries off the engine — outbox
+//! totals, pending-obligation counts, queue depths, reconciliation
 //! counters, materialization counts — and never calls
 //! `membership_log`, `held_epochs`, `live_heads`, `snapshot_heads`,
 //! or the itemized obligation lists. A vault projection cannot leak
@@ -25,36 +25,34 @@
 //! What is deliberately absent: head-classification detail (counting
 //! it needs `snapshot_heads`, whose rows carry snapshot ids), peer
 //! and membership rows (identity-bearing by construction), mailbox
-//! posture (control-plane configuration, matrix H9), and store-level
-//! blob listings (a second store open with its own side effects).
-//! The matrix permits vault surfaces a subset of the keyless column;
-//! this projection is that subset. Convergence is reported as the
-//! backlog predicate only (`backlog_empty`), never as a head-class
-//! verdict — a quiet queue with pending heads is not convergence,
-//! and the vault surface must not claim otherwise.
+//! posture (control-plane configuration, matrix H9), the durability
+//! level (snapshot-activity state the matrix's member column rates
+//! H5 — a vault surface prints no reading of it, not even a coarse
+//! one), and store-level blob listings (a second store open with its
+//! own side effects). The matrix permits vault surfaces a subset of
+//! the keyless column; this projection is that subset. Convergence
+//! is reported as the backlog predicate only (`backlog_empty`),
+//! never as a head-class verdict — a quiet queue with pending heads
+//! is not convergence, and the vault surface must not claim
+//! otherwise.
 //!
 //! Row map (matrix `docs/trust.md`, observation × trust-position):
-//! every field below is O4 (counts) except `durability`, which is
-//! drive state at the same coarse grain. No field maps to a hidden
-//! row; PR3's field inventory pins this mapping in a test.
+//! every field below is O4 (counts). No field maps to a hidden row;
+//! the field inventory pins this mapping, and the inventory is
+//! exhaustive by construction (see `disclosure_map`).
 
 use wyrd_sync::disclosure::DisclosureRow;
 use wyrd_sync::runtime::{
-    DurabilityLevel, Engine, EngineError, MaterializationSummary, OutboxTotals,
-    ReconciliationCounters,
+    Engine, EngineError, MaterializationSummary, OutboxTotals, ReconciliationCounters,
 };
 
 use crate::status::QueueDepth;
 
-/// Vault-position status: counts and drive state only. No
-/// identities, no heads, no membership, no mailbox — the type has no
+/// Vault-position status: counts only. No identities, no heads, no
+/// membership, no mailbox, no durability verdict — the type has no
 /// field that could hold them, which is the enforcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaultStatus {
-    /// The durability level the drive reached (DG-2): Working with
-    /// no recorded snapshot body, Committed while the announcement
-    /// outbox is non-empty, Published once it is quiet.
-    pub durability: DurabilityLevel,
     /// Queued vs delivered counts per obligation class. Counts
     /// only: the itemized per-recipient lists stay unread.
     pub outbox: OutboxTotals,
@@ -75,14 +73,24 @@ pub struct VaultStatus {
 
 impl VaultStatus {
     /// Disclosure inventory (matrix conformance): every field maps
-    /// to O4 (counts) — the durability level at counts grain, noted
-    /// on the struct. No hidden-row mapping is permitted here; the
-    /// conformance test rejects any. Adding a field means adding
-    /// its row here, or the golden test fails.
-    pub fn disclosure_map() -> &'static [(&'static str, DisclosureRow)] {
+    /// to O4 (counts). No hidden-row mapping is permitted here; the
+    /// conformance test rejects any.
+    ///
+    /// The destructure is exhaustive on purpose: it names every
+    /// field, so adding a field without extending both the pattern
+    /// and the map below fails the build. That is the OD-18-4
+    /// default-deny pressure in compile-error form — the map cannot
+    /// silently miss a field the struct gained.
+    pub fn disclosure_map(&self) -> &'static [(&'static str, DisclosureRow)] {
+        let Self {
+            outbox: _,
+            queue: _,
+            reconciliation: _,
+            materialization: _,
+            backlog_empty: _,
+        } = self;
         use DisclosureRow::O4;
         &[
-            ("durability", O4),
             ("outbox", O4),
             ("queue", O4),
             ("reconciliation", O4),
@@ -95,23 +103,22 @@ impl VaultStatus {
 /// Observe vault-position status from durable state. Reads committed
 /// facts only; commits nothing, connects to nothing, and — unlike
 /// [`crate::status::observe`] — never extracts an identity-bearing
-/// row. The engine calls below are the complete read set: totals,
-/// carries, reconciliation gaps, materialization, durability, and
-/// reconciliation counters.
+/// row. The engine calls below are the complete read set:
+/// totals, pending-obligation counts, carries, reconciliation gaps,
+/// materialization, and reconciliation counters.
 pub fn observe_vault(engine: &Engine) -> Result<VaultStatus, EngineError> {
     let state = engine.runtime_state()?;
     let outbox = state.outbox_totals();
+    // Pending pairs per class from the same set difference the
+    // member projection counts (`RuntimeState::pending_*`: queued
+    // minus delivered ∪ reconciled), counted inside the engine so
+    // no recipient or snapshot identity crosses this boundary —
+    // plus the staged carries the itemized lists do not cover.
+    let (announcements, transitions, capabilities) = engine.pending_obligation_counts()?;
     let carries = state.pending_carries().len();
     let reconcile = state.reconcile();
-    // Pending pairs per class, exactly as the member projection
-    // counts them (`PendingObligations::len`): queued minus
-    // delivered, plus the staged carries the itemized lists do not
-    // cover. Counts only — the per-recipient pairs stay unread.
-    let pending = outbox.announcements_queued - outbox.announcements_delivered
-        + (outbox.transitions_queued - outbox.transitions_delivered)
-        + (outbox.capabilities_queued - outbox.capabilities_delivered);
     let queue = QueueDepth {
-        outbox: pending + carries,
+        outbox: announcements + transitions + capabilities + carries,
         carries,
         fetch: reconcile.pending_snapshots.len()
             + reconcile.pending_snapshot_bodies.len()
@@ -120,9 +127,7 @@ pub fn observe_vault(engine: &Engine) -> Result<VaultStatus, EngineError> {
     };
     let reconciliation = engine.reconciliation_counters()?;
     let materialization = state.materialization_summary();
-    let durability = state.durability_level();
     Ok(VaultStatus {
-        durability,
         outbox,
         queue,
         reconciliation,
@@ -132,10 +137,10 @@ pub fn observe_vault(engine: &Engine) -> Result<VaultStatus, EngineError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
     use wyrd_format::{Entry, ObjectKind, ObjectStore, Tree};
     use wyrd_sync::keys::DeviceIdentitySecret;
+    use wyrd_sync::runtime::Engine;
 
     /// Scratch-drive uniquifier: wall-clock nanos collide across
     /// parallel tests on coarse clocks, so every scratch dir takes
@@ -152,7 +157,7 @@ mod tests {
 
     /// A fresh drive under a fixed identity: genesis tip, secret
     /// held, nothing owed.
-    fn scratch_fresh() -> (Engine, std::path::PathBuf) {
+    pub(crate) fn scratch_fresh() -> (Engine, std::path::PathBuf) {
         let dir = scratch_dir("fresh");
         std::fs::create_dir_all(&dir).unwrap();
         let identity = DeviceIdentitySecret::from_bytes([0xA5; 32]).unwrap();
@@ -164,7 +169,7 @@ mod tests {
     /// admitted with carry, so the member projection shows peers, a
     /// live head with an author, and queued obligations — everything
     /// the vault projection must not carry.
-    fn scratch_admission() -> (Engine, std::path::PathBuf) {
+    pub(crate) fn scratch_admission() -> (Engine, std::path::PathBuf) {
         let dir = scratch_dir("admission");
         std::fs::create_dir_all(&dir).unwrap();
         let identity = DeviceIdentitySecret::from_bytes([0xA6; 32]).unwrap();
@@ -186,25 +191,43 @@ mod tests {
         engine.carry_pending(&store).unwrap();
         (engine, dir)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::observe_vault;
 
     /// The vault projection agrees with the member projection on
-    /// every class both may see: totals, queue, durability,
-    /// reconciliation, and materialization are the same committed
-    /// facts through either lens. The member surface shows more;
-    /// the vault surface shows nothing different.
+    /// every class both may see: totals, queue, reconciliation,
+    /// and materialization are the same committed facts through
+    /// either lens. The member surface shows more; the vault
+    /// surface shows nothing different. Runs on both a fresh drive
+    /// (all zeros) and the admission fixture (non-zero backlog),
+    /// because a zeros-only agreement is vacuous.
     #[test]
     fn vault_projection_matches_member_counts() {
         use crate::status::observe;
-        let (engine, dir) = scratch_fresh();
+        for (engine, dir) in [scratch_fresh(), scratch_admission()] {
+            let member = observe(&engine, 0).unwrap();
+            let vault = observe_vault(&engine).unwrap();
+            assert_eq!(vault.outbox, member.totals);
+            assert_eq!(vault.queue, member.queue);
+            assert_eq!(vault.reconciliation, member.reconciliation);
+            assert_eq!(vault.materialization, member.materialization);
+            assert_eq!(vault.backlog_empty, member.queue.is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        let (engine, dir) = scratch_admission();
         let member = observe(&engine, 0).unwrap();
-        let vault = observe_vault(&engine).unwrap();
-        assert_eq!(vault.outbox, member.totals);
-        assert_eq!(vault.queue, member.queue);
-        assert_eq!(vault.durability, member.durability);
-        assert_eq!(vault.reconciliation, member.reconciliation);
-        assert_eq!(vault.materialization, member.materialization);
-        assert_eq!(vault.backlog_empty, member.queue.is_empty());
-        assert!(vault.backlog_empty, "a fresh drive owes nothing");
+        assert!(
+            !member.queue.is_empty(),
+            "the admission fixture must owe a backlog, or the agreement is vacuous"
+        );
+        assert_eq!(
+            member.queue.outbox, 4,
+            "two announcements, one transition, one capability"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -256,23 +279,22 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
-
 /// Matrix conformance: the field-to-row inventories pinned as
-/// golden literals. Adding a field to any inventoried struct
-/// without naming its row here fails these tests — that is the
-/// OD-18-4 classification pressure in test-failure form. The
-/// vault-side test below is the teeth: no hidden-row mapping may
-/// appear on the vault projection, so a restricted position can
-/// never gain a field silently.
+/// golden literals against live values. Every `disclosure_map`
+/// destructures its struct exhaustively, so adding a field without
+/// extending the map fails the build — that is the OD-18-4
+/// classification pressure in compile-error form, and these tests
+/// pin the row each field maps to. The vault-side test below is
+/// the teeth: no hidden-row mapping may appear on the vault
+/// projection, so a restricted position can never gain a field
+/// silently.
 #[cfg(test)]
 mod conformance {
-    use wyrd_sync::disclosure::DisclosureRow::{H5, H6, H8, H9, O4};
+    use wyrd_sync::disclosure::DisclosureRow::{H5, H6, H8, H9, O1, O4};
 
-    use super::VaultStatus;
-    use crate::live::PendingObligations;
-    use crate::status::{
-        ConvergenceState, HeadClasses, HeadSummary, MailboxView, PeerHandle, QueueDepth, SyncStatus,
-    };
+    use super::fixtures::*;
+    use super::{observe_vault, VaultStatus};
+    use crate::status::observe;
     use wyrd_sync::runtime::{MaterializationSummary, OutboxTotals, ReconciliationCounters};
 
     /// No hidden-row mapping on the vault projection, ever. This is
@@ -280,18 +302,23 @@ mod conformance {
     /// H-row fails here even if its golden literal was updated.
     #[test]
     fn vault_inventory_is_all_observable() {
-        for (field, row) in VaultStatus::disclosure_map() {
+        let (engine, dir) = scratch_admission();
+        let vault = observe_vault(&engine).unwrap();
+        for (field, row) in vault.disclosure_map() {
             assert!(
                 !row.is_hidden(),
                 "vault field {field} maps to hidden row {row:?}"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn member_projection_inventory_is_pinned() {
+        let (engine, dir) = scratch_admission();
+        let member = observe(&engine, 0).unwrap();
         assert_eq!(
-            SyncStatus::disclosure_map(),
+            member.disclosure_map(),
             &[
                 ("tip", H8),
                 ("held_epochs", H8),
@@ -304,19 +331,21 @@ mod conformance {
                 ("peers", H8),
                 ("queue", O4),
                 ("reconciliation", O4),
-                ("convergence", O4),
+                ("convergence", H5),
                 ("materialization", O4),
                 ("durability", H5),
             ]
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn vault_projection_inventory_is_pinned() {
+        let (engine, dir) = scratch_fresh();
+        let vault = observe_vault(&engine).unwrap();
         assert_eq!(
-            VaultStatus::disclosure_map(),
+            vault.disclosure_map(),
             &[
-                ("durability", O4),
                 ("outbox", O4),
                 ("queue", O4),
                 ("reconciliation", O4),
@@ -324,16 +353,19 @@ mod conformance {
                 ("backlog_empty", O4),
             ]
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn nested_observation_inventories_are_pinned() {
+        let (engine, dir) = scratch_admission();
+        let member = observe(&engine, 0).unwrap();
         assert_eq!(
-            HeadSummary::disclosure_map(),
+            member.live_heads[0].disclosure_map(),
             &[("id", H6), ("epoch", H5), ("author", H5)]
         );
         assert_eq!(
-            HeadClasses::disclosure_map(),
+            member.head_classes.disclosure_map(),
             &[
                 ("eligible", H5),
                 ("canonical_history", H5),
@@ -345,24 +377,27 @@ mod conformance {
             ]
         );
         assert_eq!(
-            PeerHandle::disclosure_map(),
-            &[("handle", O4), ("peer", H8), ("pending", O4)]
+            member.peers[0].disclosure_map(),
+            &[("handle", O1), ("peer", H8), ("pending", O4)]
         );
         assert_eq!(
-            QueueDepth::disclosure_map(),
+            member.queue.disclosure_map(),
             &[("outbox", O4), ("carries", O4), ("fetch", O4)]
         );
         assert_eq!(
-            ConvergenceState::disclosure_map(),
+            member.convergence.disclosure_map(),
             &[
-                ("converged", O4),
-                ("pending_heads", O4),
-                ("unfetchable_heads", O4)
+                ("converged", H5),
+                ("pending_heads", H5),
+                ("unfetchable_heads", H5)
             ]
         );
-        assert_eq!(MailboxView::disclosure_map(), &[("configured_relays", H9)]);
         assert_eq!(
-            PendingObligations::disclosure_map(),
+            member.mailbox.disclosure_map(),
+            &[("configured_relays", H9)]
+        );
+        assert_eq!(
+            member.obligations.disclosure_map(),
             &[
                 ("announcements", H9),
                 ("transitions", H9),
@@ -370,7 +405,7 @@ mod conformance {
             ]
         );
         assert_eq!(
-            OutboxTotals::disclosure_map(),
+            OutboxTotals::default().disclosure_map(),
             &[
                 ("announcements_queued", O4),
                 ("announcements_delivered", O4),
@@ -381,7 +416,7 @@ mod conformance {
             ]
         );
         assert_eq!(
-            ReconciliationCounters::disclosure_map(),
+            ReconciliationCounters::default().disclosure_map(),
             &[
                 ("statements_received", O4),
                 ("transitions_reconciled", O4),
@@ -390,8 +425,9 @@ mod conformance {
             ]
         );
         assert_eq!(
-            MaterializationSummary::disclosure_map(),
+            MaterializationSummary::default().disclosure_map(),
             &[("pinned", O4), ("cached", O4), ("local_objects", O4)]
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

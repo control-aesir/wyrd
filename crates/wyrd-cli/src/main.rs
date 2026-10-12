@@ -209,8 +209,8 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         log_file: Option<PathBuf>,
         /// Start (default) or query the vault. Relay and log-file
-        /// flags are start-only; on status the relays only label the
-        /// mailbox line, exactly as on `sync status`.
+        /// flags are start-only; status takes neither, because it
+        /// never constructs a mailbox (matrix H9).
         #[command(subcommand)]
         action: Option<VaultAction>,
         #[command(flatten)]
@@ -2452,7 +2452,6 @@ fn sync_status_render(status: &SyncStatus) -> String {
 /// composition (matrix rule), even when the process holds keys.
 fn vault_status_render(status: &VaultStatus) -> String {
     let mut out = String::new();
-    out.push_str(&format!("durability: {}\n", status.durability.as_str()));
     let totals = &status.outbox;
     out.push_str(&format!(
         "outbox announcements: {} queued, {} delivered\n",

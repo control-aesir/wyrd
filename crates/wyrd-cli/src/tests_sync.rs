@@ -605,20 +605,49 @@ fn vault_status_reports_durable_state_on_stopped_drive() {
         "stopped drive, durable facts expected:\n{report}"
     );
 }
-
 /// The stopped-drive section is the vault projection, not the
 /// member one: the report carries counts and drive state with none
 /// of the member columns (`sync status`'s tip, epochs, heads,
-/// peers, mailbox). On this fresh drive the negative half is
-/// vacuous by itself, so the test also pins the vault-only lines
-/// (`backlog:`, no per-item detail) that prove which renderer ran.
+/// peers, mailbox). Runs against an admission drive — a live head
+/// with an author, two peer identities, queued obligations — so
+/// the negative half is not vacuous: the exact hex of both
+/// identities must be absent, not just the line prefixes. The
+/// positive half pins the vault-only lines (`backlog: active`, no
+/// per-item detail) that prove which renderer ran.
 #[test]
 fn vault_status_stopped_drive_shows_vault_projection_only() {
     let fixture = Fixture::new();
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let peer_hex = peer.device_id().to_string();
+    let author_hex = read_identity(&fixture.identity_file)
+        .unwrap()
+        .device_id()
+        .to_string();
+    {
+        let mut engine = fixture.open();
+        let mut store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        let chunk = store
+            .insert(ObjectKind::Chunk, b"vault-projection-bytes")
+            .unwrap();
+        let root = Tree::from_entries(vec![Entry::file("f", 22, false, vec![chunk]).unwrap()])
+            .unwrap()
+            .insert_into(&mut store)
+            .unwrap();
+        engine.author_snapshot(&store, root).unwrap();
+        let encryption = DeviceEncryptionSecret::generate().unwrap();
+        engine.stage_carry_heads().unwrap();
+        engine
+            .admit_device(peer.device_id(), encryption.encryption_key())
+            .unwrap();
+        let store = FsObjectStore::open(fixture.drive.clone()).unwrap();
+        engine.carry_pending(&store).unwrap();
+    }
     let identity = read_identity(&fixture.identity_file).unwrap();
     let (report, outcome) = vault_status_report(fixture.drive.clone(), "test-pass", identity);
     outcome.unwrap();
-    for forbidden in [
+    for absent in [
+        peer_hex.as_str(),
+        author_hex.as_str(),
         "held secrets",
         "live heads",
         "author peer-",
@@ -630,16 +659,14 @@ fn vault_status_stopped_drive_shows_vault_projection_only() {
         "convergence:",
     ] {
         assert!(
-            !report.contains(forbidden),
-            "member column leaks onto the vault surface: {forbidden}\n{report}"
+            !report.contains(absent),
+            "member column leaks onto the vault surface: {absent}\n{report}"
         );
     }
     for required in [
-        "durability: working",
-        "outbox announcements: 0 queued, 0 delivered",
-        "queue: 0 outstanding (0 outbox, 0 fetch)",
-        "backlog: quiet",
-        "materialization: 0 cached, 0 pinned, 0 local objects",
+        "outbox announcements: 2 queued",
+        "backlog: active",
+        "materialization: 0 cached, 0 pinned",
     ] {
         assert!(
             report.contains(required),

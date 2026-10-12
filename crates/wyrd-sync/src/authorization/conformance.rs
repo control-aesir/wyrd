@@ -282,6 +282,55 @@ fn snapshot_with_unknown_parent_is_pending() {
     );
 }
 
+/// The admission-resume boundary (OD-16-3, R1 finding 2):
+/// `eligible_heads_at_epoch` pins the horizon but follows current
+/// verdicts — it does not time-travel the log. An admission and a
+/// later freeze must not move the pinned seed set: the freeze only
+/// contests the new tips, never rewrites canonical history, so the
+/// epoch-1 head stays eligible at the pinned epoch. (Voiding only
+/// ever touches branches that freezing already made ineligible, so
+/// no eligible→voided transition is reachable through the state
+/// machine; this test pins the reachable half.)
+#[test]
+fn pinned_epoch_survives_admission_and_freeze() {
+    let mut f = Fixture::new(1);
+    let mut dag = SnapshotDag::new(f.drive);
+    let s = f.owner_snapshot(Vec::new(), tree_id(1));
+    let id = observe(&mut dag, &s);
+    assert_eq!(
+        dag.eligible_heads_at_epoch(&f.log, 1),
+        vec![id],
+        "baseline: the pinned epoch reproduces the live set"
+    );
+
+    // Admission opens epoch 2: old verdicts preserved, pinned seeds
+    // unchanged — the resume guarantee.
+    let (_, second) = f.device(2);
+    f.membership(vec![admit(second)]);
+    assert_eq!(
+        dag.eligible_heads_at_epoch(&f.log, 1),
+        vec![id],
+        "admission preserves the pinned seed set"
+    );
+
+    // Freeze at epoch 3: two valid contenders, conflict frozen. The
+    // freeze contests the new tips only; canonical history — and
+    // the pinned epoch-1 head — does not move.
+    let (_, third) = f.device(3);
+    let a = f.builder.child(vec![Change::Rotate]);
+    let mut fork = a.clone();
+    fork = fork.with_changes(vec![admit(third)]).unwrap();
+    fork.members_root = set_root(MEMBER_SET_CONTEXT, &[f.owner, second, third]).unwrap();
+    crate::membership::test_util::sign(&mut fork, &f.sk, &f.drive);
+    f.log.observe(a);
+    f.log.observe(fork);
+    assert_eq!(
+        dag.eligible_heads_at_epoch(&f.log, 1),
+        vec![id],
+        "a later freeze does not rewrite the pinned seed set"
+    );
+}
+
 // --- voided / superseded / stranded --------------------------------------
 
 #[test]

@@ -103,18 +103,20 @@ impl VaultStatus {
 /// Observe vault-position status from durable state. Reads committed
 /// facts only; commits nothing, connects to nothing, and — unlike
 /// [`crate::status::observe`] — never extracts an identity-bearing
-/// row. The engine calls below are the complete read set:
-/// totals, pending-obligation counts, carries, reconciliation gaps,
-/// materialization, and reconciliation counters.
+/// row. The engine calls below are the complete read set: one
+/// runtime-state rebuild (totals, pending counts, carries,
+/// reconciliation gaps, materialization) plus the reconciliation
+/// counters — no per-class rebuilds beyond what the member
+/// projection already performs.
 pub fn observe_vault(engine: &Engine) -> Result<VaultStatus, EngineError> {
     let state = engine.runtime_state()?;
     let outbox = state.outbox_totals();
     // Pending pairs per class from the same set difference the
     // member projection counts (`RuntimeState::pending_*`: queued
-    // minus delivered ∪ reconciled), counted inside the engine so
-    // no recipient or snapshot identity crosses this boundary —
-    // plus the staged carries the itemized lists do not cover.
-    let (announcements, transitions, capabilities) = engine.pending_obligation_counts()?;
+    // minus delivered ∪ reconciled), tallied without materializing
+    // the pairs — plus the staged carries the itemized lists do
+    // not cover.
+    let (announcements, transitions, capabilities) = state.pending_obligation_counts();
     let carries = state.pending_carries().len();
     let reconcile = state.reconcile();
     let queue = QueueDepth {
@@ -293,7 +295,7 @@ mod conformance {
     use wyrd_sync::disclosure::DisclosureRow::{H5, H6, H8, H9, O1, O4};
 
     use super::fixtures::*;
-    use super::{observe_vault, VaultStatus};
+    use super::observe_vault;
     use crate::status::observe;
     use wyrd_sync::runtime::{MaterializationSummary, OutboxTotals, ReconciliationCounters};
 
@@ -361,7 +363,11 @@ mod conformance {
         let (engine, dir) = scratch_admission();
         let member = observe(&engine, 0).unwrap();
         assert_eq!(
-            member.live_heads[0].disclosure_map(),
+            member
+                .live_heads
+                .first()
+                .expect("admission fixture carries a live head")
+                .disclosure_map(),
             &[("id", H6), ("epoch", H5), ("author", H5)]
         );
         assert_eq!(
@@ -377,7 +383,11 @@ mod conformance {
             ]
         );
         assert_eq!(
-            member.peers[0].disclosure_map(),
+            member
+                .peers
+                .first()
+                .expect("admission fixture names peers")
+                .disclosure_map(),
             &[("handle", O1), ("peer", H8), ("pending", O4)]
         );
         assert_eq!(

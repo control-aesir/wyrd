@@ -538,9 +538,9 @@ strictly separated sections: process posture from the sidecar
 (instance, serving id, startup/ready timestamps, last-pass
 timestamp and verdict, run counters, posture timestamp with its
 age) and durable state (the vault-position projection — counts
-and drive state only, never the member columns `sync status`
-prints — when the drive is stopped; unavailable — never guessed
-— while the vault runs). Fresh means recent, stale means last-recorded, and
+only, never the member columns `sync status` prints — when the
+drive is stopped; unavailable — never guessed — while the
+vault runs). Fresh means recent, stale means last-recorded, and
 both say liveness unverified: a process can die immediately after
 writing, and a fresh posture is not convergence. The staleness
 threshold is three posture intervals (180s), part of the contract.

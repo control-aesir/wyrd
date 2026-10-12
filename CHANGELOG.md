@@ -23,6 +23,15 @@ version say exactly what changed.
 
 ### Added
 
+- Observation × trust-position matrix (`docs/trust.md`):
+  the 18 hidden/observable disclosure classes as normative rows
+  over five trust positions (keyless replica, member-hosted
+  composition, public relay, drive member, removed device), each
+  cell carrying a verdict at guaranteed / best-effort / accepted
+  exposure confidence, with vault surfaces bound to the keyless
+  column on every composition and conformance clauses (data-flow
+  classification, missing-and-misleading detection, derived
+  observations classified by disclosure).
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

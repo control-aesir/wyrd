@@ -112,7 +112,9 @@ export function buildLabelArgv(input: TriageInput, removals: string[] = []): str
 // Decide the single label call from an already-parsed current view. Returns
 // errors (never a call) when the view cannot establish what the triage
 // would displace: a view this tool cannot parse is a triage it must not
-// write. Gives the refusal paths a lib-level test seam.
+// write. Success returns the argv and the labels it displaces, so the
+// reported result and the --remove-label set are one array, not two
+// derivations that can drift. Gives the refusal paths a lib-level test seam.
 export function planTriageCall(view: unknown, input: TriageInput): { argv: string[]; removed: string[] } | { errors: string[] } {
   const labels: unknown =
     typeof view === "object" && view !== null && "labels" in view
@@ -131,6 +133,25 @@ export function planTriageCall(view: unknown, input: TriageInput): { argv: strin
 }
 
 export type JsonDocument = { ok: true; value: unknown } | { ok: false; error: string }
+
+// The reported success shape, built here (not in the plugin entry) so the
+// offline suite pins exactly what a triage claims: the file the loader
+// executes stays a thin façade over tested code.
+export function triageSuccessResult(input: TriageInput, removed: string[]): {
+  ok: true
+  applied: true
+  id: string
+  labels: string[]
+  removed: string[]
+} {
+  return {
+    ok: true,
+    applied: true,
+    id: input.id,
+    labels: [input.type, input.priority, input.milestone],
+    removed,
+  }
+}
 
 export function parseJsonDocument(stdout: string): JsonDocument {
   const trimmed = stdout.trim()

@@ -137,12 +137,16 @@ mechanism rather than an add-on:
 > durable recipient state demonstrates that the obligation is
 > already subsumed.
 
-- **Announcement (snapshot S → R):** R's durable state either
-  contains a snapshot whose ancestry includes S, or contains
-  whatever durable holding fact the reconciliation statement
-  projects as "S held". The statement is the transport
-  representation of that fact, never equivalent to the fact
-  itself.
+- **Announcement (snapshot S → R):** R's durable state evidences S
+  directly — S is a member of the snapshot set R's reconciliation
+  statement projects ("S held"). Direct evidence only, deliberately:
+  the sender cannot validate snapshot ancestry it never held, so a
+  successor's presence proves nothing here and ancestry-widened
+  predicates (admissible for transitions above) are not claimed for
+  announcements. Omission costs retransmission, never loss — the
+  conservative direction the safety invariant below requires. The
+  statement is the transport representation of that fact, never
+  equivalent to the fact itself.
 - **Transition (T → R):** R has durably committed T, or has
   durably committed a successor whose validated ancestry contains
   T. The successor case is a valid proof predicate, not a
@@ -158,11 +162,13 @@ Recovery requirements attach to the semantic class, not uniformly
 to all envelopes (`object-model.md` decision 33): transitions and
 capabilities carry the state machine itself, and their loss strands
 protocol progress; loss of announcements does not strand the same
-protocol state machine, so they follow later under their own
-retirement tag. The 21c scope boundary below
-reflects that ordering: transitions and capabilities retire first,
-while announcement obligations stay pending until their own
-retirement kind exists.
+protocol state machine, so they retire under their own retirement
+tag (`AnnouncementReconciled`), committed on the same durable-
+evidence rule. The implementation below retires all three classes;
+the announcement half additionally queues the recipient's missing
+set (synthesized obligations — no prior queue fact needs to exist)
+so a late joiner learns superseded-epoch snapshots through this
+mechanism instead of a second one.
 
 Retirement commits a new sender-side durable fact, one kind per
 obligation class (`AnnouncementReconciled`,
@@ -263,7 +269,11 @@ budget interacts with the resource-limits work rather than being
 solved here. The pull covers what push cannot: relay retention is
 irrelevant to a recipient that asks. This same primitive serves the
 late-joiner case (superseded-epoch snapshot ids): "the recipient
-does not know what it missed" gets one design, not two.
+does not know what it missed" gets one design, not two — the
+response pass queues and sends the missing announcements and
+retires them on later evidence, so a newcomer holding old epoch
+keys learns what exists without ever having been queued the
+announcements at admission time.
 
 A relay acceptance behind a request marks only that the bytes left,
 never that the peer opened them: a sender that has rotated past the
@@ -295,21 +305,36 @@ it may omit what the full comparison would use (causing
 retransmission), never assert subsumption the durable facts do not
 support.
 
-Implemented as 21c (`runtime::respond`): the sender answers each
+Implemented as the response pass (`runtime::respond`): the sender answers each
 received statement once per process lifetime (a volatile answered
 set; restarts re-answer idempotently), retiring what the evidence
 covers and retransmitting — at most 32 sends per statement —
-what it does not, through the existing deliver path with no new
+what it does not, through the existing deliver paths with no new
 wire kind. Transitions sealed past the recipient's newest
 evidenced install are skipped, never retired, until the
 capability install arrives (rotation framing is never skipped, so
-the keys land first). Scope boundary, stated normatively: 21c
-retires transition and capability obligations; announcement
-obligations remain pending and are not eligible for
-reconciliation retirement in 21c.
+the keys land first). Announcements follow the same epoch rule per
+snapshot — a snapshot whose epoch the recipient evidences no
+install for is neither queued nor sent until a later statement
+evidences it — and retire on direct statement evidence of the
+snapshot itself, with no ancestry widening. The announcement half
+queues but never sends inside the answer pass: the synthesized
+queue discharges on the barrier-gated publish pass (under the live
+route for first-party snapshots, through the resume path for
+third-party ones), because the answer pass runs before the
+serving-readiness barrier and only the publish pass may promise a
+local route. Two stated limits: a relay-accepted send that the
+recipient never ingested stays outside the missing set (pending
+derives as queued minus delivered, and retirement must stay
+sound), so reconciliation covers recipients with no queue fact at
+all, not sends accepted and lost; and the synthesized queue is not
+re-gated against current membership — the seal is under the
+epoch's control key the recipient already holds, so it learns
+nothing it could not decrypt, exactly like the outbox it joins.
 
 Surfaced as 21d: `sync status` carries a `reconciliation` row —
-statements received plus transitions and capabilities retired,
+statements received plus transitions, capabilities, and
+announcements retired,
 all from committed facts, classes and counts only — and `sync now`
 reports the open gap as two gauges: statements never evaluated,
 plus evaluated-but-stuck ones whose requester is still owed. The

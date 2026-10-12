@@ -8,6 +8,7 @@ use crate::keys::capability::DriveKeyring;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::transport::endpoint_id;
 use crate::transport::mailbox::Mailbox;
+use wyrd_format::SnapshotId;
 
 /// Announce an authored snapshot to every other admitted device of the
 /// snapshot's bound transition — members and readers alike — over the
@@ -473,15 +474,34 @@ fn reuse_or_seal_route(
 fn reannounce_one(
     engine: &mut Engine,
     rebuilt: &Rebuilt,
-    snapshot: wyrd_format::SnapshotId,
+    snapshot: SnapshotId,
     mailbox: &mut impl Mailbox,
-    scope: &std::collections::BTreeSet<wyrd_format::SnapshotId>,
+    scope: &std::collections::BTreeSet<SnapshotId>,
 ) -> Result<usize, EngineError> {
     let Some(known) = rebuilt.runtime.announcement(&snapshot).cloned() else {
         return Ok(0);
     };
+    let Some(sealed_bytes) = reannounce_sealed_bytes(engine, rebuilt, snapshot, &known)? else {
+        // No sealing key: retain the obligation for a later pass.
+        return Ok(0);
+    };
+    send_pending_for(engine, snapshot, &sealed_bytes, mailbox, None, scope)
+}
+
+/// Seal the known signed announcement for one snapshot: reuse the
+/// persisted bytes when a previous attempt sealed them (verified
+/// against the obligation, exactly as the resume path does), else
+/// seal the author's statement fresh under its own epoch. Returns
+/// the bytes to send, or `None` when the sealing key is not held
+/// (the obligation stays pending for a later pass).
+fn reannounce_sealed_bytes(
+    engine: &mut Engine,
+    rebuilt: &Rebuilt,
+    snapshot: SnapshotId,
+    known: &SnapshotAnnouncement,
+) -> Result<Option<Vec<u8>>, EngineError> {
     let epoch = known.epoch;
-    let sealed_bytes = match rebuilt.runtime.announcement_sealed_bytes(&snapshot) {
+    match rebuilt.runtime.announcement_sealed_bytes(&snapshot) {
         Some(bytes) => {
             // Verify reused bytes against the obligation, as in
             // `announce_pending`: a mismatched sealed fact must fail
@@ -517,12 +537,12 @@ fn reannounce_one(
             )?
             else {
                 // No sealing key: retain the obligation for a later pass.
-                return Ok(0);
+                return Ok(None);
             };
-            bytes
+            Ok(Some(bytes))
         }
         None => {
-            let message = Message::SnapshotAnnouncement(known);
+            let message = Message::SnapshotAnnouncement(known.clone());
             let Some(bytes) =
                 seal_fresh_for(engine, &rebuilt.keyring, epoch, &message, |sealed| {
                     Fact::AnnouncementSealed(snapshot, sealed)
@@ -531,12 +551,11 @@ fn reannounce_one(
                 // No sealing key: the obligation stays pending and
                 // observable via the pending projection instead of
                 // failing the whole pass on every drain.
-                return Ok(0);
+                return Ok(None);
             };
-            bytes
+            Ok(Some(bytes))
         }
-    };
-    send_pending_for(engine, snapshot, &sealed_bytes, mailbox, None, scope)
+    }
 }
 
 /// Send the sealed bytes to every send-eligible recipient of one

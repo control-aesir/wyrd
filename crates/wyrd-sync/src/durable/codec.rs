@@ -87,9 +87,7 @@ pub(super) const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
 /// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1A:
 /// the tag space is append-only. Fixed 96 bytes — a retirement names
 /// the obligation, whom it is retired for, and exactly which
-/// statement proved it, nothing else. 21c retires transitions and
-/// capabilities only; no announcement retirement kind exists (scope
-/// boundary, not a missing case).
+/// statement proved it, nothing else.
 pub(super) const TAG_TRANSITION_RECONCILED: u8 = 0x1A;
 /// A retired capability obligation: epoch u64 LE (8) ‖ recipient
 /// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1B,
@@ -102,9 +100,18 @@ pub(super) const TAG_CAPABILITY_RECONCILED: u8 = 0x1B;
 /// exactly which serving endpoint carried it, nothing else.
 /// Crate-visible for the tag-boundary pin below.
 pub(super) const TAG_ANNOUNCEMENT_DELIVERED_ROUTE: u8 = 0x1C;
+/// A retired announcement obligation: snapshot id (32) ‖ recipient
+/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1D:
+/// the tag space is append-only. Fixed 96 bytes — a retirement names
+/// the obligation, whom it is retired for, and exactly which
+/// statement proved it, nothing else. The announcement-class half of
+/// reconciliation: the late-joiner retirement the 21c scope boundary
+/// deferred.
+/// Crate-visible for the tag-boundary pin below.
+pub(super) const TAG_ANNOUNCEMENT_RECONCILED: u8 = 0x1D;
 /// Record tags this version understands. Unknown tags are skipped on
 /// decode for forward compatibility.
-pub(super) const KNOWN_TAGS: [u8; 28] = [
+pub(super) const KNOWN_TAGS: [u8; 29] = [
     TAG_TRANSITION,
     TAG_CAPABILITY,
     TAG_ANNOUNCEMENT,
@@ -133,6 +140,7 @@ pub(super) const KNOWN_TAGS: [u8; 28] = [
     TAG_TRANSITION_RECONCILED,
     TAG_CAPABILITY_RECONCILED,
     TAG_ANNOUNCEMENT_DELIVERED_ROUTE,
+    TAG_ANNOUNCEMENT_RECONCILED,
 ];
 
 /// Resource limits: a corrupt local file must not cause unbounded
@@ -471,6 +479,10 @@ pub(super) fn encode_fact(
             TAG_CAPABILITY_RECONCILED,
             encode_reconciled_capability(*epoch, recipient, statement),
         )),
+        Fact::AnnouncementReconciled(snapshot, recipient, statement) => Ok((
+            TAG_ANNOUNCEMENT_RECONCILED,
+            encode_reconciled_announcement(snapshot, recipient, statement),
+        )),
     }
 }
 
@@ -543,6 +555,21 @@ fn encode_reconciled_transition(
 fn encode_reconciled_capability(epoch: u64, recipient: &DeviceId, statement: &[u8; 32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(72);
     out.extend_from_slice(&epoch.to_le_bytes());
+    out.extend_from_slice(recipient.as_bytes());
+    out.extend_from_slice(statement);
+    out
+}
+
+/// Encode a retired announcement obligation: the fixed 96-byte
+/// triple, same shape as the transition retirement — the snapshot id
+/// is 32 bytes, so no epoch-width variant is needed.
+fn encode_reconciled_announcement(
+    snapshot: &SnapshotId,
+    recipient: &DeviceId,
+    statement: &[u8; 32],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
+    out.extend_from_slice(snapshot.as_bytes());
     out.extend_from_slice(recipient.as_bytes());
     out.extend_from_slice(statement);
     out
@@ -909,6 +936,7 @@ fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> O
         TAG_RECONCILIATION_REQUEST => Some(decode_reconciliation_request(record)?),
         TAG_TRANSITION_RECONCILED => Some(decode_reconciled_transition(record)?),
         TAG_CAPABILITY_RECONCILED => Some(decode_reconciled_capability(record)?),
+        TAG_ANNOUNCEMENT_RECONCILED => Some(decode_reconciled_announcement(record)?),
         // Unreachable: the caller filters unknown tags.
         _ => None,
     }
@@ -938,6 +966,20 @@ fn decode_reconciled_capability(record: &[u8]) -> Option<DecodedFact> {
     let statement: [u8; 32] = record[40..72].try_into().ok()?;
     Some(DecodedFact::CapabilityReconciled(
         epoch, recipient, statement,
+    ))
+}
+
+/// Decode a retired announcement obligation: the exact 96-byte
+/// triple, same strictness as the transition retirement above.
+fn decode_reconciled_announcement(record: &[u8]) -> Option<DecodedFact> {
+    if record.len() != 96 {
+        return None;
+    }
+    let snapshot = SnapshotId::from_bytes(record[0..32].try_into().ok()?);
+    let recipient = DeviceId::from_bytes(record[32..64].try_into().ok()?);
+    let statement: [u8; 32] = record[64..96].try_into().ok()?;
+    Some(DecodedFact::AnnouncementReconciled(
+        snapshot, recipient, statement,
     ))
 }
 
@@ -1106,6 +1148,7 @@ pub(super) enum DecodedFact {
     ReconciliationRequestReceived(DeviceId, ReconciliationEvidence),
     TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
     CapabilityReconciled(u64, DeviceId, [u8; 32]),
+    AnnouncementReconciled(SnapshotId, DeviceId, [u8; 32]),
 }
 
 // Sibling test file under the workspace tests_* naming: #[path] is required

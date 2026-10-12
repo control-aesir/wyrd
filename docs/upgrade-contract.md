@@ -188,10 +188,18 @@ Releases are not required to write every format they read:
     skips both tags and keeps the obligation pending (retries what a
     new node retired — the safe direction). `0x1A`/`0x1B` follow
     `0x19`, checked against the full tag set, with the one-tag-per-
-    class rule pinned alongside the boundary. No announcement
-    retirement tag exists in 21c: announcement obligations stay
-    pending by scope boundary, and a future announcement retirement
-    would allocate its own tag, never overload these two.
+    class rule pinned alongside the boundary.
+
+    The announcement retirement fact (`0x1D`) is the third
+    `*Reconciled` kind: the same fixed triple keyed by snapshot id
+    (32 ‖ 32 ‖ 32, fixed 96 bytes like the transition retirement),
+    committed when a recipient's statement evidences a snapshot the
+    sender still owes it — the late-joiner retirement. Same safe
+    direction as the other two: an old node skips the unknown tag
+    and keeps retrying what a new node retired. `0x1D` follows
+    `0x1C`, checked against the full tag set (pinned by
+    `announcement_retirement_tag_is_a_clean_upgrade_boundary`),
+    never overloading the class tags above.
 
     The announcement route record (`0x1C`) names, per discharged
     announcement, the serving endpoint it was sent against: snapshot

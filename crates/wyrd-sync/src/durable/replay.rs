@@ -53,6 +53,7 @@ pub enum RuntimeFact {
     CapabilityDelivered(u64, DeviceId),
     TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
     CapabilityReconciled(u64, DeviceId, [u8; 32]),
+    AnnouncementReconciled(SnapshotId, DeviceId, [u8; 32]),
     CarryQueued(SnapshotId),
     CarryDone(SnapshotId),
 }
@@ -117,6 +118,11 @@ pub struct LoadedFacts {
     /// recipient, proving statement digest) triples, same shape as
     /// above.
     pub capability_reconciled: Vec<(u64, DeviceId, [u8; 32])>,
+    /// Retired announcement obligations, in commit order: (snapshot,
+    /// recipient, proving statement digest) triples, same shape as
+    /// above — the late-joiner retirement the sender's set
+    /// difference commits once the recipient evidences the snapshot.
+    pub announcement_reconciled: Vec<(SnapshotId, DeviceId, [u8; 32])>,
     pub runtime_facts: Vec<RuntimeFact>,
 }
 
@@ -287,6 +293,13 @@ impl LoadedFacts {
                     epoch, recipient, statement,
                 ));
             }
+            DecodedFact::AnnouncementReconciled(snapshot, recipient, statement) => {
+                self.announcement_reconciled
+                    .push((snapshot, recipient, statement));
+                self.runtime_facts.push(RuntimeFact::AnnouncementReconciled(
+                    snapshot, recipient, statement,
+                ));
+            }
         }
     }
 }
@@ -436,6 +449,9 @@ pub(super) fn rebuild_facts(
             }
             RuntimeFact::CapabilityReconciled(epoch, recipient, statement) => {
                 runtime.record_capability_reconciled(epoch, recipient, statement);
+            }
+            RuntimeFact::AnnouncementReconciled(snapshot, recipient, statement) => {
+                runtime.record_announcement_reconciled(snapshot, recipient, statement);
             }
             RuntimeFact::CarryQueued(head) => {
                 runtime.record_carry_queued(head);

@@ -515,12 +515,17 @@ pub enum Fact {
     /// outstanding, and only against a statement from the durable
     /// received-request bucket — never against a live projection.
     /// Pending derives as queued minus (delivered ∪ reconciled), so
-    /// this is the fact that lets an obligation stop retrying. No
-    /// announcement retirement kind exists in 21c: announcement
-    /// obligations stay pending by scope boundary, pinned by test.
+    /// this is the fact that lets an obligation stop retrying.
     TransitionReconciled(TransitionId, DeviceId, [u8; 32]),
     /// A retired capability obligation: the epoch, the recipient,
     /// and the proving statement digest. Same commit rule and same
     /// pending derivation as above.
     CapabilityReconciled(u64, DeviceId, [u8; 32]),
+    /// A retired announcement obligation: the snapshot, the
+    /// recipient, and the proving statement digest. Same commit rule
+    /// and same pending derivation as above — the announcement-class
+    /// half of reconciliation, which lets a late joiner's learned
+    /// snapshots stop the sender retrying what the recipient's
+    /// durable state already evidences.
+    AnnouncementReconciled(SnapshotId, DeviceId, [u8; 32]),
 }

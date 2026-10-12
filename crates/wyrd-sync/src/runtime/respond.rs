@@ -45,11 +45,25 @@
 //! caused, carries the remainder — with no sender-side cursor. The
 //! durable recipient state is the cursor.
 //!
-//! Scope boundary (OD-21-1 b): transitions and capabilities retire
-//! here. Announcement obligations are never eligible for
-//! reconciliation retirement in 21c — no announcement retirement
-//! kind exists, the announcement derivation is untouched, and a test
-//! pins that no statement changes it.
+//! Scope: transitions, capabilities, and announcements retire
+//! here. Announcement obligations join on the same durable-evidence
+//! rule — direct statement evidence of the snapshot — with their own
+//! retirement kind (`AnnouncementReconciled`); a test pins that a
+//! statement evidencing a queued snapshot retires it. The
+//! late-joiner half: a statement from a recipient that never
+//! received an announcement queues the sender's missing set for
+//! that recipient (synthesized obligations — no prior queue fact
+//! needs to exist), and the barrier-gated publish pass discharges
+//! the queue — under the live route for first-party snapshots, and
+//! through the resume path for third-party ones — so a newcomer
+//! learns superseded-epoch snapshots through the one
+//! reconciliation mechanism instead of a second one.
+//!
+//! The answer pass itself sends no announcements, deliberately:
+//! announcement discharge stays behind the serving-readiness
+//! barrier, and the answer pass runs before it. Queueing is the
+//! answer's whole announcement half; the sends follow on the
+//! publish pass like every other queued obligation.
 //!
 //! A frozen drive answers nothing: unresolved membership leaves both
 //! the recipient set and the obligations ambiguous, and the
@@ -60,9 +74,9 @@
 
 use std::collections::BTreeSet;
 
-use wyrd_format::{DeviceId, TransitionId};
+use wyrd_format::{DeviceId, SnapshotId, TransitionId};
 
-use super::author::{capability_obligation, transition_obligation};
+use super::author::{announcement_obligation, capability_obligation, transition_obligation};
 use super::engine::{Engine, EngineError};
 use super::state::RuntimeState;
 use crate::durable::{reconciliation_statement_digest, Fact, ReconciliationEvidence};
@@ -188,14 +202,34 @@ impl Engine {
             }
             let outstanding_t = outstanding_transitions(&rebuilt.runtime, requester);
             let outstanding_c = outstanding_capabilities(&rebuilt.runtime, requester);
-            if outstanding_t.is_empty() && outstanding_c.is_empty() {
+            let outstanding_a = outstanding_announcements(&rebuilt.runtime, requester);
+            let missing_a = missing_announcements(&rebuilt.runtime, evidence, requester);
+            if outstanding_t.is_empty()
+                && outstanding_c.is_empty()
+                && outstanding_a.is_empty()
+                && missing_a.is_empty()
+            {
                 continue;
             }
             let covered_t = covered_transitions(&outstanding_t, evidence, &rebuilt.log);
             let covered_c = covered_capabilities(&outstanding_c, requester, evidence);
-            let retired = self.retire_covered(requester, digest, covered_t, covered_c)?;
+            let covered_a = covered_announcements(&outstanding_a, evidence);
+            let retired =
+                self.retire_covered(requester, digest, covered_t, covered_c, covered_a)?;
             report.retired += retired;
             if retired > 0 {
+                dirty = true;
+            }
+            // Queue the statement's missing set before sending: the
+            // obligation must exist durably before bytes move, so a
+            // crash between queue and send leaves a discoverable
+            // obligation, never a sent-but-unrecorded announcement.
+            // Chunked like retirements — same crash-granularity
+            // rationale — and marked dirty like them, so the next
+            // statement compares against state that includes these
+            // queues instead of re-queueing duplicates.
+            let queued = self.queue_missing_announcements(requester, &missing_a)?;
+            if queued > 0 {
                 dirty = true;
             }
             let sent = super::author::deliver_scoped(
@@ -211,10 +245,12 @@ impl Engine {
             // moved none — the sender-side UnknownEpoch skip is the
             // standing shape. Covered-empty statements never reach
             // here (the `continue` above), so reaching this arm with
-            // zero progress means stuck, not closed. Recorded for
-            // 21d's stall gauge; liveness is decided at read time,
-            // so no clearing belongs here.
-            if retired == 0 && sent == 0 {
+            // zero progress means stuck, not closed. Queueing counts
+            // as progress: the obligation is durably recorded and the
+            // sends follow on the publish pass. Recorded for 21d's
+            // stall gauge; liveness is decided at read time, so no
+            // clearing belongs here.
+            if retired == 0 && sent == 0 && queued == 0 {
                 self.stalled_statements.insert((*requester, *digest));
             }
         }
@@ -239,8 +275,9 @@ impl Engine {
         digest: &[u8; 32],
         covered_t: Vec<TransitionId>,
         covered_c: Vec<u64>,
+        covered_a: Vec<SnapshotId>,
     ) -> Result<usize, EngineError> {
-        let mut facts = Vec::with_capacity(covered_t.len() + covered_c.len());
+        let mut facts = Vec::with_capacity(covered_t.len() + covered_c.len() + covered_a.len());
         for id in covered_t {
             facts.push(Fact::TransitionReconciled(id, *requester, *digest));
             // Retirement discharges the obligation exactly like relay
@@ -258,12 +295,57 @@ impl Engine {
                 *requester,
             ));
         }
+        for snapshot in covered_a {
+            facts.push(Fact::AnnouncementReconciled(snapshot, *requester, *digest));
+            self.refusal_warned.remove(&(
+                "announcement",
+                announcement_obligation(&snapshot),
+                *requester,
+            ));
+        }
         let mut retired = 0usize;
         for chunk in facts.chunks(RETIRE_COMMIT_BATCH) {
             self.commit_facts(chunk)?;
             retired += chunk.len();
         }
         Ok(retired)
+    }
+
+    /// Stage 3b: queue the statement's missing announcement set for
+    /// this recipient, chunked like retirements. These are
+    /// synthesized obligations — no prior queue fact needs to exist:
+    /// the recipient evidenced a gap against snapshots this sender
+    /// knows, so the sender owes them now. Covered-gated upstream
+    /// (the `missing_announcements` derivation excludes covered
+    /// pairs), so a re-answer commits no duplicates; the
+    /// `announcement_covered` check inside the derivation is the
+    /// second layer, keeping the projection correct even if a
+    /// duplicate queue fact ever lands.
+    ///
+    /// The send cap does not bound this queue: one statement can
+    /// queue more than one pass sends. Each pair is deduped (queued
+    /// once however often it is missing), the remainder discharges
+    /// on the publish pass and the recipient's next statement, and
+    /// the per-pair cost is one small fact — the same shape as the
+    /// admission closure's one-obligation-per-member commit.
+    fn queue_missing_announcements(
+        &mut self,
+        requester: &DeviceId,
+        missing: &[SnapshotId],
+    ) -> Result<usize, EngineError> {
+        let mut queued = 0usize;
+        for chunk in missing.chunks(RETIRE_COMMIT_BATCH) {
+            let facts: Vec<Fact> = chunk
+                .iter()
+                .map(|snapshot| Fact::AnnouncementQueued(*snapshot, *requester))
+                .collect();
+            if facts.is_empty() {
+                continue;
+            }
+            self.commit_facts(&facts)?;
+            queued += facts.len();
+        }
+        Ok(queued)
     }
 }
 
@@ -355,6 +437,76 @@ fn covered_capabilities(
         .iter()
         .copied()
         .filter(|epoch| evidence.capabilities.contains(&(*recipient, *epoch)))
+        .collect()
+}
+
+/// Outstanding announcement obligations for one recipient, in
+/// pending order. Stage-1 input alongside transitions and
+/// capabilities above: what the sender still owes R.
+fn outstanding_announcements(runtime: &RuntimeState, recipient: &DeviceId) -> Vec<SnapshotId> {
+    runtime
+        .pending_announcements()
+        .into_iter()
+        .filter(|(_, r)| r == recipient)
+        .map(|(snapshot, _)| snapshot)
+        .collect()
+}
+
+/// The statement's missing announcement set: snapshots this sender
+/// has a recorded (author-signed) announcement for, minus snapshots
+/// the recipient's evidence already holds. Stage-1 input for the
+/// synthesized queue — the late-joiner derivation.
+///
+/// Three gates, all conservative:
+/// - **Recorded announcements only.** A snapshot with a body but no
+///   signed announcement cannot be forwarded: only the author
+///   authors, everyone else re-sends the author's statement.
+/// - **Installed epochs only.** The seal goes under the
+///   announcement's own epoch, so an epoch the recipient evidences
+///   no install for is skipped, never queued — the transition
+///   UnknownEpoch skip in announcement form. A later statement
+///   evidencing the install re-derives and queues then.
+/// - **Uncovered only.** Queued, delivered, or reconciled pairs
+///   never re-queue: re-answers are idempotent by construction.
+///   Sorted by snapshot id (the recorded map's order), so the queue
+///   commits deterministically.
+fn missing_announcements(
+    runtime: &RuntimeState,
+    evidence: &ReconciliationEvidence,
+    requester: &DeviceId,
+) -> Vec<SnapshotId> {
+    let installs: BTreeSet<u64> = evidence
+        .capabilities
+        .iter()
+        .filter(|(device, _)| device == requester)
+        .map(|(_, epoch)| *epoch)
+        .collect();
+    runtime
+        .recorded_announcement_epochs()
+        .filter(|(snapshot, epoch)| {
+            !evidence.snapshots.contains(snapshot)
+                && installs.contains(epoch)
+                && !runtime.announcement_covered(*snapshot, *requester)
+        })
+        .map(|(snapshot, _)| snapshot)
+        .collect()
+}
+
+/// Stage 2 for announcements: which outstanding snapshots R's
+/// evidence covers. Direct evidence only — S retires iff the
+/// statement evidences S itself. No ancestry widening: the sender
+/// cannot validate snapshot ancestry it never held, so a
+/// successor's presence proves nothing here. The conservative
+/// direction throughout: omission costs retransmission, assertion
+/// would cost the obligation.
+fn covered_announcements(
+    outstanding: &[SnapshotId],
+    evidence: &ReconciliationEvidence,
+) -> Vec<SnapshotId> {
+    outstanding
+        .iter()
+        .copied()
+        .filter(|snapshot| evidence.snapshots.contains(snapshot))
         .collect()
 }
 

@@ -160,14 +160,26 @@ characters (x-only pubkeys).
   drive carries nothing; the reported `(N carried)` names the count.
 - `invite <device> <encryption-key> <out> [--reader]`: admit a device
   and write its sealed invitation to `<out>` for out-of-band delivery.
-  The transition commits with the usual catch-up obligations; the
-  newcomer joins from the invitation file. With `--reader` the device
-  joins read-only: it holds every epoch secret but authors nothing.
-  The destination is claimed before the commit: an existing file is
-  refused, and an uncreatable path fails with no transition authored.
-  A write failure past the commit leaves the admission standing —
-  recover with `reissue-invitation` below instead of re-inviting
-  (which reports `AlreadyMember` — or `AlreadyReader`).
+  The transition commits with the usual catch-up obligations, filled
+  incrementally in bounded batches; the report names the obligations
+  and batches (`N obligations in K batches`). The newcomer joins from
+  the invitation file. With `--reader` the device joins read-only: it
+  holds every epoch secret but authors nothing. The destination is
+  claimed before the commit: an existing file is refused, and an
+  uncreatable path fails with no transition authored. A write failure
+  past the commit leaves the admission standing — recover with
+  `reissue-invitation` below, or rerun invite: rerunning for an
+  already-admitted device resumes its catch-up fill instead of
+  failing, after verifying the supplied key and role against the
+  recorded admission (a mismatch refuses with the actual role named
+  rather than recovering the wrong identity). The three rerun
+  outcomes are distinct: `already a member; resumed M obligations`,
+  `catch-up already complete; 0 obligations`, and the fresh
+  admission above — each with a reissued invitation written to
+  `<out>`. An admission whose membership batch cannot fit the
+  per-commit ceiling refuses with a named capacity error (counts,
+  ceiling, unqueued closure size) that states rerunning cannot help;
+  resume does not apply — the device was not admitted.
 - `reissue-invitation <device> <out>`: reseal a device's invitation
   from durable state, for an admission whose invitation never
   reached a file. Authors nothing; the reseal opens identically,

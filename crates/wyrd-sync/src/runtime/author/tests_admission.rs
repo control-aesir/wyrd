@@ -1,7 +1,9 @@
 use super::admission::{
-    admit_device, next_epoch, resume_admission_obligations, ADMISSION_OBLIGATION_BATCH,
+    admission_capacity_refusal, admit_device, next_epoch, resume_admission_obligations,
+    ADMISSION_OBLIGATION_BATCH,
 };
 use super::tests_harness::{device_of, owner_engine};
+use crate::runtime::engine::UnqueuedClosure;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::ManifestRecord;
 
@@ -1912,4 +1914,178 @@ fn crash_mid_incremental_admission_resumes_without_duplicate_obligations() {
             "stage {stage:?}: survivors never doubled, the middle never lost"
         );
     }
+}
+
+/// Child-2 pure-function test: the capacity refusal carries the
+/// membership batch count, the ceiling, and the unqueued closure
+/// size as structured fields, and renders the continuation guidance
+/// (rerunning cannot help; the bound must change) with no key
+/// material anywhere. The refusal path itself takes no store reads
+/// by construction, so this needs no drive.
+#[test]
+fn admission_capacity_refusal_carries_counts_ceiling_and_continuation() {
+    let error = admission_capacity_refusal(70_000, UnqueuedClosure::Counted(120_000));
+    let EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    } = error
+    else {
+        panic!("builder returns the named variant, got {error:?}");
+    };
+    assert_eq!(records, 70_000);
+    assert_eq!(max, 65_536);
+    assert_eq!(closure, UnqueuedClosure::Counted(120_000));
+    let rendered = EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    }
+    .to_string();
+    for needle in [
+        "70000",
+        "65536",
+        "120000",
+        "rerunning unchanged cannot help",
+        "not admitted",
+        "bound must change",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "refusal tells the operator why rerunning cannot help: {rendered}"
+        );
+    }
+
+    // The defined fallback when the closure cannot even be counted:
+    // the refusal still carries the batch and the ceiling.
+    let fallback = admission_capacity_refusal(70_000, UnqueuedClosure::Uncounted).to_string();
+    assert!(
+        fallback.contains("could not be computed"),
+        "uncounted closure degrades the message, never the refusal: {fallback}"
+    );
+}
+
+/// Child-2 continuation through CLI-equivalent calls: admit, tear
+/// the fill, then rerun the invite exactly as the CLI arm does
+/// (admit → `AlreadyMember` → guarded resume → reissue) and assert
+/// the recovery completes with no duplicate obligations, no
+/// duplicate admission, and an invitation that opens for the
+/// newcomer. Guards refuse wrong keys, wrong roles, and strangers.
+#[test]
+fn member_invite_rerun_resumes_interrupted_fill() {
+    use crate::control::bootstrap::open_bootstrap;
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::key;
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 300;
+
+    let (dir, mut engine, genesis_id) = owner_engine("admission-rerun");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+    let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let newcomer_key = encryption_key(&newcomer_encryption);
+    // Interrupt: the membership commit lands, the single fill chunk
+    // tears, the process "dies".
+    engine.crash_after_nth_commit(1, CrashStage::AfterWriteTemp);
+    engine.admit_device(newcomer_id, newcomer_key).unwrap();
+    drop(engine);
+    let (owner_sk, owner_id) = key(10);
+    let mut engine = Engine::open(
+        dir.path.clone(),
+        crate::membership::test_util::drive(),
+        owner_id,
+        "test-pass",
+        identity_secret(&owner_sk),
+        DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+    )
+    .unwrap();
+
+    // The CLI-equivalent rerun: admit refuses (already a member),
+    // the guarded resume completes the fill, the invitation is
+    // reissued for the claimed destination.
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(
+        matches!(rerun, Err(EngineError::AlreadyMember)),
+        "rerun meets the durable admission, not a fresh one"
+    );
+    let resume = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(
+        resume.committed, CHAIN_LEN,
+        "rerun resumes the whole torn fill"
+    );
+    assert_eq!(resume.batches, 1, "one batch spent");
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(
+        queued, want,
+        "resumed obligations match the closure exactly once"
+    );
+    let tip = engine.log.known_state().expect("tip").transition_id;
+    let invitation = open_bootstrap(&newcomer_encryption, &resume.invitation).unwrap();
+    assert_eq!(
+        invitation.invitee, newcomer_id,
+        "reissued invitation names the newcomer"
+    );
+    drop(invitation);
+
+    // Second rerun after completion: zero obligations, same tip, no
+    // duplicate admission and no duplicate obligations.
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(matches!(rerun, Err(EngineError::AlreadyMember)));
+    let again = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(again.committed, 0, "completed catch-up resumes nothing");
+    assert_eq!(
+        engine.log.known_state().expect("tip").transition_id,
+        tip,
+        "reruns author nothing"
+    );
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(queued, want, "reruns duplicate nothing");
+
+    // Guards: a wrong key, a wrong role, and a stranger all refuse
+    // without touching the obligations.
+    let wrong_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE9; 32]).unwrap());
+    let refused = engine.resume_admission(newcomer_id, &wrong_key, false);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AdmissionKeyMismatch { device }) if device == newcomer_id
+        ),
+        "key mismatch refuses"
+    );
+    let refused = engine.resume_admission(newcomer_id, &newcomer_key, true);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AdmissionRoleMismatch { device, actual: "a member" }) if device == newcomer_id
+        ),
+        "role mismatch refuses with the actual role named"
+    );
+    let stranger = identity(0x59).1;
+    let refused = engine.resume_admission(stranger, &newcomer_key, false);
+    assert!(
+        matches!(refused, Err(EngineError::NotMember)),
+        "strangers refuse"
+    );
 }

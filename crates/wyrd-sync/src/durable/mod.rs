@@ -117,6 +117,9 @@ pub use reconciliation::{
 };
 pub(crate) use replay::build_keyring;
 pub use replay::{LoadedFacts, Rebuilt};
+// The per-commit record ceiling, named by the admission capacity
+// refusal (child 2): the only non-load reader of a load constant.
+pub(crate) use codec::MAX_RECORDS_PER_COMMIT;
 // Raw-commit test seam (planted-forgery tests): test-only re-exports.
 pub(crate) use codec::{decode_reconciliation_evidence, encode_reconciliation_view_canonical};
 #[cfg(test)]

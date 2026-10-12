@@ -3636,22 +3636,58 @@ fn member(
                 }
             };
             engine.stage_carry_heads()?;
-            let outcome = match admit(&mut engine) {
-                Ok(outcome) => outcome,
+            match admit(&mut engine) {
+                Ok(outcome) => {
+                    let carried = carry_pending(&mut engine, &drive_dir)?;
+                    write_invitation(&out, &mut file, &outcome.invitation.encode())?;
+                    println!(
+                        "invited {device}{} at epoch {} -> {} ({} obligations in {} batches, {} carried)",
+                        if reader { " as reader" } else { "" },
+                        outcome.transition.epoch,
+                        out.display(),
+                        outcome.obligations_queued,
+                        outcome.batches,
+                        carried
+                    );
+                    return Ok(());
+                }
+                Err(EngineError::AlreadyMember | EngineError::AlreadyReader) => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&out);
+                    return Err(error.into());
+                }
+            }
+            // Already admitted under some role: rerunning resumes the
+            // interrupted fill instead of failing. The engine guard
+            // verifies the supplied key and role against the recorded
+            // admission first — a mismatch refuses with the actual
+            // role named rather than recovering the wrong identity —
+            // then resumes the catch-up and reissues the invitation
+            // (the original may never have reached a file).
+            let resume = match engine.resume_admission(device, &encryption_key, reader) {
+                Ok(resume) => resume,
                 Err(error) => {
                     let _ = fs::remove_file(&out);
                     return Err(error.into());
                 }
             };
             let carried = carry_pending(&mut engine, &drive_dir)?;
-            write_invitation(&out, &mut file, &outcome.invitation.encode())?;
-            println!(
-                "invited {device}{} at epoch {} -> {} ({} carried)",
-                if reader { " as reader" } else { "" },
-                outcome.transition.epoch,
-                out.display(),
-                carried
-            );
+            write_invitation(&out, &mut file, &resume.invitation.encode())?;
+            if resume.committed == 0 {
+                println!(
+                    "catch-up already complete; 0 obligations, invitation re-issued -> {} ({} carried)",
+                    out.display(),
+                    carried
+                );
+            } else {
+                println!(
+                    "already a member; resumed {} obligations in {} batches, invitation re-issued -> {} ({} carried)",
+                    resume.committed,
+                    resume.batches,
+                    out.display(),
+                    carried
+                );
+            }
             Ok(())
         }
         MemberAction::ReissueInvitation { device, out } => {

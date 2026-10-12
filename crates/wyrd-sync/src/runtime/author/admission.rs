@@ -5,11 +5,11 @@ use wyrd_format::{Change, DeviceEncryptionKey, DeviceId, MembershipTransition, T
 
 use super::common::escrow_fresh_secret;
 use crate::control::bootstrap::{seal_bootstrap, SealedBootstrap};
-use crate::durable::{AuthorizedCapability, Fact};
+use crate::durable::{AuthorizedCapability, DurableError, Fact, MAX_RECORDS_PER_COMMIT};
 use crate::keys::capability::Capability;
 use crate::keys::EpochSecret;
 use crate::membership::{sign_transition, TransitionStatus};
-use crate::runtime::engine::{Engine, EngineError};
+use crate::runtime::engine::{Engine, EngineError, UnqueuedClosure};
 use zeroize::Zeroizing;
 
 /// Announcement obligations committed per admission batch commit.
@@ -27,6 +27,22 @@ pub(crate) const ADMISSION_OBLIGATION_BATCH: usize = 1024;
 /// cannot arrive as a control message).
 pub struct AdmitOutcome {
     pub transition: MembershipTransition,
+    pub invitation: SealedBootstrap,
+    /// Announcement obligations queued for the newcomer by the
+    /// bounded fill: every closure member exactly once.
+    pub obligations_queued: usize,
+    /// Fill commits spent: one membership commit plus this many
+    /// obligation batches, each under the per-commit ceiling.
+    pub batches: usize,
+}
+
+/// The completed recovery of one interrupted admission: the
+/// catch-up obligations resume committed, plus a reissued
+/// invitation (the original may never have reached a file). The
+/// operator surface for `member invite` reruns.
+pub struct ResumeOutcome {
+    pub committed: usize,
+    pub batches: usize,
     pub invitation: SealedBootstrap,
 }
 
@@ -231,14 +247,25 @@ fn admit(
     // against post-commit bodies (the commit adds no snapshots), so
     // every chunk sees the same closure.
     let seeds = engine.live_heads()?;
-    engine.commit_facts(&batch)?;
+    engine.commit_facts(&batch).map_err(|error| match error {
+        // The only commit in `admit` whose size is a function of
+        // recorded history: a pathological membership chain can
+        // overflow it. The fill chunks cannot (bounded by
+        // `ADMISSION_OBLIGATION_BATCH`), so a refusal here is always
+        // the membership half — map it to the named capacity refusal
+        // rather than a generic durable failure.
+        DurableError::TooManyRecords { .. } => {
+            admission_capacity_refusal(batch.len(), count_unqueued_closure(engine, &seeds, device))
+        }
+        other => EngineError::Durable(other),
+    })?;
     // The lineage closure follows in bounded batches (OD-16-1 B):
     // each obligation is independently durable and idempotent per
     // (snapshot, recipient), so the batches are the progress record
     // and a crash between them loses nothing but the uncommitted
     // suffix — `fill_admission_obligations` re-derives exactly the
     // missing pairs. See that function for the resume contract.
-    fill_admission_obligations(engine, device, &seeds)?;
+    let committed = fill_admission_obligations(engine, device, &seeds)?;
     engine.resync()?;
     engine.add_epoch_key(
         epoch,
@@ -253,7 +280,64 @@ fn admit(
     Ok(AdmitOutcome {
         transition,
         invitation,
+        obligations_queued: committed,
+        // Each fill commit takes a full batch except possibly the
+        // last, so the commit count is exactly the ceiling division.
+        batches: committed.div_ceil(ADMISSION_OBLIGATION_BATCH),
     })
+}
+
+/// Build the capacity refusal for a membership batch of `records`
+/// facts with `closure` catch-up announcements left unqueued.
+/// Pure: no store reads, so the refusal path itself cannot fail —
+/// the diagnostic walk happens in `count_unqueued_closure` before
+/// this, and its `Uncounted` fallback flows through untouched.
+pub(crate) fn admission_capacity_refusal(records: usize, closure: UnqueuedClosure) -> EngineError {
+    EngineError::AdmissionBatchOverBudget {
+        records,
+        max: MAX_RECORDS_PER_COMMIT,
+        closure,
+    }
+}
+
+/// Count the closure announcements one admission would queue,
+/// without materializing them: read-only walk over the pre-commit
+/// view for the refusal diagnostic. Saturating: the count serves a
+/// message and must never become a second failure — an
+/// unrepresentable count collapses to `usize::MAX`, still a valid
+/// number to report. `Uncounted` when durable state cannot even be
+/// read; the refusal carries on regardless.
+fn count_unqueued_closure(
+    engine: &Engine,
+    seeds: &[crate::durable::AuthorizedSnapshot],
+    device: DeviceId,
+) -> UnqueuedClosure {
+    use std::collections::BTreeSet;
+    use wyrd_format::SnapshotId;
+
+    let Ok(rebuilt) = engine.store.rebuild(engine.device) else {
+        return UnqueuedClosure::Uncounted;
+    };
+    let mut stack: Vec<SnapshotId> = seeds
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut count = 0usize;
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(body) = rebuilt.runtime.snapshot_body(&id) else {
+            continue;
+        };
+        let servable = body.author == engine.device || rebuilt.runtime.announcement(&id).is_some();
+        if servable && !rebuilt.runtime.announcement_covered(id, device) {
+            count = count.saturating_add(1);
+        }
+        stack.extend(body.parents.iter().copied());
+    }
+    UnqueuedClosure::Counted(count)
 }
 
 /// Resume one device's admission catch-up after a crash that
@@ -264,9 +348,9 @@ fn admit(
 /// commit leaves the tip untouched, so a plain re-admit re-derives
 /// everything); it exists for the window between a durable
 /// membership commit and a complete fill, where a re-admit would
-/// refuse `AlreadyMember`. Child 2 wires the operator rerun onto
-/// this; child 1 tests drive it explicitly after reopen.
-#[allow(dead_code)] // child 2's continuation call site; tests until then
+/// refuse `AlreadyMember`. The operator rerun (`resume_admission`
+/// below, wired to `member invite`) completes the set; child 1
+/// tests drive this explicitly after reopen.
 pub(crate) fn resume_admission_obligations(
     engine: &mut Engine,
     device: DeviceId,
@@ -290,6 +374,62 @@ pub(crate) fn resume_admission_obligations(
         .ok_or(EngineError::NoCanonicalMembership)?;
     let seeds = engine.live_heads_at_epoch(tip.epoch)?;
     fill_admission_obligations(engine, device, &seeds)
+}
+
+/// Recover one interrupted admission for the operator: verify the
+/// command names the device the durable admission actually admitted
+/// (identity guard), resume its catch-up fill, and reissue its
+/// invitation (the original may never have reached a file).
+/// Returns the obligations committed plus the fresh invitation.
+///
+/// The guard compares the caller-supplied encryption key and role
+/// against the canonical admission's recorded values: a key
+/// mismatch refuses with `AdmissionKeyMismatch`, a role mismatch
+/// with `AdmissionRoleMismatch`. Key bytes never render — the
+/// mismatch is stated, never shown. A device with no canonical
+/// admission refuses `NotMember` (a torn membership commit leaves
+/// the tip untouched, so that case retries with a plain admit,
+/// never resume).
+pub(crate) fn resume_admission(
+    engine: &mut Engine,
+    device: DeviceId,
+    expected_key: &DeviceEncryptionKey,
+    expect_reader: bool,
+) -> Result<ResumeOutcome, EngineError> {
+    let (_, id) = canonical_admission_of(engine, &device)?;
+    let admission = engine
+        .log
+        .transition(&id)
+        .ok_or(EngineError::NoCanonicalMembership)?;
+    let (admitted_as_reader, recorded) = admission
+        .changes()
+        .iter()
+        .find_map(|change| match change {
+            Change::Admit(a) if a.device == device => Some((false, a.encryption_key)),
+            Change::AdmitReader(a) if a.device == device => Some((true, a.encryption_key)),
+            _ => None,
+        })
+        .ok_or(EngineError::NotMember)?;
+    if admitted_as_reader != expect_reader {
+        return Err(EngineError::AdmissionRoleMismatch {
+            device,
+            actual: if admitted_as_reader {
+                "a reader"
+            } else {
+                "a member"
+            },
+        });
+    }
+    if recorded != *expected_key {
+        return Err(EngineError::AdmissionKeyMismatch { device });
+    }
+    let committed = resume_admission_obligations(engine, device)?;
+    let invitation = reissue_invitation(engine, device)?;
+    Ok(ResumeOutcome {
+        committed,
+        batches: committed.div_ceil(ADMISSION_OBLIGATION_BATCH),
+        invitation,
+    })
 }
 
 /// Complete one device's admission catch-up: derive the lineage
@@ -334,9 +474,9 @@ pub(crate) fn resume_admission_obligations(
 /// after a crash that interrupts it, [`resume_admission_obligations`]
 /// (or a plain re-admit, when the membership commit itself tore and
 /// the tip is untouched) completes the set. Returns the committed
-/// count so callers (and, in child 2, the operator surface) can
-/// report progress — a short count after `Ok` means a torn batch,
-/// never a smaller closure.
+/// count so callers — the operator surface via [`resume_admission`]
+/// — can report progress — a short count after `Ok` means a torn
+/// batch, never a smaller closure.
 pub(crate) fn fill_admission_obligations(
     engine: &mut Engine,
     device: DeviceId,

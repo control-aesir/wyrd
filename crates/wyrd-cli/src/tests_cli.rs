@@ -692,3 +692,32 @@ fn update_verify_names_the_invariant_on_a_torn_store() {
         "torn store must fail with invariant 2, got: {error}"
     );
 }
+
+/// The capacity refusal renders for the operator with counts,
+/// ceiling, and the non-retryable continuation — the engine's
+/// string wrapped unchanged as `CliError::Engine`, so this pins
+/// the operator-facing text of the pure-function refusal.
+#[test]
+fn admission_capacity_refusal_renders_counts_and_continuation() {
+    use wyrd_sync::runtime::{EngineError, UnqueuedClosure};
+
+    let error = CliError::Engine(EngineError::AdmissionBatchOverBudget {
+        records: 70_000,
+        max: 65_536,
+        closure: UnqueuedClosure::Counted(120_000),
+    });
+    let text = format!("{error}");
+    for needle in [
+        "engine failed: admission refused",
+        "70000",
+        "65536",
+        "120000",
+        "rerunning unchanged cannot help",
+        "bound must change",
+    ] {
+        assert!(
+            text.contains(needle),
+            "operator sees why rerunning cannot help: {text}"
+        );
+    }
+}

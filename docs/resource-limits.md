@@ -105,10 +105,19 @@ plus one batch of at most 1,024 obligations per commit
 `crates/wyrd-sync/src/runtime/author/tests_admission.rs`). The
 ceiling still answers the same way for the membership half — an
 admission whose membership batch exceeds 65,536 records is refused
-whole (`check_commit_fits` rejects the batch before the encode loop,
-`DurableError::TooManyRecords`, surfaced as `EngineError::Durable`
-through `commit_facts`), so the newcomer is not admitted and nothing
-commits — while the obligation fill can never trip the ceiling for
+whole (`check_commit_fits` rejects the batch before the encode loop),
+so the newcomer is not admitted and nothing commits — but the
+refusal is now named, not generic: `EngineError::AdmissionBatchOverBudget`
+carries the batch record count, the ceiling, and the catch-up
+closure size left unqueued (counted read-only on the error path,
+with a defined fallback when it cannot be computed), and states
+that rerunning unchanged cannot help — the device was not admitted,
+resume does not apply, and no operator action shortens membership
+history. Interruption is the distinct case: a crash between fill
+batches leaves a durable transition with a partial fill, and
+rerunning `member invite` resumes exactly the missing obligations
+(verifying key and role against the recorded admission first),
+never duplicating work. — while the obligation fill can never trip the ceiling for
 closure length, because no fill commit's size is a function of
 recorded history. A crash between fill batches loses nothing but
 the uncommitted suffix: obligations are idempotent per

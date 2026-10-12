@@ -35,8 +35,19 @@ version say exactly what changed.
   per (snapshot, recipient) — the batches are the progress record,
   no checkpoint marker — and a crash between batches resumes to
   exactly the missing suffix. The per-epoch walk horizon stays by
-  explicit decision (OD-16-2 A). Child 2 (named capacity refusal,
-  progress and continuation) follows on this PR.
+  explicit decision (OD-16-2 A).
+- Named admission capacity refusal plus invite rerun-resume (child 2
+  of the same issue, same PR): an admission whose membership batch
+  cannot fit the per-commit ceiling fails as
+  `EngineError::AdmissionBatchOverBudget` — batch count, ceiling,
+  and unqueued closure size, stating rerunning cannot help — instead
+  of a generic durable failure. Rerunning `member invite` for an
+  already-admitted device resumes its catch-up fill (identity-guard:
+  supplied key and role verified against the recorded admission)
+  and reissues its invitation, reporting `already a member; resumed
+  M obligations` or `catch-up already complete; 0 obligations`;
+  `AdmitOutcome` carries `obligations_queued` and `batches` for the
+  fresh path.
 - Observation × trust-position matrix (`docs/trust.md`):
   the 18 hidden/observable disclosure classes as normative rows
   over five trust positions (keyless replica, member-hosted

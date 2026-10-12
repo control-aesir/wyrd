@@ -80,6 +80,7 @@ use crate::membership::TransitionStatus;
 use crate::transport::mailbox::Mailbox;
 
 pub use super::author::AdmitOutcome;
+pub use super::author::ResumeOutcome;
 pub use super::author::{
     MergePath, MergePlan, MergeSelection, RecoveryPath, RecoveryPlan, RecoveryStatus,
 };
@@ -117,6 +118,32 @@ impl DurabilityLevel {
             DurabilityLevel::Working => "working",
             DurabilityLevel::Committed => "committed",
             DurabilityLevel::Published => "published",
+        }
+    }
+}
+
+/// How many catch-up announcements a capacity refusal left
+/// unqueued: the diagnostic half of
+/// [`EngineError::AdmissionBatchOverBudget`]. Counted read-only on
+/// the error path (the failed commit left the tip untouched, so the
+/// pre-admission view still holds); `Uncounted` is the defined
+/// fallback when the count cannot be computed, and it never
+/// obscures the refusal itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnqueuedClosure {
+    Counted(usize),
+    Uncounted,
+}
+
+impl std::fmt::Display for UnqueuedClosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnqueuedClosure::Counted(n) => {
+                write!(f, "; {n} catch-up announcements left unqueued")
+            }
+            UnqueuedClosure::Uncounted => {
+                write!(f, "; closure size could not be computed")
+            }
         }
     }
 }
@@ -239,6 +266,37 @@ pub enum EngineError {
     ObjectStore(String),
     #[error("the snapshot timestamp space is exhausted at u64::MAX")]
     TimestampExhausted,
+    /// An admission whose membership batch cannot fit the per-commit
+    /// ceiling: a capacity refusal, not a durable failure. Rerunning
+    /// unchanged cannot help — the device was not admitted, so
+    /// resume does not apply — and no operator action shortens the
+    /// existing membership history; the bound must change. Child 2
+    /// of the bound-admission-closure issue; the obligation fill can
+    /// never produce this (its commits are bounded by
+    /// `ADMISSION_OBLIGATION_BATCH`), only the membership half can.
+    #[error("admission refused: membership batch of {records} records exceeds the per-commit ceiling of {max} records{closure} — rerunning unchanged cannot help: the device was not admitted and no operator action shortens membership history; the bound must change")]
+    AdmissionBatchOverBudget {
+        records: usize,
+        max: usize,
+        closure: UnqueuedClosure,
+    },
+    /// A resume was asked for a device whose recorded admission
+    /// names a different encryption key than the command supplied:
+    /// the arguments do not unambiguously identify the admitted
+    /// device, so resume refuses rather than recovering the wrong
+    /// identity. Key bytes never render — the mismatch is stated,
+    /// never shown. Child-2 identity guard.
+    #[error("refusing resume for {device}: the supplied encryption key does not match the recorded admission")]
+    AdmissionKeyMismatch { device: DeviceId },
+    /// A resume was asked under a role the device does not hold
+    /// (reader flag against a member admission or vice versa):
+    /// intent is ambiguous, so resume refuses with the actual role
+    /// named. Child-2 identity guard.
+    #[error("refusing resume for {device}: admitted as {actual}, not as requested")]
+    AdmissionRoleMismatch {
+        device: DeviceId,
+        actual: &'static str,
+    },
     #[error("a drive already exists at this directory")]
     DriveExists,
     #[error("drive file is not a 32-byte drive id")]
@@ -1086,6 +1144,23 @@ impl Engine {
         encryption_key: DeviceEncryptionKey,
     ) -> Result<super::author::AdmitOutcome, EngineError> {
         super::author::admit_reader(self, device, encryption_key)
+    }
+
+    /// Recover one interrupted admission: verify the supplied
+    /// encryption key and role against the device's canonical
+    /// admission (identity guard — key or role mismatch refuses
+    /// rather than recovering the wrong identity), resume its
+    /// catch-up fill, and reissue its invitation. The operator
+    /// surface for `member invite` reruns after a crash between the
+    /// membership commit and a complete fill. See
+    /// [`super::author::resume_admission`].
+    pub fn resume_admission(
+        &mut self,
+        device: DeviceId,
+        expected_key: &DeviceEncryptionKey,
+        expect_reader: bool,
+    ) -> Result<super::author::ResumeOutcome, EngineError> {
+        super::author::resume_admission(self, device, expected_key, expect_reader)
     }
 
     /// Remove a device from the drive: author, sign, and commit the

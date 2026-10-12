@@ -21,6 +21,13 @@ version say exactly what changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- ngit-workflow triage tool success result referenced an undefined
+  `removals` binding (every success threw ReferenceError after applying
+  labels): `planTriageCall` now returns the displaced labels and the
+  entry reports them.
+
 ### Added
 
 - Observation × trust-position matrix (`docs/trust.md`):

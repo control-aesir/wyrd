@@ -109,7 +109,8 @@ Deno.test("planTriageCall builds the removal-carrying argv from a stacked view",
           "--remove-label", "bug",
           "--remove-label", "release:v0.2.0-alpha",
           "--json",
-        ]),
+        ]) &&
+      JSON.stringify(planned.removed) === JSON.stringify(["bug", "release:v0.2.0-alpha"]),
     JSON.stringify(planned),
   )
 })

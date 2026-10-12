@@ -110,7 +110,7 @@ export default (async ({ $ }) => {
             applied: true,
             id: input.id,
             labels: [input.type, input.priority, input.milestone],
-            removed: removals,
+            removed: planned.removed,
           })
         },
       }),

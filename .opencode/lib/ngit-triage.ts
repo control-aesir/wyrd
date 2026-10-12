@@ -113,7 +113,7 @@ export function buildLabelArgv(input: TriageInput, removals: string[] = []): str
 // errors (never a call) when the view cannot establish what the triage
 // would displace: a view this tool cannot parse is a triage it must not
 // write. Gives the refusal paths a lib-level test seam.
-export function planTriageCall(view: unknown, input: TriageInput): { argv: string[] } | { errors: string[] } {
+export function planTriageCall(view: unknown, input: TriageInput): { argv: string[]; removed: string[] } | { errors: string[] } {
   const labels: unknown =
     typeof view === "object" && view !== null && "labels" in view
       ? (view as { labels: unknown }).labels
@@ -126,7 +126,8 @@ export function planTriageCall(view: unknown, input: TriageInput): { argv: strin
     }
   }
   const current = labels.filter((l): l is string => typeof l === "string")
-  return { argv: buildLabelArgv(input, staleLabels(current, input)) }
+  const removed = staleLabels(current, input)
+  return { argv: buildLabelArgv(input, removed), removed }
 }
 
 export type JsonDocument = { ok: true; value: unknown } | { ok: false; error: string }

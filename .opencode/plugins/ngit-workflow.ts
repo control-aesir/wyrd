@@ -110,7 +110,7 @@ export function verifyLabels(view: unknown, input: TriageInput): string[] {
   return missing.map((want) => `verified view is missing label ${want}`)
 }
 
-export const NgitWorkflowPlugin: Plugin = async ({ $ }) => {
+export const server: Plugin = async ({ $ }) => {
   return {
     tool: {
       ngit_issue_triage: tool({
@@ -174,4 +174,4 @@ export const NgitWorkflowPlugin: Plugin = async ({ $ }) => {
   }
 }
 
-export default NgitWorkflowPlugin
+export default server

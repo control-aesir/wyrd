@@ -588,8 +588,8 @@ fn sync_status_refuses_a_locked_drive() {
 }
 
 /// `vault status` on a stopped drive reports the vault-position
-/// projection (counts and drive state only — never the member
-/// columns `sync status` prints) beside an absent process section.
+/// projection (counts only — never the member columns `sync status`
+/// prints) beside an absent process section.
 #[test]
 fn vault_status_reports_durable_state_on_stopped_drive() {
     let fixture = Fixture::new();
@@ -606,7 +606,7 @@ fn vault_status_reports_durable_state_on_stopped_drive() {
     );
 }
 /// The stopped-drive section is the vault projection, not the
-/// member one: the report carries counts and drive state with none
+/// member one: the report carries counts with none
 /// of the member columns (`sync status`'s tip, epochs, heads,
 /// peers, mailbox). Runs against an admission drive — a live head
 /// with an author, two peer identities, queued obligations — so

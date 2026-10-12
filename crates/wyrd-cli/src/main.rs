@@ -3408,7 +3408,7 @@ fn vault(
 /// query — and never claims liveness: fresh means recent, stale means
 /// last-recorded, and both say liveness unverified. The durable
 /// section shows the vault-position projection when the drive is
-/// stopped (counts and drive state only — never the member columns
+/// stopped (counts only — never the member columns
 /// `sync status` prints), and reports unavailable — never guessed —
 /// while the vault holds the lock. The surface takes no relay
 /// configuration: it never constructs a mailbox, so there is no
@@ -3486,7 +3486,7 @@ fn vault_status_report(
         // The vault projection, never the member one: this is a
         // vault surface on every composition (matrix rule), so the
         // stopped-drive section shows the keyless-replica subset —
-        // counts and drive state, no tip, heads, peers, or mailbox.
+        // counts only, no tip, heads, peers, or mailbox.
         Ok(engine) => match observe_vault(&engine) {
             // Observed through our own open: the lock was ours
             // throughout, so the drive was free when the probe ran.

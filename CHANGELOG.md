@@ -49,9 +49,9 @@ version say exactly what changed.
   the member projection's tip, epochs, head authors, peer
   handles, mailbox line, and durability verdict. Pending counts
   come from the same delivered-union-reconciled set difference
-  the member projection counts, tallied inside the engine so no
-  identity crosses the boundary. The surface takes no relay
-  configuration (matrix H9).
+  the member projection counts, tallied in the runtime state
+  beside the lists so no identity crosses the boundary. The
+  surface takes no relay configuration (matrix H9).
 - Disclosure conformance inventory (`wyrd-sync::disclosure`,
   `disclosure_map` on every observation struct): each field of the
   member and vault projections plus their nested types maps to
@@ -77,7 +77,6 @@ version say exactly what changed.
   pending derives as queued minus (delivered ∪ reconciled) for all
   three classes. `sync status` reports announcements retired
   alongside the other classes.
-
 - Freshness ordering in bulk fetch (`docs/retry-policy.md`,
   `crates/wyrd-sync/src/bulk.rs`): the candidate walk orders each
   attempt from a per-provider outcome memory — recently failed

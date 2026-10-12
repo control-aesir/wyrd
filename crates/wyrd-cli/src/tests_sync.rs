@@ -1430,7 +1430,7 @@ fn sync_status_reconciliation_row_names_classes_not_identities() {
         .find(|line| line.starts_with("reconciliation: "))
         .expect("the reconciliation row renders: {rendered}");
     assert_eq!(
-        row, "reconciliation: 0 statements received, 0 transitions + 0 capabilities retired",
+        row, "reconciliation: 0 statements received, 0 transitions + 0 capabilities + 0 announcements retired",
         "classes and counts only: {rendered}"
     );
 }

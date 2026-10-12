@@ -1463,6 +1463,37 @@ fn delivered_route_tag_is_a_clean_upgrade_boundary() {
     );
 }
 
+/// The announcement-retirement tag is a clean upgrade boundary:
+/// 0x1D is new (no old reader decodes it as another fact) and
+/// pinned (a different value is a different format), and a
+/// malformed record fails closed instead of decoding as a wrong
+/// triple.
+#[test]
+fn announcement_retirement_tag_is_a_clean_upgrade_boundary() {
+    use super::codec::{KNOWN_TAGS, TAG_ANNOUNCEMENT_RECONCILED};
+    let pre_retirement_tags = [
+        0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+    ];
+    assert!(
+        !pre_retirement_tags.contains(&TAG_ANNOUNCEMENT_RECONCILED),
+        "the retirement tag must be new, or an old reader would decode it as another fact"
+    );
+    assert_eq!(
+        TAG_ANNOUNCEMENT_RECONCILED, 0x1D,
+        "the tag is pinned: a different value is a different format"
+    );
+    let mut sorted = KNOWN_TAGS.to_vec();
+    sorted.sort_unstable();
+    let len = sorted.len();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        len,
+        "a duplicate tag decodes as the wrong fact"
+    );
+}
+
 /// A rotation-framed sealed fact commits when it names the
 /// obligation's epoch, and fails when it names another: the
 /// commit-time gate accepts either framing, with the recipient
@@ -1816,12 +1847,14 @@ fn reconciled_facts_replay_to_the_same_retirement() {
     let dir = TestDir::new("reconciliation-retired");
     let mut store = DurableStore::open(dir.path.clone(), drive(), PASSPHRASE).unwrap();
     let transition = TransitionId::from_bytes([0x41; 32]);
+    let snapshot = SnapshotId::from_bytes([0xA1; 32]);
     let recipient = DeviceId::from_bytes([0x31; 32]);
     let statement = [0x5A; 32];
     store
         .commit(&[
             Fact::TransitionReconciled(transition, recipient, statement),
             Fact::CapabilityReconciled(7, recipient, statement),
+            Fact::AnnouncementReconciled(snapshot, recipient, statement),
         ])
         .unwrap();
     drop(store);
@@ -1836,6 +1869,11 @@ fn reconciled_facts_replay_to_the_same_retirement() {
         loaded.capability_reconciled,
         vec![(7, recipient, statement)],
         "the capability retirement replays verbatim"
+    );
+    assert_eq!(
+        loaded.announcement_reconciled,
+        vec![(snapshot, recipient, statement)],
+        "the announcement retirement replays verbatim"
     );
     assert!(
         loaded.reconciliation_views.is_empty() && loaded.reconciliation_requests.is_empty(),

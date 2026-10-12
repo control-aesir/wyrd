@@ -425,12 +425,14 @@ fn capability_retires_on_exact_install_match() {
         .is_empty(),);
 }
 
-/// The 21c scope boundary as a tested fact: a statement evidencing
-/// announcement snapshots changes no announcement derivation.
-/// Announcements stay pending — no retirement kind exists for them,
-/// and the shared machinery must not "helpfully" retire them.
+/// A statement evidencing a queued announcement snapshot retires
+/// it: the announcement-class half of reconciliation. The sender
+/// held the obligation outstanding, the recipient's durable state
+/// proves it holds the snapshot, and the retirement commits the
+/// same triple shape as the other classes — obligation, recipient,
+/// proving statement.
 #[test]
-fn announcement_obligations_stay_pending() {
+fn announcement_obligations_retire_on_evidence() {
     let (mut fx, _, _) = world();
     let (_, r) = requester();
     let snapshot = SnapshotId::from_bytes([0xA1; 32]);
@@ -442,19 +444,25 @@ fn announcement_obligations_stay_pending() {
         snapshots: BTreeSet::from([snapshot]),
         capabilities: BTreeSet::new(),
     };
-    state(&mut fx, r, evidence);
+    state(&mut fx, r, evidence.clone());
     let mut mailbox = NullMailbox;
     let report = fx.engine.answer_reconciliation(&mut mailbox).unwrap();
-    assert_eq!(report.retired, 0);
-    assert_eq!(report.sent, 0);
-    assert_eq!(
-        fx.engine.runtime_state().unwrap().pending_announcements(),
-        vec![(snapshot, r)],
-        "announcement obligations are not eligible for reconciliation retirement in 21c"
+    assert_eq!(report.retired, 1, "the evidenced snapshot retires");
+    assert_eq!(report.sent, 0, "covered needs no send");
+    assert!(
+        fx.engine
+            .runtime_state()
+            .unwrap()
+            .pending_announcements()
+            .is_empty(),
+        "a reconciled announcement stops retrying exactly like a delivered one"
     );
     let loaded = fx.engine.store.load().unwrap();
-    assert!(loaded.transition_reconciled.is_empty());
-    assert!(loaded.capability_reconciled.is_empty());
+    assert_eq!(
+        loaded.announcement_reconciled,
+        vec![(snapshot, r, statement_digest(r, &evidence))],
+        "the retirement names the obligation, the recipient, and the proving statement"
+    );
 }
 
 /// `UnknownEpoch` can never produce a `Reconciled` fact: the
@@ -1462,24 +1470,28 @@ fn retire_commits_across_chunks() {
 }
 
 /// The covered accessors see reconciled pairs: recording a
-/// retirement covers the obligation against re-queueing, for both
-/// classes, while announcements (no retirement kind) stay
-/// uncovered. Pins the reconciled clauses as exercised behavior.
+/// retirement covers the obligation against re-queueing, for all
+/// three classes. Pins the reconciled clauses as exercised behavior.
 #[test]
 fn covered_includes_reconciled() {
     use crate::runtime::RuntimeState;
     let mut runtime = RuntimeState::new(member_drive());
     let (_, r) = requester();
     let id = TransitionId::from_bytes([0xD1; 32]);
+    let snapshot = SnapshotId::from_bytes([0xA1; 32]);
     let digest = [0x5A; 32];
     assert!(!runtime.transition_covered(id, r));
     assert!(!runtime.capability_covered(2, r));
+    assert!(!runtime.announcement_covered(snapshot, r));
     assert!(runtime.record_transition_reconciled(id, r, digest));
     assert!(runtime.record_capability_reconciled(2, r, digest));
+    assert!(runtime.record_announcement_reconciled(snapshot, r, digest));
     assert!(runtime.transition_covered(id, r));
     assert!(runtime.capability_covered(2, r));
+    assert!(runtime.announcement_covered(snapshot, r));
     assert!(!runtime.record_transition_reconciled(id, r, digest));
     assert!(!runtime.record_capability_reconciled(2, r, digest));
+    assert!(!runtime.record_announcement_reconciled(snapshot, r, digest));
     // A different statement digest for an already-retired pair is
     // refused too — the pair is the identity, the digest is audit.
     // This is the behaviour the companion pair sets exist to
@@ -1487,9 +1499,10 @@ fn covered_includes_reconciled() {
     let other = [0x5B; 32];
     assert!(!runtime.record_transition_reconciled(id, r, other));
     assert!(!runtime.record_capability_reconciled(2, r, other));
+    assert!(!runtime.record_announcement_reconciled(snapshot, r, other));
     assert!(runtime.pending_transitions().is_empty());
     assert!(runtime.pending_capabilities().is_empty());
-    assert!(!runtime.announcement_covered(SnapshotId::from_bytes([0xA1; 32]), r));
+    assert!(runtime.pending_announcements().is_empty());
 }
 
 /// Two distinct statements from one requester in a single pass: the

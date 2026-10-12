@@ -41,7 +41,7 @@ pub(super) struct Pair {
 /// Open one device holding the scenario control keys: the keys
 /// are capability-delivered knowledge, so both members hold every
 /// epoch they are a member of.
-fn open_device(
+pub(super) fn open_device(
     name: &str,
     identity_byte: u8,
     encryption_byte: u8,

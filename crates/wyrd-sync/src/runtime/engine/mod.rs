@@ -1481,11 +1481,13 @@ impl Engine {
     /// them reports the facts, not its volatile evaluation.
     pub fn reconciliation_counters(&self) -> Result<super::ReconciliationCounters, EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
-        let (transitions_reconciled, capabilities_reconciled) = rebuilt.runtime.reconciled_counts();
+        let (transitions_reconciled, capabilities_reconciled, announcements_reconciled) =
+            rebuilt.runtime.reconciled_counts();
         Ok(super::ReconciliationCounters {
             statements_received: rebuilt.reconciliation_requests.len(),
             transitions_reconciled,
             capabilities_reconciled,
+            announcements_reconciled,
         })
     }
 
@@ -2474,6 +2476,8 @@ mod tests_drain;
 mod tests_durability;
 #[cfg(test)]
 mod tests_harness;
+#[cfg(test)]
+mod tests_late_joiner;
 #[cfg(test)]
 mod tests_lifecycle;
 #[cfg(test)]

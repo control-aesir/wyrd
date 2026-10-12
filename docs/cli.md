@@ -322,9 +322,10 @@ sync now
   membership tip against held epoch secrets (knowledge is not
   possession), live heads with classification counts over every DAG
   head, and mailbox posture. A `reconciliation` row reports control-plane
-  recovery progress from committed facts only: statements received,
-  plus transitions and capabilities retired by reconciliation. The row
-  names classes and counts, never identities — the outstanding gap
+   recovery progress from committed facts only: statements received,
+   plus transitions, capabilities, and announcements retired by
+   reconciliation. The row
+   names classes and counts, never identities — the outstanding gap
   itself is volatile (answering resets on restart), so it lives on
   `now` as two gauges — never evaluated, plus evaluated-but-stuck —
   not here. Read-only against durable state only:
@@ -680,8 +681,9 @@ Both are read and hardened by wyrd code, never by clap:
   obligation, live-head lines name the held heads — that is their job
   as merge identities, and no DeviceId appears beside them there.
   The `reconciliation` row goes further and names no identities at
-  all: three counts (statements received, transitions and capabilities
-  retired), so a future field cannot smuggle an id onto the surface.
+   all: three counts (statements received, transitions,
+   capabilities, and announcements retired), so a future field cannot
+   smuggle an id onto the surface.
   DeviceIds never reach the durable `sync status` surface or the
   structured dispatch lines; `sync now` alone names the senders its
   intake actually heard, because that process connected and the

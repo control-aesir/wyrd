@@ -98,6 +98,10 @@ pub struct ReconciliationCounters {
     pub transitions_reconciled: usize,
     /// Capability obligations retired by reconciliation (21c).
     pub capabilities_reconciled: usize,
+    /// Announcement obligations retired by reconciliation: the
+    /// late-joiner half — snapshots a recipient evidenced holding
+    /// after learning them through an answered statement.
+    pub announcements_reconciled: usize,
 }
 
 /// Durably retained runtime sync state: the live view rebuilds from
@@ -136,6 +140,15 @@ pub struct RuntimeState {
     /// unknown routes always count as changed. Transitions and
     /// capabilities carry no route and have no entry here.
     pub(super) announcement_delivered_route: BTreeMap<(SnapshotId, DeviceId), [u8; 32]>,
+    /// Announcement obligations retired by reconciliation: the triple
+    /// names what the runtime needs (the pair) plus the audit trail
+    /// (which statement proved it). Pending derives as queued minus
+    /// (delivered ∪ reconciled); nothing is ever deleted. The
+    /// companion pair set keeps that derivation a lookup, exactly as
+    /// for transitions and capabilities below — both written together
+    /// by `record_announcement_reconciled`, never separately.
+    pub(super) announcement_reconciled: BTreeSet<(SnapshotId, DeviceId, [u8; 32])>,
+    pub(super) announcement_reconciled_pairs: BTreeSet<(SnapshotId, DeviceId)>,
     /// Route-specific announcement reseals: one sealed envelope per
     /// (snapshot, route) for resumes whose live route differs from the
     /// first seal's. First seal per pair wins, like the canonical map
@@ -211,6 +224,8 @@ impl RuntimeState {
             announcement_route_sealed: BTreeMap::new(),
             announcement_delivered: BTreeSet::new(),
             announcement_delivered_route: BTreeMap::new(),
+            announcement_reconciled: BTreeSet::new(),
+            announcement_reconciled_pairs: BTreeSet::new(),
             transition_queued: BTreeSet::new(),
             transition_sealed: BTreeMap::new(),
             transition_delivered: BTreeSet::new(),
@@ -475,21 +490,20 @@ impl RuntimeState {
     /// sets are the projection (the triple sets beside them are the
     /// audit trail naming the proving statement). Counts only, so the
     /// operator surface never touches identities.
-    pub fn reconciled_counts(&self) -> (usize, usize) {
+    pub fn reconciled_counts(&self) -> (usize, usize, usize) {
         (
             self.transition_reconciled_pairs.len(),
             self.capability_reconciled_pairs.len(),
+            self.announcement_reconciled_pairs.len(),
         )
     }
 
-    /// Whether transition or capability obligations are still owed to
-    /// one recipient: the liveness half of the stall gauge. A stall
+    /// Whether obligations of any class are still owed to one
+    /// recipient: the liveness half of the stall gauge. A stall
     /// entry outlives its gap when obligations drain through another
     /// path (relay acceptance, a newer statement), so the gauge
     /// counts only stalls whose requester is still owed — the set
-    /// stays insert-only and needs no event plumbing. Scoped to the
-    /// 21c classes: announcements never stall (no retirement set to
-    /// wait on).
+    /// stays insert-only and needs no event plumbing.
     pub fn has_outstanding_for(&self, recipient: &DeviceId) -> bool {
         self.transition_queued.iter().any(|pair| {
             pair.1 == *recipient
@@ -499,30 +513,61 @@ impl RuntimeState {
             pair.1 == *recipient
                 && !self.capability_delivered.contains(pair)
                 && !self.capability_reconciled_pairs.contains(pair)
+        }) || self.announcement_queued.iter().any(|pair| {
+            pair.1 == *recipient
+                && !self.announcement_delivered.contains(pair)
+                && !self.announcement_reconciled_pairs.contains(pair)
         })
     }
 
     /// Every still-undischarged obligation, in `(snapshot, recipient)`
-    /// order: queued pairs minus delivered ones. Deterministic under
-    /// replay, so resume sends in a stable order. Deliberately
-    /// minus-delivered only: 21c retires transition and capability
-    /// obligations, never announcements (scope boundary) — no
-    /// announcement retirement set exists to subtract, and a test
-    /// pins that no statement changes this derivation.
+    /// order: queued pairs minus (delivered ∪ reconciled) ones.
+    /// Deterministic under replay, so resume sends in a stable order.
+    /// A reconciled obligation stops retrying exactly like a
+    /// delivered one: the recipient's durable state proved it held.
     pub fn pending_announcements(&self) -> Vec<(SnapshotId, DeviceId)> {
         self.announcement_queued
             .iter()
             .copied()
-            .filter(|pair| !self.announcement_delivered.contains(pair))
+            .filter(|pair| {
+                !self.announcement_delivered.contains(pair)
+                    && !self.announcement_reconciled_pairs.contains(pair)
+            })
             .collect()
     }
 
-    /// Whether one obligation is already covered — queued or
-    /// discharged — so re-announces stay idempotent instead of
-    /// appending duplicate queue facts per call.
+    /// Whether one obligation is already covered — queued,
+    /// discharged, or reconciled. Re-queueing and re-retiring stay
+    /// idempotent instead of appending duplicate facts per call.
     pub fn announcement_covered(&self, snapshot: SnapshotId, recipient: DeviceId) -> bool {
         self.announcement_queued.contains(&(snapshot, recipient))
             || self.announcement_delivered.contains(&(snapshot, recipient))
+            || self
+                .announcement_reconciled_pairs
+                .contains(&(snapshot, recipient))
+    }
+
+    /// Record one announcement obligation retired by reconciliation:
+    /// the recipient's durable state proved it holds the snapshot, so
+    /// the sender stops retrying. Same rule as the transition and
+    /// capability retirements: first marker for the pair wins, the
+    /// statement digest is audit.
+    pub fn record_announcement_reconciled(
+        &mut self,
+        snapshot: SnapshotId,
+        recipient: DeviceId,
+        statement: [u8; 32],
+    ) -> bool {
+        if self
+            .announcement_reconciled_pairs
+            .contains(&(snapshot, recipient))
+        {
+            return false;
+        }
+        self.announcement_reconciled_pairs
+            .insert((snapshot, recipient));
+        self.announcement_reconciled
+            .insert((snapshot, recipient, statement))
     }
 
     /// Record a transition-delivery obligation for one recipient.
@@ -877,6 +922,19 @@ impl RuntimeState {
     /// The announcement for one snapshot, if recorded.
     pub fn announcement(&self, snapshot: &SnapshotId) -> Option<&SnapshotAnnouncement> {
         self.announcements.get(snapshot)
+    }
+
+    /// Every recorded announcement with its epoch, in snapshot-id
+    /// order: the sender-side offer set for statement-triggered
+    /// catch-up. Recorded announcements only — a snapshot with a
+    /// body but no signed announcement cannot be forwarded (only
+    /// the author authors; everyone else re-sends the author's
+    /// statement).
+    pub fn recorded_announcement_epochs(&self) -> Vec<(SnapshotId, u64)> {
+        self.announcements
+            .iter()
+            .map(|(snapshot, announcement)| (*snapshot, announcement.epoch))
+            .collect()
     }
 
     /// The record for one manifest id, if recorded.

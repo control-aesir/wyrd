@@ -2213,10 +2213,11 @@ fn sync_status_render(status: &SyncStatus) -> String {
     // a per-peer backlog.
     let reconcile = &status.reconciliation;
     out.push_str(&format!(
-        "reconciliation: {} statements received, {} transitions + {} capabilities retired\n",
+        "reconciliation: {} statements received, {} transitions + {} capabilities + {} announcements retired\n",
         reconcile.statements_received,
         reconcile.transitions_reconciled,
         reconcile.capabilities_reconciled,
+        reconcile.announcements_reconciled,
     ));
     if status.live_heads.is_empty() {
         out.push_str("live heads: none\n");

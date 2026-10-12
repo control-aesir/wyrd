@@ -23,6 +23,21 @@ version say exactly what changed.
 
 ### Added
 
+- Announcement-class reconciliation for late joiners
+  (`docs/sync-and-peers.md`, `planning/v0.3/issues/38-late-joiners-superseded-epochs.md`):
+  a sender answering a reconciliation statement queues the
+  recipient's missing announcements (recorded announcements minus
+  evidenced snapshots, installed epochs only — synthesized
+  obligations, no prior queue fact needed) and sends them under the
+  same per-statement cap, so a device admitted epochs later learns
+  superseded-epoch snapshot ids through the one reconciliation
+  mechanism. Retirement commits the new `AnnouncementReconciled`
+  fact (tag `0x1D`, fixed triple like the other classes) on direct
+  statement evidence of the snapshot — no ancestry widening — and
+  pending derives as queued minus (delivered ∪ reconciled) for all
+  three classes. `sync status` reports announcements retired
+  alongside the other classes.
+
 - Freshness ordering in bulk fetch (`docs/retry-policy.md`,
   `crates/wyrd-sync/src/bulk.rs`): the candidate walk orders each
   attempt from a per-provider outcome memory — recently failed

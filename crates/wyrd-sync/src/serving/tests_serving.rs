@@ -1,7 +1,17 @@
 use super::*;
+use std::path::{Path, PathBuf};
+
+use iroh::{endpoint::presets, Endpoint};
+use iroh_blobs::store::fs::FsStore;
+use wyrd_format::{
+    durable, BaoRoot, ContentId, DriveId, FsObjectStore, Manifest, ObjectKind, ObjectStore,
+    SnapshotId, StorageId,
+};
+
+use crate::bulk::{BulkError, BulkSource};
 use crate::keys::EpochSecret;
-use crate::seal::seal_manifest;
-use wyrd_format::{DriveId, FsObjectStore, Manifest, ObjectKind, ObjectStore, SnapshotId};
+use crate::runtime::RuntimeState;
+use crate::seal::{blob_root, seal_manifest};
 
 fn drive() -> DriveId {
     DriveId::from_bytes([0xEE; 32])
@@ -488,11 +498,7 @@ fn a_timed_out_barrier_stays_queued_until_the_worker_handles_it() {
             Ok(())
         }
     }));
-    let handle = ServingHandle {
-        runtime: runtime.handle().clone(),
-        sender: sender.clone(),
-        barrier_in_flight: Arc::new(AtomicBool::new(false)),
-    };
+    let handle = ServingHandle::new(runtime.handle().clone(), sender.clone());
 
     // A blocked import: the first barrier times out but stays
     // queued behind the import.
@@ -656,7 +662,6 @@ fn a_full_mirror_queue_applies_backpressure_without_losing_the_vault() {
 /// backpressure rejection, not just generically.
 #[test]
 fn a_rejected_import_lands_once_the_drain_catches_up() {
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -716,11 +721,7 @@ fn a_rejected_import_lands_once_the_drain_catches_up() {
 
     // A barrier proves every accepted byte — including the retry —
     // landed in the mirror.
-    let handle = ServingHandle {
-        runtime: runtime.handle().clone(),
-        sender: sender.clone(),
-        barrier_in_flight: Arc::new(AtomicBool::new(false)),
-    };
+    let handle = ServingHandle::new(runtime.handle().clone(), sender.clone());
     assert!(
         handle.flush_bounded(Duration::from_secs(30)).unwrap(),
         "the barrier lands once the drain catches up"
@@ -779,11 +780,7 @@ fn a_full_queue_reports_not_ready_instead_of_a_barrier() {
         let bytes = vec![i as u8; 3];
         sender.send_import(blob_root(&bytes), bytes).unwrap();
     }
-    let handle = ServingHandle {
-        runtime: runtime.handle().clone(),
-        sender: sender.clone(),
-        barrier_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
+    let handle = ServingHandle::new(runtime.handle().clone(), sender.clone());
     assert!(
         !handle.flush_bounded(Duration::from_secs(5)).unwrap(),
         "a barrier behind a full queue reports not-ready"

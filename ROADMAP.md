@@ -30,12 +30,16 @@ thing; v1.0, ship it.
 
 ## Triage: placing work on the map
 
-Every triaged issue carries exactly one `release:*` milestone. The label scheme is
+Every triaged issue carries exactly one `release:*` milestone, applied with
+`ngit issue label` in triage — never at creation: creation-time labels are
+lowercased, embedded permanently in the issue event, and cannot be removed
+through a later `ngit label` event. The label scheme is
 `release:v0.2.0-alpha`, `release:v0.3.0-alpha`, and `release:v0.9.0-beta`
 for the existing milestones, then bare `release:v0.4`, `release:v0.5`,
 `release:v0.6`, `release:v0.7`, `release:v0.8`, and `release:v1.0` with no
 qualifier suffix, plus `release:backlog` for visible future work with no
-commitment.
+commitment. Earlier alphas are retired from the scheme but stay on their
+issues for history.
 
 - Backlog issues (deferred beyond the immediate roadmap) carry
   `release:backlog`. The label is the signal; no body sentence is required.

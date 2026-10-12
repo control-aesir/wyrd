@@ -119,7 +119,8 @@ Lima for macOS dev iteration and as the refactor guard.)
   branches (see the ngit skill).
 - Follow `docs/collaboration-workflow.md` for issue triage, PR review, merge,
   and issue resolution. Project labels are applied after issue creation —
-  never during it (creation-time labels are permanent and unremovable):
+  never during it (creation-time labels are permanent: no later `ngit label`
+  event retracts them):
   exactly one type (`bug`, `enhancement`, or `chore`), one priority (`P0` to
   `P4`), and one `release:*` milestone (`release:backlog` when the work is
   deferred beyond the immediate roadmap; no triaged issue is ever without

@@ -9,7 +9,7 @@ architecture and documented contracts. Read `AGENTS.md` and
 Follow [`docs/collaboration-workflow.md`](docs/collaboration-workflow.md) for
 the complete issue, triage, PR, review, and merge workflow.
 
-Every open issue should have exactly one label from each category:
+Every triaged issue carries exactly one label from each category:
 
 - Type: `bug`, `enhancement`, or `chore`.
 - Priority: `P0`, `P1`, `P2`, `P3`, or `P4`.
@@ -18,8 +18,8 @@ Every open issue should have exactly one label from each category:
 Apply these labels in a deliberate triage pass after creating the issue.
 Never pass them to `ngit issue create --label`: creation-time labels are
 lowercased, embedded permanently in the issue event, and cannot be removed
-afterwards — not even with `ngit issue label --remove-label`, which only
-retracts labels applied during triage. A wrong label at creation is forever.
+through a later `ngit label` event — `--remove-label` only retracts labels
+applied during triage. A wrong label at creation is effectively forever.
 Use `ngit issue label` so priority case is preserved and the label is a
 separate, manageable event.
 

@@ -17,9 +17,9 @@ ngit issue create --subject "feat(format): path-level tree mutation" \
 ```
 
 Never add project labels during creation. Creation-time labels are lowercased,
-embedded permanently in the issue event, and cannot be removed afterwards —
-not even with `ngit issue label --remove-label`, which only retracts labels
-applied during triage. Create issues bare and label them in triage.
+embedded permanently in the issue event, and cannot be removed through a
+later `ngit label` event — `--remove-label` only retracts labels applied
+during triage. Create issues bare and label them in triage.
 
 ## 2. Triage The Issue
 

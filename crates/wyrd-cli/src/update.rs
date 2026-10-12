@@ -2627,20 +2627,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn verdict_write_failure_warns_and_continues() {
-        use std::os::unix::fs::PermissionsExt;
         // The record is a channel, not a transaction step: an
-        // unwritable directory must never fail the run. A
-        // read-only dir refuses the temp file; permissions are
-        // restored before the harness removes the tree.
+        // unwritable location must never fail the run. A path
+        // nested under a regular file fails for every uid —
+        // permission bits would not fail root, and CI runs as
+        // root — so this is ENOTDIR, not EACCES.
         let temp = TempDir::new();
-        let exe = temp.0.join("wyrd");
-        fs::write(&exe, b"old-binary").unwrap();
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o555)).unwrap();
+        let anchor = temp.0.join("anchor");
+        fs::write(&anchor, b"not a directory").unwrap();
+        let exe = anchor.join("wyrd");
         assert!(write_verdict(&exe, &verdict_fixture("done")).is_err());
         record_verdict(&exe, &verdict_fixture("done"));
-        fs::set_permissions(&temp.0, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

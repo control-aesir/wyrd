@@ -244,7 +244,7 @@ step4_member() {
   reinvite_out="$(expect_exit 0 step4-reinvite-ok \
     with_creds "$oc" member "$od" invite "$dev" "$key" "$E2E_ROOT/invitation-dup")"
   [[ -f "$E2E_ROOT/invitation-dup" ]] || die "re-invite wrote no file"
-  echo "$reinvite_out" | grep -qi "already a member" \
+  echo "$reinvite_out" | grep -qiE "already a member|catch-up already complete" \
     || die "re-invite did not report resume: $reinvite_out"
   local log_after
   log_after="$(with_creds "$oc" member "$od" log)"

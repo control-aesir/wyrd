@@ -333,7 +333,8 @@ epoch's control key the recipient already holds, so it learns
 nothing it could not decrypt, exactly like the outbox it joins.
 
 Surfaced as 21d: `sync status` carries a `reconciliation` row —
-statements received plus transitions and capabilities retired,
+statements received plus transitions, capabilities, and
+announcements retired,
 all from committed facts, classes and counts only — and `sync now`
 reports the open gap as two gauges: statements never evaluated,
 plus evaluated-but-stuck ones whose requester is still owed. The

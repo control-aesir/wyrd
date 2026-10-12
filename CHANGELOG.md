@@ -32,6 +32,15 @@ version say exactly what changed.
   column on every composition and conformance clauses (data-flow
   classification, missing-and-misleading detection, derived
   observations classified by disclosure).
+- ngit-workflow opencode plugin (spike: issue triage only,
+  `.opencode/plugins/ngit-workflow.ts`): a typed `ngit_issue_triage` tool
+  that applies exactly one type, one priority, and one `release:*`
+  milestone in a single validated call, removing displaced labels in the
+  same call, and verifies the end state, so agents stop re-deriving label
+  ceremony. Closed label sets are enforced in code (creation-time labels
+  are unrepresentable: the tool takes no creation path); pure logic is
+  covered by offline deno tests in   `.opencode/plugin-tests/` (run:
+  `devenv shell -- deno test --allow-read .opencode/plugin-tests/`).
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

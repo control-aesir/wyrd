@@ -41,6 +41,14 @@ version say exactly what changed.
   are unrepresentable: the tool takes no creation path); pure logic is
   covered by offline deno tests in   `.opencode/plugin-tests/` (run:
   `devenv shell -- deno test --allow-read .opencode/plugin-tests/`).
+- Vault-position diagnostics projection (`wyrd-core::vault`,
+  `wyrd vault status`): the stopped-drive section now shows the
+  keyless-replica subset (durability, outbox/queue counts,
+  reconciliation and materialization counts, backlog predicate)
+  through a dedicated `VaultStatus` type with no identity-bearing
+  field, instead of the member projection's tip, epochs, head
+  authors, peer handles, and mailbox line. The surface takes no
+  relay configuration (matrix H9).
 - Announcement-class reconciliation for late joiners
   (`docs/sync-and-peers.md`):
   a sender answering a reconciliation statement queues the

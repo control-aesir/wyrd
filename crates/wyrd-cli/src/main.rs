@@ -22,6 +22,7 @@ use wyrd_core::policy::{
     RetentionPolicy,
 };
 use wyrd_core::status::{observe, SyncStatus};
+use wyrd_core::vault::{observe_vault, VaultStatus};
 use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
@@ -885,9 +886,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             Some(VaultAction::Status) if log_file.is_some() => Err(CliError::Usage(
                 "--log-file is start-only: status writes no diagnostics".into(),
             )),
-            Some(VaultAction::Status) => {
-                vault_status(drive_dir, relays.relay, &passphrase, identity)
-            }
+            Some(VaultAction::Status) => vault_status(drive_dir, &passphrase, identity),
         },
         Command::Pin {
             drive_dir, path, ..
@@ -2445,6 +2444,69 @@ fn sync_status_render(status: &SyncStatus) -> String {
     out
 }
 
+/// Render the vault-position projection for `vault status`'s
+/// stopped-drive section. Counts and drive state only — the struct
+/// has no identity-bearing field, so the renderer cannot print one:
+/// no tip transition id, no held epochs, no head ids or authors, no
+/// peer handles, no mailbox line. A vault surface on every
+/// composition (matrix rule), even when the process holds keys.
+fn vault_status_render(status: &VaultStatus) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("durability: {}\n", status.durability.as_str()));
+    let totals = &status.outbox;
+    out.push_str(&format!(
+        "outbox announcements: {} queued, {} delivered\n",
+        totals.announcements_queued, totals.announcements_delivered,
+    ));
+    out.push_str(&format!(
+        "outbox transitions: {} queued, {} delivered\n",
+        totals.transitions_queued, totals.transitions_delivered,
+    ));
+    out.push_str(&format!(
+        "outbox capabilities: {} queued, {} delivered\n",
+        totals.capabilities_queued, totals.capabilities_delivered,
+    ));
+    let queue = &status.queue;
+    out.push_str(&format!(
+        "queue: {} outstanding ({} outbox, {} fetch)\n",
+        queue.total(),
+        queue.outbox,
+        queue.fetch,
+    ));
+    if queue.carries > 0 {
+        out.push_str(&format!(
+            "  carries: {} staged (counted in outbox)\n",
+            queue.carries
+        ));
+    }
+    // The backlog predicate, not a convergence verdict: head-class
+    // detail is member-only (its rows carry snapshot ids), so a
+    // quiet queue beside pending heads is named quiet, never
+    // converged.
+    if status.backlog_empty {
+        out.push_str("backlog: quiet\n");
+    } else {
+        out.push_str(&format!(
+            "backlog: active ({} outbox, {} fetch)\n",
+            queue.outbox, queue.fetch,
+        ));
+    }
+    let reconcile = &status.reconciliation;
+    out.push_str(&format!(
+        "reconciliation: {} statements received, {} transitions + {} capabilities + {} announcements retired\n",
+        reconcile.statements_received,
+        reconcile.transitions_reconciled,
+        reconcile.capabilities_reconciled,
+        reconcile.announcements_reconciled,
+    ));
+    let materialization = &status.materialization;
+    out.push_str(&format!(
+        "materialization: {} cached, {} pinned, {} local objects\n",
+        materialization.cached, materialization.pinned, materialization.local_objects,
+    ));
+    out
+}
+
 /// The relay-less mailbox posture, shared by the status and now
 /// surfaces so the two cannot drift apart.
 const MAILBOX_IDLE_LINE: &str = "mailbox: idle (no --relay given)\n";
@@ -3346,17 +3408,18 @@ fn vault(
 /// the store — a running vault's exclusivity is undisturbed by the
 /// query — and never claims liveness: fresh means recent, stale means
 /// last-recorded, and both say liveness unverified. The durable
-/// section reuses `sync status`'s observation verbatim when the drive
-/// is stopped (nothing new is revealed), and reports unavailable —
-/// never guessed — while the vault holds the lock. The relay list
-/// only labels the mailbox line, exactly as on `sync status`.
+/// section shows the vault-position projection when the drive is
+/// stopped (counts and drive state only — never the member columns
+/// `sync status` prints), and reports unavailable — never guessed —
+/// while the vault holds the lock. The surface takes no relay
+/// configuration: it never constructs a mailbox, so there is no
+/// mailbox line to label (matrix H9).
 fn vault_status(
     drive_dir: PathBuf,
-    relays: Vec<String>,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let (out, outcome) = vault_status_report(drive_dir, relays, passphrase, identity);
+    let (out, outcome) = vault_status_report(drive_dir, passphrase, identity);
     print!("{out}");
     outcome
 }
@@ -3394,7 +3457,7 @@ fn open_error_proves_free(error: &EngineError) -> bool {
 /// but only a proven-free failure reclassifies a fresh sidecar as
 /// retained history.
 enum DurableProbe {
-    Stopped(Box<SyncStatus>),
+    Stopped(Box<VaultStatus>),
     Held,
     Unreadable {
         failure: CliError,
@@ -3410,7 +3473,6 @@ enum DurableProbe {
 /// not take down what the sidecar read needs no credentials for.
 fn vault_status_report(
     drive_dir: PathBuf,
-    relays: Vec<String>,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> (String, Result<(), CliError>) {
@@ -3422,7 +3484,11 @@ fn vault_status_report(
     // contended drive; any other failure keeps its error plus its
     // lock provenance for the tail.
     let probe = match Engine::open_keystore(drive_dir, passphrase, identity) {
-        Ok(engine) => match observe(&engine, relays.len()) {
+        // The vault projection, never the member one: this is a
+        // vault surface on every composition (matrix rule), so the
+        // stopped-drive section shows the keyless-replica subset —
+        // counts and drive state, no tip, heads, peers, or mailbox.
+        Ok(engine) => match observe_vault(&engine) {
             // Observed through our own open: the lock was ours
             // throughout, so the drive was free when the probe ran.
             Ok(status) => DurableProbe::Stopped(Box::new(status)),
@@ -3444,8 +3510,8 @@ fn vault_status_report(
         DurableProbe::Stopped(status) => {
             let process = posture::read_posture(&sidecar);
             let mut out = posture::render_process_section(&process, true);
-            out.push_str("durable: stopped drive (same facts `sync status` reports)\n");
-            out.push_str(&sync_status_render(&status));
+            out.push_str("durable: stopped drive (vault-position facts only)\n");
+            out.push_str(&vault_status_render(&status));
             (out, Ok(()))
         }
         DurableProbe::Held => {

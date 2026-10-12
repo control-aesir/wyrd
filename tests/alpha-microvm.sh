@@ -190,6 +190,18 @@ as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$M
   "$MD" join "$RUN/invitation-n" >"$RUN/logs/join-n.out" 2>"$RUN/logs/join-n.stderr" \
   || die "member-n join failed"
 pass "member-n joins"
+# Rerun-resume cover (bound-admission-closure child 2): re-inviting
+# an admitted device resumes its catch-up instead of failing — same
+# device and key, fresh destination (the destination policy refuses
+# existing files, so reusing invitation-n would fail at the claim,
+# before the resume logic under test). A non-zero exit or a missing
+# file fails the phase.
+as_guest "$WYRD_BIN" member --identity-file "$RUN/creds/owner/identity" \
+  --passphrase-file "$RUN/creds/owner/passphrase" "$RUN/drives/owner" \
+  invite "$DEV" "$KEY" "$RUN/invitation-n-rerun" >"$RUN/logs/invite-n-rerun.out" 2>"$RUN/logs/invite-n-rerun.stderr" \
+  || die "owner re-invite of member-n failed"
+test -s "$RUN/invitation-n-rerun" || die "re-invitation file missing after rerun"
+pass "owner re-invite of member-n resumes"
 fi # want_phase 6
 
 # --- phase 3: cross-host convergence ------------------------------------

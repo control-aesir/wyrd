@@ -365,6 +365,121 @@ fn sync_status_after_invite_shows_pending_obligations() {
     assert!(rendered.contains("live heads:"), "{rendered}");
 }
 
+/// Invite arguments for one admission attempt: member by default,
+/// `--reader` when asked. Reruns name a fresh destination — the
+/// destination policy refuses existing files rather than replacing
+/// them, so a rerun that reused the first path would fail at the
+/// claim, before the resume logic under test.
+fn invite_command(
+    fixture: &Fixture,
+    peer: &DeviceIdentitySecret,
+    encryption: &DeviceEncryptionSecret,
+    out: &std::path::Path,
+    reader: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "member".into(),
+        fixture.drive.display().to_string(),
+        "--identity-file".into(),
+        fixture.identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        fixture.passphrase_file.display().to_string(),
+        "invite".into(),
+        peer.device_id().to_string(),
+        encryption.encryption_key().to_string(),
+        out.display().to_string(),
+    ];
+    if reader {
+        args.push("--reader".into());
+    }
+    args
+}
+
+/// Rerunning invite after a completed admission succeeds through
+/// the resume path with zero new obligations and a reissued
+/// invitation: fresh randomness, so different bytes that open for
+/// the same newcomer.
+#[test]
+fn member_invite_rerun_after_completion_reissues_invitation() {
+    let fixture = Fixture::new();
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let encryption = DeviceEncryptionSecret::generate().unwrap();
+    let first = fixture._temp.0.join("invitation-1");
+    command(invite_command(&fixture, &peer, &encryption, &first, false)).unwrap();
+    let second = fixture._temp.0.join("invitation-2");
+    command(invite_command(&fixture, &peer, &encryption, &second, false)).unwrap();
+    let first_bytes = std::fs::read(&first).unwrap();
+    let second_bytes = std::fs::read(&second).unwrap();
+    assert_ne!(
+        first_bytes, second_bytes,
+        "reissue uses fresh randomness, never a copy"
+    );
+    let reopened = SealedBootstrap::decode(&second_bytes).unwrap();
+    assert_eq!(
+        reopened.recipient,
+        peer.device_id(),
+        "reissued invitation names the newcomer"
+    );
+}
+
+/// The role half of the identity guard: inviting an admitted
+/// member `--reader` refuses with the actual role named, and the
+/// failed rerun removes its destination claim.
+#[test]
+fn member_invite_role_mismatch_refuses_with_actual_role() {
+    let fixture = Fixture::new();
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let encryption = DeviceEncryptionSecret::generate().unwrap();
+    let first = fixture._temp.0.join("invitation-1");
+    command(invite_command(&fixture, &peer, &encryption, &first, false)).unwrap();
+    let second = fixture._temp.0.join("invitation-2");
+    let error = command(invite_command(&fixture, &peer, &encryption, &second, true)).unwrap_err();
+    let text = format!("{error}");
+    assert!(
+        matches!(
+            error,
+            CliError::Engine(EngineError::AdmissionRoleMismatch {
+                actual: "a member",
+                ..
+            })
+        ),
+        "role mismatch names the actual role: {text}"
+    );
+    assert!(text.contains("admitted as a member"), "{text}");
+    assert!(
+        !second.exists(),
+        "failed rerun removes its claim so a retry starts clean"
+    );
+}
+
+/// The key half of the identity guard: rerunning with an
+/// encryption key the recorded admission does not name refuses
+/// without touching the obligations, and removes the claim.
+#[test]
+fn member_invite_wrong_key_refuses_resume() {
+    let fixture = Fixture::new();
+    let peer = DeviceIdentitySecret::generate().unwrap();
+    let encryption = DeviceEncryptionSecret::generate().unwrap();
+    let first = fixture._temp.0.join("invitation-1");
+    command(invite_command(&fixture, &peer, &encryption, &first, false)).unwrap();
+    let other = DeviceEncryptionSecret::generate().unwrap();
+    let second = fixture._temp.0.join("invitation-2");
+    let error = command(invite_command(&fixture, &peer, &other, &second, false)).unwrap_err();
+    let text = format!("{error}");
+    assert!(
+        matches!(
+            error,
+            CliError::Engine(EngineError::AdmissionKeyMismatch { .. })
+        ),
+        "key mismatch refuses: {text}"
+    );
+    assert!(text.contains("does not match"), "{text}");
+    assert!(
+        !second.exists(),
+        "failed rerun removes its claim so a retry starts clean"
+    );
+}
+
 /// PR 2 surfaces on one render: opaque peer handles over the
 /// admitted peer and the authoring device, the durable queue depth,
 /// convergence, materialization counts, and the explicit

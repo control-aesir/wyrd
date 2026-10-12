@@ -692,3 +692,64 @@ fn update_verify_names_the_invariant_on_a_torn_store() {
         "torn store must fail with invariant 2, got: {error}"
     );
 }
+
+/// The capacity refusal renders for the operator with counts,
+/// ceiling, and the non-retryable continuation — the engine's
+/// string wrapped unchanged as `CliError::Engine`, so this pins
+/// the operator-facing text of the pure-function refusal.
+#[test]
+fn admission_capacity_refusal_renders_counts_and_continuation() {
+    use wyrd_sync::runtime::{EngineError, UnqueuedClosure};
+
+    let error = CliError::Engine(EngineError::AdmissionBatchOverBudget {
+        records: 70_000,
+        max: 65_536,
+        closure: UnqueuedClosure::Counted(120_000),
+    });
+    let text = format!("{error}");
+    for needle in [
+        "engine failed: admission refused",
+        "70000",
+        "65536",
+        "120000",
+        "rerunning unchanged cannot help",
+        "bound must change",
+    ] {
+        assert!(
+            text.contains(needle),
+            "operator sees why rerunning cannot help: {text}"
+        );
+    }
+}
+
+/// The three invite outcomes render distinctly: a fresh admission
+/// names obligations and batches, a resumed interruption names the
+/// resumed count, and an already-complete rerun says so — so an
+/// automatic recovery can never be mistaken for a fresh admission.
+#[test]
+fn invite_outcomes_render_distinctly() {
+    use std::path::PathBuf;
+    use wyrd_format::DeviceId;
+
+    let device = DeviceId::from_bytes([0x11; 32]);
+    let out = PathBuf::from("invitation");
+    let fresh = render_invited(&device, false, 2, &out, 5, 1, 0);
+    let resumed = render_resumed(5, 1, &out, 0);
+    let complete = render_resumed(0, 0, &out, 0);
+    assert!(
+        fresh.contains("invited") && fresh.contains("5 obligations in 1 batches"),
+        "fresh admission headline: {fresh}"
+    );
+    assert!(
+        resumed.contains("already a member; resumed 5 obligations"),
+        "resumed interruption: {resumed}"
+    );
+    assert!(
+        complete.contains("catch-up already complete; 0 obligations"),
+        "already-complete rerun: {complete}"
+    );
+    assert!(
+        !resumed.contains("invited ") && !complete.contains("invited "),
+        "reruns never read as fresh admissions"
+    );
+}

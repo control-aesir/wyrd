@@ -47,13 +47,31 @@ committed log by exactly the refused statements.
 
 ## Membership authoring
 
-Each authoring commits transition + self capability + every catch-up
-obligation (queued transitions, wraps, head announcements) in ONE
-batch — there is no window where a transition is durable but its
-outbox is not. Validation stages against a cloned log, so a failed
-op leaves no phantom tip. Pinned by `failed_admit_leaves_no_phantom_tip`
-and `admit_queues_and_delivers_newcomer_catch_up` (restart before
-first send still delivers; `author/tests_admission.rs`).
+Each admission commits its membership half — transition + self
+capability + queued transitions and wraps — in ONE batch, so a
+failed op leaves no phantom tip and there is no window where a
+transition is durable but its membership outbox is not. The
+head-announcement outbox follows incrementally in bounded batches
+(OD-16-1 B), so a transition CAN be durable while its announcement
+catch-up is incomplete: each obligation is independently durable
+and idempotent, and resume re-derives exactly the missing suffix
+with no checkpoint marker. The re-derivation assumes later
+transitions did not change old verdicts — admission preserves
+owners and never voids history, so the pinned pre-admission seed
+set reproduces exactly (pinned by
+`pinned_epoch_survives_admission_and_freeze`; a post-admission
+freeze is outside this path's contract). The production trigger
+for that resume is rerunning `member invite` for the admitted
+device (`Engine::resume_admission`: identity guard, fill, invitation
+reissue). Pinned by `failed_admit_leaves_no_phantom_tip` (atomic
+membership half), `admit_queues_and_delivers_newcomer_catch_up`
+(restart before first send still delivers;
+`author/tests_admission.rs`), the bounded-fill trio
+`admission_commit_is_bounded_by_the_pass_budget`,
+`crash_torn_fill_chunk_resumes_exactly_once`, and
+`crash_mid_incremental_admission_resumes_without_duplicate_obligations`,
+and `member_invite_rerun_resumes_interrupted_fill` (the operator
+rerun).
 
 ## Namespace carry across transitions
 

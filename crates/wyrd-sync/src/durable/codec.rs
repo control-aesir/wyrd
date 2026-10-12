@@ -147,7 +147,9 @@ pub(super) const KNOWN_TAGS: [u8; 29] = [
 /// allocation. Commits hold small canonical facts; anything beyond
 /// these bounds is damage, not data.
 pub(super) const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
-pub(super) const MAX_RECORDS_PER_COMMIT: usize = 65_536;
+/// Visible crate-wide (not just load) because the admission refusal
+/// names this ceiling in its structured error variant.
+pub(crate) const MAX_RECORDS_PER_COMMIT: usize = 65_536;
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Domain tag for the commit-chain hash: integrity and ordering of the

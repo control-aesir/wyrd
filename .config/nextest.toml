@@ -12,7 +12,9 @@
 #   cover, normal persistence and restart, selected mailbox and iroh
 #   loopback). Branch reviews run this profile.
 # - `slow` is the master-CI supplement: the nine >10s live-relay tests
-#   excluded from `default`. A future `master` profile (everything plus
+#   excluded from `default`, plus the ceiling-scale admission tests
+#   (debug-profile signatures at 2.5k-66k links) that the bounded-
+#   admission work adds under the same rule. A future `master` profile (everything plus
 #   stress and enlarged proptest budgets) is planned; until then master
 #   CI runs `default` plus `slow`.
 #
@@ -48,7 +50,8 @@ contracts-serial = { max-threads = 1 }
 # ignore attribute is reserved for tests that need external resources (a
 # public relay, kernel FUSE) or are blocked on future work, which must
 # never run in CI. Substrings are distinctive enough to select exactly
-# these nine without a name-by-name list at each call site.
+# these tests without a name-by-name list at each call site (nine
+# live-relay plus the named ceiling-scale admission tests).
 #
 # Deliberate exception: heterogeneous_relays_cover stays in the default
 # profile. Both its relays are localhost (MiniRelay plus an in-process
@@ -59,7 +62,7 @@ contracts-serial = { max-threads = 1 }
 # `local`, where multi-relay integration cover is out of budget by
 # design (single-relay and iroh unit tests stay; see below).
 [profile.default]
-default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover))"
+default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover) or test(~admission_commit_is_bounded_by_the_pass_budget) or test(~admission_closure_commits_bounded_batches) or test(~crash_mid_incremental_admission_resumes_without_duplicate_obligations) or test(~member_invite_rerun_resumes_across_batches))"
 # Nextest's LEAK verdict fires when a test's stdout/stderr pipes stay
 # open past its exit: a live child process inheriting them, or an event
 # loop too loaded to observe the EOF within the window. Nextest runs
@@ -80,7 +83,7 @@ default-filter = "not (test(~flood_beyond_channel_capacity) or test(~saturation_
 leak-timeout = "5s"
 
 # The local edit-loop profile: cheap deterministic tests only. Profiles
-# do not inherit filters, so the nine slow tests excluded from `default`
+# do not inherit filters, so the slow tests excluded from `default`
 # above are restated here. Beyond them, local additionally excludes:
 #
 # - the whole contracts binary (cross-crate composition; PR evidence),
@@ -112,11 +115,11 @@ leak-timeout = "5s"
 # If a heavy flood test ever lands in this profile, mirror the
 # default-profile mailbox-flood overrides here.
 [profile.local]
-default-filter = "not (package(wyrd-contracts) or test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover) or test(~heterogeneous) or test(~unacked_bound) or test(~useless_flood) or test(~spam) or test(~deep_tree_authoring) or test(~large_announcement_history) or test(~merge_plan_refuses_more_heads) or test(~deep_tip_classifies) or test(~seen_store_evicts) or test(~repeated_compaction) or test(~budgeted_walk_reaches_live) or test(~replacement_commit_is_atomic) or test(~same_mailbox_acquires_missed) or test(~disconnected_peer_acquires_missed) or test(~sliced_run_attempts_live) or test(~prod_kdf_params))"
+default-filter = "not (package(wyrd-contracts) or test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover) or test(~heterogeneous) or test(~unacked_bound) or test(~useless_flood) or test(~spam) or test(~deep_tree_authoring) or test(~large_announcement_history) or test(~merge_plan_refuses_more_heads) or test(~deep_tip_classifies) or test(~seen_store_evicts) or test(~repeated_compaction) or test(~budgeted_walk_reaches_live) or test(~replacement_commit_is_atomic) or test(~same_mailbox_acquires_missed) or test(~disconnected_peer_acquires_missed) or test(~sliced_run_attempts_live) or test(~prod_kdf_params) or test(~admission_commit_is_bounded_by_the_pass_budget) or test(~admission_closure_commits_bounded_batches) or test(~crash_mid_incremental_admission_resumes_without_duplicate_obligations) or test(~member_invite_rerun_resumes_across_batches))"
 leak-timeout = "5s"
 
 [profile.slow]
-default-filter = "test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover)"
+default-filter = "test(~flood_beyond_channel_capacity) or test(~saturation_recovers_broadcast_drops) or test(~saturation_recoveries_keep_single) or test(~restart_past_retention_redelivers) or test(~relay_outage_marks_down) or test(~serving_restart_with_accumulated_failures) or test(~poison_flood_stays_memory_only_at_scale) or test(~retry_flood_holds_at_most_one_window) or test(~two_relays_cover) or test(~admission_commit_is_bounded_by_the_pass_budget) or test(~admission_closure_commits_bounded_batches) or test(~crash_mid_incremental_admission_resumes_without_duplicate_obligations) or test(~member_invite_rerun_resumes_across_batches)"
 
 [[profile.default.overrides]]
 filter = 'test(flood)'

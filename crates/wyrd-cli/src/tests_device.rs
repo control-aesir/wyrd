@@ -400,21 +400,31 @@ fn non_owner_reissue_refuses() {
     assert!(!out.exists(), "a refused reissue writes no file");
 }
 
+/// Deliberate replacement for `double_invite_refuses` (child 2):
+/// rerunning invite for an admitted device resumes its catch-up
+/// instead of failing — the second invite succeeds with a reissued
+/// invitation and authors no duplicate admission.
 #[test]
-fn double_invite_refuses() {
+fn double_invite_resumes_instead_of_refusing() {
     let pair = Pair::new();
     let (newcomer, newcomer_key) = pair.pair_and_join();
+    let epoch = pair.owner_tip_epoch();
     let out = pair._temp.0.join("second-invitation");
-    let error = command(pair.owner_member(vec![
+    command(pair.owner_member(vec![
         "invite".into(),
         newcomer.to_string(),
         newcomer_key.to_string(),
         out.display().to_string(),
     ]))
-    .unwrap_err();
+    .unwrap();
     assert!(
-        matches!(error, CliError::Engine(EngineError::AlreadyMember)),
-        "second invite names the existing membership: {error:?}"
+        out.is_file(),
+        "rerun reissues the invitation for the admitted device"
+    );
+    assert_eq!(
+        pair.owner_tip_epoch(),
+        epoch,
+        "rerun resumes obligations; it never authors a second admission"
     );
 }
 

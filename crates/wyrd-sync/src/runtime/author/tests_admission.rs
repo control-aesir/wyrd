@@ -1,5 +1,9 @@
-use super::admission::{admit_device, next_epoch};
+use super::admission::{
+    admission_capacity_refusal, admit_device, membership_commit_error, next_epoch,
+    resume_admission_obligations, ADMISSION_OBLIGATION_BATCH,
+};
 use super::tests_harness::{device_of, owner_engine};
+use crate::runtime::engine::UnqueuedClosure;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::ManifestRecord;
 
@@ -1096,21 +1100,133 @@ fn admission_queues_the_lineage_closure_for_the_newcomer() {
     );
 }
 
-/// The admission-time lineage walk costs O(recorded history) in
-/// one commit: every servable closure member queues exactly one
-/// obligation and the closure is never truncated to fit. The walk
-/// seeds from the live (current-epoch eligible) heads, so one long
-/// epoch's whole chain queues in one admission — and a superseded
-/// epoch's chain is not re-walked for later joiners. This pins the
-/// cost shape the eventual incremental checkpointing must
-/// preserve-or-replace deliberately. Atomicity the other way (a
-/// failed admit commits nothing) is pinned by
-/// `failed_admit_leaves_no_phantom_tip`.
+/// Mint a bare signed snapshot chain straight onto the store: one
+/// Schnorr signature per link, no content, no manifests, no
+/// announcements. The admission walk needs recorded bodies under a
+/// live tip, and classification needs only signature plus membership
+/// binding plus epoch match — so contentless links exercise the true
+/// closure path at ceiling scale without tens of thousands of full
+/// authorings. Bodies commit in bounded chunks (the setup dogfoods
+/// the bound the fill relies on). Returns every link id in chain
+/// order, tip last.
+fn mint_bare_chain(
+    engine: &mut Engine,
+    genesis_id: wyrd_format::TransitionId,
+    tree: wyrd_format::ContentId,
+    len: usize,
+) -> Vec<wyrd_format::SnapshotId> {
+    use crate::authorization::test_util::sign_snapshot;
+    use crate::membership::test_util::{drive as member_drive, key};
+
+    let (owner_sk, owner_id) = key(10);
+    let drive = member_drive();
+    let mut parents = Vec::new();
+    let mut ids = Vec::with_capacity(len);
+    let mut batch = Vec::new();
+    for n in 0..len {
+        let mut body =
+            wyrd_format::Snapshot::new(parents, tree, owner_id, genesis_id, 1, 0, n as u64)
+                .unwrap();
+        sign_snapshot(&mut body, &owner_sk, &drive);
+        let authorized = AuthorizedSnapshot::authorize(body, &drive).unwrap();
+        let id = authorized.snapshot().snapshot_id();
+        parents = vec![id];
+        ids.push(id);
+        batch.push(Fact::SnapshotBody(authorized));
+        if batch.len() == ADMISSION_OBLIGATION_BATCH {
+            engine.commit_facts(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        engine.commit_facts(&batch).unwrap();
+    }
+    ids
+}
+
+/// One shared content root for bare chains: the closure walk and
+/// classification never resolve the tree, so every link reuses it.
+fn bare_tree(objects: &mut wyrd_format::MemoryObjectStore) -> wyrd_format::ContentId {
+    use wyrd_format::{Entry, ObjectKind, ObjectStore, Tree};
+
+    let chunk = objects.insert(ObjectKind::Chunk, b"bare").unwrap();
+    Tree::from_entries(vec![Entry::file("bare.txt", 4, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(objects)
+        .unwrap()
+}
+
+/// The issue's headline assertion (slow profile: ~8 minutes of
+/// debug-profile signatures — master-CI evidence, not PR-gate
+/// evidence): a closure far longer than the per-commit ceiling
+/// admits successfully, and no single commit's record count is a
+/// function of recorded history. Under the old single-batch
+/// admission this chain refuses whole with `TooManyRecords`; here
+/// it fills in one membership commit plus one commit per full
+/// batch.
 #[test]
-fn admission_closure_cost_scales_with_history() {
+fn admission_commit_is_bounded_by_the_pass_budget() {
+    use wyrd_format::MemoryObjectStore;
+
+    // 65,536 mirrors MAX_RECORDS_PER_COMMIT (durable/codec.rs),
+    // hardcoded deliberately: the ceiling is load's `pub(super)`
+    // business, and the commit-delta assertion below is relative,
+    // so a moved ceiling changes the margin, never the verdict.
+    const CLOSURE_LEN: usize = 65_536 + ADMISSION_OBLIGATION_BATCH;
+
+    let (_dir, mut engine, genesis_id) = owner_engine("admission-bounded");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let ids = mint_bare_chain(&mut engine, genesis_id, tree, CLOSURE_LEN);
+    let tip = *ids.last().unwrap();
+    assert_eq!(
+        engine
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|h| h.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![tip],
+        "the minted chain is one live tip before admission"
+    );
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let before = engine.current();
+    engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    let chunks = CLOSURE_LEN.div_ceil(ADMISSION_OBLIGATION_BATCH) as u64;
+    assert_eq!(
+        engine.current() - before,
+        1 + chunks,
+        "one membership commit plus one commit per full obligation batch"
+    );
+    let queued = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .count();
+    assert_eq!(
+        queued, CLOSURE_LEN,
+        "every closure member queued exactly once across the batches"
+    );
+}
+/// Deliberate replacement for `admission_closure_cost_scales_with_history`
+/// (OD-16-1 B), first half: the pinned cost shape changed from "one
+/// commit per closure" to "one membership commit plus one commit per
+/// bounded batch", so this asserts the new shape on a small chain —
+/// exact commit count plus one obligation per member, no truncation.
+/// The ceiling-scale proof lives in
+/// `admission_closure_commits_bounded_batches` (slow profile); the
+/// per-epoch horizon second half is unchanged below.
+#[test]
+fn admission_fill_commits_one_batch_per_chunk() {
     use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 
-    let (_dir, mut engine, _genesis) = owner_engine("admission-closure-cost");
+    let (_dir, mut engine, _genesis) = owner_engine("admission-closure-bounded");
     let mut objects = MemoryObjectStore::default();
     const CHAIN_LEN: u8 = 6;
     for n in 0..CHAIN_LEN {
@@ -1126,9 +1242,15 @@ fn admission_closure_cost_scales_with_history() {
     let newcomer = DeviceIdentitySecret::generate().unwrap();
     let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
     let newcomer_id = device_of(&newcomer);
+    let before = engine.current();
     engine
         .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
         .unwrap();
+    assert_eq!(
+        engine.current() - before,
+        2,
+        "one membership commit plus one obligation batch commit under the batch size"
+    );
     let queued = engine
         .pending_announcements()
         .unwrap()
@@ -1138,7 +1260,7 @@ fn admission_closure_cost_scales_with_history() {
     assert_eq!(
         queued,
         usize::from(CHAIN_LEN),
-        "first admission queues one obligation per closure member, no truncation"
+        "bounded admission queues one obligation per closure member, no truncation"
     );
 
     // A post-admission write starts a fresh root: below-epoch
@@ -1175,6 +1297,47 @@ fn admission_closure_cost_scales_with_history() {
     );
 }
 
+/// Multi-chunk proof for the bounded shape (slow profile: minutes of
+/// debug-profile signatures at ceiling scale are master-CI evidence,
+/// not PR-gate evidence — see `.config/nextest.toml`). Three batches
+/// (1024 + 1024 + 452) fill in one membership commit plus one commit
+/// per full batch; the single-chunk mechanism pin lives in
+/// `admission_fill_commits_one_batch_per_chunk` (default profile).
+#[test]
+fn admission_closure_commits_bounded_batches() {
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 2 * ADMISSION_OBLIGATION_BATCH + 452;
+
+    let (_dir, mut engine, genesis_id) = owner_engine("admission-closure-multi");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let before = engine.current();
+    engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    assert_eq!(
+        engine.current() - before,
+        1 + 3,
+        "one membership commit plus one commit per full obligation batch"
+    );
+    let queued = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .count();
+    assert_eq!(
+        queued, CHAIN_LEN,
+        "bounded admission queues one obligation per closure member, no truncation"
+    );
+}
+
 /// Admission onto a frozen log fails closed instead of becoming a
 /// third contender: the staged transition would leave the conflict
 /// frozen, which intake would never elect.
@@ -1196,4 +1359,860 @@ fn admit_on_a_frozen_drive_fails_closed() {
     );
     assert_eq!(engine.log.frozen_at(), Some(2), "still frozen");
     assert_eq!(engine.current(), seq, "nothing committed");
+}
+
+/// Drive one newcomer's membership catch-up over the relay: the
+/// owner sends transitions and capabilities (`deliver_pending`) plus
+/// announcements (`announce_pending`), the newcomer drains until
+/// quiet (at most four rounds cover the key-install two-pass shape
+/// plus redelivery). Returns nothing; tests assert on durable
+/// state afterwards.
+fn relay_catch_up(
+    engine: &mut Engine,
+    joined: &mut Engine,
+    relay: &mut MemoryRelay,
+    newcomer_id: wyrd_format::DeviceId,
+) {
+    for _ in 0..4 {
+        {
+            let mut sender = MemoryMailbox {
+                relay: &mut *relay,
+                owner: engine.device(),
+            };
+            engine.deliver_pending(&mut sender).unwrap();
+            engine.announce_pending(&mut sender, None).unwrap();
+        }
+        let report = {
+            let mut receiver = MemoryMailbox {
+                relay: &mut *relay,
+                owner: newcomer_id,
+            };
+            joined.drain(&mut receiver).unwrap()
+        };
+        if report.accepted == 0 {
+            break;
+        }
+    }
+}
+
+/// Child-1 convergence (Zander condition 1): a bounded admission's
+/// newcomer converges across passes with no repair and no restart.
+/// The tip body arrives first (out of order) and classifies pending
+/// on its unknown parent — nonterminal, and no bar to the ancestors
+/// staying eligible for reconciliation — then the ancestors arrive
+/// over the fetch path and the newcomer adopts the same head as a
+/// single-shot admission would, each obligation discharged exactly
+/// once.
+#[test]
+fn admission_catch_up_completes_across_passes() {
+    use crate::authorization::{Classification, Pendency};
+    use crate::bulk::MemoryBulkSource;
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    let (_dir, mut engine, _genesis) = owner_engine("admission-catch-up");
+    let mut objects = MemoryObjectStore::default();
+    let mut tips = Vec::new();
+    for n in 0..5u8 {
+        let chunk = objects.insert(ObjectKind::Chunk, &[0xC0 + n]).unwrap();
+        let tree = Tree::from_entries(vec![
+            Entry::file("catch.txt", 1, false, vec![chunk]).unwrap()
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+        tips.push(engine.author_snapshot(&objects, tree).unwrap());
+    }
+    let tip_id = tips.last().unwrap().snapshot().snapshot_id();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+
+    let join_dir = TestDir::new("admission-catch-up-join");
+    let mut joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &outcome.invitation,
+    )
+    .unwrap();
+    let mut relay = MemoryRelay::default();
+    relay_catch_up(&mut engine, &mut joined, &mut relay, newcomer_id);
+    // All five announcements rode the relay: the catch-up the
+    // admission queued is the catch-up the newcomer holds.
+    for t in &tips {
+        let id = t.snapshot().snapshot_id();
+        assert!(
+            joined
+                .store
+                .rebuild(joined.device())
+                .unwrap()
+                .runtime
+                .announcement(&id)
+                .is_some(),
+            "newcomer holds the announcement for every closure member"
+        );
+    }
+
+    // The tip body arrives first, ancestors still missing: the tip
+    // classifies pending on its unknown parent — held, not adopted.
+    joined
+        .commit_facts(&[Fact::SnapshotBody(tips.last().unwrap().clone())])
+        .unwrap();
+    let heads = joined.snapshot_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .find(|h| h.id == tip_id)
+            .map(|h| h.classification),
+        Some(Classification::Pending(Pendency::UnknownParent)),
+        "tip with unrecorded parents is pending, never adopted early"
+    );
+    assert!(
+        joined.live_heads().unwrap().is_empty(),
+        "no live view advances onto a partial lineage"
+    );
+    // ... yet the ancestors stay eligible for reconciliation
+    // regardless of arrival order: the plan wants every announced
+    // bodiless snapshot, ancestry or none.
+    let plan = joined
+        .store
+        .rebuild(joined.device())
+        .unwrap()
+        .runtime
+        .reconcile();
+    for t in &tips[..4] {
+        assert!(
+            plan.pending_snapshot_bodies
+                .contains(&t.snapshot().snapshot_id()),
+            "order-independent reconciliation still wants the ancestors"
+        );
+    }
+
+    // The ancestors arrive over the fetch path; the second pass is
+    // quiet, proving convergence rather than a lucky single run.
+    // (Root manifests stay missing — heads need bodies, and manifest
+    // catch-up is orthogonal to lineage convergence.)
+    let mut bulk = MemoryBulkSource::default();
+    for t in &tips {
+        bulk.publish_snapshot(t.snapshot().snapshot_id(), t.snapshot().encode());
+    }
+    let mut join_objects = MemoryObjectStore::default();
+    let first = joined.execute_plan(&mut bulk, &mut join_objects).unwrap();
+    assert_eq!(
+        first.snapshot_bodies, 4,
+        "the four ancestors arrive over bulk"
+    );
+    let second = joined.execute_plan(&mut bulk, &mut join_objects).unwrap();
+    assert_eq!(second.snapshot_bodies, 0, "no body is fetched twice");
+    let arrived = joined
+        .store
+        .rebuild(joined.device())
+        .unwrap()
+        .runtime
+        .reconcile()
+        .pending_snapshot_bodies;
+    assert!(
+        arrived.is_empty(),
+        "every announced body is held after the passes"
+    );
+    // Adopted past, not pending: with the ancestors held, the whole
+    // epoch-1 chain classifies Superseded at the newcomer — authorized
+    // history below the admission epoch, the same verdict the owner
+    // renders. (Neither side holds it live: admission opened epoch
+    // 2.) Only the tip is a DAG head, so the ancestors are checked
+    // through the full classification, not the head listing.
+    let classes = joined.store.rebuild(joined.device()).unwrap();
+    let mut dag = crate::authorization::SnapshotDag::new(joined.drive());
+    for body in classes.runtime.snapshot_bodies.values() {
+        dag.observe(body.clone());
+    }
+    let map = dag.classify(&joined.log);
+    for t in &tips {
+        let id = t.snapshot().snapshot_id();
+        assert_eq!(
+            map.get(&id).copied(),
+            Some(Classification::Superseded),
+            "held ancestors are adopted history, not pending and not stranded"
+        );
+    }
+
+    // Convergence to the same live view: the owner authors in epoch
+    // 2 (a fresh root — no eligible heads exist to parent onto), the
+    // post-admission gossip reaches the newcomer through the same
+    // relay rounds, and both engines hold the same live head. This
+    // is the head the issue means by "the newcomer classifying the
+    // same heads as a single-shot admission would".
+    let chunk = objects.insert(ObjectKind::Chunk, b"seventh").unwrap();
+    let tree = Tree::from_entries(vec![
+        Entry::file("catch.txt", 1, false, vec![chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let seventh = engine.author_snapshot(&objects, tree).unwrap();
+    let seventh_id = seventh.snapshot().snapshot_id();
+    assert!(
+        seventh.snapshot().parents.is_empty(),
+        "new epoch, no eligible heads: post-admission writes start a fresh root"
+    );
+    relay_catch_up(&mut engine, &mut joined, &mut relay, newcomer_id);
+    bulk.publish_snapshot(seventh_id, seventh.snapshot().encode());
+    let seventh_pass = joined.execute_plan(&mut bulk, &mut join_objects).unwrap();
+    assert_eq!(
+        seventh_pass.snapshot_bodies, 1,
+        "the epoch-2 write arrives over the same fetch path"
+    );
+    for (label, heads) in [
+        ("owner", engine.live_heads().unwrap()),
+        ("newcomer", joined.live_heads().unwrap()),
+    ] {
+        assert_eq!(
+            heads
+                .iter()
+                .map(|h| h.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![seventh_id],
+            "{label} holds the epoch-2 write live, with no repair and no restart"
+        );
+    }
+
+    // Exactly-once discharge: a further send pass has nothing left
+    // to send on any outbox, and the newcomer is owed nothing.
+    {
+        let mut sender = MemoryMailbox {
+            relay: &mut relay,
+            owner: engine.device(),
+        };
+        assert_eq!(
+            engine.deliver_pending(&mut sender).unwrap(),
+            0,
+            "converged transitions and capabilities are never re-sent"
+        );
+        assert_eq!(
+            engine.announce_pending(&mut sender, None).unwrap(),
+            0,
+            "converged announcements are never re-sent"
+        );
+    }
+    assert!(
+        engine
+            .pending_announcements()
+            .unwrap()
+            .into_iter()
+            .all(|(_, device)| device != newcomer_id),
+        "no obligation is still owed to the converged newcomer"
+    );
+}
+
+/// The negative half of convergence: an ancestor that never arrives
+/// leaves the descendant pending forever — held as
+/// `UnknownParent`, never adopted into the live view, never
+/// rejected as invalid either. This is the rule OD-16-1 B relaxes
+/// "from terminal to pending" without ever relaxing "pending to
+/// accepted".
+#[test]
+fn unknown_parent_never_adopts_without_its_ancestor() {
+    use crate::authorization::{Classification, Pendency};
+    use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
+
+    let (_dir, mut engine, _genesis) = owner_engine("admission-unknown-parent");
+    let mut objects = MemoryObjectStore::default();
+    let mut tips = Vec::new();
+    for n in 0..3u8 {
+        let chunk = objects.insert(ObjectKind::Chunk, &[0xD0 + n]).unwrap();
+        let tree = Tree::from_entries(vec![
+            Entry::file("orphan.txt", 1, false, vec![chunk]).unwrap()
+        ])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+        tips.push(engine.author_snapshot(&objects, tree).unwrap());
+    }
+    let tip_id = tips.last().unwrap().snapshot().snapshot_id();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let outcome = engine
+        .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+        .unwrap();
+    let join_dir = TestDir::new("admission-unknown-parent-join");
+    let mut joined = Engine::accept_invitation(
+        join_dir.path.clone(),
+        "test-pass",
+        newcomer,
+        newcomer_encryption,
+        &outcome.invitation,
+    )
+    .unwrap();
+    let mut relay = MemoryRelay::default();
+    relay_catch_up(&mut engine, &mut joined, &mut relay, newcomer_id);
+
+    // Only the tip body ever arrives; its ancestors never do.
+    joined
+        .commit_facts(&[Fact::SnapshotBody(tips.last().unwrap().clone())])
+        .unwrap();
+    let heads = joined.snapshot_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .find(|h| h.id == tip_id)
+            .map(|h| h.classification),
+        Some(Classification::Pending(Pendency::UnknownParent)),
+        "a genuinely absent ancestor parks the descendant as pending"
+    );
+    assert!(
+        joined.live_heads().unwrap().is_empty(),
+        "the live view never adopts a lineage with a missing ancestor"
+    );
+}
+
+/// Resume reaches exactly the state an uninterrupted admission
+/// would: the same chain admitted straight on one engine and
+/// admitted-then-torn-then-resumed on another must queue the
+/// identical snapshot set — the issue's
+/// `incremental_admission_reaches_the_same_state_as_a_single_shot_admission`,
+/// stated for the resume half that carries the risk. (Two engines
+/// because a second admission on one engine walks only the new
+/// epoch's chain — the horizon rule, pinned above — so each half
+/// needs its own pre-admission tip. Deterministic minting plus
+/// nonce-deterministic signatures yield identical chains.)
+#[test]
+fn incremental_admission_reaches_the_same_state_as_a_single_shot_admission() {
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::key;
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 300;
+
+    let (_straight_dir, mut straight, straight_genesis) =
+        owner_engine("admission-equivalence-straight");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let straight_ids = mint_bare_chain(&mut straight, straight_genesis, tree, CHAIN_LEN);
+    let want: std::collections::BTreeSet<_> = straight_ids.into_iter().collect();
+
+    let first = DeviceIdentitySecret::generate().unwrap();
+    let first_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let first_id = device_of(&first);
+    straight
+        .admit_device(first_id, encryption_key(&first_encryption))
+        .unwrap();
+    let straight_set: std::collections::BTreeSet<_> = straight
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == first_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(
+        straight_set, want,
+        "uninterrupted admission queues the whole closure"
+    );
+
+    // Interrupted admission on a second engine with the identical
+    // chain: the membership commit lands, the first fill chunk
+    // tears, the process "dies" (drop), reopens cold, and resumes —
+    // the state must equal the straight run's.
+    let (dir, mut engine, genesis_id) = owner_engine("admission-equivalence-torn");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+    let second = DeviceIdentitySecret::generate().unwrap();
+    let second_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let second_id = device_of(&second);
+    engine.crash_after_nth_commit(1, CrashStage::AfterWriteTemp);
+    engine
+        .admit_device(second_id, encryption_key(&second_encryption))
+        .unwrap();
+    drop(engine);
+    let (owner_sk, owner_id) = key(10);
+    let mut engine = Engine::open(
+        dir.path.clone(),
+        crate::membership::test_util::drive(),
+        owner_id,
+        "test-pass",
+        identity_secret(&owner_sk),
+        DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+    )
+    .unwrap();
+    let resumed = resume_admission_obligations(&mut engine, second_id).unwrap();
+    assert_eq!(
+        resumed, CHAIN_LEN,
+        "resume completes the torn fill: nothing was durable"
+    );
+    let via_resume: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == second_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(
+        via_resume, want,
+        "resumed admission queues the identical snapshot set"
+    );
+}
+
+/// A torn fill chunk followed by reopen and resume leaves every
+/// closure member obligated exactly once — neither lost nor
+/// doubled. The commit-protocol stages tear differently (temp file
+/// vs rename vs CURRENT), so each stage gets its own engine; the
+/// tear position (first vs middle chunk) is orthogonal and covered
+/// by `crash_mid_incremental_admission_resumes_without_duplicate_obligations`
+/// (slow profile).
+#[test]
+fn crash_torn_fill_chunk_resumes_exactly_once() {
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::{drive as member_drive, key};
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 40;
+    const STAGES: [CrashStage; 7] = [
+        CrashStage::AfterWriteTemp,
+        CrashStage::AfterFsyncTemp,
+        CrashStage::AfterRenameCommit,
+        CrashStage::AfterFsyncCommitDir,
+        CrashStage::AfterWriteCurrentTemp,
+        CrashStage::AfterFsyncCurrentTemp,
+        CrashStage::AfterRenameCurrent,
+    ];
+    for stage in STAGES {
+        let (dir, mut engine, genesis_id) = owner_engine("admission-crash-stage");
+        let mut objects = MemoryObjectStore::default();
+        let tree = bare_tree(&mut objects);
+        let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+        let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let newcomer_id = device_of(&newcomer);
+        // Skip the membership commit: it lands, the single fill
+        // chunk tears, and the fill stops with a partial count.
+        engine.crash_after_nth_commit(1, stage);
+        engine
+            .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+            .unwrap();
+        drop(engine);
+        let (owner_sk, owner_id) = key(10);
+        let mut engine = Engine::open(
+            dir.path.clone(),
+            member_drive(),
+            owner_id,
+            "test-pass",
+            identity_secret(&owner_sk),
+            DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+        )
+        .unwrap();
+        let resumed = resume_admission_obligations(&mut engine, newcomer_id).unwrap();
+        // AfterRenameCurrent tears after CURRENT advances: the commit
+        // file and CURRENT are both on disk, so reopen replays the
+        // chunk as committed (never a hybrid — the loader treats a
+        // commit at or below CURRENT as authoritative) and resume is
+        // a no-op. Every earlier stage leaves nothing durable.
+        let expected = if stage == CrashStage::AfterRenameCurrent {
+            0
+        } else {
+            CHAIN_LEN
+        };
+        assert_eq!(
+            resumed, expected,
+            "stage {stage:?}: resume completes exactly what the tear left missing"
+        );
+        let queued: std::collections::BTreeSet<_> = engine
+            .pending_announcements()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, device)| *device == newcomer_id)
+            .map(|(snapshot, _)| snapshot)
+            .collect();
+        assert_eq!(
+            queued, want,
+            "stage {stage:?}: every closure member obligated exactly once"
+        );
+    }
+}
+
+/// The mid-fill mixed state (slow profile): an early chunk durable,
+/// a middle chunk torn, a later chunk durable — resume must fill
+/// exactly the torn middle without doubling the survivors, at every
+/// commit-protocol stage.
+#[test]
+fn crash_mid_incremental_admission_resumes_without_duplicate_obligations() {
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::{drive as member_drive, key};
+    use wyrd_format::MemoryObjectStore;
+
+    // Three chunks (1024 + 1024 + 452): the tear lands in the middle
+    // with survivors on both sides.
+    const CHAIN_LEN: usize = 2 * ADMISSION_OBLIGATION_BATCH + 452;
+    const STAGES: [CrashStage; 7] = [
+        CrashStage::AfterWriteTemp,
+        CrashStage::AfterFsyncTemp,
+        CrashStage::AfterRenameCommit,
+        CrashStage::AfterFsyncCommitDir,
+        CrashStage::AfterWriteCurrentTemp,
+        CrashStage::AfterFsyncCurrentTemp,
+        CrashStage::AfterRenameCurrent,
+    ];
+    for stage in STAGES {
+        let (dir, mut engine, genesis_id) = owner_engine("admission-crash-mid");
+        let mut objects = MemoryObjectStore::default();
+        let tree = bare_tree(&mut objects);
+        let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+        let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+        let newcomer = DeviceIdentitySecret::generate().unwrap();
+        let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+        let newcomer_id = device_of(&newcomer);
+        // Skip the membership commit and the first chunk: both land,
+        // the middle chunk tears, the fill stops partial.
+        engine.crash_after_nth_commit(2, stage);
+        engine
+            .admit_device(newcomer_id, encryption_key(&newcomer_encryption))
+            .unwrap();
+        drop(engine);
+        let (owner_sk, owner_id) = key(10);
+        let mut engine = Engine::open(
+            dir.path.clone(),
+            member_drive(),
+            owner_id,
+            "test-pass",
+            identity_secret(&owner_sk),
+            DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+        )
+        .unwrap();
+        let resumed = resume_admission_obligations(&mut engine, newcomer_id).unwrap();
+        // AfterRenameCurrent keeps the torn middle chunk (CURRENT
+        // advanced past it), so the fill completed on its own and
+        // resume is a no-op; every earlier stage leaves the whole
+        // middle missing. See the single-chunk test for the stage
+        // semantics.
+        let expected = if stage == CrashStage::AfterRenameCurrent {
+            0
+        } else {
+            CHAIN_LEN - ADMISSION_OBLIGATION_BATCH
+        };
+        assert_eq!(
+            resumed, expected,
+            "stage {stage:?}: resume fills exactly the torn middle"
+        );
+        let queued: std::collections::BTreeSet<_> = engine
+            .pending_announcements()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, device)| *device == newcomer_id)
+            .map(|(snapshot, _)| snapshot)
+            .collect();
+        assert_eq!(
+            queued, want,
+            "stage {stage:?}: survivors never doubled, the middle never lost"
+        );
+    }
+}
+
+/// Child-2 pure-function test: the capacity refusal carries the
+/// membership batch count, the ceiling, and the unqueued closure
+/// size as structured fields, and renders the continuation guidance
+/// (rerunning cannot help; the bound must change) with no key
+/// material anywhere. The refusal path itself takes no store reads
+/// by construction, so this needs no drive.
+#[test]
+fn admission_capacity_refusal_carries_counts_ceiling_and_continuation() {
+    let error = admission_capacity_refusal(70_000, UnqueuedClosure::Counted(120_000));
+    let EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    } = error
+    else {
+        panic!("builder returns the named variant, got {error:?}");
+    };
+    assert_eq!(records, 70_000);
+    assert_eq!(max, 65_536);
+    assert_eq!(closure, UnqueuedClosure::Counted(120_000));
+    let rendered = EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    }
+    .to_string();
+    for needle in [
+        "70000",
+        "65536",
+        "120000",
+        "rerunning unchanged cannot help",
+        "not admitted",
+        "bound must change",
+    ] {
+        assert!(
+            rendered.contains(needle),
+            "refusal tells the operator why rerunning cannot help: {rendered}"
+        );
+    }
+    // The defined fallback when the closure cannot even be counted:
+    // the refusal still carries the batch and the ceiling.
+    let fallback = admission_capacity_refusal(70_000, UnqueuedClosure::Uncounted).to_string();
+    assert!(
+        fallback.contains("could not be computed"),
+        "uncounted closure degrades the message, never the refusal: {fallback}"
+    );
+}
+
+/// Child-2 mapping pin: the record-ceiling failure of the
+/// membership commit becomes the named variant — with the
+/// diagnostic closure count read off the live view — while any
+/// other durable failure passes through generic. The trigger
+/// itself is not manufactured (that needs a 65,536-record
+/// membership batch); the match arms are.
+#[test]
+fn membership_commit_error_maps_ceiling_refusal_to_named_variant() {
+    use crate::durable::DurableError;
+    use wyrd_format::MemoryObjectStore;
+
+    let (_dir, mut engine, genesis_id) = owner_engine("admission-map-refusal");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    mint_bare_chain(&mut engine, genesis_id, tree, 3);
+    let seeds = engine.live_heads().unwrap();
+    let device = identity(0x5A).1;
+
+    let mapped = membership_commit_error(
+        &engine,
+        70_000,
+        &seeds,
+        device,
+        DurableError::TooManyRecords {
+            count: 70_000,
+            max: 65_536,
+        },
+    );
+    let EngineError::AdmissionBatchOverBudget {
+        records,
+        max,
+        closure,
+    } = mapped
+    else {
+        panic!("ceiling refusal maps to the named variant, got {mapped:?}");
+    };
+    assert_eq!(records, 70_000, "the variant carries the batch length");
+    assert_eq!(max, 65_536);
+    assert_eq!(
+        closure,
+        UnqueuedClosure::Counted(3),
+        "the diagnostic count reads the live closure"
+    );
+
+    let passthrough = membership_commit_error(
+        &engine,
+        70_000,
+        &seeds,
+        device,
+        DurableError::SequenceExhausted,
+    );
+    assert!(
+        matches!(
+            passthrough,
+            EngineError::Durable(DurableError::SequenceExhausted)
+        ),
+        "other durable failures pass through unchanged: {passthrough:?}"
+    );
+}
+
+/// Child-2 continuation through CLI-equivalent calls: admit, tear
+/// the fill, then rerun the invite exactly as the CLI arm does
+/// (admit → `AlreadyMember` → guarded resume → reissue) and assert
+/// the recovery completes with no duplicate obligations, no
+/// duplicate admission, and an invitation that opens for the
+/// newcomer. Guards refuse wrong keys, wrong roles, and strangers.
+#[test]
+fn member_invite_rerun_resumes_interrupted_fill() {
+    use crate::control::bootstrap::open_bootstrap;
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::key;
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 300;
+
+    let (dir, mut engine, genesis_id) = owner_engine("admission-rerun");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+    let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let newcomer_key = encryption_key(&newcomer_encryption);
+    // Interrupt: the membership commit lands, the single fill chunk
+    // tears, the process "dies".
+    engine.crash_after_nth_commit(1, CrashStage::AfterWriteTemp);
+    engine.admit_device(newcomer_id, newcomer_key).unwrap();
+    drop(engine);
+    let (owner_sk, owner_id) = key(10);
+    let mut engine = Engine::open(
+        dir.path.clone(),
+        crate::membership::test_util::drive(),
+        owner_id,
+        "test-pass",
+        identity_secret(&owner_sk),
+        DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+    )
+    .unwrap();
+
+    // The CLI-equivalent rerun: admit refuses (already a member),
+    // the guarded resume completes the fill, the invitation is
+    // reissued for the claimed destination.
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(
+        matches!(rerun, Err(EngineError::AlreadyMember)),
+        "rerun meets the durable admission, not a fresh one"
+    );
+    let resume = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(
+        resume.committed, CHAIN_LEN,
+        "rerun resumes the whole torn fill"
+    );
+    assert_eq!(resume.batches, 1, "one batch spent");
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(
+        queued, want,
+        "resumed obligations match the closure exactly once"
+    );
+    let tip = engine.log.known_state().expect("tip").transition_id;
+    let invitation = open_bootstrap(&newcomer_encryption, &resume.invitation).unwrap();
+    assert_eq!(
+        invitation.invitee, newcomer_id,
+        "reissued invitation names the newcomer"
+    );
+    drop(invitation);
+
+    // Second rerun after completion: zero obligations, same tip, no
+    // duplicate admission and no duplicate obligations.
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(matches!(rerun, Err(EngineError::AlreadyMember)));
+    let again = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(again.committed, 0, "completed catch-up resumes nothing");
+    assert_eq!(
+        engine.log.known_state().expect("tip").transition_id,
+        tip,
+        "reruns author nothing"
+    );
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(queued, want, "reruns duplicate nothing");
+
+    // Guards: a wrong key, a wrong role, and a stranger all refuse
+    // without touching the obligations.
+    let wrong_key = encryption_key(&DeviceEncryptionSecret::from_bytes([0xE9; 32]).unwrap());
+    let refused = engine.resume_admission(newcomer_id, &wrong_key, false);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AdmissionKeyMismatch { device }) if device == newcomer_id
+        ),
+        "key mismatch refuses"
+    );
+    let refused = engine.resume_admission(newcomer_id, &newcomer_key, true);
+    assert!(
+        matches!(
+            refused,
+            Err(EngineError::AdmissionRoleMismatch { device, actual: "a member" }) if device == newcomer_id
+        ),
+        "role mismatch refuses with the actual role named"
+    );
+    let stranger = identity(0x59).1;
+    let refused = engine.resume_admission(stranger, &newcomer_key, false);
+    assert!(
+        matches!(refused, Err(EngineError::NotMember)),
+        "strangers refuse"
+    );
+}
+
+/// Multi-batch resume through the operator API (slow profile):
+/// the membership batch and the first chunk land, the middle chunk
+/// tears, and the trailing chunk is never attempted — 1,476
+/// obligations missing across the last two chunks — resumed via the
+/// guarded `resume_admission` (not the fill directly): batches
+/// counted, invitation reissued, survivors never doubled. The
+/// single-chunk shape lives in the default profile above.
+#[test]
+fn member_invite_rerun_resumes_across_batches() {
+    use crate::control::bootstrap::open_bootstrap;
+    use crate::durable::CrashStage;
+    use crate::membership::test_util::key;
+    use wyrd_format::MemoryObjectStore;
+
+    const CHAIN_LEN: usize = 2 * ADMISSION_OBLIGATION_BATCH + 452;
+
+    let (dir, mut engine, genesis_id) = owner_engine("admission-rerun-batches");
+    let mut objects = MemoryObjectStore::default();
+    let tree = bare_tree(&mut objects);
+    let ids = mint_bare_chain(&mut engine, genesis_id, tree, CHAIN_LEN);
+    let want: std::collections::BTreeSet<_> = ids.into_iter().collect();
+
+    let newcomer = DeviceIdentitySecret::generate().unwrap();
+    let newcomer_encryption = DeviceEncryptionSecret::generate().unwrap();
+    let newcomer_id = device_of(&newcomer);
+    let newcomer_key = encryption_key(&newcomer_encryption);
+    // Tear the middle chunk: the membership commit and the first
+    // chunk land, then the process "dies".
+    engine.crash_after_nth_commit(2, CrashStage::AfterRenameCommit);
+    engine.admit_device(newcomer_id, newcomer_key).unwrap();
+    drop(engine);
+    let (owner_sk, owner_id) = key(10);
+    let mut engine = Engine::open(
+        dir.path.clone(),
+        crate::membership::test_util::drive(),
+        owner_id,
+        "test-pass",
+        identity_secret(&owner_sk),
+        DeviceEncryptionSecret::from_bytes([0xE1; 32]).unwrap(),
+    )
+    .unwrap();
+
+    let rerun = engine.admit_device(newcomer_id, newcomer_key);
+    assert!(matches!(rerun, Err(EngineError::AlreadyMember)));
+    let resume = engine
+        .resume_admission(newcomer_id, &newcomer_key, false)
+        .unwrap();
+    assert_eq!(
+        resume.committed,
+        CHAIN_LEN - ADMISSION_OBLIGATION_BATCH,
+        "resume fills exactly the torn middle and trailing chunks"
+    );
+    assert_eq!(resume.batches, 2, "two batches spent");
+    let queued: std::collections::BTreeSet<_> = engine
+        .pending_announcements()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, device)| *device == newcomer_id)
+        .map(|(snapshot, _)| snapshot)
+        .collect();
+    assert_eq!(queued, want, "multi-batch resume completes exactly once");
+    let invitation = open_bootstrap(&newcomer_encryption, &resume.invitation).unwrap();
+    assert_eq!(
+        invitation.invitee, newcomer_id,
+        "reissued invitation names the newcomer"
+    );
 }

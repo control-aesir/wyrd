@@ -3543,6 +3543,47 @@ fn vault_status_report(
 /// catch-up obligations through the engine (which enforces
 /// owner-only). Catch-up delivery to other devices happens on the
 /// next mounted sync via the mailbox, not here.
+///
+/// Invite outcome renderers, built as strings so tests assert the
+/// rendering without capturing stdout (same pattern as
+/// `sync_status_render`). The three outcomes must stay
+/// distinguishable: a fresh admission, a resumed interruption, and
+/// an already-complete rerun report different actions.
+fn render_invited(
+    device: &wyrd_format::DeviceId,
+    reader: bool,
+    epoch: u64,
+    out: &std::path::Path,
+    obligations: usize,
+    batches: usize,
+    carried: usize,
+) -> String {
+    format!(
+        "invited {device}{} at epoch {epoch} -> {} ({obligations} obligations in {batches} batches, {carried} carried)",
+        if reader { " as reader" } else { "" },
+        out.display(),
+    )
+}
+
+fn render_resumed(
+    committed: usize,
+    batches: usize,
+    out: &std::path::Path,
+    carried: usize,
+) -> String {
+    if committed == 0 {
+        format!(
+            "catch-up already complete; 0 obligations, invitation re-issued -> {} ({carried} carried)",
+            out.display(),
+        )
+    } else {
+        format!(
+            "already a member; resumed {committed} obligations in {batches} batches, invitation re-issued -> {} ({carried} carried)",
+            out.display(),
+        )
+    }
+}
+
 fn member(
     drive_dir: PathBuf,
     action: MemberAction,
@@ -3636,21 +3677,49 @@ fn member(
                 }
             };
             engine.stage_carry_heads()?;
-            let outcome = match admit(&mut engine) {
-                Ok(outcome) => outcome,
+            match admit(&mut engine) {
+                Ok(outcome) => {
+                    let carried = carry_pending(&mut engine, &drive_dir)?;
+                    write_invitation(&out, &mut file, &outcome.invitation.encode())?;
+                    println!(
+                        "{}",
+                        render_invited(
+                            &device,
+                            reader,
+                            outcome.transition.epoch,
+                            &out,
+                            outcome.obligations_queued,
+                            outcome.batches,
+                            carried
+                        )
+                    );
+                    return Ok(());
+                }
+                Err(EngineError::AlreadyMember | EngineError::AlreadyReader) => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&out);
+                    return Err(error.into());
+                }
+            }
+            // Already admitted under some role: rerunning resumes the
+            // interrupted fill instead of failing. The engine guard
+            // verifies the supplied key and role against the recorded
+            // admission first — a mismatch refuses with the actual
+            // role named rather than recovering the wrong identity —
+            // then resumes the catch-up and reissues the invitation
+            // (the original may never have reached a file).
+            let resume = match engine.resume_admission(device, &encryption_key, reader) {
+                Ok(resume) => resume,
                 Err(error) => {
                     let _ = fs::remove_file(&out);
                     return Err(error.into());
                 }
             };
             let carried = carry_pending(&mut engine, &drive_dir)?;
-            write_invitation(&out, &mut file, &outcome.invitation.encode())?;
+            write_invitation(&out, &mut file, &resume.invitation.encode())?;
             println!(
-                "invited {device}{} at epoch {} -> {} ({} carried)",
-                if reader { " as reader" } else { "" },
-                outcome.transition.epoch,
-                out.display(),
-                carried
+                "{}",
+                render_resumed(resume.committed, resume.batches, &out, carried)
             );
             Ok(())
         }

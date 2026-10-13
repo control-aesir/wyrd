@@ -313,10 +313,13 @@ fn credential_symlinks_are_rejected_without_following() {
     write_secret(&passphrase_target, b"test-pass\n");
     let passphrase_link = temp.0.join("passphrase");
     symlink(&passphrase_target, &passphrase_link).unwrap();
-    let error = read_credentials(&Credentials {
-        identity_file,
-        passphrase_file: passphrase_link,
-    })
+    let error = read_credentials(
+        &Credentials {
+            identity_file: Some(identity_file),
+            passphrase_file: Some(passphrase_link),
+        },
+        None,
+    )
     .unwrap_err();
     assert!(
         matches!(&error, CliError::Io { source, .. }
@@ -369,10 +372,13 @@ fn credential_contents_never_appear_in_errors() {
     let mut marker = b"sekrit-marker-".to_vec();
     marker.extend_from_slice(&[0xff, 0xfe]);
     write_secret(&passphrase_file, &marker);
-    let error = read_credentials(&Credentials {
-        identity_file: identity_file.clone(),
-        passphrase_file,
-    })
+    let error = read_credentials(
+        &Credentials {
+            identity_file: Some(identity_file.clone()),
+            passphrase_file: Some(passphrase_file),
+        },
+        None,
+    )
     .unwrap_err();
     let text = format!("{error}");
     assert!(

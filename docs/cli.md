@@ -708,7 +708,49 @@ Both are read and hardened by wyrd code, never by clap:
   — and are a separate hardening issue. Pre-existing files and
   established drives are otherwise untouched — inspect a pre-fix drive
   with `stat` (e.g. `stat -c '%a %n'` on Linux, `stat -f '%Lp %N'` on
-  macOS) and repair by hand. Non-Unix platforms get no mode guarantee.
+   macOS) and repair by hand. Non-Unix platforms get no mode guarantee.
+
+## Drive configuration file
+
+An operator configures a drive's relays and credential paths once,
+in a file, instead of repeating flags on every cron line and
+service unit. The file is TOML, lives in the drive directory as
+`default.toml` (alongside `keystore`, `DRIVE`, `LOCK`, and
+`commits/`), and holds deployment state only — relays are
+per-deployment availability state that travels with the drive when
+the directory is copied elsewhere:
+
+```toml
+[drive]
+relays = ["wss://relay.example", "wss://relay2.example"]
+identity_file = "/etc/wyrd/member.key"
+passphrase_file = "/etc/wyrd/passphrase"
+```
+
+- `--config PATH` points at a file elsewhere; every subcommand
+  reads the same file. A missing override is a named error, never
+  an empty configuration; an absent `default.toml` is simply no
+  configuration.
+- Precedence is flags, then file, then defaults. Explicit
+  `--relay` values *replace* the configured list rather than
+  appending to it, so the effective set is always knowable; the
+  credential flags likewise override `identity_file` and
+  `passphrase_file`.
+- The empty-means-idle refusal is preserved: a file that declares
+  no relays still refuses a bare `sync now`, and only `--offline`
+  opts out. A configured relay contradicts `--offline` exactly
+  like a flag — the refusal names the file.
+- Unknown keys are refused with their name; a typo'd key is never
+  silently discarded. The schema holds no key for secret material —
+  only paths, read through the same hardening as the flags — so the
+  file stays committable and printable.
+- `sync status` and `sync now` print a `relays from:` line (flags,
+  file with its path, or none configured), and `cache policy`
+  prints a `configuration:` section with the file, the relay source,
+  and each credential path's source.
+- The file reads without the store lock: it is deployment state,
+  not store state. Offline commands still need the drive
+  un-mounted where they always did.
 
 ## Diagnostics and exit codes
 

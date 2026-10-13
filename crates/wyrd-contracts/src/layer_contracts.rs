@@ -163,7 +163,10 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
         // schema-versioned sidecar file, `getrandom` for the fresh
         // per-process instance id. `wyrd update` (29) adds `blake3`:
         // the artifact digest that names the archive in reports and
-        // the transaction log — an identity, never trust. No other
+        // the transaction log — an identity, never trust. The drive
+        // deployment configuration (27) adds `toml`: strict parsing
+        // of the relay list and credential paths from `default.toml`
+        // — parse-only, the file holds no secrets. No other
         // crate may follow.
         "wyrd-cli" => Some(MemberPolicy {
             workspace_allow: &["wyrd-format", "wyrd-sync", "wyrd-core", "wyrd-daemon"],
@@ -178,6 +181,7 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
                 "serde",
                 "serde_json",
                 "thiserror",
+                "toml",
                 "tracing",
                 "tracing-subscriber",
                 "tracing-log",
@@ -1098,6 +1102,7 @@ mod policy_tests {
                 "libc",
                 "nostr",
                 "thiserror",
+                "toml",
                 "tracing",
                 "tracing-subscriber",
                 "tracing-log",

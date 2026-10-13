@@ -125,6 +125,7 @@ nostr-sdk = { version = "0.45.2", default-features = false, features = ["rustls-
 # machines; never a production dependency)
 proptest = "1"
 
-# manifest parsing for the dependency-DAG layer contract (test-only: the
-# checker reads member Cargo.tomls; never a production dependency)
+# manifest parsing for the dependency-DAG layer contract, and for the
+# CLI's drive deployment configuration (a production edge for
+# `wyrd-cli` only, allow-listed in the contract's policy)
 toml = "1"

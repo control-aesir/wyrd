@@ -63,6 +63,10 @@ impl Fixture {
         let identity = read_identity(&self.identity_file).unwrap();
         Engine::open_keystore(self.drive.clone(), "test-pass", identity).unwrap()
     }
+
+    fn write_default_toml(&self, text: &str) {
+        std::fs::write(self.drive.join("default.toml"), text).unwrap();
+    }
 }
 
 /// Records outbound mail and delivers nothing: the collection half
@@ -2050,6 +2054,50 @@ fn sync_now_on_quiet_drive_completes() {
     let engine = fixture.open();
     let rendered = sync_status_render(&observe(&engine, 0).unwrap());
     assert!(rendered.contains("live heads: none"), "{rendered}");
+}
+
+/// A missing `--config` override is a named error, never an empty
+/// configuration: the refusal precedes the keystore open, so it
+/// names the override path rather than failing on custody.
+#[test]
+fn a_missing_config_override_is_a_named_error() {
+    let fixture = Fixture::new();
+    let missing = fixture.drive.join("elsewhere.toml");
+    let args = vec![
+        "--config".into(),
+        missing.display().to_string(),
+        "sync".into(),
+        fixture.drive.display().to_string(),
+        "--identity-file".into(),
+        fixture.identity_file.display().to_string(),
+        "--passphrase-file".into(),
+        fixture.passphrase_file.display().to_string(),
+        "status".into(),
+    ];
+    let error = command(args).unwrap_err();
+    let CliError::Io { path, .. } = error else {
+        panic!("expected an IO error naming the path, got: {error:?}");
+    };
+    assert_eq!(path, missing);
+}
+
+/// Credential paths resolve from the file when the flags are
+/// absent: `sync status` with no credential flags opens the drive
+/// through the configured paths and still reports the relay source.
+#[test]
+fn sync_status_without_credential_flags_reads_them_from_the_file() {
+    let fixture = Fixture::new();
+    fixture.write_default_toml(&format!(
+        "[drive]\nidentity_file = \"{}\"\npassphrase_file = \"{}\"\n",
+        fixture.identity_file.display(),
+        fixture.passphrase_file.display(),
+    ));
+    let args = vec![
+        "sync".into(),
+        fixture.drive.display().to_string(),
+        "status".into(),
+    ];
+    command(args).unwrap();
 }
 
 /// A bare `sync now` with no relays is a usage error, not a quiet

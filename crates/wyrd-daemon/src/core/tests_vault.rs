@@ -344,6 +344,121 @@ fn install_role_dir_wires_vault_retention() {
 /// role's strength. The fail-closed rejection itself is pinned at
 /// `role::load`; this pins the loop's half — sync must not stall on
 /// an operator-repairable file.
+/// A failed admission leaves pending ownerless demand standing
+/// for the next pass: the vault walk registered it, the commit
+/// failed, and neither the error arm nor the revision gate may drop
+/// it. A read-only drive directory makes the durable commit fail
+/// with a store-class error — the transient condition a supervisor
+/// retries through — while reads (walk, rebuild, intake) keep
+/// working, so the failure lands exactly on admission.
+#[test]
+fn failed_admission_keeps_pending_for_next_pass() {
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+    use wyrd_format::{EntryContent, ObjectKind, ObjectStore, Tree};
+
+    let (mut engine, dir, _) = scratch_drive();
+    let identity_b = DeviceIdentitySecret::generate().unwrap();
+    let encryption_b = DeviceEncryptionSecret::generate().unwrap();
+    engine
+        .admit_device(identity_b.device_id(), encryption_b.encryption_key())
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let authored = daemon
+        .put_file("admit-fail.txt", b"post-admission")
+        .unwrap();
+    let tree_id = authored.snapshot().tree;
+    let tree_bytes = daemon
+        .view()
+        .store_read()
+        .unwrap()
+        .get(&tree_id)
+        .unwrap()
+        .expect("authored tree serves");
+    let mut chunks = Tree::decode(&tree_bytes)
+        .unwrap()
+        .entries()
+        .iter()
+        .flat_map(|entry| match &entry.content {
+            EntryContent::File { chunks, .. } => chunks.clone(),
+            EntryContent::Dir { .. } | EntryContent::Symlink { .. } => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 1, "one flat file chunk");
+    let chunk = chunks.pop().unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (mut live, _parts) = daemon
+        .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+        .unwrap();
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Vault,
+            transition: Transition::Settled,
+        },
+    )
+    .unwrap();
+    install_role_dir(&mut live, &dir);
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: vec![3u8; 32],
+            barrier: Arc::new(Ready),
+        },
+    )
+    .unwrap();
+    let mut mailbox = AcceptingMailbox::default();
+    // Pass 1, writable: the announcement drains, leaving a quiet
+    // drive with nothing pending.
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(live.wants().peek_pending().is_empty());
+    // Seed ownerless demand for held content: the walk skips local
+    // identities, so direct registration models a sweep-collected
+    // identity without coupling this test to quarantine.
+    live.wants().register_unowned(chunk).unwrap();
+    // Pass 2, read-only drive: intake, drain, and the walk all read
+    // fine, but the admission commit fails — the pass must error
+    // and the demand must stand pending, not silently die.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            failed.is_err(),
+            "a read-only drive fails the admission commit"
+        );
+        assert!(
+            live.wants().peek_pending().contains(&chunk),
+            "failed admission leaves the demand pending for next pass"
+        );
+    }
+    // Pass 3 (pass 2 off Unix), writable again: clear the claim
+    // so the chunk is genuinely unheld, then the standing demand
+    // admits. Asserted as fetch demand, not registry marks: the
+    // settlement sweep promptly retires ownerless admitted demand
+    // nothing can fetch, so `is_admitted` is transient by design —
+    // but the admitted `Cached` fact drives the fetch plan, and with
+    // an empty bulk source that demand stays unfulfilled.
+    live.quarantine_queue()
+        .submit(VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk,
+        ));
+    let mut empty = MemoryBulkSource::default();
+    let report = live.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
+    assert!(
+        report.fetched.unfulfilled > 0,
+        "the surviving demand admits once the store is writable"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn install_role_dir_torn_role_file_degrades_without_aborting() {
     // Reuse the unheld setup through a local copy: the shared

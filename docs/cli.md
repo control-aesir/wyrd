@@ -707,7 +707,9 @@ the default names current behavior, never a silent choice.
   until withdrawal completes, and completion is reported, never
   assumed.
 - `role status`: configured role, transition, effective posture,
-  and the quadrant totals to back it.
+  and the quadrant totals to back it. While withdrawing it names
+  the outstanding count: own snapshots still routing this device
+  at a peer (zero means serving is still draining).
 - `evict` under an effective `vault` role refuses and says the
   role forbids it: the role promises no pruning.
 

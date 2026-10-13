@@ -604,11 +604,17 @@ fn send_pending_for(
             // The route record commits atomically with its marker, so
             // a crash can never leave a delivered pair route-unknown
             // mid-repair: unknown routes count as changed and resend.
-            if let Some(endpoint) = route_id {
-                facts.push(Fact::AnnouncementDeliveredRoute(
-                    snapshot, recipient, endpoint,
-                ));
-            }
+            // A route-less send records the withdrawal sentinel, never
+            // nothing — withdrawing to no route must quench exactly
+            // like redelivery under a new route, or the narrowing
+            // device resends its withdrawal every pass. A later send
+            // under a real route overwrites it (re-widening
+            // re-addresses like any route change).
+            facts.push(Fact::AnnouncementDeliveredRoute(
+                snapshot,
+                recipient,
+                route_id.unwrap_or(crate::runtime::state::WITHDRAWN_ROUTE),
+            ));
             facts
         },
     )

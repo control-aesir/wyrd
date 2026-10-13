@@ -21,16 +21,19 @@
 //!
 //! Narrowing (away from `vault`) is a transition, not an edit
 //! (OD-24-T): acknowledgement records intent while the effective
-//! posture stays `vault` until withdrawal completes. The
-//! withdrawal-pending and withdrawal-complete states arrive with the
-//! route-publication gate; until then a narrowing device reports
-//! [`Transition::NarrowingAcknowledged`] and retains like `vault`.
+//! posture stays `vault` until withdrawal completes. The live loop
+//! drives acknowledgement forward through the route-publication
+//! gate: while narrowing it announces route-less, so the signed
+//! route-update channel drops this device from peers' maps instead
+//! of a silent endpoint stop; when its own announcements name no
+//! route and serving is idle, the transition completes and the
+//! effective role flips. Until then a narrowing device reports its
+//! transition and retains like `vault`.
 
 use std::path::{Path, PathBuf};
 
-use wyrd_sync::runtime::MaterializationState;
-
 use crate::policy::RetentionPolicy;
+use wyrd_sync::runtime::{Engine, EngineError, MaterializationState};
 
 /// What this device intends to be. Two values deliberately: they are
 /// the peer roles `docs/sync-and-peers.md` fixes, not a new axis.
@@ -75,9 +78,18 @@ pub enum Transition {
     /// No transition in flight: the configured role is effective.
     Settled,
     /// Narrowing acknowledged (`--yes` recorded): intent is durable
-    /// but the effective posture is still `vault`. Withdrawal states
-    /// arrive with the route-publication gate.
+    /// but the effective posture is still `vault`. The live loop
+    /// advances this to [`Transition::WithdrawalPending`] on its next
+    /// pass (or straight to settled when there is nothing to
+    /// withdraw); it never rests here.
     NarrowingAcknowledged,
+    /// Withdrawal in flight: route-less announcements are discharging
+    /// and the effective posture is still `vault`. Completes when the
+    /// device's own announcements name no route and serving is idle —
+    /// then the loop stores settled `mirror` and the effective role
+    /// flips. A withdrawal that cannot complete reports this with
+    /// its reason, never success.
+    WithdrawalPending,
 }
 
 impl Transition {
@@ -85,14 +97,16 @@ impl Transition {
         match self {
             Transition::Settled => "settled",
             Transition::NarrowingAcknowledged => "narrowing-acknowledged",
+            Transition::WithdrawalPending => "withdrawal-pending",
         }
     }
 
     fn parse(line: &str) -> Result<Transition, RoleError> {
         match line {
             "transition: narrowing-acknowledged" => Ok(Transition::NarrowingAcknowledged),
+            "transition: withdrawal-pending" => Ok(Transition::WithdrawalPending),
             other => Err(RoleError::Malformed {
-                detail: format!("unknown transition line {other:?}, want \"transition: narrowing-acknowledged\""),
+                detail: format!("unknown transition line {other:?}, want \"transition: narrowing-acknowledged\" or \"transition: withdrawal-pending\""),
             }),
         }
     }
@@ -116,14 +130,14 @@ impl RoleState {
         }
     }
 
-    /// The retention posture in force right now. An acknowledged
-    /// narrowing is still `vault` until withdrawal completes — intent
-    /// is not observability, and the reconciliation contract retires
-    /// obligations, not acknowledgements.
+    /// The retention posture in force right now. An acknowledged or
+    /// pending narrowing is still `vault` until withdrawal completes —
+    /// intent is not observability, and the reconciliation contract
+    /// retires obligations, not acknowledgements.
     pub fn effective(self) -> Role {
         match self.transition {
             Transition::Settled => self.role,
-            Transition::NarrowingAcknowledged => Role::Vault,
+            Transition::NarrowingAcknowledged | Transition::WithdrawalPending => Role::Vault,
         }
     }
 
@@ -158,6 +172,20 @@ pub fn effective_policy(stored: MaterializationState, effective: Role) -> Retent
             RetentionPolicy::RemoteOnly
         }
     }
+}
+
+/// How many of this device's own in-scope snapshots still name a
+/// serving route at some peer. The withdrawal-completion half of the
+/// predicate, evaluated off durable state only so the driver and
+/// `role status` observe the same value: [`Engine::withdrawal_outstanding`]
+/// counts own-authored redelivery-scope snapshots with a queued
+/// recipient whose last discharge carried a real route. Snapshots
+/// this device did not author, undelivered pairs (nothing to
+/// withdraw — they discharge route-less under the driver), and
+/// out-of-scope history (the redelivery gate never resends it, so
+/// the predicate must not wait for it) never count.
+pub fn withdrawal_outstanding(engine: &Engine) -> Result<usize, EngineError> {
+    engine.withdrawal_outstanding()
 }
 
 /// The role file lives beside the keystore (`keystore`, `DRIVE`,
@@ -279,6 +307,10 @@ mod tests {
                 role: Role::Mirror,
                 transition: Transition::NarrowingAcknowledged,
             },
+            RoleState {
+                role: Role::Mirror,
+                transition: Transition::WithdrawalPending,
+            },
         ] {
             store(&dir, state).unwrap();
             assert_eq!(load(&dir).unwrap(), state);
@@ -314,15 +346,20 @@ mod tests {
             transition: Transition::Settled,
         };
         assert_eq!(settled_mirror.effective(), Role::Mirror);
-        let acknowledged = RoleState {
-            role: Role::Mirror,
-            transition: Transition::NarrowingAcknowledged,
-        };
-        assert_eq!(
-            acknowledged.effective(),
-            Role::Vault,
-            "intent is not observability: posture flips only at withdrawal-complete"
-        );
+        for transition in [
+            Transition::NarrowingAcknowledged,
+            Transition::WithdrawalPending,
+        ] {
+            let narrowing = RoleState {
+                role: Role::Mirror,
+                transition,
+            };
+            assert_eq!(
+                narrowing.effective(),
+                Role::Vault,
+                "intent is not observability: posture flips only at withdrawal-complete"
+            );
+        }
         let settled_vault = RoleState {
             role: Role::Vault,
             transition: Transition::Settled,

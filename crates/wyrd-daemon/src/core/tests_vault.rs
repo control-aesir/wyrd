@@ -625,3 +625,77 @@ fn vault_observer_forwards_failures_and_postures_when_stale() {
         events[2]
     );
 }
+
+/// Narrowing completes through route publication: acknowledgement
+/// becomes pending while own snapshots still name a route (the pass
+/// announces route-less from the first narrowing pass), and pending
+/// becomes settled mirror once the withdrawal discharged and serving
+/// is idle — effective stays vault until that commit. A fake route
+/// would decode to no route and record the withdrawal sentinel on
+/// first discharge, completing vacuously without ever going pending;
+/// the real route below is what makes the middle state observable.
+#[test]
+fn narrowing_withdraws_through_route_publication_then_completes() {
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+    let (mut live, dir) = live_owing_announcement("withdrawal-driver");
+    let id = iroh::SecretKey::from_bytes(&[0x0Bu8; 32]).public();
+    let route = wyrd_sync::transport::encode_node_addr(&iroh::EndpointAddr::new(id));
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: route,
+            barrier: Arc::new(Ready),
+        },
+    )
+    .unwrap();
+    install_role_dir(&mut live, &dir);
+    // Discharge routed: the first seal carries the live route.
+    let mut mailbox = AcceptingMailbox::default();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "the routed first discharge clears the backlog"
+    );
+    // Narrow: acknowledgement records intent, posture stays vault.
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+    let sent_before = mailbox.sent;
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    let state = role::load(&dir).unwrap();
+    assert_eq!(
+        state.transition,
+        Transition::WithdrawalPending,
+        "outstanding routes move acknowledgement to pending"
+    );
+    assert_eq!(
+        state.effective(),
+        Role::Vault,
+        "intent is not observability: posture holds through pending"
+    );
+    assert!(
+        mailbox.sent > sent_before,
+        "the narrowing pass discharges the route-less withdrawal"
+    );
+    // The withdrawal discharged and serving is idle: the next pass
+    // finds nothing outstanding and completes.
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    let state = role::load(&dir).unwrap();
+    assert_eq!(state.transition, Transition::Settled);
+    assert_eq!(state.role, Role::Mirror);
+    assert_eq!(
+        state.effective(),
+        Role::Mirror,
+        "the effective posture flips only at withdrawal-complete"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -1896,7 +1896,10 @@ fn role_set(drive_dir: PathBuf, role: String, yes: bool) -> Result<(), CliError>
         return Ok(());
     }
     if target == Role::Mirror && current.effective() == Role::Vault {
-        if current.transition == Transition::NarrowingAcknowledged {
+        if matches!(
+            current.transition,
+            Transition::NarrowingAcknowledged | Transition::WithdrawalPending
+        ) {
             return Err(CliError::Usage(
                 "narrowing is already acknowledged and still withdrawing as vault: to start over, widen back to vault first (role set vault), then narrow again with --yes.".into(),
             ));
@@ -1912,7 +1915,7 @@ fn role_set(drive_dir: PathBuf, role: String, yes: bool) -> Result<(), CliError>
         };
         wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
         println!(
-            "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: withdrawal completion (route publication drained, no old-role serve streams) is not yet wired; this device retains like vault"
+            "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: the live loop withdraws on its next passes (route-less announcements, then settled mirror); this device retains like vault until then"
         );
         return Ok(());
     }
@@ -1937,17 +1940,26 @@ fn role_status(
     let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
     let (engine, view) = node.parts();
     let census = residency_census_with_role(engine, view, "", state.effective())?;
-    print!("{}", role_status_render(&drive_dir, state, &census));
+    let outstanding = wyrd_core::role::withdrawal_outstanding(engine)?;
+    print!(
+        "{}",
+        role_status_render(&drive_dir, state, &census, outstanding)
+    );
     Ok(())
 }
 
 /// The configured role, any in-flight narrowing, and the effective
 /// retention posture with the numbers to back it: the same census
 /// `cache status` reports, because there is one effective policy.
+/// While withdrawing, the outstanding count names what is left: own
+/// snapshots still routing this device at a peer (zero means serving
+/// is still draining — status reads durable state only, so idleness
+/// itself is the loop's to observe).
 fn role_status_render(
     drive_dir: &std::path::Path,
     state: wyrd_core::role::RoleState,
     census: &ResidencyCensus,
+    outstanding: usize,
 ) -> String {
     use wyrd_core::role::Transition;
     let mut out = format!(
@@ -1965,6 +1977,11 @@ fn role_status_render(
         out.push_str(
             "note: narrowing acknowledged; retains like vault until withdrawal completes\n",
         );
+    }
+    if state.transition == Transition::WithdrawalPending {
+        out.push_str(&format!(
+            "note: withdrawal pending: {outstanding} own snapshot(s) still route this device at a peer; retains like vault until route publication drains and serving idles\n",
+        ));
     }
     out.push_str(&cache_quadrant_summary(census));
     out

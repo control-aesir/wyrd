@@ -538,7 +538,12 @@ never happen silently:
 - **Withdrawal complete.** No serve streams originated under the old role
   remain open and route publication no longer names this device for new
   snapshots. Only then does the effective role flip. A withdrawal that
-  cannot complete reports pending with its reason, never success.
+  cannot complete reports pending with its reason, never success. The
+  loop derives both halves off durable state each pass: own in-scope
+  snapshots with no real-route discharge left, plus an idle serving
+  barrier. Out-of-scope history is accepted stale — the redelivery
+  gate never resends it, so the predicate never waits for it, exactly
+  as endpoint rotation leaves old routes behind.
 
 ### Role effects on pin, evict, quota, and serving
 

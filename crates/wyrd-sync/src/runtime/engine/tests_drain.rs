@@ -721,11 +721,12 @@ fn chain_tree(objects: &mut MemoryObjectStore, byte: u8) -> ContentId {
 
 /// Route-scoped redelivery (22b): a discharged announcement is
 /// discharged for its serving route, not forever. The same route
-/// resends nothing and a routeless resume repairs nothing; a restart
-/// under a new endpoint identity reopens eligibility, reseals under
-/// the live route, and quenches — while relay-acceptance accounting
-/// (still discharged, still no re-queue) and the other obligation
-/// classes stay untouched.
+/// resends nothing; withdrawing to no route redelivers the route-less
+/// reseal once (so peers drop the dead provider) and quenches; a
+/// restart under a new endpoint identity reopens eligibility, reseals
+/// under the live route, and quenches — while relay-acceptance
+/// accounting (still discharged, still no re-queue) and the other
+/// obligation classes stay untouched.
 #[test]
 fn route_change_redelivers_discharged_announcements() {
     let (mut pair, controls, _) = scenario();
@@ -762,28 +763,78 @@ fn route_change_redelivers_discharged_announcements() {
         "every discharge records route A"
     );
 
-    // Same route: nothing resends. No route: nothing repairs.
-    for route in [Some(route_a.as_slice()), None] {
-        let sent = {
-            let mut mailbox = MemoryMailbox {
-                relay: &mut pair.relay,
-                owner: pair.a.device,
-            };
-            pair.a.engine.announce_pending(&mut mailbox, route).unwrap()
+    // Same route: nothing resends.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
         };
-        assert_eq!(sent, 0, "no redelivery without a route change");
-    }
+        pair.a
+            .engine
+            .announce_pending(&mut mailbox, Some(route_a.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 0, "no redelivery without a route change");
 
-    // Crash between discharge and repair: memory drops, the route
-    // record replays from the fact log.
+    // Withdrawing to no route redelivers once: both pairs resend as
+    // route-less reseals, so the peer holding the routed version
+    // learns the withdrawal through the route-update channel instead
+    // of dialing a dead provider.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a.engine.announce_pending(&mut mailbox, None).unwrap()
+    };
+    assert_eq!(
+        sent, 2,
+        "withdrawing the route redelivers both pairs route-less"
+    );
+    assert!(pair.a.engine.pending_announcements().unwrap().is_empty());
+    let state = pair.a.engine.runtime_state().unwrap();
+    assert!(
+        state
+            .announcement_delivered_route
+            .values()
+            .all(|route| *route == crate::runtime::state::WITHDRAWN_ROUTE),
+        "the withdrawal send records the route as withdrawn"
+    );
+    // The repair quenches: a second route-less pass resends nothing.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a.engine.announce_pending(&mut mailbox, None).unwrap()
+    };
+    assert_eq!(
+        sent, 0,
+        "the withdrawal quenches under the recorded sentinel"
+    );
+    // The peer converges on the route-less version: its recorded
+    // announcement names no route, so its next publication pass
+    // offers no provider for the snapshot.
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 2);
+    let state = pair.b.engine.runtime_state().unwrap();
+    assert_eq!(
+        state
+            .announcement(&id)
+            .and_then(|announcement| announcement.node_addr.clone()),
+        None,
+        "the peer records the withdrawal, not the dead route"
+    );
+
+    // Crash between withdrawal and repair: memory drops, the
+    // withdrawn route record replays from the fact log.
     restart(&mut pair.a, &controls);
     let state = pair.a.engine.runtime_state().unwrap();
     assert!(
         state
             .announcement_delivered_route
             .values()
-            .all(|route| *route == endpoint_a),
-        "the route record survives the crash"
+            .all(|route| *route == crate::runtime::state::WITHDRAWN_ROUTE),
+        "the withdrawn route record survives the crash"
     );
 
     // New endpoint identity reopens eligibility: both pairs resend
@@ -825,12 +876,18 @@ fn route_change_redelivers_discharged_announcements() {
             .unwrap()
     };
     assert_eq!(sent, 0, "the repair quenches under the recorded route");
-    // The route-B reseal reaches the peer alongside its undrained
-    // route-A copy: two envelopes, one obligation — the reseal is a
-    // route update, not a duplicate, and the peer converges once.
-    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 2);
+    // Only the route-B reseal is new to the peer: the route-A copy
+    // and the withdrawal both drained earlier, so one envelope lands
+    // and the peer converges on the re-widened route.
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 1);
     let state = pair.b.engine.runtime_state().unwrap();
-    assert!(state.announcement(&id).is_some());
+    assert_eq!(
+        state
+            .announcement(&id)
+            .and_then(|announcement| announcement.node_addr.clone()),
+        Some(route_b.clone()),
+        "the peer converges on the re-widened route"
+    );
     assert!(
         pair.a
             .engine

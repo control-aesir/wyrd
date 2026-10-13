@@ -242,7 +242,7 @@ Releases are not required to write every format they read:
 
 `wyrd-contracts` carries one named test per invariant direction
 (catalog 23-33), over fixture stores checked in under
-`tests/fixtures/stores/<release>/`. Two fixtures exist: the `dev`
+`crates/wyrd-contracts/tests/fixtures/stores/<release>/`. Two fixtures exist: the `dev`
 harness-smoke store and the `v0.2.0-alpha` release baseline; per-release
 fixtures continue under their tag with each release. (The `v0.1.0-alpha.1`
 fixture went out with the reader-set format break: pre-v1 alphas may break
@@ -254,7 +254,7 @@ payload clause, pending the v0.9.0 payload-versioning issue)
 and the full version matrix
 (invariant 5's matrix half, pending capability negotiation). Release
 checklist, so this coverage cannot silently remain absent: cutting a
-release checks in `tests/fixtures/stores/<tag>/` and re-enables
+release checks in `crates/wyrd-contracts/tests/fixtures/stores/<tag>/` and re-enables
 `upgrade_previous_release_store_replays` against it. The list below is the acceptance set for
 the contract issue — one bullet per invariant, in the same order:
 

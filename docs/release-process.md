@@ -54,7 +54,7 @@ Right:
 ## Cut checklist
 
 1. Prep PR: version bump, `CHANGELOG.md ## [Unreleased]` entries,
-   fresh fixture under `tests/fixtures/stores/<tag>/`, re-enabled
+   fresh fixture under `crates/wyrd-contracts/tests/fixtures/stores/<tag>/`, re-enabled
    replay test, upgrade-contract brought current. No gates, no tag.
 2. Confirm `nix build .#wyrd-dist` archives under the new version name.
 3. Cut PR: flip `dist.yml` (`if: false`), drop the `release.yaml`
@@ -163,7 +163,7 @@ Right:
 - `CHANGELOG.md`: `ngit release publish` extracts the section
   matching the version; the `[Unreleased]` rename is part of the cut,
   not the prep.
-- Fixture per release under `tests/fixtures/stores/<tag>/` with a
+- Fixture per release under `crates/wyrd-contracts/tests/fixtures/stores/<tag>/` with a
   digest pin in the replay test; the generator stays `#[ignore]`d
   so CI replays frozen bytes. Next release re-runs the generator
   under its tag and repoints the constant.

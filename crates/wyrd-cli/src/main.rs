@@ -1433,7 +1433,7 @@ fn mount(
     // route, then the discharge barrier — one copy for every live
     // composer, so the order cannot drift between mount, headless
     // sync, and vault.
-    install_serving(&mut live, &serving).map_err(CliError::Serving)?;
+    install_serving(&mut live, &serving, &drive_dir).map_err(CliError::Serving)?;
     // Endpoint ownership (and shutdown below) stays here; the loop
     // holds only the cloneable readiness handle the install took.
     // The composer builds its presentation backend from the node's
@@ -3515,7 +3515,7 @@ fn sync_now(
         // peers can already dial; then publish the route and gate
         // every pass's discharge on mirror readiness. A backed-up
         // mirror leaves the obligation recorded, never discharged.
-        install_serving(&mut live, serving).map_err(CliError::Serving)?;
+        install_serving(&mut live, serving, &drive_dir).map_err(CliError::Serving)?;
     }
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but
@@ -3794,6 +3794,7 @@ fn vault(
     });
     let outcome = run_vault(VaultRun {
         live,
+        drive_dir: drive_dir.clone(),
         mailbox,
         bulk: Some(bulk),
         serving,

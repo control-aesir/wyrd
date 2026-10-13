@@ -504,7 +504,8 @@ and role selection is never an authorization mechanism.
   device holding the vault role. Never use bare `vault` where the
   distinction matters.
 - **Storage.** The role is one string in a `role` file beside the drive's
-  keystore, read at startup. It is not a fact-log entry and never leaves
+  keystore, read at startup by offline commands and once per pass by
+  the live loop. It is not a fact-log entry and never leaves
   the   device. Policy the role implies is admitted as `Cached` facts
   through the same admission path `pin` uses, so `wyrd role set`
   and `wyrd pin` cannot disagree about what the device intends.

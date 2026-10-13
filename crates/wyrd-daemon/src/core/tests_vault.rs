@@ -130,6 +130,7 @@ fn vault_install_holds_discharge_on_a_backed_up_mirror() {
             addr: addr.clone(),
             barrier: Arc::new(NeverReady),
         },
+        &dir,
     )
     .unwrap();
     assert_eq!(
@@ -164,6 +165,7 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
             addr: vec![9u8; 32],
             barrier: Arc::new(NeverReady),
         },
+        &dir,
     )
     .unwrap();
     let mut mailbox = AcceptingMailbox::default();
@@ -179,6 +181,7 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
             addr: vec![9u8; 32],
             barrier: Arc::new(Ready),
         },
+        &dir,
     )
     .unwrap();
     live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -186,6 +189,196 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
     assert!(
         live.pending_announcements().unwrap().is_empty(),
         "a ready mirror discharges what the stall held back"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Installing the serving surface also installs the role
+/// directory: a vault-role device composed the way production
+/// compositions compose it admits demand for reachable unheld
+/// content with no explicit want anywhere. This is the test that
+/// would have caught an unwired composition — it builds the loop
+/// through `install_serving`, never `set_role_dir` directly, so
+/// removing the install inside `install_serving` fails it. The
+/// mirror leg runs the identical composition with no role file and
+/// admits nothing, proving the demand is the role's doing.
+#[test]
+fn install_serving_wires_vault_retention() {
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+    use wyrd_format::{EntryContent, ObjectKind, ObjectStore, Tree};
+
+    // One authored file, then its bytes verification-failed away:
+    // reachable, unheld, unpinned, never demanded, never
+    // quarantined before — the only demand source in the vault leg
+    // is the role walk. Returns the live node, its dir, and the
+    // unheld chunk.
+    fn unheld_setup(
+        case: &str,
+        role: Option<RoleState>,
+    ) -> (
+        LiveNode<DriveView<MemoryObjectStore, RuntimeMaterialization>>,
+        std::path::PathBuf,
+        wyrd_format::ContentId,
+    ) {
+        let (mut engine, dir, _) = scratch_drive();
+        let identity_b = DeviceIdentitySecret::generate().unwrap();
+        let encryption_b = DeviceEncryptionSecret::generate().unwrap();
+        engine
+            .admit_device(identity_b.device_id(), encryption_b.encryption_key())
+            .unwrap();
+        let mut daemon: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+            WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+        let authored = daemon
+            .put_file(&format!("{case}.txt"), b"post-admission")
+            .unwrap();
+        let tree_id = authored.snapshot().tree;
+        let tree_bytes = daemon
+            .view()
+            .store_read()
+            .unwrap()
+            .get(&tree_id)
+            .unwrap()
+            .expect("authored tree serves");
+        let mut chunks = Tree::decode(&tree_bytes)
+            .unwrap()
+            .entries()
+            .iter()
+            .flat_map(|entry| match &entry.content {
+                EntryContent::File { chunks, .. } => chunks.clone(),
+                EntryContent::Dir { .. } | EntryContent::Symlink { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1, "one flat file chunk");
+        let chunk = chunks.pop().unwrap();
+        daemon.refresh_live_heads().unwrap();
+        let (mut live, _parts) = daemon
+            .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+            .unwrap();
+        if let Some(state) = role {
+            role::store(&dir, state).unwrap();
+        }
+        install_serving(
+            &mut live,
+            &StubSurface {
+                addr: vec![3u8; 32],
+                barrier: Arc::new(Ready),
+            },
+            &dir,
+        )
+        .unwrap();
+        live.quarantine_queue()
+            .submit(VerificationFailure::content_hash_mismatch(
+                chunk,
+                ObjectKind::Chunk,
+            ));
+        (live, dir, chunk)
+    }
+
+    // Control leg: identical composition, no role file. The
+    // quarantine drain clears the claim and nothing re-demands it:
+    // the fetch plan drops the never-wanted identity from tracking.
+    let (mut control, control_dir, _control_chunk) = unheld_setup("vault-wire-control", None);
+    let mut mailbox = AcceptingMailbox::default();
+    let mut empty = MemoryBulkSource::default();
+    let control_report = control.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
+    assert_eq!(
+        control_report.fetched.unfulfilled, 0,
+        "without a role the unheld chunk leaves no fetch demand"
+    );
+
+    // Vault leg: the role walk admits what the control leg leaves.
+    // The empty bulk source fetches nothing, so the admitted demand
+    // stays unfulfilled — and unfulfilled is exactly the observable
+    // that distinguishes demanded from never-wanted.
+    let (mut vault, vault_dir, _vault_chunk) = unheld_setup(
+        "vault-wire-vault",
+        Some(RoleState {
+            role: Role::Vault,
+            transition: Transition::Settled,
+        }),
+    );
+    let vault_report = vault.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
+    assert!(
+        vault_report.fetched.unfulfilled > 0,
+        "install_serving wires the role directory: vault demand is admitted with no explicit want"
+    );
+
+    drop(control);
+    drop(vault);
+    std::fs::remove_dir_all(control_dir).unwrap();
+    std::fs::remove_dir_all(vault_dir).unwrap();
+}
+
+/// A torn role file degrades the loop without aborting it: the pass
+/// warns, retains as mirror for the pass, and admits nothing on the
+/// role's strength. The fail-closed rejection itself is pinned at
+/// `role::load`; this pins the loop's half — sync must not stall on
+/// an operator-repairable file.
+#[test]
+fn install_serving_torn_role_file_degrades_without_aborting() {
+    // Reuse the unheld setup through a local copy: the shared
+    // helper lives inside the wiring test above, so this leg
+    // rebuilds the same shape with a torn file instead of a role.
+    // (Deliberate duplication over coupling two tests through a
+    // helper with a failure-injection parameter.)
+    use wyrd_core::quarantine::VerificationFailure;
+    use wyrd_format::{EntryContent, ObjectKind, ObjectStore, Tree};
+
+    let (mut engine, dir, _) = scratch_drive();
+    let identity_b = DeviceIdentitySecret::generate().unwrap();
+    let encryption_b = DeviceEncryptionSecret::generate().unwrap();
+    engine
+        .admit_device(identity_b.device_id(), encryption_b.encryption_key())
+        .unwrap();
+    let mut daemon: WyrdNode<DriveView<MemoryObjectStore, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+    let authored = daemon.put_file("torn.txt", b"post-admission").unwrap();
+    let tree_id = authored.snapshot().tree;
+    let tree_bytes = daemon
+        .view()
+        .store_read()
+        .unwrap()
+        .get(&tree_id)
+        .unwrap()
+        .expect("authored tree serves");
+    let mut chunks = Tree::decode(&tree_bytes)
+        .unwrap()
+        .entries()
+        .iter()
+        .flat_map(|entry| match &entry.content {
+            EntryContent::File { chunks, .. } => chunks.clone(),
+            EntryContent::Dir { .. } | EntryContent::Symlink { .. } => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 1, "one flat file chunk");
+    let chunk = chunks.pop().unwrap();
+    daemon.refresh_live_heads().unwrap();
+    let (mut live, _parts) = daemon
+        .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
+        .unwrap();
+    std::fs::write(dir.join("role"), "vaul").unwrap();
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: vec![3u8; 32],
+            barrier: Arc::new(Ready),
+        },
+        &dir,
+    )
+    .unwrap();
+    live.quarantine_queue()
+        .submit(VerificationFailure::content_hash_mismatch(
+            chunk,
+            ObjectKind::Chunk,
+        ));
+    let mut mailbox = AcceptingMailbox::default();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .expect("a torn role file must not abort the pass");
+    assert!(
+        !live.wants().is_admitted(&chunk),
+        "degraded to mirror: nothing admitted on the role's strength"
     );
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();

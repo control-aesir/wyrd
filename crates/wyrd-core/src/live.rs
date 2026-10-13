@@ -1020,10 +1020,12 @@ where
     /// A torn role file warns and retains as mirror for the pass:
     /// the loop must not stall sync on an operator-repairable file,
     /// and nothing prunes under any role, so the degradation is
-    /// availability-only and self-heals on repair.
-    fn register_vault_wants(&mut self) -> Result<(), LiveError> {
+    /// availability-only and self-heals on repair. Returns the
+    /// identities this pass newly registered, for release after
+    /// admission.
+    fn register_vault_wants(&mut self) -> Result<Vec<ContentId>, LiveError> {
         let Some(dir) = self.role_dir.clone() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let role = match crate::role::load(&dir) {
             Ok(state) => state.effective(),
@@ -1033,15 +1035,15 @@ where
                     error = %error,
                     "unreadable role file: retaining as mirror until repaired"
                 );
-                return Ok(());
+                return Ok(Vec::new());
             }
         };
         if role != crate::role::Role::Vault {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let revision = self.engine.current();
         if self.vault_swept_revision == Some(revision) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Never re-register in-flight identities: registration
         // coalesces but still gains a waiter per call, so pending or
@@ -1064,15 +1066,16 @@ where
             ))
         })?;
         drop(projection);
+        let mut registered = Vec::new();
         for id in candidates {
             if pending.contains(&id) || self.wants.is_admitted(&id) {
                 continue;
             }
             match self.wants.register(id) {
-                Ok(()) => {}
+                Ok(()) => registered.push(id),
                 // Past the bound the leftover waits for the next
                 // pass, exactly like backend demand past the bound.
-                Err(crate::want::WantError::Saturated) => return Ok(()),
+                Err(crate::want::WantError::Saturated) => return Ok(registered),
                 // Only the poisoned lock remains (TimedOut belongs
                 // to the waiting path; register never returns it):
                 // fail closed.
@@ -1082,7 +1085,7 @@ where
         if completed {
             self.vault_swept_revision = Some(revision);
         }
-        Ok(())
+        Ok(registered)
     }
 
     /// Install this drive's retrieval route for announcements: the
@@ -1486,8 +1489,10 @@ where
         // admission commits Cached through the existing path and the
         // fetch plan needs no role knowledge, so no new fact kind
         // exists. Skipped below vault-effective (zero cost) and while
-        // a full sweep already covers the durable revision.
-        self.register_vault_wants()?;
+        // a full sweep already covers the durable revision. The
+        // returned ids are this pass's registrations: released after
+        // admission below, so the loop holds no phantom waiter.
+        let vault_registered = self.register_vault_wants()?;
         let mut admission = if self.wants.peek_pending().is_empty() {
             None
         } else {
@@ -1503,6 +1508,15 @@ where
             self.engine
                 .set_materialization_from(snapshot, want, MaterializationState::Cached)
         })?;
+        // Release this pass's vault registrations: admission marked
+        // them admitted (an admitted fetch keeps its in-flight mark
+        // and continues), so the loop must not keep a waiter on
+        // them — otherwise the settlement predicate's waiters==0 arm
+        // could never fire for vault demand and the waiting map
+        // would grow with every distinct identity ever wanted.
+        for id in &vault_registered {
+            self.wants.release(id);
+        }
         // Local scrub, walk half (child 13): re-stat locally
         // claimed identities against the store from the rotating
         // cursor, submitting misses for the drain below. The

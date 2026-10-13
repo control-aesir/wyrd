@@ -70,11 +70,18 @@ impl ServeSurface for ServingEndpoint {
 /// Install a bound surface on a live node, in the mount's order:
 /// flush before announcing the address, so the first seal carries a
 /// route peers can already dial; then publish the route and gate
-/// every pass's discharge on mirror readiness. Returns the address
-/// bytes for the ready line. A backed-up mirror leaves the
+/// every pass's discharge on mirror readiness. Also installs the
+/// drive directory the loop reads the materialization role from, so
+/// every composition built through this step retains like its role
+/// without rediscovering the obligation. Returns the address bytes
+/// for the ready line. A backed-up mirror leaves the
 /// obligation recorded, never discharged — the wiring test pins
 /// exactly that through this function.
-pub fn install_serving<V>(live: &mut LiveNode<V>, surface: &dyn ServeSurface) -> io::Result<Vec<u8>>
+pub fn install_serving<V>(
+    live: &mut LiveNode<V>,
+    surface: &dyn ServeSurface,
+    drive_dir: &std::path::Path,
+) -> io::Result<Vec<u8>>
 where
     V: NamespaceView<Materialization = RuntimeMaterialization>,
     <V as NamespaceView>::Store: ObjectStore,
@@ -84,6 +91,7 @@ where
     let addr = surface.node_addr_bytes();
     live.set_node_addr(Some(addr.clone()));
     live.set_serving_barrier(surface.serving_barrier());
+    live.set_role_dir(drive_dir.to_path_buf());
     Ok(addr)
 }
 
@@ -338,6 +346,10 @@ pub struct VaultOutcome {
 pub struct VaultRun<V: NamespaceView, M, B> {
     /// The composed live node, serving not yet installed.
     pub live: LiveNode<V>,
+    /// The drive directory the loop reads the materialization role
+    /// from: installed on the loop with the serving surface, so the
+    /// vault process retains like its role.
+    pub drive_dir: std::path::PathBuf,
     /// The connected control-plane mailbox.
     pub mailbox: M,
     /// The bound bulk source, if the composer bound one.
@@ -382,6 +394,7 @@ where
 {
     let VaultRun {
         mut live,
+        drive_dir,
         mailbox,
         bulk,
         serving,
@@ -394,7 +407,7 @@ where
     // The surface the loop's barrier reads through is the bound
     // endpoint itself: flush before announcing the address, then
     // publish the route and gate discharge on mirror readiness.
-    install_serving(&mut live, &serving)?;
+    install_serving(&mut live, &serving, &drive_dir)?;
     // The observer's two ends: completed passes report through the
     // node's hook, failures through the loop's closure. Both ends
     // share one observer, so readiness, posture, and error counts

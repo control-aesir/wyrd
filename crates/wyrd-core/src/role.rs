@@ -1,8 +1,9 @@
 //! Device-local materialization roles: what this device intends to be.
 //!
 //! A role is replication and retention posture, never replicated drive
-//! state. It lives in one `role` file beside the drive's keystore, is
-//! read at startup, and must never become a fact-log entry, affect
+//! state. It lives in one `role` file beside the drive's keystore,
+//! read at startup by offline commands and once per pass by the live
+//! loop, and must never become a fact-log entry, affect
 //! authorization, or alter the replicated snapshot model
 //! (`docs/sync-and-peers.md`, Materialization policy vs peer role).
 //!

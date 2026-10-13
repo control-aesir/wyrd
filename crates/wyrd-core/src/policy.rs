@@ -391,13 +391,23 @@ pub fn unheld_want_candidates<V: NamespaceView>(
     })?;
     let runtime = engine.runtime_state()?;
     let mut out = Vec::new();
+    // A chunk shared across files is one identity: dedupe here, so
+    // one sweep never registers the same demand twice (registration
+    // coalesces but still gains a waiter per call).
+    let mut seen = std::collections::BTreeSet::new();
     let mut stack = vec![(path.to_string(), root, 0usize)];
     while let Some((at, node, depth)) = stack.pop() {
         if out.len() >= cap {
             return Ok((out, false));
         }
         if depth > MAX_PATH_DEPTH {
-            return Err(PolicyError::TooDeep(at));
+            // A path deeper than the format's own legal bound is
+            // not a store failure: skip the subtree and keep
+            // walking siblings. The census (a one-shot operator
+            // report) still errors on it; inside the loop an
+            // illegal path must never abort sync under the
+            // tightest failure class in the system.
+            continue;
         }
         match node {
             Node::File { chunks, .. } => {
@@ -407,6 +417,7 @@ pub fn unheld_want_candidates<V: NamespaceView>(
                     }
                     if runtime.materialization(id) != MaterializationState::Pinned
                         && !runtime.is_local(id)
+                        && seen.insert(*id)
                     {
                         out.push(*id);
                     }
@@ -848,6 +859,173 @@ mod tests {
             store: Arc::new(RwLock::new(MemoryObjectStore::default())),
             arenas,
         }
+    }
+
+    /// A namespace with one ordinary sibling file beside one
+    /// illegally deep chain: the root holds `shallow.txt` plus
+    /// `d0/d1/…/d299/deep.txt`. Depth rides the first two subtree-id
+    /// bytes (big-endian u16) instead of an arena index, so no
+    /// convention constrains it.
+    struct ChainView {
+        store: Arc<RwLock<MemoryObjectStore>>,
+        shallow: Vec<ContentId>,
+        deep: Vec<ContentId>,
+    }
+
+    fn chain_id(depth: u16) -> ContentId {
+        let mut bytes = [0xD2; 32];
+        bytes[0..2].copy_from_slice(&depth.to_be_bytes());
+        ContentId::from_bytes(bytes)
+    }
+
+    fn chain_depth(id: &ContentId) -> Option<u16> {
+        let bytes = id.as_bytes();
+        if bytes[2..] != [0xD2; 30] {
+            return None;
+        }
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    impl NamespaceView for ChainView {
+        type Store = MemoryObjectStore;
+        type Materialization = FakePolicy;
+
+        fn open(store: MemoryObjectStore, _: FakePolicy, _: Vec<Head>) -> Self {
+            ChainView {
+                store: Arc::new(RwLock::new(store)),
+                shallow: Vec::new(),
+                deep: Vec::new(),
+            }
+        }
+
+        fn open_shared(store: Arc<RwLock<MemoryObjectStore>>, _: FakePolicy, _: Vec<Head>) -> Self {
+            ChainView {
+                store,
+                shallow: Vec::new(),
+                deep: Vec::new(),
+            }
+        }
+
+        fn store_handle(&self) -> Arc<RwLock<MemoryObjectStore>> {
+            Arc::clone(&self.store)
+        }
+
+        fn store_read(&self) -> Result<RwLockReadGuard<'_, MemoryObjectStore>, ViewLockError> {
+            self.store.read().map_err(|_| ViewLockError)
+        }
+
+        fn store_write(&self) -> Result<RwLockWriteGuard<'_, MemoryObjectStore>, ViewLockError> {
+            self.store.write().map_err(|_| ViewLockError)
+        }
+
+        fn set_heads(&mut self, _: Vec<Head>) {}
+
+        fn set_materialization(&mut self, _: FakePolicy) {}
+
+        fn status(&self, _id: &ContentId) -> wyrd_format::FetchStatus {
+            wyrd_format::FetchStatus::Available
+        }
+
+        fn lookup(&self, path: &str) -> Result<Node, ViewError> {
+            if path.is_empty() {
+                Ok(Node::Dir {
+                    subtree: chain_id(0),
+                })
+            } else {
+                Err(ViewError::NotFound)
+            }
+        }
+
+        fn stat(&self, path: &str) -> Result<Attr, ViewError> {
+            Ok(match self.lookup(path)? {
+                Node::File {
+                    size, executable, ..
+                } => Attr {
+                    kind: Kind::File,
+                    size,
+                    executable,
+                },
+                _ => Attr {
+                    kind: Kind::Dir,
+                    size: 0,
+                    executable: false,
+                },
+            })
+        }
+
+        fn readdir(&self, node: &Node) -> Result<Vec<DirEntry>, ViewError> {
+            let Node::Dir { subtree } = node else {
+                return Err(ViewError::NotADirectory);
+            };
+            let depth = chain_depth(subtree).ok_or(ViewError::NotADirectory)?;
+            if depth == 0 {
+                return Ok(vec![
+                    DirEntry {
+                        name: "chain".into(),
+                        node: Node::Dir {
+                            subtree: chain_id(1),
+                        },
+                    },
+                    DirEntry {
+                        name: "shallow.txt".into(),
+                        node: Node::File {
+                            chunks: self.shallow.clone(),
+                            size: 1,
+                            executable: false,
+                        },
+                    },
+                ]);
+            }
+            if depth < 300 {
+                return Ok(vec![DirEntry {
+                    name: format!("d{depth}"),
+                    node: Node::Dir {
+                        subtree: chain_id(depth + 1),
+                    },
+                }]);
+            }
+            Ok(vec![DirEntry {
+                name: "deep.txt".into(),
+                node: Node::File {
+                    chunks: self.deep.clone(),
+                    size: 1,
+                    executable: false,
+                },
+            }])
+        }
+
+        fn open_file(&self, node: &Node) -> Result<OpenFile, ViewError> {
+            match node {
+                Node::File { chunks, size, .. } => Ok(OpenFile::new(chunks.clone(), *size)),
+                _ => Err(ViewError::NotAFile),
+            }
+        }
+
+        fn read(&self, _file: &OpenFile, _offset: u64, _len: usize) -> Result<Vec<u8>, ViewError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn too_deep_subtrees_skip_without_aborting_the_walk() {
+        let (engine, dir) = scratch_engine();
+        let view = ChainView {
+            store: Arc::new(RwLock::new(MemoryObjectStore::default())),
+            shallow: vec![id(0xE1)],
+            deep: vec![id(0xE2)],
+        };
+        let (found, completed) = unheld_want_candidates(&engine, &view, "", 64).unwrap();
+        assert_eq!(
+            found,
+            vec![id(0xE1)],
+            "the shallow sibling is collected; the illegally deep chain is skipped, never an abort"
+        );
+        assert!(
+            completed,
+            "skipping is not stalling: the sweep still completes"
+        );
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

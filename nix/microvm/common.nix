@@ -43,6 +43,9 @@
       procps
       e2fsprogs
       util-linux
+      # `wyrd update` unpacks release archives by shelling out to
+      # system tar: the post-upgrade convergence leg needs it in-guest.
+      gnutar
     ];
     security.sudo.enable = true;
     # The suite runs as e2e, mirroring the Lima guest's unprivileged

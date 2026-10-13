@@ -304,10 +304,10 @@ wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
 # just-built binary under the canonical name, so resolve runs for
 # real; the true cross-version extension reuses these assertions
 # with a v0.2.0 binary (fixture-half design on the issue).
-rm -f "$RUN/member-u-ready" "$RUN/member-u-done" "$RUN/upgrade-blob.sha256"
+rm -f "$RUN/member-u-ready" "$RUN/member-u-done" "$RUN/owner-u-updated" "$RUN/upgrade-blob.sha256"
 UPGRADE_ROOT="$(dirname "$SCRIPT_DIR")"
-UPGRADE_VERSION="$(grep '^version = ' "$UPGRADE_ROOT/Cargo.toml" | head -n 1 | cut -d'"' -f2)"
-[[ -n "$UPGRADE_VERSION" ]] || die "workspace version unreadable ($UPGRADE_ROOT/Cargo.toml)"
+UPGRADE_VERSION="$(grep '^version = ' "$UPGRADE_ROOT/Cargo.toml" | head -n 1 | cut -d'"' -f2)" \
+  || die "workspace version unreadable ($UPGRADE_ROOT/Cargo.toml)"
 UPGRADE_GARCH="$(on_o "uname -m" 2>/dev/null | tr -d ' \r\n')" \
   || die "guest arch unreadable over ssh"
 case "$UPGRADE_GARCH" in

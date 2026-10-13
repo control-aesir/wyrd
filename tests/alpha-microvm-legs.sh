@@ -123,11 +123,12 @@ leg_restart_member() {
 # stop+update+remount IS the production upgrade (new instance over a
 # persisted route, re-announced under the live route). Write the
 # post-upgrade set; the member must converge without remounting.
-# The nix store is read-only, so the update targets a guest-local
-# copy of the binary — the swap siblings live beside the copy, and
-# WYRD_BIN is re-exported so every later helper uses the upgraded
-# build. (Issue: post-upgrade convergence leg; the true cross-version
-# extension reuses these assertions with a v0.2.0 binary.)
+# The nix store is read-only, so the update targets a writable copy
+# of the binary on the shared state root — the swap siblings live
+# beside the copy, and WYRD_BIN is re-exported so every later helper
+# uses the upgraded build. (Issue: post-upgrade convergence leg; the
+# true cross-version extension reuses these assertions with a v0.2.0
+# binary.)
 leg_upgrade_owner() {
   local d="$1" c="$2" relay="$3" archive="$4"
   step 8 "post-upgrade serving leg"
@@ -153,6 +154,10 @@ leg_upgrade_owner() {
   grep -q '"outcome": "done"' "$uexe.update-verdict" \
     || die "owner update verdict is not done (see wyrd-upgraded/wyrd.update-verdict)"
   pass "owner binary upgrades in place with a done verdict"
+  # Transaction rendezvous: the member waits on this before its
+  # convergence poll, so a slow update reports as a slow
+  # transaction, never as a route failure.
+  touch "$E2E_ROOT/owner-u-updated"
   check_no_leaks "$LOGDIR/update-owner.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   start_mount xowner-u2 "$c" "$d" "$MNTS/xowner-u2" --relay "$relay"
   grep -q "serving over iroh" "$LOGDIR/mount-xowner-u2.err" \
@@ -182,6 +187,11 @@ leg_upgrade_member() {
     || die "member never converged before the upgrade"
   pass "member holds the pre-upgrade route"
   touch "$E2E_ROOT/member-u-ready"
+  # The update's verify children are budgeted well above the
+  # convergence poll below: wait on the owner's transaction
+  # rendezvous first, so only a live route is ever polled.
+  poll_until 600 test -f "$E2E_ROOT/owner-u-updated" \
+    || die "owner never finished the update transaction"
   poll_until 120 converged "$MNTS/xmember-u/after-upgrade.txt" "after-upgrade" \
     || die "member never converged after the owner's upgrade"
   pass "re-announcement recovers the route from the upgraded binary"

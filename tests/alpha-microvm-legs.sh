@@ -10,6 +10,15 @@
 set -euo pipefail
 
 E2E_ENV_FILE="${E2E_ENV_FILE:-/mnt/wyrd-state/e2e-env.sh}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Wrapper-only entry, before alpha-common.sh sources the env file
+# (sourcing first would install the published token into this shell
+# and make the comparison vacuous). The host orchestrator passes
+# the run token on every ssh invocation; anything else dies here.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/e2e-guard.sh"
+e2e_require_wrapped "$E2E_ENV_FILE" "sudo ./nix/microvm/run-microvm.sh" \
+  || { echo "  FAIL: unwrapped legs invocation refused" >&2; exit 2; }
 # shellcheck source=/dev/null
 source /etc/wyrd-tests/alpha-common.sh
 

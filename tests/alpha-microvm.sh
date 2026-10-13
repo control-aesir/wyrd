@@ -61,10 +61,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # would reap guest pid files from the host namespace).
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/step-grammar.sh"
+# Wrapper-only entry: a direct invocation bypasses the runner's
+# flock and can mutate the shared fleet underneath a wrapped run.
+# The runner passes WYRD_E2E_TOKEN + WYRD_E2E_LOCK in the
+# environment (see nix/microvm/run-microvm.sh); anything else dies
+# here before touching a guest.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/e2e-guard.sh"
 
 STATE_DIR="${STATE_DIR:-/var/lib/wyrd-microvm/state}"
 RUN="$STATE_DIR/run"
 SSH_KEY="$STATE_DIR/sshkey"
+# Wrapper-only entry, enforced before anything else (including the
+# :? defaults below, which would otherwise fire first with a
+# confusing message): the token must match the runner-published env
+# file, and the runner's flock must be held (stale tokens from dead
+# or kept runs do not authorize a suite). See tests/e2e-guard.sh.
+e2e_require_wrapped "$STATE_DIR/e2e-env.sh" "sudo ./nix/microvm/run-microvm.sh" \
+  || { echo "  FAIL: unwrapped orchestrator invocation refused" >&2; exit 2; }
 WYRD_BIN="${WYRD_BIN:?runner sets WYRD_BIN from the host build}"
 NAK_BIN="${NAK_BIN:?runner sets NAK_BIN from the host build}"
 RELAY_URL="${RELAY_URL:-ws://10.0.7.10:18761}"
@@ -117,8 +131,15 @@ command -v setpriv >/dev/null || die "setpriv missing on the host (util-linux)"
 as_guest() { setpriv --reuid 1000 --regid 1000 --clear-groups -- "$@"; }
 
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
-on_o() { $SSH "$PEER_O" "$@"; }
-on_n() { $SSH "$PEER_N" "$@"; }
+# Every guest invocation carries the run token (ssh joins the
+# arguments, so the assignment prefixes the remote command): legs
+# refuse processes the orchestrator did not launch. Raw probes get
+# it too — an env prefix is harmless on any remote command. The
+# token is minted hex (see the runner), so no quoting is needed.
+# The unwrapped-bypass flag rides along too: deliberate debugging
+# must reach the legs, not die at the first one.
+on_o() { $SSH "$PEER_O" "WYRD_E2E_TOKEN=${WYRD_E2E_TOKEN:-}" "WYRD_E2E_UNWRAPPED=${WYRD_E2E_UNWRAPPED:-0}" "$@"; }
+on_n() { $SSH "$PEER_N" "WYRD_E2E_TOKEN=${WYRD_E2E_TOKEN:-}" "WYRD_E2E_UNWRAPPED=${WYRD_E2E_UNWRAPPED:-0}" "$@"; }
 
 # wait_conflict_file <seconds> <file> <what> <leg-pid>: shared
 # rendezvous waiter for host-driven fault blocks (partition, kill):

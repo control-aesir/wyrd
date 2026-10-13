@@ -80,6 +80,18 @@ in
       files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/.*\\.sh)$";
       pass_filenames = false;
     };
+
+    # Shell syntax gate: a stray `done` once shipped and invalidated a
+    # 40-minute suite run after all its evidence was collected (bash
+    # parses incrementally, so nothing failed until the final step).
+    # bash -n over every staged shell script at commit time.
+    bash-syntax = {
+      enable = true;
+      name = "bash syntax (bash -n)";
+      entry = "bash -n";
+      files = "\\.sh$";
+      pass_filenames = true;
+    };
   };
 
   # Release tooling: `build` wraps `.ngit/scripts/build.sh`,

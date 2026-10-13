@@ -78,6 +78,10 @@
       # check. Keep this set in sync with what the guest-run scripts
       # source — Lima runs off the share and can never catch a gap here.
       "wyrd-tests/step-grammar.sh".source = ../../tests/step-grammar.sh;
+      # Wrapper-only entry enforcement: sourced by every suite script
+      # above before anything else. Same sync rule — a missing guard
+      # file fails every leg at source time.
+      "wyrd-tests/e2e-guard.sh".source = ../../tests/e2e-guard.sh;
     };
 
     services.openssh = {

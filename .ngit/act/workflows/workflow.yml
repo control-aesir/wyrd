@@ -60,6 +60,7 @@ jobs:
           bash tests/test-baked-set.sh
           bash tests/test-runner-fd.sh
           bash tests/test-probe-mark.sh
+          bash tests/test-e2e-guard.sh
 
   draft:
     if: github.event.action == 'opened'

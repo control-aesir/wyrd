@@ -109,6 +109,7 @@ pub fn owner_proof_challenge(preimage: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Change, ContentId, DeviceId, TransitionId};
 
     #[test]
     fn domains_are_closed_and_distinct() {
@@ -146,6 +147,66 @@ mod tests {
         assert_eq!(
             hex::encode(owner_proof_challenge(b"wyrd signing fixture: owner proof")),
             "cdeedd5972d2cb206e3710ef577f847c654548e3c9a3884ad6dba1a7d057e481"
+        );
+    }
+
+    /// The typed wrappers pin their own wiring, not just the raw
+    /// finalization: these prove the hashed bytes are the object's
+    /// `signing_message` for this drive. An edit that swapped in a
+    /// different preimage (or a different drive binding) breaks these
+    /// while leaving the raw-finalization pins above green, and the
+    /// sync-side round trips would move sign and verify together —
+    /// so without these, nothing in the tree would fail.
+    fn fixture_drive() -> DriveId {
+        DriveId::from_bytes([0xEE; 32])
+    }
+
+    fn fixture_transition() -> MembershipTransition {
+        MembershipTransition::new(
+            1,
+            None,
+            Vec::new(),
+            vec![Change::Rotate],
+            [0x11; 32],
+            [0x22; 32],
+            [0x33; 32],
+            DeviceId::from_bytes([0x44; 32]),
+        )
+        .expect("fixture transition")
+    }
+
+    fn fixture_snapshot() -> Snapshot {
+        Snapshot::new(
+            Vec::new(),
+            ContentId::from_bytes([0x55; 32]),
+            DeviceId::from_bytes([0x44; 32]),
+            TransitionId::from_bytes([0x71; 32]),
+            1,
+            0,
+            1,
+        )
+        .expect("fixture snapshot")
+    }
+
+    #[test]
+    fn membership_challenge_for_matches_known_answer() {
+        assert_eq!(
+            hex::encode(membership_challenge_for(
+                &fixture_transition(),
+                &fixture_drive()
+            )),
+            "9655a54926643b8d477672c9e855826cd7e924876b7172c447c466aa7d7acc4f"
+        );
+    }
+
+    #[test]
+    fn snapshot_challenge_for_matches_known_answer() {
+        assert_eq!(
+            hex::encode(snapshot_challenge_for(
+                &fixture_snapshot(),
+                &fixture_drive()
+            )),
+            "986fd7f1133e023ffb2312b324763eab7629fa21bc4400cc65a5a052551cd9fd"
         );
     }
 }

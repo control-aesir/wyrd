@@ -6,12 +6,13 @@
 //! publishing rig's durable content and drives the fetch plane the
 //! daemon's sync pass drives it.
 
-use wyrd_format::ObjectStore;
+use wyrd_format::{MemoryObjectStore, ObjectStore};
 use wyrd_sync::bulk::IrohBulkSource;
-use wyrd_sync::runtime::{MaterializationState, RoutePublishing};
+use wyrd_sync::runtime::{Engine, MaterializationState, RoutePublishing};
 use wyrd_sync::serving::{ServingEndpoint, Vault};
+use zeroize::Zeroizing;
 
-use crate::support::{scratch_dir, Loaded};
+use crate::support::{drive, scratch_dir, Loaded, Relay};
 
 /// The contract: one real-iroh serving surface over the durable vault
 /// turns the bulk-source contract into live transport. Round one: the
@@ -98,6 +99,171 @@ fn a_serving_daemon_serves_a_peer_over_live_iroh() {
         .unwrap();
     loaded.rig.teardown();
     let _ = std::fs::remove_dir_all(&serve_dir);
+}
+
+/// The substitute shape (fetch-d, without the 140-minute gate): the
+/// endpoint that published the content dies before a second peer ever
+/// contacts it, a replacement opens over the same vault, and that
+/// fresh peer converges entirely against the substitute. Round one
+/// pins the pre-kill half: the first peer drains the announcement
+/// naming endpoint one and fetches the structural metadata, proving
+/// the vault served before the kill. The kill is the substitute
+/// point: endpoint one shuts down, the replacement opens over the
+/// same vault directory under a new node identity — nothing is
+/// re-imported, so the mirror rebuilds from the vault, never by
+/// re-deriving bytes. The second peer (a fresh engine with its own
+/// relay, membership, and capability, announced to under the
+/// replacement's route) then fetches body, manifests, tree, and
+/// chunk from the substitute alone. Success proves vault-persisted
+/// representations outlive the endpoint for a peer with no prior
+/// contact — the composition the Phase-12 fetch-d leg covers with
+/// three serving processes and two fetching devices. (The route
+/// update half — re-announcement rotating a recorded route — stays
+/// with `a_serving_daemon_serves_a_peer_over_live_iroh` above.)
+#[test]
+fn a_fresh_peer_fetches_pre_kill_content_from_the_substitute_endpoint() {
+    let mut loaded = Loaded::new("substitute.txt", b"substitute contract");
+    let serve_dir = scratch_dir("serving-substitute");
+    let vault = Vault::open(&serve_dir).unwrap();
+    vault.import(&loaded.snapshot.encode()).unwrap();
+    vault.import(&loaded.content.root.sealed.clone()).unwrap();
+    for (_, sealed) in &loaded.content.objects {
+        vault.import(sealed).unwrap();
+    }
+    // Endpoint one serves the pre-kill round: the first peer drains
+    // the announcement under its route and fetches the structural
+    // metadata, so the vault provably served before the kill.
+    let serving = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    serving.flush().unwrap();
+    let first_addr = serving.node_addr_bytes();
+    loaded.publish_body_and_announcement(Some(first_addr.clone()));
+    let report = loaded.drain();
+    assert_eq!(report.accepted, 2, "the capability and the announcement");
+
+    let mut engine = loaded.rig.take_engine();
+    let mut bulk = loopback_bulk_source();
+    bulk.publish_routes(&engine.runtime_state().unwrap())
+        .unwrap();
+    let mut objects = loaded.objects.clone();
+    let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
+    assert_eq!(first.snapshot_bodies, 1);
+    assert_eq!(first.manifests, 1);
+    serving
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+
+    // The substitute: same vault directory, fresh endpoint identity.
+    // The address must differ — otherwise this would prove nothing
+    // about serving past the publishing endpoint's death.
+    let substitute = ServingEndpoint::open_loopback(&vault, &serve_dir).unwrap();
+    let substitute_addr = substitute.node_addr_bytes();
+    assert_ne!(
+        substitute_addr, first_addr,
+        "the substitute is a new endpoint, not the dead one reopened"
+    );
+
+    // The second peer: the owner's engine over its own scratch dir,
+    // with the same membership and epoch material on its own relay.
+    // It never saw endpoint one — its announcement names only the
+    // substitute's route.
+    let owner = loaded.rig.owner.id;
+    let dir_b = scratch_dir("substitute-peer");
+    let mut engine_b = Engine::open(
+        dir_b.clone(),
+        drive(),
+        owner,
+        "contracts",
+        loaded.rig.owner.identity.clone(),
+        loaded.rig.owner.encryption.clone(),
+    )
+    .unwrap();
+    engine_b.add_epoch_key(
+        1,
+        Zeroizing::new(loaded.rig.epoch1.control_key(&drive(), 1)),
+    );
+    engine_b.add_epoch_key(
+        2,
+        Zeroizing::new(loaded.rig.epoch2.control_key(&drive(), 2)),
+    );
+    engine_b.add_epoch_key(
+        3,
+        Zeroizing::new(loaded.rig.epoch3.control_key(&drive(), 3)),
+    );
+    let mut relay_b = Relay::new();
+    let genesis = loaded.rig.genesis.clone();
+    loaded
+        .rig
+        .enqueue_transition_for(&genesis, 1, owner, &mut relay_b);
+    let admit = loaded.rig.admit.clone();
+    loaded
+        .rig
+        .enqueue_transition_for(&admit, 1, owner, &mut relay_b);
+    let secrets = [loaded.rig.epoch1.clone(), loaded.rig.epoch2.clone()];
+    loaded
+        .rig
+        .enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
+    let roots = loaded.announcement_roots();
+    loaded.rig.enqueue_announcement_for(
+        loaded.snapshot.snapshot_id(),
+        loaded.rig.admit_id,
+        2,
+        roots,
+        Some(substitute_addr),
+        owner,
+        &mut relay_b,
+    );
+    let report = engine_b.drain(&mut relay_b).unwrap();
+    assert_eq!(
+        report.accepted, 4,
+        "genesis, admit, capability, announcement"
+    );
+
+    // The fresh peer fetches everything — body, manifests, tree,
+    // chunk — from the substitute alone. Its store starts empty, so
+    // every byte below crossed live transport after the kill.
+    let mut bulk_b = loopback_bulk_source();
+    bulk_b
+        .publish_routes(&engine_b.runtime_state().unwrap())
+        .unwrap();
+    loaded.want_all(&mut engine_b);
+    let mut objects_b = MemoryObjectStore::default();
+    let mut landed = false;
+    for _ in 0..10 {
+        // Republish every pass: the recorded manifest adds its entry
+        // routes only after the pass that records it, so the tree's
+        // route appears on a later pass than the manifest's.
+        bulk_b
+            .publish_routes(&engine_b.runtime_state().unwrap())
+            .unwrap();
+        engine_b.execute_plan(&mut bulk_b, &mut objects_b).unwrap();
+        if loaded
+            .content
+            .content_ids
+            .iter()
+            .all(|id| objects_b.get(id).unwrap().is_some())
+        {
+            landed = true;
+            break;
+        }
+    }
+    assert!(
+        landed,
+        "the fresh peer converges against the substitute endpoint"
+    );
+    for id in &loaded.content.content_ids {
+        assert!(
+            objects_b.get(id).unwrap().is_some(),
+            "every sealed object landed over live transport after the kill"
+        );
+    }
+    bulk.shutdown(std::time::Duration::from_secs(10));
+    bulk_b.shutdown(std::time::Duration::from_secs(10));
+    substitute
+        .shutdown(std::time::Duration::from_secs(10))
+        .unwrap();
+    loaded.rig.teardown();
+    let _ = std::fs::remove_dir_all(&serve_dir);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// A loopback bulk source: its own runtime and a relay-disabled

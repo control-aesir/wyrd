@@ -1357,14 +1357,11 @@ async fn supervise(ctx: SupervisorContext, total_relays: usize) {
     let mut ever_connected = false;
     loop {
         tick.tick().await;
-        // The tick count advances on every loop pass, including passes
-        // that launch or run alongside a recovery episode: it is the
-        // proof the supervisor keeps reporting while an episode spins.
-        health.ticks.fetch_add(1, Ordering::Relaxed);
         refresh(&client, &health).await;
-        if health.connected_relays.load(Ordering::Relaxed) > 0 {
+        let connected = health.connected_relays.load(Ordering::Relaxed);
+        note_supervisor_observation(&health, connected);
+        if connected > 0 {
             ever_connected = true;
-            health.relay_attached.store(true, Ordering::Relaxed);
         }
         // Offline mailbox: nothing to re-drive; health is stream-alive
         // alone, and an empty client refuses connect/subscribe.
@@ -1507,6 +1504,23 @@ async fn refresh(client: &Client, health: &SupervisorState) {
     health
         .connected_relays
         .store(connected_count(client).await, Ordering::Relaxed);
+}
+
+/// Fold one supervisor observation into the shared health: the tick
+/// count advances on every pass, including passes that launch or run
+/// alongside a recovery episode (it is the proof the supervisor
+/// keeps reporting while an episode spins), and any observed
+/// connection latches `relay_attached` permanently. Factored pure —
+/// no client, no clock — so the sampler-input contract pins without
+/// a live relay: the verdict path reads this latch to separate
+/// "attached then lost" from "never attached", so the set-once /
+/// never-clear shape is load-bearing. (`refresh` above only writes
+/// `connected_relays`, so folding after it is unobservable.)
+fn note_supervisor_observation(health: &SupervisorState, connected_relays: usize) {
+    health.ticks.fetch_add(1, Ordering::Relaxed);
+    if connected_relays > 0 {
+        health.relay_attached.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Releases a recovery-episode claim when the episode task ends: the

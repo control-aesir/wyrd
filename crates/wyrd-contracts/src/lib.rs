@@ -61,7 +61,12 @@
 //!     serves a peer's fetch from announcement routes alone, and a
 //!     serving restart's route update rewires subsequent fetches
 //!     (`sync-and-peers.md` exchange; tracking issue: real-iroh
-//!     serving router loopback).
+//!     serving router loopback). Its substitute companion,
+//!     `a_fresh_peer_fetches_pre_kill_content_from_the_substitute_endpoint`,
+//!     pins the fetch-d shape without the Phase-12 gate: the publishing
+//!     endpoint dies before a second peer ever contacts it, and that
+//!     fresh peer converges entirely against the replacement over the
+//!     same vault.
 //! 14. `snapshot_manifest_closure_correspondence` — a snapshot's manifest
 //!     hierarchy must correspond exactly to its tree closure; a valid
 //!     manifest advertising unreachable objects is rejected

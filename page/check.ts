@@ -77,6 +77,15 @@ if (!update) {
 }
 
 const failures: string[] = [];
+// A failing slot must tell the human everything needed to re-read
+// it without opening three files: slot ids are opaque by design
+// (stable anchors, not descriptions), so every failure carries the
+// slot's current page copy and its copy rules alongside the backing
+// reference.
+const quotedBody = (body: string): string[] => [
+  `page copy now reads:`,
+  ...body.split("\n").map((l) => `  | ${l}`),
+];
 for (const s of map.slots) {
   const body = slotBody(page, s.slot);
   if (body === null) {
@@ -84,11 +93,23 @@ for (const s of map.slots) {
     continue;
   }
   for (const want of s.mustContain) {
-    if (!body.includes(want)) failures.push(`"${s.slot}" no longer says ${JSON.stringify(want)}`);
+    if (!body.includes(want)) {
+      failures.push(
+        [
+          `"${s.slot}" no longer says ${JSON.stringify(want)}`,
+          ...quotedBody(body),
+        ].join("\n"),
+      );
+    }
   }
   for (const ban of s.forbids) {
     if (body.toLowerCase().includes(ban.toLowerCase())) {
-      failures.push(`"${s.slot}" contains forbidden phrase ${JSON.stringify(ban)}`);
+      failures.push(
+        [
+          `"${s.slot}" contains forbidden phrase ${JSON.stringify(ban)}`,
+          ...quotedBody(body),
+        ].join("\n"),
+      );
     }
   }
   for (let n = 0; n < s.backs.length; n++) {
@@ -109,7 +130,11 @@ for (const s of map.slots) {
       lock.hashes[key] = hash;
     } else if (lock.hashes[key] !== hash) {
       failures.push(
-        `drift: ${back.file} ${JSON.stringify(back.heading)} changed under slot "${s.slot}" — re-read the slot, then re-pin with --update`,
+        [
+          `drift under slot "${s.slot}": ${back.file} ${JSON.stringify(back.heading)} changed.`,
+          ...quotedBody(body),
+          `backed by copy rules mustContain ${JSON.stringify(s.mustContain)} forbids ${JSON.stringify(s.forbids)} — re-read the copy against the section above, then re-pin with: deno run --allow-read --allow-write page/check.ts --update`,
+        ].join("\n"),
       );
     }
   }

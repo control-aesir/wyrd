@@ -8,6 +8,41 @@ use wyrd_sync::transport::mailbox::{
 
 use std::time::Duration;
 
+/// The sampler-input contract the verdict path rests on: every
+/// observation advances the tick count, the first observed
+/// connection latches attachment, and the latch never clears — an
+/// attach-then-loss between ticks still reads attached, so only a
+/// genuinely never-attached run is exempt from an unreachable-relay
+/// verdict. Deterministic: no relay, no clock, just the fold the
+/// tick loop calls.
+#[test]
+fn supervisor_observation_latches_attachment_once() {
+    let health = SupervisorState::default();
+    note_supervisor_observation(&health, 0);
+    note_supervisor_observation(&health, 0);
+    assert_eq!(health.ticks.load(Ordering::Relaxed), 2);
+    assert!(
+        !health.relay_attached.load(Ordering::Relaxed),
+        "zero-connected observations never attach"
+    );
+    // First observed presence latches ...
+    note_supervisor_observation(&health, 1);
+    assert_eq!(health.ticks.load(Ordering::Relaxed), 3);
+    assert!(
+        health.relay_attached.load(Ordering::Relaxed),
+        "observed presence attaches"
+    );
+    // ... and a later zero-connected observation (attach-then-loss
+    // between ticks) keeps the latch: the loss is observed trouble,
+    // not unobserved health.
+    note_supervisor_observation(&health, 0);
+    assert_eq!(health.ticks.load(Ordering::Relaxed), 4);
+    assert!(
+        health.relay_attached.load(Ordering::Relaxed),
+        "the latch never clears"
+    );
+}
+
 /// A poisoned channel lock fails the drain pass instead of panicking
 /// the process: poison means a thread panicked mid-critical-section,
 /// and serving threads fail the operation, never the process.

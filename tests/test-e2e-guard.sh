@@ -18,10 +18,15 @@ trap 'rm -rf "$TMP"' EXIT
 # run_guard <want-rc> <name> [env-file-content]: the caller token
 # comes from WYRD_E2E_TOKEN, the lock path from WYRD_E2E_LOCK; both
 # are set per-case below. A fresh token file per case keeps cases
-# independent.
+# independent. Content __MISSING__ means no file at all (stale
+# checkout, wrong state dir).
 run_guard() { # <want-rc> <name> [env-file-content]
   local want="$1" name="$2" content="${3:-}" rc=0 f="$TMP/env-$PASS.sh"
-  printf '%s\n' "$content" > "$f"
+  if [[ "$content" == "__MISSING__" ]]; then
+    rm -f "$f"
+  else
+    printf '%s\n' "$content" > "$f"
+  fi
   e2e_require_wrapped "$f" "wrapper-cmd" 2>/dev/null || rc=$?
   [[ "$rc" == "$want" ]] || {
     echo "FAIL: $name: exit $rc, want $want" >&2
@@ -39,18 +44,33 @@ run_guard 1 "no token refused" "WYRD_E2E_TOKEN=abc"
 # Token present but no published file: stale checkout, wrong
 # state dir. Must refuse, not pass on env alone.
 export WYRD_E2E_TOKEN="abc"
-rm -f "$TMP/env-$PASS.sh"
-rc=0
-e2e_require_wrapped "$TMP/env-$PASS.sh" "wrapper-cmd" 2>/dev/null || rc=$?
-[[ "$rc" == 1 ]] || { echo "FAIL: missing file accepted" >&2; exit 1; }
-PASS=$((PASS + 1))
-echo "  PASS: missing env file refused"
+run_guard 1 "missing env file refused" "__MISSING__"
 
 # Token mismatch: another run's token, or a hand-typed guess.
 run_guard 1 "mismatched token refused" "WYRD_E2E_TOKEN=def"
 
 # Match: the wrapper's child. Must pass.
 run_guard 0 "matching token accepted" "WYRD_E2E_TOKEN=abc"
+
+# Owner-pid tie (microVM orchestrator path): a live owner passes, a
+# dead one refuses even with a matching token, and a missing pid
+# line refuses. $$ is alive, so it stands in for the wrapper.
+run_pid() { # <want-rc> <name> <pid-line>
+  local want="$1" name="$2" pidline="$3" rc=0 f="$TMP/env-$PASS.sh"
+  { printf 'WYRD_E2E_TOKEN=abc\n'; printf '%s\n' "$pidline"; } > "$f"
+  e2e_require_wrapped "$f" "wrapper-cmd" --check-owner-pid 2>/dev/null || rc=$?
+  [[ "$rc" == "$want" ]] || {
+    echo "FAIL: $name: exit $rc, want $want" >&2
+    exit 1
+  }
+  PASS=$((PASS + 1))
+  echo "  PASS: $name"
+}
+run_pid 0 "live owner accepted" "WYRD_E2E_PID=$$"
+# Above the kernel pid ceiling (2^22), so kill -0 can never
+# succeed no matter what runs here.
+run_pid 1 "dead owner refused" "WYRD_E2E_PID=99999999"
+run_pid 1 "missing owner refused" "SOME_OTHER_VAR=1"
 
 # Deliberate bypass: warns on stderr, exits 0 without a token.
 unset WYRD_E2E_TOKEN

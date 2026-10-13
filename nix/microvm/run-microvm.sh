@@ -270,6 +270,11 @@ cp "$SSH_KEY.pub" "$STATE_DIR/authorized_keys.pub"
   printf 'CHECKOUT=%q\n' "/etc/wyrd-tests"
   printf 'E2E_ROOT=%q\n' "/mnt/wyrd-state/run"
   printf 'WYRD_E2E_TOKEN=%q\n' "$E2E_TOKEN"
+  # Owner pid for the guard's liveness tie: the orchestrator shares
+  # this pid namespace, so kill -0 proves the minting wrapper is the
+  # live lock holder (guests must never check this — their pids are
+  # a different namespace).
+  printf 'WYRD_E2E_PID=%q\n' "$$"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
   printf 'E2E_INTERVAL=%q\n' "${E2E_INTERVAL:-}"
 } > "$STATE_DIR/e2e-env.sh"

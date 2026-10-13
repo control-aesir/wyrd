@@ -112,6 +112,12 @@ Lima for macOS dev iteration and as the refactor guard.)
 - Failures here are usually product bugs, not harness bugs — the suite exists
   to find them. Diagnose from the phase timings in the mount logs
   (`wyrd_core=debug` is on for step 6) before touching the script.
+- Wrapper-only entry: the suite and leg scripts refuse direct
+  execution. Each wrapper mints a per-run token and hands it to its
+  child; without a matching token you get `refuse direct execution`
+  and exit 2 before anything runs. Run the wrapper, not the script.
+  Deliberate debugging only: `WYRD_E2E_UNWRAPPED=1` bypasses the
+  check with a warning.
 
 ## Conventions
 

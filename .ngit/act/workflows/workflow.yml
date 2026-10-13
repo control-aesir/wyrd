@@ -61,6 +61,7 @@ jobs:
           bash tests/test-runner-fd.sh
           bash tests/test-probe-mark.sh
           bash tests/test-e2e-guard.sh
+          bash tests/test-bash-syntax.sh
 
   draft:
     if: github.event.action == 'opened'

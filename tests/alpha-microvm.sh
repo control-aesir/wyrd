@@ -77,7 +77,7 @@ SSH_KEY="$STATE_DIR/sshkey"
 # confusing message): the token must match the runner-published env
 # file, and the runner's flock must be held (stale tokens from dead
 # or kept runs do not authorize a suite). See tests/e2e-guard.sh.
-e2e_require_wrapped "$STATE_DIR/e2e-env.sh" "sudo ./nix/microvm/run-microvm.sh" \
+e2e_require_wrapped "$STATE_DIR/e2e-env.sh" "sudo ./nix/microvm/run-microvm.sh" --check-owner-pid \
   || { echo "  FAIL: unwrapped orchestrator invocation refused" >&2; exit 2; }
 WYRD_BIN="${WYRD_BIN:?runner sets WYRD_BIN from the host build}"
 NAK_BIN="${NAK_BIN:?runner sets NAK_BIN from the host build}"

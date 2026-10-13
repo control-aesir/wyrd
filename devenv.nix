@@ -84,11 +84,14 @@ in
     # Shell syntax gate: a stray `done` once shipped and invalidated a
     # 40-minute suite run after all its evidence was collected (bash
     # parses incrementally, so nothing failed until the final step).
-    # bash -n over every staged shell script at commit time.
+    # bash -n parses only its first file argument, so the entry is a
+    # wrapper that sweeps every staged shell script (passing them
+    # straight to `bash -n` would check exactly one and report green).
+    # Pinned by tests/test-bash-syntax.sh.
     bash-syntax = {
       enable = true;
       name = "bash syntax (bash -n)";
-      entry = "bash -n";
+      entry = "bash tests/check-bash-syntax.sh";
       files = "\\.sh$";
       pass_filenames = true;
     };

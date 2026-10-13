@@ -295,6 +295,45 @@ pass "route update rewires fetch across hosts"
 # the leg fails on it if the log is still empty at the end.
 wc -l < "$MD/mailbox.seen" > "$RUN/seen-after-restart" 2>/dev/null \
   || echo 0 > "$RUN/seen-after-restart"
+# Upgrade rejoin (post-upgrade convergence leg,
+# nostr:nevent1qqsr9arqyq4vjvcvtfsqrqf3r5h0wp0zju2zrf7h42uzggl950e0h8qpz9mhxue69uhkwunpwdczuap49eehg57t5zx):
+# the owner upgrades its serving binary in-guest via `wyrd update`,
+# then re-announces; the member converges on the post-upgrade set
+# with no remount and byte-identical views. Same-checkout archive
+# first, crafted here per run (never checked in) from the
+# just-built binary under the canonical name, so resolve runs for
+# real; the true cross-version extension reuses these assertions
+# with a v0.2.0 binary (fixture-half design on the issue).
+rm -f "$RUN/member-u-ready" "$RUN/member-u-done" "$RUN/owner-u-updated" "$RUN/upgrade-blob.sha256"
+UPGRADE_ROOT="$(dirname "$SCRIPT_DIR")"
+UPGRADE_VERSION="$(grep '^version = ' "$UPGRADE_ROOT/Cargo.toml" | head -n 1 | cut -d'"' -f2)" \
+  || die "workspace version unreadable ($UPGRADE_ROOT/Cargo.toml)"
+UPGRADE_GARCH="$(on_o "uname -m" 2>/dev/null | tr -d ' \r\n')" \
+  || die "guest arch unreadable over ssh"
+case "$UPGRADE_GARCH" in
+  x86_64) UPGRADE_ARCH="x86_64" ;;
+  aarch64) UPGRADE_ARCH="aarch64" ;;
+  *) die "guest arch '$UPGRADE_GARCH' has no canonical archive name" ;;
+esac
+UPGRADE_NAME="wyrd-${UPGRADE_VERSION}-linux-${UPGRADE_ARCH}.tar.gz"
+UPGRADE_STAGE="$RUN/upgrade-archive/stage"
+rm -rf "$RUN/upgrade-archive"
+mkdir -p "$UPGRADE_STAGE/top/bin"
+cp "$WYRD_BIN" "$UPGRADE_STAGE/top/bin/wyrd" \
+  || die "upgrade archive staging failed"
+tar -czf "$RUN/upgrade-archive/$UPGRADE_NAME" -C "$UPGRADE_STAGE" top \
+  || die "upgrade archive packing failed"
+rm -rf "$UPGRADE_STAGE"
+chown -R 1000:1000 "$RUN/upgrade-archive"
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh upgrade-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-upgrade-member.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh upgrade-owner $OD $OC $RELAY_URL $GUEST_RUN/upgrade-archive/$UPGRADE_NAME" \
+  >"$RUN/logs/leg-upgrade-owner.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "upgrade member leg failed (see logs/leg-upgrade-member.out)"
+wait "$LEG_O" || die "upgrade owner leg failed (see logs/leg-upgrade-owner.out)"
+pass "upgrade rejoin rewires fetch across hosts"
 fi # want_phase 8
 
 # --- phase 5: fetch plane ---------------------------------------------

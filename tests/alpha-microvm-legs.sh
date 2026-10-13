@@ -115,6 +115,103 @@ leg_restart_member() {
   check_no_leaks "$LOGDIR/mount-xmember-r.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_upgrade_owner <drive> <creds> <relay> <archive>: mount
+# (endpoint 1), write the pre-upgrade marker, wait for the member to
+# converge on it, then stop and upgrade the serving binary in place
+# via `wyrd update` against the host-crafted same-checkout archive
+# before mounting fresh (endpoint 2) with the upgraded binary: the
+# stop+update+remount IS the production upgrade (new instance over a
+# persisted route, re-announced under the live route). Write the
+# post-upgrade set; the member must converge without remounting.
+# The nix store is read-only, so the update targets a writable copy
+# of the binary on the shared state root — the swap siblings live
+# beside the copy, and WYRD_BIN is re-exported so every later helper
+# uses the upgraded build. (Issue: post-upgrade convergence leg; the
+# true cross-version extension reuses these assertions with a v0.2.0
+# binary.)
+leg_upgrade_owner() {
+  local d="$1" c="$2" relay="$3" archive="$4"
+  step 8 "post-upgrade serving leg"
+  start_mount xowner-u1 "$c" "$d" "$MNTS/xowner-u1" --relay "$relay"
+  echo "before-upgrade" > "$MNTS/xowner-u1/before-upgrade.txt"
+  poll_until 120 test -f "$E2E_ROOT/member-u-ready" \
+    || die "member never converged on the pre-upgrade write"
+  pass "member converges before the upgrade"
+  stop_mount xowner-u1 INT
+  check_no_leaks "$LOGDIR/mount-xowner-u1.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  # Writable copy first: the shared store binary cannot be swapped
+  # in place (read-only), and the update siblings must sit beside
+  # the target executable on one filesystem.
+  local uexe="$E2E_ROOT/wyrd-upgraded/wyrd"
+  mkdir -p "$E2E_ROOT/wyrd-upgraded"
+  cp "$WYRD_BIN" "$uexe"
+  export WYRD_BIN="$uexe"
+  with_creds "$c" update "$d" --archive "$archive" \
+    >"$LOGDIR/update-owner.out" 2>"$LOGDIR/update-owner.err" \
+    || die "owner update transaction failed (see update-owner.err)"
+  grep -q "^update done: " "$LOGDIR/update-owner.out" \
+    || die "owner update never reported done (see update-owner.out)"
+  grep -q '"outcome": "done"' "$uexe.update-verdict" \
+    || die "owner update verdict is not done (see wyrd-upgraded/wyrd.update-verdict)"
+  pass "owner binary upgrades in place with a done verdict"
+  # Transaction rendezvous: the member waits on this before its
+  # convergence poll, so a slow update reports as a slow
+  # transaction, never as a route failure.
+  touch "$E2E_ROOT/owner-u-updated"
+  check_no_leaks "$LOGDIR/update-owner.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  start_mount xowner-u2 "$c" "$d" "$MNTS/xowner-u2" --relay "$relay"
+  grep -q "serving over iroh" "$LOGDIR/mount-xowner-u2.err" \
+    || die "upgraded owner: serving endpoint never bound"
+  echo "after-upgrade" > "$MNTS/xowner-u2/after-upgrade.txt"
+  # Bulk byte-identity witness: random once, hash published over the
+  # shared root — the member proves byte-identical receipt without
+  # the suite baking the bytes.
+  head -c 1048576 /dev/urandom > "$MNTS/xowner-u2/payload.bin"
+  sha256sum "$MNTS/xowner-u2/payload.bin" | cut -d' ' -f1 > "$E2E_ROOT/upgrade-blob.sha256"
+  poll_until 120 test -f "$E2E_ROOT/member-u-done" \
+    || die "member never converged on the upgraded owner"
+  stop_mount xowner-u2 INT
+  check_no_leaks "$LOGDIR/mount-xowner-u2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_upgrade_member <drive> <creds> <relay>: mount, converge on the
+# pre-upgrade write, then hold that same mount across the owner's
+# binary upgrade: the post-upgrade set must arrive over the
+# re-announced route with no remount, no manual repair — the old
+# routes resend under the live route against the new binary.
+leg_upgrade_member() {
+  local d="$1" c="$2" relay="$3"
+  step 8 "upgrade convergence leg"
+  start_mount xmember-u "$c" "$d" "$MNTS/xmember-u" --relay "$relay"
+  poll_until 120 converged "$MNTS/xmember-u/before-upgrade.txt" "before-upgrade" \
+    || die "member never converged before the upgrade"
+  pass "member holds the pre-upgrade route"
+  touch "$E2E_ROOT/member-u-ready"
+  # The update's verify children are budgeted well above the
+  # convergence poll below: wait on the owner's transaction
+  # rendezvous first, so only a live route is ever polled.
+  poll_until 600 test -f "$E2E_ROOT/owner-u-updated" \
+    || die "owner never finished the update transaction"
+  poll_until 120 converged "$MNTS/xmember-u/after-upgrade.txt" "after-upgrade" \
+    || die "member never converged after the owner's upgrade"
+  pass "re-announcement recovers the route from the upgraded binary"
+  poll_until 120 test -f "$E2E_ROOT/upgrade-blob.sha256" \
+    || die "owner never published the payload hash"
+  poll_until 120 blob_converged \
+    || die "member payload diverged from the upgraded owner"
+  pass "post-upgrade views are byte-identical"
+  touch "$E2E_ROOT/member-u-done"
+  stop_mount xmember-u TERM
+  check_no_leaks "$LOGDIR/mount-xmember-u.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# blob_converged: the mounted payload hashes to the owner-published
+# digest. Predicate form for poll_until (exit status only, no output).
+blob_converged() {
+  [[ -f "$MNTS/xmember-u/payload.bin" ]] || return 1
+  [[ "$(sha256sum "$MNTS/xmember-u/payload.bin" | cut -d' ' -f1)" == "$(cat "$E2E_ROOT/upgrade-blob.sha256")" ]]
+}
+
 # leg_fetch_owner <drive> <creds> <relay>: mount, publish the cold
 # file, then the two stale files the member lists before the route
 # dies, then stop: the stop IS the stale-route setup — no VM
@@ -1762,6 +1859,8 @@ case "${1:-}" in
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
   restarted-owner) leg_restarted_owner "$2" "$3" "$4" ;;
   restart-member) leg_restart_member "$2" "$3" "$4" ;;
+  upgrade-owner) leg_upgrade_owner "$2" "$3" "$4" "$5" ;;
+  upgrade-member) leg_upgrade_member "$2" "$3" "$4" ;;
   fetch-owner) leg_fetch_owner "$2" "$3" "$4" ;;
   fetch-member) leg_fetch_member "$2" "$3" "$4" ;;
   conflict-owner) leg_conflict_owner "$2" "$3" "$4" ;;
@@ -1776,7 +1875,7 @@ case "${1:-}" in
   headless-serve) leg_headless_serve "$2" "$3" "$4" ;;
   headless-fetch) leg_headless_fetch "$2" "$3" "$4" "$5" "$6" "$7" ;;
   headless-setup) leg_headless_setup "$2" "$3" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|fetch-owner|fetch-member|conflict-owner|conflict-member|crash-owner|steady-member|crash-member|steady-owner|exhaustion|uparent-owner|uparent-member|headless-serve <drive> <creds> <relay> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
+  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|upgrade-member|fetch-owner|fetch-member|conflict-owner|conflict-member|crash-owner|steady-member|crash-member|steady-owner|exhaustion|uparent-owner|uparent-member|headless-serve <drive> <creds> <relay> | upgrade-owner <drive> <creds> <relay> <archive> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
 e2e_timing_report
 echo "legs: $PASS_COUNT checks passed"

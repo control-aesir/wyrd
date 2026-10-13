@@ -23,6 +23,15 @@ version say exactly what changed.
 
 ### Added
 
+- Post-upgrade convergence leg
+  (`nostr:nevent1qqsr9arqyq4vjvcvtfsqrqf3r5h0wp0zju2zrf7h42uzggl950e0h8qpz9mhxue69uhkwunpwdczuap49eehg57t5zx`):
+  microVM phase 8 gains an upgrade-rejoin leg pair — the owner upgrades its
+  serving binary in-guest via `wyrd update` against a host-crafted
+  same-checkout archive, then re-announces, and the member converges on the
+  post-upgrade set (text markers plus a 1 MiB blob verified by published
+  hash) with no remount and byte-identical views. The true cross-version
+  extension reuses these assertions with a v0.2.0 binary; the fixture-half
+  design and blockers are recorded on the issue.
 - Persistent relay and replication configuration
   (`nostr:nevent1qqs8x585cx3ut5wr5m6prd0286g3c05mxlm9emqm8v236xl600ew4cqpz9mhxue69uhkwunpwdczuap49eehgk3hyj4`,
   OD-C1..C4 all option A): a drive directory's `default.toml` names its

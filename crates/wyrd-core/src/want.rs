@@ -65,11 +65,20 @@ struct RegistryState {
     /// observes it local ([`WantRegistry::complete_local`]) — the
     /// slow first open makes the next one instant.
     admitted: BTreeSet<ContentId>,
-    /// Waiter count per outstanding identity (keys of `pending` ∪
-    /// `admitted`). When the last waiter of a pending identity
-    /// leaves, the demand dies — nothing fetches for a nobody. An
-    /// admitted fetch outlives its waiters.
+    /// Waiter count per outstanding waiter-carrying identity (a
+    /// subset of `pending` ∪ `admitted`). When the last waiter of a
+    /// pending identity leaves, the demand dies — nothing fetches
+    /// for a nobody — unless the identity is marked [`RegistryState::unowned`].
+    /// An admitted fetch outlives its waiters.
     waiting: BTreeMap<ContentId, usize>,
+    /// Pending identities with no owning waiter (loop-originated
+    /// demand, e.g. vault retention). `release` never retires these:
+    /// a coincident backend waiter timing out must not take loop
+    /// demand down with it. Entries leave on admission
+    /// ([`WantRegistry::mark_admitted`]), so the set holds only
+    /// un-admitted ownerless demand and cannot grow past the
+    /// admission bound.
+    unowned: BTreeSet<ContentId>,
     /// Sticky reopen demand since the last loop sweep: identities a
     /// reader observed terminal, noted for generation rotation.
     /// Unlike `pending`, a note survives its waiter — the waiter
@@ -154,6 +163,7 @@ impl WantRegistry {
             return Err(WantError::Saturated);
         }
         state.pending.insert(content);
+        state.unowned.insert(content);
         Ok(true)
     }
 
@@ -174,10 +184,15 @@ impl WantRegistry {
             if *slot.get() == 0 {
                 slot.remove();
                 // An unadmitted demand dies with its waiters — nothing
-                // fetches for a nobody. An admitted fetch keeps its
-                // in-flight mark and continues; the loop retires it
-                // when it lands.
-                state.pending.remove(content);
+                // fetches for a nobody — unless the loop owns it: an
+                // ownerless pending identity has no waiter to leave,
+                // so a coincident backend waiter timing out must not
+                // retire it. An admitted fetch keeps its in-flight
+                // mark and continues; the loop retires it when it
+                // lands.
+                if !state.unowned.contains(content) {
+                    state.pending.remove(content);
+                }
             }
         }
     }
@@ -213,6 +228,7 @@ impl WantRegistry {
             if state.pending.remove(content) {
                 state.admitted.insert(*content);
             }
+            state.unowned.remove(content);
         }
     }
 
@@ -388,6 +404,25 @@ mod tests {
         assert_eq!(admit_all(&registry), vec![content(1)]);
         assert!(registry.is_admitted(&content(1)));
         assert_eq!(registry.waiter_count(&content(1)), 0);
+    }
+
+    /// A coincident backend waiter timing out must not take loop
+    /// demand down with it: the ownerless mark, not the waiter
+    /// count, decides whether a pending entry is retir-able.
+    #[test]
+    fn coincident_waiter_timeout_keeps_ownerless_demand() {
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        // A FUSE reader demands the same identity, then times out.
+        registry.register(content(1)).unwrap();
+        assert_eq!(registry.waiter_count(&content(1)), 1);
+        registry.release(&content(1));
+        // The backend waiter is gone, but the loop's demand stands:
+        // still pending, still admittable next pass.
+        assert_eq!(registry.waiter_count(&content(1)), 0);
+        assert_eq!(registry.peek_pending(), vec![content(1)]);
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
     }
 
     #[test]

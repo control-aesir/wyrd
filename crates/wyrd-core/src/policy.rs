@@ -396,8 +396,9 @@ pub fn unheld_want_candidates<V: NamespaceView>(
     let runtime = engine.runtime_state()?;
     let mut out = Vec::new();
     // A chunk shared across files is one identity: dedupe here, so
-    // one sweep never registers the same demand twice (registration
-    // coalesces but still gains a waiter per call).
+    // one sweep never hands the registry the same demand twice
+    // (ownerless registration is free to repeat, but the walk
+    // would still pay the admission check per duplicate).
     let mut seen = std::collections::BTreeSet::new();
     let mut stack = vec![(path.to_string(), root, 0usize)];
     while let Some((at, node, depth)) = stack.pop() {

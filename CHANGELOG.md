@@ -424,7 +424,7 @@ version say exactly what changed.
   contexts plus finalizations move from `wyrd-sync` into `wyrd-format`,
   so a minimal remote signer recomputes digests depending only on
   `wyrd-format` plus `secp256k1`/`blake3`. `wyrd-sync` re-exports every
-  moved path, so no public spelling changes. The v2 request/response
+  publicly reachable moved path, so no public spelling changes. The v2 request/response
   envelope codec stays sync-side (session framing, per the review
   amendment), as do the epoch-secret vector commitment and the
   owner-proof preimage builder (sync-side key material and `Zeroizing`

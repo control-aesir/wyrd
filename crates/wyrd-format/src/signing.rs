@@ -15,6 +15,8 @@
 //! receives full preimages — it finalizes them with
 //! [`owner_proof_challenge`], it never builds them.
 
+use crate::{DriveId, MembershipTransition, Snapshot};
+
 /// The operations a Wyrd signer session may be asked to sign. Closed:
 /// adding an operation is a contract change, not a string.
 ///
@@ -64,21 +66,42 @@ pub const PROOF_CONTEXT: &str = "wyrd owner proof v1";
 /// `BLAKE3-derive-key(CHALLENGE_CONTEXT, preimage)`. Callers pass
 /// `MembershipTransition::signing_message(drive)`; the function takes
 /// the preimage bytes so a remote signer, which receives preimages it
-/// did not build, shares the exact finalization.
+/// did not build, shares the exact finalization. Production callers
+/// that hold the typed object should prefer
+/// [`membership_challenge_for`], which keeps the compiler bound to the
+/// signing message.
 pub fn membership_challenge(preimage: &[u8]) -> [u8; 32] {
     blake3::derive_key(CHALLENGE_CONTEXT, preimage)
 }
 
+/// Type-bound form of [`membership_challenge`]: the hashed bytes are
+/// always this transition's signing message, so a future caller cannot
+/// park foreign bytes under the membership domain. The raw form stays
+/// for the remote signer.
+pub fn membership_challenge_for(t: &MembershipTransition, drive: &DriveId) -> [u8; 32] {
+    membership_challenge(&t.signing_message(drive))
+}
+
 /// The 32-byte BIP-340 challenge for a snapshot signing preimage.
-/// Same preimage-passing shape as [`membership_challenge`].
+/// Same preimage-passing shape as [`membership_challenge`]; production
+/// callers that hold the typed object should prefer
+/// [`snapshot_challenge_for`].
 pub fn snapshot_challenge(preimage: &[u8]) -> [u8; 32] {
     blake3::derive_key(SNAPSHOT_CHALLENGE_CONTEXT, preimage)
+}
+
+/// Type-bound form of [`snapshot_challenge`]: the hashed bytes are
+/// always this snapshot's signing message. The raw form stays for the
+/// remote signer.
+pub fn snapshot_challenge_for(s: &Snapshot, drive: &DriveId) -> [u8; 32] {
+    snapshot_challenge(&s.signing_message(drive))
 }
 
 /// The 32-byte BIP-340 challenge for an owner-proof preimage. Same
 /// preimage-passing shape as [`membership_challenge`]: the secret-vector
 /// commitment inside the preimage is computed sync-side, the signer
-/// only finalizes.
+/// only finalizes. There is no type-bound form — the preimage builder
+/// lives sync-side with the key material, so format cannot name it.
 pub fn owner_proof_challenge(preimage: &[u8]) -> [u8; 32] {
     blake3::derive_key(PROOF_CONTEXT, preimage)
 }

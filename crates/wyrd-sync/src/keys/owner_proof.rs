@@ -51,8 +51,9 @@ use crate::transport::signer::{SignerError, SignerSession};
 use wyrd_format::signing::{owner_proof_challenge, SignDomain};
 
 // The proof context lives in `wyrd_format::signing` (the signer needs
-// it without the transport); re-exported here so existing paths keep
-// their spelling.
+// it without the transport). Compatibility alias: no in-tree consumer
+// remains, but the public spelling stays so external users do not
+// break.
 pub use wyrd_format::signing::PROOF_CONTEXT;
 
 /// Domain context for the secret-vector commitment, separate from the

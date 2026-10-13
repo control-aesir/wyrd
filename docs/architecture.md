@@ -47,7 +47,7 @@ arbitrary subsets of that drive locally.
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
-| `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror only |
+| `wyrd-format` | DriveId/ContentId/StorageId/SnapshotId (distinct types), canonical encoding, chunking, Merkle trees, snapshot DAG, `ObjectStore` | blake3, hex, thiserror, fastcdc, serde — never networking, async, or FUSE |
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, `wyrd-namespace` (verification-proof token), iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-namespace` | Provider-neutral namespace model: value types, verified-head handle, read surface every presentation backend serves | `wyrd-format`, thiserror only — never sync, never iroh |
 | `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format`, `wyrd-namespace` (namespace value model) |

@@ -40,8 +40,9 @@ pub use mutation::{
     mkdir, put, put_strict, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH,
 };
 pub use signing::{
-    membership_challenge, owner_proof_challenge, snapshot_challenge, SignDomain, CHALLENGE_CONTEXT,
-    PROOF_CONTEXT, SNAPSHOT_CHALLENGE_CONTEXT,
+    membership_challenge, membership_challenge_for, owner_proof_challenge, snapshot_challenge,
+    snapshot_challenge_for, SignDomain, CHALLENGE_CONTEXT, PROOF_CONTEXT,
+    SNAPSHOT_CHALLENGE_CONTEXT,
 };
 pub use snapshot::{Snapshot, SnapshotError, RECOVERY_FLAG};
 pub use store::{

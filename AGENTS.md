@@ -116,8 +116,10 @@ Lima for macOS dev iteration and as the refactor guard.)
   execution. Each wrapper mints a per-run token and hands it to its
   child; without a matching token you get `refuse direct execution`
   and exit 2 before anything runs. Run the wrapper, not the script.
-  Deliberate debugging only: `WYRD_E2E_UNWRAPPED=1` bypasses the
-  check with a warning.
+  The microVM orchestrator additionally requires the runner's flock
+  to be held and its owner pid to be alive (stale tokens from dead
+  or kept runs refuse). Deliberate debugging only:
+  `WYRD_E2E_UNWRAPPED=1` bypasses the check with a warning.
 
 ## Conventions
 

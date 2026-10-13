@@ -46,4 +46,13 @@ bash "$SCRIPT_DIR/check-bash-syntax.sh" "$TMP/clean-a.sh" "$TMP/broken.sh" "$TMP
 PASS=$((PASS + 1))
 echo "  PASS: broken file rejected after clean ones"
 
+# The hook wiring itself is pinned too: the entry in devenv.nix
+# must point at the sweep wrapper, not bare `bash -n` (which parses
+# only its first file argument). Without this, the fixed regression
+# could silently return via a one-line hook edit.
+grep -q 'entry = "bash tests/check-bash-syntax.sh"' "$SCRIPT_DIR/../devenv.nix" \
+  || { echo "FAIL: bash-syntax hook entry does not point at the sweep wrapper" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: hook entry points at the sweep wrapper"
+
 echo "bash-syntax: $PASS checks passed"

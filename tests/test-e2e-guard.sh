@@ -89,10 +89,13 @@ echo "  PASS: explicit bypass warns and proceeds"
 if command -v flock >/dev/null; then
   export WYRD_E2E_TOKEN="abc"
   export WYRD_E2E_LOCK="$TMP/guard.lock"
-  flock "$WYRD_E2E_LOCK" sleep 30 & HOLDER=$!
-  sleep 0.5
+  # The holder must exit by itself (wait), never by kill: killing
+  # the flock process orphans its `sleep` child, which inherits the
+  # locked fd and keeps the lock held — the "free" case below would
+  # then see a held lock and fail deterministically on Linux.
+  flock "$WYRD_E2E_LOCK" sleep 5 & HOLDER=$!
   run_guard 0 "held lock accepted" "WYRD_E2E_TOKEN=abc"
-  kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+  wait "$HOLDER"
   run_guard 1 "free lock refused" "WYRD_E2E_TOKEN=abc"
   unset WYRD_E2E_LOCK
 else

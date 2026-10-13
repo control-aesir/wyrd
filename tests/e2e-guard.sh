@@ -74,12 +74,15 @@ e2e_require_wrapped() { # <env-file> <wrapper-command> [--check-owner-pid]
   [[ -f "$env_file" ]] \
     || { e2e_refuse "$wrapper" "no published token at $env_file"; return 1; }
   # Parsed, never sourced (see header): the token is minted hex, so
-  # %q emits it bare, but cut on the first '=' either way.
-  published="$(grep -E '^WYRD_E2E_TOKEN=' "$env_file" | cut -d= -f2- | tail -n 1)"
+  # %q emits it bare, but cut on the first '=' either way. The
+  # `|| true` keeps the pipeline set -e-safe on its own (an empty
+  # match refuses below), instead of relying on every caller to
+  # wrap this function in `||`.
+  published="$(grep -E '^WYRD_E2E_TOKEN=' "$env_file" | cut -d= -f2- | tail -n 1 || true)"
   [[ -n "$published" && "$caller" == "$published" ]] \
     || { e2e_refuse "$wrapper" "run token does not match $env_file"; return 1; }
   if [[ "$check_pid" == 1 ]]; then
-    owner_pid="$(grep -E '^WYRD_E2E_PID=' "$env_file" | cut -d= -f2- | tail -n 1)"
+    owner_pid="$(grep -E '^WYRD_E2E_PID=' "$env_file" | cut -d= -f2- | tail -n 1 || true)"
     [[ -n "$owner_pid" ]] \
       || { e2e_refuse "$wrapper" "no owner pid published in $env_file"; return 1; }
     kill -0 "$owner_pid" 2>/dev/null \

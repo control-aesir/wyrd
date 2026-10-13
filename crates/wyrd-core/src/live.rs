@@ -1498,7 +1498,7 @@ where
         } else {
             Some(self.engine.runtime_state()?)
         };
-        admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
+        let admit_result = admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
             let Some(snapshot) = admission.as_mut() else {
                 // Unreachable: the gate above took the snapshot exactly
                 // when pending was non-empty, and nothing else touches
@@ -1507,16 +1507,30 @@ where
             };
             self.engine
                 .set_materialization_from(snapshot, want, MaterializationState::Cached)
-        })?;
-        // Release this pass's vault registrations: admission marked
-        // them admitted (an admitted fetch keeps its in-flight mark
-        // and continues), so the loop must not keep a waiter on
-        // them — otherwise the settlement predicate's waiters==0 arm
-        // could never fire for vault demand and the waiting map
-        // would grow with every distinct identity ever wanted.
-        for id in &vault_registered {
-            self.wants.release(id);
+        });
+        match &admit_result {
+            Ok(_) => {
+                // Admission marked them admitted (an admitted fetch
+                // keeps its in-flight mark and continues), so the
+                // loop must not keep a waiter on them.
+                for id in &vault_registered {
+                    self.wants.release(id);
+                }
+            }
+            Err(_) => {
+                // Admission failed partway: admitted ids keep their
+                // mark, but still-pending ones must not keep a waiter
+                // nobody owns — or the leak detector reports a leak
+                // and later sweeps skip them outright. The next pass
+                // re-registers what is still outstanding.
+                for id in &vault_registered {
+                    if !self.wants.is_admitted(id) {
+                        self.wants.release(id);
+                    }
+                }
+            }
         }
+        admit_result?;
         // Local scrub, walk half (child 13): re-stat locally
         // claimed identities against the store from the rotating
         // cursor, submitting misses for the drain below. The

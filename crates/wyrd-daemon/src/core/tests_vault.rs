@@ -20,7 +20,7 @@ use wyrd_sync::transport::mailbox::{
     Delivery, DeliveryId, Disposition, Mailbox, MailboxEnvelope, MailboxError, SendReport,
 };
 
-use crate::vault::{install_serving, ServeSurface};
+use crate::vault::{install_role_dir, install_serving, ServeSurface};
 
 /// A barrier that never reports ready: the backed-up serving mirror.
 struct NeverReady;
@@ -130,7 +130,6 @@ fn vault_install_holds_discharge_on_a_backed_up_mirror() {
             addr: addr.clone(),
             barrier: Arc::new(NeverReady),
         },
-        &dir,
     )
     .unwrap();
     assert_eq!(
@@ -165,7 +164,6 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
             addr: vec![9u8; 32],
             barrier: Arc::new(NeverReady),
         },
-        &dir,
     )
     .unwrap();
     let mut mailbox = AcceptingMailbox::default();
@@ -181,7 +179,6 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
             addr: vec![9u8; 32],
             barrier: Arc::new(Ready),
         },
-        &dir,
     )
     .unwrap();
     live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
@@ -194,15 +191,12 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Installing the serving surface also installs the role
-/// directory: a vault-role device composed the way production
-/// compositions compose it admits demand for reachable unheld
-/// content with no explicit want anywhere. This is the test that
-/// would have caught an unwired composition — it builds the loop
-/// through `install_serving`, never `set_role_dir` directly, so
-/// removing the install inside `install_serving` fails it. The
-/// mirror leg runs the identical composition with no role file and
-/// admits nothing, proving the demand is the role's doing.
+/// Installing the role directory also installs retention: a
+/// vault-role device composed the way production compositions
+/// compose it — role step beside serving, never through serving —
+/// admits demand for reachable unheld content with no explicit want
+/// anywhere. This is the test that would have caught an unwired
+/// composition: remove either install and it fails.
 #[test]
 fn install_serving_wires_vault_retention() {
     use wyrd_core::quarantine::VerificationFailure;
@@ -259,13 +253,15 @@ fn install_serving_wires_vault_retention() {
         if let Some(state) = role {
             role::store(&dir, state).unwrap();
         }
+        // Production order: the role directory installs beside
+        // serving, never through it.
+        install_role_dir(&mut live, &dir);
         install_serving(
             &mut live,
             &StubSurface {
                 addr: vec![3u8; 32],
                 barrier: Arc::new(Ready),
             },
-            &dir,
         )
         .unwrap();
         live.quarantine_queue()
@@ -292,7 +288,7 @@ fn install_serving_wires_vault_retention() {
     // The empty bulk source fetches nothing, so the admitted demand
     // stays unfulfilled — and unfulfilled is exactly the observable
     // that distinguishes demanded from never-wanted.
-    let (mut vault, vault_dir, _vault_chunk) = unheld_setup(
+    let (mut vault, vault_dir, vault_chunk) = unheld_setup(
         "vault-wire-vault",
         Some(RoleState {
             role: Role::Vault,
@@ -302,7 +298,12 @@ fn install_serving_wires_vault_retention() {
     let vault_report = vault.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
     assert!(
         vault_report.fetched.unfulfilled > 0,
-        "install_serving wires the role directory: vault demand is admitted with no explicit want"
+        "install_role_dir wires the role directory: vault demand is admitted with no explicit want"
+    );
+    assert_eq!(
+        vault.wants().waiter_count(&vault_chunk),
+        0,
+        "admission releases this pass's vault registrations: no phantom waiter survives"
     );
 
     drop(control);
@@ -359,13 +360,13 @@ fn install_serving_torn_role_file_degrades_without_aborting() {
         .into_live(Duration::from_secs(30), &LiveConfig::for_local_sync())
         .unwrap();
     std::fs::write(dir.join("role"), "vaul").unwrap();
+    install_role_dir(&mut live, &dir);
     install_serving(
         &mut live,
         &StubSurface {
             addr: vec![3u8; 32],
             barrier: Arc::new(Ready),
         },
-        &dir,
     )
     .unwrap();
     live.quarantine_queue()

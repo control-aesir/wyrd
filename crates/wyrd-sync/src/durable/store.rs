@@ -145,6 +145,10 @@ const DRIVE_DIR_MODE: u32 = 0o700;
 /// and a second failure propagates — the mode invariant is enforced,
 /// not assumed. Creation is single-writer (the store lock), so a retry
 /// meets a crashed predecessor's temp, never a live competitor.
+/// Callers outside the store lock (today: the materialization-role
+/// file) share the crash semantics but not the single-writer
+/// precondition: concurrent writers resolve last-writer-wins, and
+/// the file always holds one complete write, never a torn one.
 /// Non-Unix falls back to `File::create_new`: the mode guarantee is
 /// Unix-only (see `docs/cli.md`).
 pub(crate) fn create_mode_temp(

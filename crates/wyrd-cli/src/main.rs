@@ -32,8 +32,8 @@ use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{
-    install_serving, run_vault, shutdown_transport, TransportDeadlines, VaultEvent, VaultLoopEnd,
-    VaultRun,
+    install_role_dir, install_serving, run_vault, shutdown_transport, TransportDeadlines,
+    VaultEvent, VaultLoopEnd, VaultRun,
 };
 use wyrd_daemon::{
     FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor,
@@ -1433,7 +1433,8 @@ fn mount(
     // route, then the discharge barrier — one copy for every live
     // composer, so the order cannot drift between mount, headless
     // sync, and vault.
-    install_serving(&mut live, &serving, &drive_dir).map_err(CliError::Serving)?;
+    install_role_dir(&mut live, &drive_dir);
+    install_serving(&mut live, &serving).map_err(CliError::Serving)?;
     // Endpoint ownership (and shutdown below) stays here; the loop
     // holds only the cloneable readiness handle the install took.
     // The composer builds its presentation backend from the node's
@@ -3509,13 +3510,16 @@ fn sync_now(
         None
     };
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    // The role directory installs whether or not a serving surface
+    // exists: a serving-less `sync now` retains like its role too.
+    install_role_dir(&mut live, &drive_dir);
     if let Some(serving) = &serving {
         // Mount order, through the shared install step: flush before
         // announcing the address, so the first seal carries a route
         // peers can already dial; then publish the route and gate
         // every pass's discharge on mirror readiness. A backed-up
         // mirror leaves the obligation recorded, never discharged.
-        install_serving(&mut live, serving, &drive_dir).map_err(CliError::Serving)?;
+        install_serving(&mut live, serving).map_err(CliError::Serving)?;
     }
     // The headless consumer has no presentation backend: the live
     // parts (projection handle, wants, mutations) are owned but

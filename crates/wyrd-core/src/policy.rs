@@ -371,14 +371,18 @@ fn census_impl<V: NamespaceView>(
 }
 
 /// Reachable chunk identities a vault-role device still has to
-/// fetch, bounded by `cap`. Same walk as the census, different
-/// fold: only chunks that are neither explicitly pinned (the pin
-/// paths own those — admitting one here as `Cached` would
-/// downgrade the promise) nor already local. Stops the moment the
-/// cap fills, so a pass pays for what it admits, never for the
-/// whole namespace. Returns the collected identities and whether
-/// the walk ran to completion (no cap hit): the caller records a
-/// sweep only on completion.
+/// fetch, with collection bounded by `cap`. Same walk as the census
+/// with a different fold — except past the depth bound, where the
+/// census aborts and this skips the subtree and keeps walking
+/// siblings (an illegal path must never abort sync): only chunks
+/// that are neither explicitly pinned (the pin paths own those —
+/// admitting one here as `Cached` would downgrade the promise) nor
+/// already local. Collection stops the moment the cap fills, so a
+/// pass admits at most `cap`; the walk itself still scans (the
+/// revision gate, not this bound, is what spares converged vaults
+/// the scan). Returns the collected identities and whether the walk
+/// ran to completion (no cap hit): the caller records a sweep only
+/// on completion.
 pub fn unheld_want_candidates<V: NamespaceView>(
     engine: &Engine,
     view: &V,

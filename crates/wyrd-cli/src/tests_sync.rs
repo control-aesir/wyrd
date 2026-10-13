@@ -1423,15 +1423,20 @@ fn mailbox_line_reads_posture_not_connection() {
 }
 
 /// The line and the exit agree on every posture except a
-/// never-observed sample: the word the operator reads and the code
-/// automation keys on never contradict each other — degraded word
-/// with a non-zero exit, live or idle word with zero — but an
-/// unticked zero sample reports degraded on the line while the exit
-/// cannot convict on it (see unverified_verdict_requires_observation).
-/// The healed case is pinned explicitly: attached now but blind
-/// mid-run still reads degraded, with the episodes named.
+/// never-observed sample or corroborated communication: the word the
+/// operator reads and the code automation keys on never contradict
+/// each other — degraded word with a non-zero exit, live or idle
+/// word with zero — but an unticked zero sample reports degraded on
+/// the line while the exit cannot convict on it (see
+/// unverified_verdict_requires_observation), and delivered evidence
+/// (accepted intake or accepted sends) with no observed attachment
+/// keeps the honest degraded line while the exit completes (see
+/// relay_intake_without_attachment_exempts_unreachable and
+/// accepted_sends_without_attachment_exempt_unreachable). The healed
+/// case is pinned explicitly: attached now but blind mid-run still
+/// reads degraded, with the episodes named.
 #[test]
-fn mailbox_line_and_exit_agree_except_unobserved_sample() {
+fn mailbox_line_and_exit_agree_except_unobserved_or_corroborated() {
     // Offline: the line reads idle, the exit succeeds.
     let offline = fixture_mailbox();
     assert!(mailbox_line(&offline).contains("idle"));
@@ -1463,6 +1468,21 @@ fn mailbox_line_and_exit_agree_except_unobserved_sample() {
     healed.relay_recovery_attempts = 1;
     assert!(mailbox_line(&healed).starts_with("mailbox: degraded"));
     assert!(run_outcome_error(&report_with(RunOutcome::Quiet, Some(healed))).is_err());
+    // Corroborated but never attached: the line still reports the
+    // down sample honestly — 0 of 1 connected is what the
+    // supervisor last saw — while the exit completes on the
+    // delivered evidence. Both directions pin the second
+    // exception: intake arrived, and sends were accepted.
+    let mut corroborated = blind_mailbox();
+    corroborated.supervisor_ticks = 2;
+    assert!(!corroborated.relay_attached);
+    assert!(mailbox_line(&corroborated).starts_with("mailbox: degraded"));
+    let mut intake_report = report_with(RunOutcome::Quiet, Some(corroborated));
+    intake_report.accepted = 2;
+    assert!(run_outcome_error(&intake_report).is_ok());
+    let mut sends_report = report_with(RunOutcome::Quiet, Some(corroborated));
+    sends_report.sent = 12;
+    assert!(run_outcome_error(&sends_report).is_ok());
 }
 
 /// An offline completion names its limits: it discharged local

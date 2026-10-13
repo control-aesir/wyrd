@@ -268,6 +268,45 @@ impl Rig {
         envelope
     }
 
+    /// Enqueue a snapshot announcement sealed for another member of
+    /// the drive (the rig's own engine is the recipient) and queue it
+    /// on their relay: multi-peer contracts announce the same snapshot
+    /// to each fetching member under its own seal.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_announcement_for(
+        &mut self,
+        snapshot: SnapshotId,
+        membership: TransitionId,
+        epoch: u64,
+        roots: AnnouncedRoots,
+        node_addr: Option<Vec<u8>>,
+        recipient: DeviceId,
+        relay: &mut Relay,
+    ) -> MailboxEnvelope {
+        let mut announcement = SnapshotAnnouncement {
+            snapshot,
+            author: self.owner.id,
+            epoch,
+            membership,
+            body_root: roots.body_root,
+            root_manifest: roots.root_manifest,
+            root_manifest_transport: roots.root_transport,
+            node_addr,
+            signature: [0; 64],
+        };
+        sign_announcement(&mut announcement, &self.owner.identity, &drive());
+        let message = Message::SnapshotAnnouncement(announcement);
+        let envelope = sealed_envelope(
+            &self.owner.identity,
+            recipient,
+            self.epoch_secret(epoch),
+            epoch,
+            &message,
+        );
+        relay.queue([envelope.clone()]);
+        envelope
+    }
+
     /// Mint the capability covering `secrets.len()` epochs for the
     /// recipient from the state `transition` produces, wrap it, and
     /// enqueue it at its covered epoch.

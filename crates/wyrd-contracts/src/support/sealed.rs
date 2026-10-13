@@ -193,19 +193,23 @@ impl Loaded {
         let body_bytes = self.snapshot.encode();
         self.bulk.publish_snapshot(snapshot_id, body_bytes.clone());
         self.bulk.publish_transport(body_bytes.clone());
-        self.rig.enqueue_announcement(
-            snapshot_id,
-            self.rig.admit_id,
-            2,
-            AnnouncedRoots {
-                body_root: BaoRoot::from_bytes(*blake3::hash(&body_bytes).as_bytes()),
-                root_manifest: self.content.manifest_id,
-                root_transport: BaoRoot::from_bytes(
-                    *blake3::hash(&self.content.root.sealed).as_bytes(),
-                ),
-            },
-            node_addr,
-        )
+        let roots = self.announcement_roots();
+        self.rig
+            .enqueue_announcement(snapshot_id, self.rig.admit_id, 2, roots, node_addr)
+    }
+
+    /// The author-signed routing columns for this snapshot, factored
+    /// so multi-peer contracts announce identical roots to each
+    /// member under their own seal.
+    pub(crate) fn announcement_roots(&self) -> AnnouncedRoots {
+        let body_bytes = self.snapshot.encode();
+        AnnouncedRoots {
+            body_root: BaoRoot::from_bytes(*blake3::hash(&body_bytes).as_bytes()),
+            root_manifest: self.content.manifest_id,
+            root_transport: BaoRoot::from_bytes(
+                *blake3::hash(&self.content.root.sealed).as_bytes(),
+            ),
+        }
     }
 
     /// Publish the root manifest and every sealed object except the

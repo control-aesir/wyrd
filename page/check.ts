@@ -77,19 +77,39 @@ if (!update) {
 }
 
 const failures: string[] = [];
+// A failing slot must tell the human everything needed to re-read
+// it without opening three files: slot ids are opaque by design
+// (stable anchors, not descriptions). Copy-rule failures print once
+// per slot with the live copy; drift failures print per backing
+// section with the live copy, the section as it now reads, and the
+// re-pin command.
+const quotedBody = (body: string): string[] => [
+  `page copy now reads:`,
+  ...body.split("\n").map((l) => `  | ${l}`),
+];
+const quotedSection = (text: string): string[] => [
+  `backing docs section now reads:`,
+  ...text.split("\n").map((l) => `  > ${l}`),
+];
 for (const s of map.slots) {
   const body = slotBody(page, s.slot);
   if (body === null) {
     failures.push(`slot markers missing for "${s.slot}" in ${map.page}`);
     continue;
   }
+  const broken: string[] = [];
   for (const want of s.mustContain) {
-    if (!body.includes(want)) failures.push(`"${s.slot}" no longer says ${JSON.stringify(want)}`);
+    if (!body.includes(want)) broken.push(`no longer says ${JSON.stringify(want)}`);
   }
   for (const ban of s.forbids) {
     if (body.toLowerCase().includes(ban.toLowerCase())) {
-      failures.push(`"${s.slot}" contains forbidden phrase ${JSON.stringify(ban)}`);
+      broken.push(`contains forbidden phrase ${JSON.stringify(ban)}`);
     }
+  }
+  if (broken.length > 0) {
+    failures.push(
+      [`"${s.slot}": ${broken.join("; ")}`, ...quotedBody(body)].join("\n"),
+    );
   }
   for (let n = 0; n < s.backs.length; n++) {
     const back = s.backs[n];
@@ -109,7 +129,12 @@ for (const s of map.slots) {
       lock.hashes[key] = hash;
     } else if (lock.hashes[key] !== hash) {
       failures.push(
-        `drift: ${back.file} ${JSON.stringify(back.heading)} changed under slot "${s.slot}" — re-read the slot, then re-pin with --update`,
+        [
+          `drift under slot "${s.slot}": ${back.file} ${JSON.stringify(back.heading)} changed.`,
+          ...quotedBody(body),
+          ...quotedSection(text),
+          `copy rules mustContain ${JSON.stringify(s.mustContain)} forbids ${JSON.stringify(s.forbids)} — re-read the copy against the section above, then re-pin with: deno run --allow-read --allow-write page/check.ts --update`,
+        ].join("\n"),
       );
     }
   }

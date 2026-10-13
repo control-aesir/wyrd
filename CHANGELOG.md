@@ -23,6 +23,17 @@ version say exactly what changed.
 
 ### Added
 
+- Validation pins for the serving-endpoint follow-ups
+  (`nostr:nevent1qqsr5xjn0nfpwd2dgl4ez6fzt3hurajgdk39nj2d443df5l2utuv9ggpz9mhxue69uhkwunpwdczuap49eehgk382gu`):
+  the mailbox-line/exit agreement test now pins the corroborated-communication
+  exception both directions (accepted intake and accepted sends keep the honest
+  degraded line while the exit completes); the supervisor's sampler-input fold
+  (`note_supervisor_observation`: ticks advance every observation, the first
+  observed connection latches `relay_attached` permanently) pins deterministically
+  without a live relay; a fresh peer converges entirely against a substitute
+  serving endpoint over the same vault (fetch-d shape, 0.8 s, no Phase-12 gate);
+  and page-check drift/copy failures now print the slot's live copy and rules
+  inline instead of an opaque slot id.
 - Bounded incremental admission catch-up (`docs/resource-limits.md`,
   child 1 of `nostr:nevent1qqsqufuj24ttsndlug9usn904axmy4m2sslgs2hk3u9n592sy0hlvdspz9mhxue69uhkwunpwdczuap49eehg4rsmla`):
   admitting a device no longer commits one batch proportional to

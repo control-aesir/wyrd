@@ -222,7 +222,7 @@ Decided properties:
    necessarily in the pass that learns it; and only subdivided
    attempts expire as deadlines — counted, and repeated nonzero
    slices back the representation off on the separate burn ledger —
-   while a full-share attempt (the only or last candidate, or any
+   while a full-share attempt (the only, last, or K-th attempted candidate, or any
    single-route fetch outside a walk, which is the production case)
     expires as a transport failure exactly as before, so a hanging
     route with no one behind it still backs off. A zero-grant

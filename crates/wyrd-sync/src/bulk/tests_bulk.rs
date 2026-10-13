@@ -980,9 +980,10 @@ fn capped_walk_pages_through_dead_heads_across_passes() {
     source.set_attempt_deadline(Some(
         std::time::Instant::now() + std::time::Duration::from_secs(30),
     ));
-    // Pass one: the head three fail fast as transport errors —
-    // instant dial failures complete their observation even under
-    // a subdivided share — and the walk stops at the cap.
+    // Pass one: the head three [0xC0, 0xC1, 0xC2] fail fast as
+    // transport errors — instant dial failures complete their
+    // observation even under a subdivided share — mark, sink, and
+    // the walk stops at the cap.
     let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
     assert!(
         matches!(error, BulkError::Transport(_)),
@@ -993,17 +994,19 @@ fn capped_walk_pages_through_dead_heads_across_passes() {
         3,
         "pass one attempts the cap, not the list"
     );
-    // Pass two: the marked heads sink, so the next three unmarked
-    // dead providers fail from the re-derived order.
+    // Pass two: the three marked heads sink, so the order is
+    // [0xC3, 0xC4, 0xC5, 0xC6, LIVE] and the reach is the next
+    // three dead providers [0xC3, 0xC4, 0xC5] — 0xC6 and LIVE
+    // stay outside the cap this pass.
     let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
     assert!(
         matches!(error, BulkError::Transport(_)),
         "pass two fails the next three: {error:?}"
     );
     assert_eq!(source.fetch_stats().attempts, 6);
-    // Pass three: six sunk heads leave the seventh dead provider
-    // plus the live tail inside the cap — fulfillment through
-    // paging, eight attempts total.
+    // Pass three: six sunk heads leave [0xC6, LIVE] inside the
+    // cap — the seventh dead provider fails, the live tail
+    // fulfills: fulfillment through paging, eight attempts total.
     assert_eq!(
         source.fetch_transport(&root, usize::MAX).unwrap(),
         Some(content.to_vec())
@@ -1169,9 +1172,9 @@ fn capped_walk_pages_dial_hangs_one_per_pass() {
     // subdivided Deadlines (budget evidence, never marked); the
     // third holds the full remaining share, so its dial expiry
     // classifies as fault evidence exactly like an uncapped walk's
-    // last candidate and marks. Pass two therefore meets the two
-    // unmarked hangs sunk past... the marked third sinks behind
-    // the live tail, the walk tries hang, hang, live, and
+    // last candidate and marks. Pass two therefore meets the order
+    // [hang, hang, LIVE, marked-hang]: the marked third sinks
+    // behind the live tail, the walk tries hang, hang, live, and
     // fulfills. Dial hangs page one per pass; transfer-phase hangs
     // never mark (only dial evidence trains the memory), so a tail
     // pinned behind stalled transfers waits on the strike/burn

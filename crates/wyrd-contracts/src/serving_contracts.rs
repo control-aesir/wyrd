@@ -148,6 +148,11 @@ fn a_fresh_peer_fetches_pre_kill_content_from_the_substitute_endpoint() {
     let first = engine.execute_plan(&mut bulk, &mut objects).unwrap();
     assert_eq!(first.snapshot_bodies, 1);
     assert_eq!(first.manifests, 1);
+    assert_eq!(
+        first.objects, 0,
+        "objects stay unwanted in the pre-kill round"
+    );
+    assert_eq!(first.unfulfilled, 1, "the structural tree awaits its route");
     serving
         .shutdown(std::time::Duration::from_secs(10))
         .unwrap();

@@ -1510,12 +1510,14 @@ async fn refresh(client: &Client, health: &SupervisorState) {
 /// count advances on every pass, including passes that launch or run
 /// alongside a recovery episode (it is the proof the supervisor
 /// keeps reporting while an episode spins), and any observed
-/// connection latches `relay_attached` permanently. Factored pure —
-/// no client, no clock — so the sampler-input contract pins without
-/// a live relay: the verdict path reads this latch to separate
-/// "attached then lost" from "never attached", so the set-once /
-/// never-clear shape is load-bearing. (`refresh` above only writes
-/// `connected_relays`, so folding after it is unobservable.)
+/// connection latches `relay_attached` permanently. Factored out of
+/// the tick loop — no client, no clock — so the sampler-input
+/// contract pins without a live relay. The shape the verdict path
+/// depends on is set-once / never-clear: only a genuinely
+/// never-attached run is exempt from an unreachable-relay verdict.
+/// (Reordered after `refresh`, which only writes `connected_relays`
+/// (`mod.rs:1503-1507`), so no other writer can interleave within
+/// the pass and no reader can observe the difference.)
 fn note_supervisor_observation(health: &SupervisorState, connected_relays: usize) {
     health.ticks.fetch_add(1, Ordering::Relaxed);
     if connected_relays > 0 {

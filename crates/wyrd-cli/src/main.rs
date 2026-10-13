@@ -291,14 +291,14 @@ enum Command {
     /// replicated state — setting one writes one local file, no fact,
     /// no snapshot. It is not the `vault` process: a device can hold
     /// the role without running one, and one can run without the
-    /// role.
+    /// role. Setting needs no credentials, so a role is settable on
+    /// a machine whose keystore is unavailable; only status opens
+    /// the node.
     Role {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
         #[command(subcommand)]
         action: RoleAction,
-        #[command(flatten)]
-        credentials: Credentials,
     },
     /// Upgrade this installation from a local release archive:
     /// quiesce, flush, stop, swap the binary atomically, verify the
@@ -663,7 +663,10 @@ enum RoleAction {
     /// Report the configured role, transition, and effective
     /// retention posture. Reads durable state only; never connects,
     /// never mutates.
-    Status,
+    Status {
+        #[command(flatten)]
+        credentials: Credentials,
+    },
 }
 
 #[cfg(unix)]
@@ -954,10 +957,19 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             ..
         } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
         Command::Role {
-            drive_dir,
-            credentials,
-            ..
-        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+            drive_dir, action, ..
+        } => match action {
+            // Setting touches one local file and no key: return
+            // before credential loading, so a role is settable on
+            // a machine whose keystore is unavailable (OD-24-R).
+            // Status loads below like every other command.
+            RoleAction::Set { role, yes } => {
+                return role_set(drive_dir.clone(), role.clone(), *yes);
+            }
+            RoleAction::Status { credentials } => {
+                load_credentials(drive_dir, credentials, cli.config.as_deref())?
+            }
+        },
     };
 
     match cli.command {
@@ -1082,7 +1094,14 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         }
         Command::Role {
             drive_dir, action, ..
-        } => role(drive_dir, action, &passphrase, identity),
+        } => match action {
+            // Set returns before credential loading above; the arm
+            // exists only because the match is exhaustive.
+            RoleAction::Set { .. } => {
+                unreachable!("role set returns before credential loading")
+            }
+            RoleAction::Status { .. } => role_status(drive_dir, &passphrase, identity),
+        },
     }
 }
 
@@ -1864,64 +1883,61 @@ fn role_err(error: wyrd_core::role::RoleError) -> CliError {
     }
 }
 
-/// Set or report this device's materialization role. Setting writes
-/// exactly one local file: no fact, no snapshot, no membership
-/// transition, nothing any other device can observe.
-fn role(
+/// Set this device's materialization role without touching keys:
+/// exactly one local file is written — no fact, no snapshot, no
+/// membership transition, nothing any other device can observe.
+fn role_set(drive_dir: PathBuf, role: String, yes: bool) -> Result<(), CliError> {
+    use wyrd_core::role::{Role, RoleState, Transition};
+    let target = Role::parse(&role).map_err(|error| CliError::Usage(error.to_string()))?;
+    let current = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    if current.transition == Transition::Settled && current.role == target {
+        println!("role already {target} (settled); no change");
+        return Ok(());
+    }
+    if target == Role::Mirror && current.effective() == Role::Vault {
+        if current.transition == Transition::NarrowingAcknowledged {
+            return Err(CliError::Usage(
+                "narrowing is already acknowledged and still withdrawing as vault: to start over, widen back to vault first (role set vault), then narrow again with --yes.".into(),
+            ));
+        }
+        if !yes {
+            return Err(CliError::Usage(
+                "narrowing away from the vault role requires --yes: leaving vault stops being a provider, and that must be explicit. Acknowledgement records intent only; effective posture stays vault until withdrawal completes.".into(),
+            ));
+        }
+        let state = RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        };
+        wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+        println!(
+            "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: withdrawal completion (route publication drained, no old-role serve streams) is not yet wired; this device retains like vault"
+        );
+        return Ok(());
+    }
+    let state = RoleState {
+        role: target,
+        transition: Transition::Settled,
+    };
+    wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+    println!("role set to {target}; effective immediately");
+    Ok(())
+}
+
+/// Report the configured role, any in-flight narrowing, and the
+/// effective retention posture. Reads durable state only; never
+/// connects, never mutates.
+fn role_status(
     drive_dir: PathBuf,
-    action: RoleAction,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    use wyrd_core::role::{Role, RoleState, Transition};
-    match action {
-        RoleAction::Set { role, yes } => {
-            let target = Role::parse(&role).map_err(|error| CliError::Usage(error.to_string()))?;
-            let current = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
-            if current.transition == Transition::Settled && current.role == target {
-                println!("role already {target} (settled); no change");
-                return Ok(());
-            }
-            if target == Role::Mirror && current.effective() == Role::Vault {
-                if current.transition == Transition::NarrowingAcknowledged {
-                    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
-                    let (engine, view) = node.parts();
-                    let census = residency_census_with_role(engine, view, "", current.effective())?;
-                    print!("{}", role_status_render(&drive_dir, current, &census));
-                    return Ok(());
-                }
-                if !yes {
-                    return Err(CliError::Usage(
-                        "narrowing away from the vault role requires --yes: leaving vault stops being a provider, and that must be explicit. Acknowledgement records intent only; effective posture stays vault until withdrawal completes.".into(),
-                    ));
-                }
-                let state = RoleState {
-                    role: Role::Mirror,
-                    transition: Transition::NarrowingAcknowledged,
-                };
-                wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
-                println!(
-                    "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: withdrawal completion (route publication drained, no old-role serve streams) is not yet wired; this device retains like vault"
-                );
-                return Ok(());
-            }
-            let state = RoleState {
-                role: target,
-                transition: Transition::Settled,
-            };
-            wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
-            println!("role set to {target}; effective immediately");
-            Ok(())
-        }
-        RoleAction::Status => {
-            let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
-            let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
-            let (engine, view) = node.parts();
-            let census = residency_census_with_role(engine, view, "", state.effective())?;
-            print!("{}", role_status_render(&drive_dir, state, &census));
-            Ok(())
-        }
-    }
+    let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+    let (engine, view) = node.parts();
+    let census = residency_census_with_role(engine, view, "", state.effective())?;
+    print!("{}", role_status_render(&drive_dir, state, &census));
+    Ok(())
 }
 
 /// The configured role, any in-flight narrowing, and the effective

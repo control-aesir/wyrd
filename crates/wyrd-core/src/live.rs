@@ -652,6 +652,20 @@ pub struct LiveNode<V: NamespaceView> {
     /// state — the loop owns the passes, the composer owns what they
     /// mean to the operator.
     pub(super) pass_hook: Option<Box<PassHook>>,
+    /// Drive directory the loop reads the materialization role
+    /// from, once per pass. Installed by the composer beside the
+    /// keystore it already opens (`role` file); `None` (tests,
+    /// compositions without a drive directory) behaves as mirror,
+    /// which is today's behavior exactly. A per-pass file read —
+    /// not cached node state — so `role set` bites a running loop
+    /// on its next pass and a restart reconciles nothing.
+    pub(super) role_dir: Option<std::path::PathBuf>,
+    /// Durable revision a full vault sweep last covered with no new
+    /// wants: passes skip the walk while the revision stands still,
+    /// so a converged vault pays nothing per pass. Memory-only
+    /// (scrub-cursor precedent): a restart re-sweeps from scratch.
+    /// `None` before the first complete sweep.
+    pub(super) vault_swept_revision: Option<u64>,
 }
 
 /// The live half of a split node: everything a presentation
@@ -978,6 +992,8 @@ where
                 fetch_pass_budget: config.fetch_pass_budget,
                 last_mailbox_reconnects: None,
                 pass_hook: None,
+                role_dir: None,
+                vault_swept_revision: None,
             },
             parts,
         ))
@@ -989,6 +1005,83 @@ where
     pub fn want(&mut self, content: ContentId) -> Result<(), LiveError> {
         self.engine
             .set_materialization(content, MaterializationState::Cached)?;
+        Ok(())
+    }
+
+    /// Register vault-role retention demand for this pass, if any.
+    /// Under an effective `vault` role every reachable unheld
+    /// identity (never explicitly pinned ones — the pin paths own
+    /// those, and admitting one here as `Cached` would downgrade the
+    /// promise) becomes a want, paced by the admission cap like any
+    /// other demand. Below vault-effective, or with no role
+    /// directory installed, this costs one `Option` test. A full
+    /// sweep with no new wants covers the durable revision, so a
+    /// converged vault pays nothing per pass until the next commit.
+    /// A torn role file warns and retains as mirror for the pass:
+    /// the loop must not stall sync on an operator-repairable file,
+    /// and nothing prunes under any role, so the degradation is
+    /// availability-only and self-heals on repair.
+    fn register_vault_wants(&mut self) -> Result<(), LiveError> {
+        let Some(dir) = self.role_dir.clone() else {
+            return Ok(());
+        };
+        let role = match crate::role::load(&dir) {
+            Ok(state) => state.effective(),
+            Err(error) => {
+                tracing::warn!(
+                    path = ?dir,
+                    error = %error,
+                    "unreadable role file: retaining as mirror until repaired"
+                );
+                return Ok(());
+            }
+        };
+        if role != crate::role::Role::Vault {
+            return Ok(());
+        }
+        let revision = self.engine.current();
+        if self.vault_swept_revision == Some(revision) {
+            return Ok(());
+        }
+        // Never re-register in-flight identities: registration
+        // coalesces but still gains a waiter per call, so pending or
+        // admitted ids are skipped, not re-registered.
+        let pending: std::collections::BTreeSet<ContentId> =
+            self.wants.peek_pending().into_iter().collect();
+        let projection = self.projection.read().map_err(|_| LiveError::Lock)?;
+        // A broken namespace walk is a local data-path failure: map
+        // it onto the store class (tight abort budget, like the
+        // backend's EIO mapping), never Engine-generic.
+        let (candidates, completed) = crate::policy::unheld_want_candidates(
+            &self.engine,
+            projection.view(),
+            "",
+            self.budgets.max_admit_per_pass,
+        )
+        .map_err(|error| {
+            LiveError::Engine(wyrd_sync::runtime::EngineError::ObjectStore(
+                error.to_string(),
+            ))
+        })?;
+        drop(projection);
+        for id in candidates {
+            if pending.contains(&id) || self.wants.is_admitted(&id) {
+                continue;
+            }
+            match self.wants.register(id) {
+                Ok(()) => {}
+                // Past the bound the leftover waits for the next
+                // pass, exactly like backend demand past the bound.
+                Err(crate::want::WantError::Saturated) => return Ok(()),
+                // Only the poisoned lock remains (TimedOut belongs
+                // to the waiting path; register never returns it):
+                // fail closed.
+                Err(_) => return Err(LiveError::Lock),
+            }
+        }
+        if completed {
+            self.vault_swept_revision = Some(revision);
+        }
         Ok(())
     }
 
@@ -1033,6 +1126,17 @@ where
     /// a peer acting on an announcement never races the write-through.
     pub fn set_serving_barrier(&mut self, barrier: Arc<dyn ServingBarrier>) {
         self.serving_barrier = Some(barrier);
+    }
+
+    /// Install the drive directory the loop reads the
+    /// materialization role from, once per pass. The composer passes
+    /// the directory whose keystore it already opened; `None` (the
+    /// default) behaves as mirror. Reading per pass rather than
+    /// caching keeps `role set` effective on a running loop with no
+    /// restart reconciliation.
+    pub fn set_role_dir(&mut self, dir: std::path::PathBuf) {
+        self.role_dir = Some(dir);
+        self.vault_swept_revision = None;
     }
 
     /// Install the completed-pass hook: the loop calls it with the
@@ -1376,6 +1480,14 @@ where
         // direct `want()` callers; returning `Ok` here still marks
         // the identity admitted, and the fetch plan picks it up from
         // the durable `Cached` policy.
+        // Vault retention (24-materialization-roles): a vault-role
+        // device wants every reachable unheld identity, paced by the
+        // admission cap. Registration coalesces with backend demand;
+        // admission commits Cached through the existing path and the
+        // fetch plan needs no role knowledge, so no new fact kind
+        // exists. Skipped below vault-effective (zero cost) and while
+        // a full sweep already covers the durable revision.
+        self.register_vault_wants()?;
         let mut admission = if self.wants.peek_pending().is_empty() {
             None
         } else {

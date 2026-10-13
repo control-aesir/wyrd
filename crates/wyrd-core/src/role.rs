@@ -205,8 +205,10 @@ pub fn load(drive_dir: &Path) -> Result<RoleState, RoleError> {
 
 /// Persist a role change. Exactly one file is written: no fact, no
 /// snapshot, no membership transition, nothing any other device can
-/// observe. Atomic (tmp + rename) so a crash leaves the previous
-/// role or the new one, never a torn half.
+/// observe. Durable through the same primitive custody files use
+/// (temp claimed at mode + `fsync` + rename + directory `fsync`),
+/// so a crash leaves the previous role or the new one, never a
+/// torn half.
 pub fn store(drive_dir: &Path, state: RoleState) -> Result<(), RoleError> {
     let mut text = String::from(state.role.word());
     text.push('\n');
@@ -215,25 +217,12 @@ pub fn store(drive_dir: &Path, state: RoleState) -> Result<(), RoleError> {
         text.push_str(state.transition.word());
         text.push('\n');
     }
-    let tmp = drive_dir.join("role.tmp");
-    std::fs::write(&tmp, text.as_bytes()).map_err(|source| RoleError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(
-            |source| RoleError::Io {
-                path: tmp.clone(),
-                source,
-            },
-        )?;
-    }
-    std::fs::rename(&tmp, role_path(drive_dir)).map_err(|source| RoleError::Io {
-        path: role_path(drive_dir),
-        source,
-    })?;
+    wyrd_sync::durable::atomic_write_mode(drive_dir, "role", text.as_bytes(), 0o600).map_err(
+        |source| RoleError::Io {
+            path: role_path(drive_dir),
+            source,
+        },
+    )?;
     Ok(())
 }
 
@@ -302,6 +291,7 @@ mod tests {
         let dir = scratch_role_dir("garbage");
         for (name, content) in [
             ("empty", ""),
+            ("torn", "vaul"),
             ("unknown", "archivist\n"),
             ("shouted", "VAULT\n"),
             ("trailing", "vault\n\n"),

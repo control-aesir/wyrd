@@ -716,7 +716,11 @@ the default names current behavior, never a silent choice.
 All subcommands take `--identity-file` and `--passphrase-file`,
 optionally: each defaults to the drive configuration file's
 `identity_file` / `passphrase_file` when the flag is absent (see
-"Drive configuration file" below), and the flag always wins.
+"Drive configuration file" below), and the flag always wins —
+with one exception: `role set` writes one local file and touches
+no key, so it takes neither flag and reads no file. A role stays
+settable on a machine whose keystore is unavailable. (`role
+status` opens the node and takes both.)
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters

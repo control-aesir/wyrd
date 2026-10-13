@@ -243,7 +243,10 @@ impl ResidencyCensus {
     /// deduplicated across files that share chunks. This is the
     /// per-identity number — "what the device has promised" — as
     /// opposed to per-file counts, which over- or under-count
-    /// shared chunks by construction.
+    /// shared chunks by construction. Under a vault-effective role
+    /// the set includes role-implied retention alongside explicit
+    /// pins: both are retained, only the explicit subset was
+    /// promised by a pin.
     pub fn pinned_chunk_union(&self) -> BTreeSet<ContentId> {
         self.files
             .iter()
@@ -365,6 +368,68 @@ fn census_impl<V: NamespaceView>(
     }
     census.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(census)
+}
+
+/// Reachable chunk identities a vault-role device still has to
+/// fetch, bounded by `cap`. Same walk as the census, different
+/// fold: only chunks that are neither explicitly pinned (the pin
+/// paths own those — admitting one here as `Cached` would
+/// downgrade the promise) nor already local. Stops the moment the
+/// cap fills, so a pass pays for what it admits, never for the
+/// whole namespace. Returns the collected identities and whether
+/// the walk ran to completion (no cap hit): the caller records a
+/// sweep only on completion.
+pub fn unheld_want_candidates<V: NamespaceView>(
+    engine: &Engine,
+    view: &V,
+    path: &str,
+    cap: usize,
+) -> Result<(Vec<ContentId>, bool), PolicyError> {
+    let root = view.lookup(path).map_err(|source| PolicyError::View {
+        path: path.to_string(),
+        source,
+    })?;
+    let runtime = engine.runtime_state()?;
+    let mut out = Vec::new();
+    let mut stack = vec![(path.to_string(), root, 0usize)];
+    while let Some((at, node, depth)) = stack.pop() {
+        if out.len() >= cap {
+            return Ok((out, false));
+        }
+        if depth > MAX_PATH_DEPTH {
+            return Err(PolicyError::TooDeep(at));
+        }
+        match node {
+            Node::File { chunks, .. } => {
+                for id in &chunks {
+                    if out.len() >= cap {
+                        return Ok((out, false));
+                    }
+                    if runtime.materialization(id) != MaterializationState::Pinned
+                        && !runtime.is_local(id)
+                    {
+                        out.push(*id);
+                    }
+                }
+            }
+            Node::Dir { .. } | Node::MergedDir { .. } => {
+                let entries = view.readdir(&node).map_err(|source| PolicyError::View {
+                    path: at.clone(),
+                    source,
+                })?;
+                for entry in entries {
+                    let child = if at.is_empty() {
+                        entry.name.clone()
+                    } else {
+                        format!("{}/{}", at, entry.name)
+                    };
+                    stack.push((child, entry.node, depth + 1));
+                }
+            }
+            Node::Symlink { .. } | Node::Conflict { .. } => {}
+        }
+    }
+    Ok((out, true))
 }
 
 /// What one pin committed. Counts distinguish new promises from

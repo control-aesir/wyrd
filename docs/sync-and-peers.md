@@ -505,9 +505,9 @@ and role selection is never an authorization mechanism.
   distinction matters.
 - **Storage.** The role is one string in a `role` file beside the drive's
   keystore, read at startup. It is not a fact-log entry and never leaves
-  the device. Policy the role implies flows through the same policy store
-  `pin` / `evict` already use, so `wyrd role set` and `wyrd pin` cannot
-  disagree about what the device intends.
+  the   device. Policy the role implies is admitted as `Cached` facts
+  through the same admission path `pin` uses, so `wyrd role set`
+  and `wyrd pin` cannot disagree about what the device intends.
 - **Default.** A device with no role file reports its effective role
   explicitly and behaves exactly as today: no pins and no quota means
   prunable, which is the `mirror` posture. The default names current
@@ -546,10 +546,12 @@ never happen silently:
 - `evict` under `vault` refuses (and says the role forbids it): the role
   promises no pruning, and a silent bypass of the pin refusal would be
   worse than no role. `evict` under `mirror` behaves exactly as today.
-- Quota enforcement is role-aware. A `vault` device with a
-  `retained_bytes_quota` set hits the quota and refuses with `ENOSPC` —
-  "never prunes" and "refuses" are the only permitted behaviours, and
-  silently discarding is neither.
+- Quota enforcement needs no role branch. The ceiling compares
+  retained bytes and nothing prunes under any role — there is no
+  prune path to gate — so a `vault` device with a
+  `retained_bytes_quota` set hits the quota and refuses with `ENOSPC`,
+  exactly as a `mirror` device does. "Never prunes" and "refuses" are
+  the only permitted behaviours, and silently discarding is neither.
 - The role never gates the serving endpoint: serving answers for bytes the
   device holds regardless of role (role ≠ process). What the role governs
   is retention intent and route publication — a narrowing device stops

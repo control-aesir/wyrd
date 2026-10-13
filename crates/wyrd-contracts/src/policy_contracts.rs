@@ -22,10 +22,11 @@ use crate::support::scratch_dir;
 fn policy_drive() -> (
     WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>>,
     std::path::PathBuf,
+    DeviceIdentitySecret,
 ) {
     let dir = scratch_dir("policy-local");
     let identity = DeviceIdentitySecret::generate().unwrap();
-    let mut engine = Engine::create(dir.clone(), "contracts-test-pass", identity).unwrap();
+    let mut engine = Engine::create(dir.clone(), "contracts-test-pass", identity.clone()).unwrap();
     let mut store = FsObjectStore::open(dir.clone()).unwrap();
     let a = store.insert(ObjectKind::Chunk, b"contract alpha").unwrap();
     let b = store.insert(ObjectKind::Chunk, b"contract beta").unwrap();
@@ -40,7 +41,7 @@ fn policy_drive() -> (
     let mut node: WyrdNode<DriveView<FsObjectStore, RuntimeMaterialization>> =
         WyrdNode::new(engine, FsObjectStore::open(dir.clone()).unwrap()).unwrap();
     node.refresh_live_heads().unwrap();
-    (node, dir)
+    (node, dir, identity)
 }
 
 /// Pinning, unpinning, and evicting leave the replicated state
@@ -50,7 +51,7 @@ fn policy_drive() -> (
 /// a policy fact, because policy facts never enter the outbox.
 #[test]
 fn policy_commits_change_no_replicated_state() {
-    let (mut node, dir) = policy_drive();
+    let (mut node, dir, _) = policy_drive();
     let heads_before = node.engine().live_heads().unwrap();
     assert_eq!(heads_before.len(), 1);
     assert!(observe(node.engine(), 0).unwrap().obligations.is_empty());
@@ -78,7 +79,7 @@ fn policy_commits_change_no_replicated_state() {
 fn a_role_change_appends_no_fact_and_no_snapshot() {
     use wyrd_core::role::{self, Role, RoleState, Transition};
 
-    let (node, dir) = policy_drive();
+    let (node, dir, identity) = policy_drive();
     let facts_before = node.engine().fact_log_bytes().unwrap();
     let heads_before = node.engine().live_heads().unwrap();
     let membership_before = node.engine().membership_log().known_state();
@@ -121,6 +122,25 @@ fn a_role_change_appends_no_fact_and_no_snapshot() {
         "no peer is owed anything for a local posture change"
     );
 
+    // The posture survives a reopen from custody with the same
+    // replicated state: the role file is durable device state, and
+    // reopening observes the acknowledged transition still
+    // vault-effective. Single-node by construction — with byte-
+    // identical facts, unchanged heads and membership, and an empty
+    // outbox, no mechanism exists by which a second device could
+    // observe anything the assertions above missed.
     drop(node);
+    let reopened = Engine::open_keystore(dir.clone(), "contracts-test-pass", identity).unwrap();
+    assert_eq!(
+        reopened.fact_log_bytes().unwrap(),
+        facts_before,
+        "reopening observes the same fact log"
+    );
+    assert_eq!(
+        role::load(&dir).unwrap().effective(),
+        Role::Vault,
+        "the acknowledged narrowing is still vault-effective after reopen"
+    );
+
     std::fs::remove_dir_all(dir).unwrap();
 }

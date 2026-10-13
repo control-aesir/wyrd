@@ -173,19 +173,19 @@ pub(crate) fn create_mode_temp(
     }
 }
 
-/// Durably create-or-replace one custody file: temp (at an explicit
+/// Durably create-or-replace one file: temp (at an explicit
 /// Unix `mode`, see [`create_mode_temp`]) + `fsync` + rename +
 /// directory `fsync`. The rename preserves the temp's mode, so no
 /// post-rename chmod — and no chmod-failure-after-rename outcome —
 /// exists. Custody and identity files flow through here; operational
 /// state (`CURRENT`, commits) keeps flowing through [`atomic_write`]:
 /// creation hardens, opening never chmods.
-pub(crate) fn atomic_write_mode(
-    dir: &Path,
-    name: &str,
-    bytes: &[u8],
-    mode: u32,
-) -> std::io::Result<()> {
+///
+/// Public because device-local operational files beside the drive
+/// directory (like the materialization-role file, owned by
+/// `wyrd-core`) need exactly this sequencing and must not
+/// reimplement it more weakly.
+pub fn atomic_write_mode(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
     let mut f = create_mode_temp(dir, name, mode)?;
     f.write_all(bytes)?;

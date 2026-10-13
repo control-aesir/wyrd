@@ -23,6 +23,20 @@ version say exactly what changed.
 
 ### Added
 
+- Persistent relay and replication configuration
+  (`nostr:nevent1qqs8x585cx3ut5wr5m6prd0286g3c05mxlm9emqm8v236xl600ew4cqpz9mhxue69uhkwunpwdczuap49eehgk3hyj4`,
+  OD-C1..C4 all option A): a drive directory's `default.toml` names its
+  relays and credential paths once, and every networked subcommand resolves
+  the same file — explicit `--relay` flags replace the configured list, the
+  credential flags override the configured paths, and `--config` points at a
+  file elsewhere. The empty-means-idle refusal judges the effective set (a
+  file declaring no relays still refuses a bare `sync now`; a configured
+  relay contradicts `--offline` like a flag), unknown keys are refused with
+  their name, the file holds paths never secret material, and it reads
+  without the store lock. `sync status` / `sync now` print a `relays from:`
+  line and `cache policy` a `configuration:` section, so precedence is
+  debuggable. `toml` joins `wyrd-cli`'s production edges (parse-only),
+  allow-listed in the layer contract's policy.
 - Validation pins for the serving-endpoint follow-ups
   (`nostr:nevent1qqsr5xjn0nfpwd2dgl4ez6fzt3hurajgdk39nj2d443df5l2utuv9ggpz9mhxue69uhkwunpwdczuap49eehgk382gu`):
   the mailbox-line/exit agreement test now pins the corroborated-communication

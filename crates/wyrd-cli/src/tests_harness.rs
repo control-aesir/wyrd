@@ -79,3 +79,11 @@ pub(crate) fn write_secret(path: &Path, bytes: impl AsRef<[u8]>) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }
+
+/// Write a drive deployment configuration file: shared by the
+/// in-binary suites so the relay/credential tests name the file one
+/// way. (The process-level suite in `tests/` keeps its own method:
+/// it is a separate binary and cannot import this module.)
+pub(crate) fn write_default_toml(drive: &Path, text: &str) {
+    fs::write(drive.join("default.toml"), text).unwrap();
+}

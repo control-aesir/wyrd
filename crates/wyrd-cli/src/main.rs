@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::drive_config::{
+    check_vault_relays, load_drive_config, relay_source_line, resolve_credential_path,
+    resolve_relays, update_request_relays, CredentialProvenance, LoadedConfig, RelayResolution,
+    RelaySource,
+};
 use crate::logging::{init_mount_diagnostics, init_sync_diagnostics, init_vault_diagnostics};
 use crate::probes::combine_status;
 #[cfg(target_os = "macos")]
@@ -53,11 +58,19 @@ use zeroize::Zeroizing;
 /// credential files (read and hardened by wyrd code, never by clap);
 /// `--relay` is deployment state shared by every networked
 /// subcommand — nothing in the keystore names relays, so they arrive
-/// as flags.
+/// as flags, defaulted from the drive's `default.toml` when the flags
+/// name none (see `drive_config`).
 /// Export is offline by construction: no relays, no serving, no FUSE.
 #[derive(Debug, Parser)]
 #[command(name = "wyrd", version, about)]
 struct Cli {
+    /// Drive deployment configuration elsewhere than the drive
+    /// directory's `default.toml`: every subcommand reads the same
+    /// file, so one override covers them all. A missing override is
+    /// a named error, never an empty configuration; an absent
+    /// default is simply no configuration.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -65,24 +78,32 @@ struct Cli {
 #[derive(Debug, Args)]
 struct Credentials {
     /// Nostr identity secret: 32 raw bytes or 64 hex characters.
+    /// Defaults to the configuration file's `identity_file` when
+    /// the flag is absent; the flag always wins.
     #[arg(long, value_name = "PATH")]
-    identity_file: PathBuf,
+    identity_file: Option<PathBuf>,
 
-    /// Keystore passphrase, UTF-8 text.
+    /// Keystore passphrase, UTF-8 text. Defaults to the
+    /// configuration file's `passphrase_file` when the flag is
+    /// absent; the flag always wins.
     #[arg(long, value_name = "PATH")]
-    passphrase_file: PathBuf,
+    passphrase_file: Option<PathBuf>,
 }
 
 /// Control-plane relays: repeatable deployment state shared by every
 /// networked subcommand. Nothing in the keystore names relays, so
 /// they arrive as flags with identical parsing and identical
 /// empty-means-idle semantics everywhere — mount and sync must never
-/// drift into subtly different relay handling.
+/// drift into subtly different relay handling. When the flags name
+/// none, the drive's configuration file supplies the list (see
+/// `drive_config`); explicit flags replace the configured list
+/// rather than appending to it, so the effective set is knowable.
 #[derive(Debug, Args)]
 struct RelayArgs {
-    /// Control-plane relay; repeatable. With none given, intake
-    /// stays idle and the command runs offline (`sync now`
-    /// additionally requires `--offline` to say so explicitly).
+    /// Control-plane relay; repeatable. With none given and none
+    /// configured, intake stays idle and the command runs offline
+    /// (`sync now` additionally requires `--offline` to say so
+    /// explicitly).
     #[arg(long, value_name = "URL")]
     relay: Vec<String>,
 }
@@ -734,7 +755,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         }
         Err(error) => return Err(CliError::Usage(error.to_string())),
     };
-    let (identity, passphrase) = match &cli.command {
+    let (identity, passphrase, credential_provenance, config) = match &cli.command {
         // Update runs the whole transaction below without secrets
         // (credential paths forward to the verification child, who
         // opens custody), so it returns before credential loading.
@@ -751,12 +772,42 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 path: PathBuf::from("<current executable>"),
                 source,
             })?;
+            // The handoff child never reads the configuration: the
+            // parent resolves the effective set and forwards it
+            // flattened as `--relay`/`--identity-file`/`--passphrase-file`
+            // argv, so the child takes no `--config` and inherits no
+            // file. The two update guards therefore judge different
+            // surfaces: "restart needs a relay" judges the effective
+            // set (a configured relay satisfies it), while
+            // "relay-is-restart-only" judges the flag list (a file the
+            // operator adopted for every other subcommand must not
+            // fail an update that never consumes relays).
+            let update_config = load_drive_config(drive_dir, cli.config.as_deref())?;
+            let update_config = update_config.as_ref();
+            let identity_file = resolve_credential_path(
+                credentials.identity_file.clone(),
+                update_config.and_then(|c| c.identity_file.clone()),
+                "--identity-file",
+                "identity_file",
+            )?;
+            let passphrase_file = resolve_credential_path(
+                credentials.passphrase_file.clone(),
+                update_config.and_then(|c| c.passphrase_file.clone()),
+                "--passphrase-file",
+                "passphrase_file",
+            )?;
+            let resolution = resolve_relays(relays.relay.clone(), update_config);
+            // B1 shape: without `--restart` relays travel nowhere, so
+            // only explicitly passed flags can be a mistake worth
+            // refusing; with `--restart` the handoff consumes the
+            // effective set.
+            let request_relays = update_request_relays(*restart, &relays.relay, &resolution.relays);
             let outcome = update::update_run(&update::UpdateRequest {
                 drive_dir,
                 archive,
-                identity_file: &credentials.identity_file,
-                passphrase_file: &credentials.passphrase_file,
-                relays: &relays.relay,
+                identity_file: &identity_file,
+                passphrase_file: &passphrase_file,
+                relays: request_relays,
                 restart: *restart,
                 exe: &exe,
             })?;
@@ -797,19 +848,71 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             println!("{}", update::render_build_info(&update::own_build_info()));
             return Ok(());
         }
-        Command::Init { credentials, .. } => read_credentials(credentials)?,
-        Command::Mount { credentials, .. } => read_credentials(credentials)?,
-        Command::Export { credentials, .. } => read_credentials(credentials)?,
-        Command::Member { credentials, .. } => read_credentials(credentials)?,
-        Command::Snapshot { credentials, .. } => read_credentials(credentials)?,
-        Command::Device { credentials, .. } => read_credentials(credentials)?,
-        Command::Sync { credentials, .. } => read_credentials(credentials)?,
-        Command::Vault { credentials, .. } => read_credentials(credentials)?,
-        Command::Pin { credentials, .. } => read_credentials(credentials)?,
-        Command::Unpin { credentials, .. } => read_credentials(credentials)?,
-        Command::Evict { credentials, .. } => read_credentials(credentials)?,
-        Command::Cache { credentials, .. } => read_credentials(credentials)?,
-        Command::UpdateVerify { credentials, .. } => read_credentials(credentials)?,
+        Command::Init {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Mount {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Export {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Member {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Snapshot {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Device {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Sync {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Vault {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Pin {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Unpin {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Evict {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Cache {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::UpdateVerify {
+            drive_dir,
+            credentials,
+            ..
+        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
     };
 
     match cli.command {
@@ -845,7 +948,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             mount(
                 drive_dir,
                 mountpoint,
-                relays.relay,
+                resolve_relays(relays.relay, config.as_ref()).relays,
                 verbose,
                 interval,
                 &passphrase,
@@ -869,7 +972,17 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             relays,
             action,
             ..
-        } => sync(drive_dir, relays.relay, action, &passphrase, identity),
+        } => {
+            let resolution = resolve_relays(relays.relay, config.as_ref());
+            sync(
+                drive_dir,
+                resolution,
+                config.as_ref(),
+                action,
+                &passphrase,
+                identity,
+            )
+        }
         Command::Vault {
             drive_dir,
             relays,
@@ -878,7 +991,15 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             ..
         } => match action {
             None | Some(VaultAction::Start) => {
-                vault(drive_dir, relays.relay, log_file, &passphrase, identity)
+                let resolution = resolve_relays(relays.relay, config.as_ref());
+                vault(
+                    drive_dir,
+                    resolution,
+                    config.as_ref(),
+                    log_file,
+                    &passphrase,
+                    identity,
+                )
             }
             // `--log-file` lives on the parent command so clap cannot
             // express this (same shape as `sync now`'s `--offline`
@@ -899,17 +1020,83 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
         } => evict(drive_dir, &path, &passphrase, identity),
         Command::Cache {
             drive_dir, action, ..
-        } => cache(drive_dir, action, &passphrase, identity),
+        } => {
+            // Cache names no relays of its own: the effective set is
+            // whatever the file declares, and the policy report says
+            // where it came from.
+            let resolution = resolve_relays(Vec::new(), config.as_ref());
+            cache(
+                drive_dir,
+                action,
+                &resolution,
+                config.as_ref(),
+                &credential_provenance,
+                &passphrase,
+                identity,
+            )
+        }
     }
 }
 
+/// Load one invocation's secrets: the drive's configuration file
+/// first (every subcommand reads the same file, so relay and
+/// credential defaults cannot drift between commands), then the
+/// credential files the flags or the file name. Returns the secrets
+/// with their provenance and the loaded configuration for the
+/// dispatch below, which resolves relays and reports provenance
+/// from the same value — one read, one source of truth.
+fn load_credentials(
+    drive_dir: &Path,
+    creds: &Credentials,
+    override_path: Option<&Path>,
+) -> Result<
+    (
+        DeviceIdentitySecret,
+        Zeroizing<String>,
+        CredentialProvenance,
+        Option<LoadedConfig>,
+    ),
+    CliError,
+> {
+    let config = load_drive_config(drive_dir, override_path)?;
+    let (identity, passphrase, provenance) = read_credentials(creds, config.as_ref())?;
+    Ok((identity, passphrase, provenance, config))
+}
+
 /// Read and harden the credential files. The passphrase keeps its
-/// trailing newline stripped; the identity may be raw or hex.
+/// trailing newline stripped; the identity may be raw or hex. Paths
+/// resolve flags-first, file-second; the resolved paths travel
+/// through the same hardening either way — the file defaults the
+/// location, never the protection.
 fn read_credentials(
     creds: &Credentials,
-) -> Result<(DeviceIdentitySecret, Zeroizing<String>), CliError> {
-    let identity = read_identity(&creds.identity_file)?;
-    let passphrase_bytes = read_secret_file(&creds.passphrase_file)?;
+    config: Option<&LoadedConfig>,
+) -> Result<
+    (
+        DeviceIdentitySecret,
+        Zeroizing<String>,
+        CredentialProvenance,
+    ),
+    CliError,
+> {
+    let identity_file = resolve_credential_path(
+        creds.identity_file.clone(),
+        config.and_then(|c| c.identity_file.clone()),
+        "--identity-file",
+        "identity_file",
+    )?;
+    let passphrase_file = resolve_credential_path(
+        creds.passphrase_file.clone(),
+        config.and_then(|c| c.passphrase_file.clone()),
+        "--passphrase-file",
+        "passphrase_file",
+    )?;
+    let provenance = CredentialProvenance {
+        identity_from_file: creds.identity_file.is_none(),
+        passphrase_from_file: creds.passphrase_file.is_none(),
+    };
+    let identity = read_identity(&identity_file)?;
+    let passphrase_bytes = read_secret_file(&passphrase_file)?;
     let passphrase_text = std::str::from_utf8(&passphrase_bytes)
         .map_err(|_| CliError::Usage("passphrase file must contain UTF-8 text".into()))?;
     let passphrase = Zeroizing::new(passphrase_text.to_owned());
@@ -921,7 +1108,7 @@ fn read_credentials(
     // command completes, so it stays in a `Zeroizing` rather than a
     // plain `String`. Callers pass `&passphrase` as `&str` through
     // deref coercion.
-    Ok((identity, Zeroizing::new(passphrase.to_owned())))
+    Ok((identity, Zeroizing::new(passphrase.to_owned()), provenance))
 }
 
 /// Read a bounded credential file without following symlinks. On Unix the
@@ -1617,6 +1804,9 @@ fn evict_render(path: &str, report: &wyrd_core::policy::EvictReport) -> String {
 fn cache(
     drive_dir: PathBuf,
     action: CacheAction,
+    resolution: &RelayResolution,
+    config: Option<&LoadedConfig>,
+    credential_provenance: &CredentialProvenance,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
@@ -1652,9 +1842,45 @@ fn cache(
                 quota: budgets.retained_bytes_quota,
             };
             print!("{}", cache_policy_render(&census, &accounting, &budgets));
+            print!(
+                "{}",
+                config_section_render(resolution, config, credential_provenance)
+            );
             Ok(())
         }
     }
+}
+
+/// The effective deployment configuration behind a `cache policy`
+/// report: which file was read (or that none was), where the relay
+/// list came from, and which surface each credential path came
+/// from — so the operator answers "what is this drive actually
+/// configured with" without reading the file. Pure over the
+/// resolved values, next to its only consumer.
+fn config_section_render(
+    resolution: &RelayResolution,
+    config: Option<&LoadedConfig>,
+    credential_provenance: &CredentialProvenance,
+) -> String {
+    let mut out = String::from("configuration:\n");
+    match config {
+        Some(loaded) => out.push_str(&format!("  file: {}\n", loaded.path.display())),
+        None => out.push_str("  file: none (no configuration file)\n"),
+    }
+    out.push_str(&format!(
+        "  relays: {} ({})\n",
+        resolution.relays.len(),
+        resolution.source.word(),
+    ));
+    out.push_str(&format!(
+        "  identity_file: {}\n",
+        CredentialProvenance::word(credential_provenance.identity_from_file),
+    ));
+    out.push_str(&format!(
+        "  passphrase_file: {}\n",
+        CredentialProvenance::word(credential_provenance.passphrase_from_file),
+    ));
+    out
 }
 
 /// Empty path addresses the drive root; render it as `/` so the
@@ -2966,19 +3192,25 @@ fn run_outcome_error(report: &SyncRunReport) -> Result<(), CliError> {
 /// Headless sync over the keystore: `status` observes durable state
 /// only (no intake, no send, no seen-log or outbox mutation — the
 /// relay list only labels the mailbox line), `now` runs the mount's
-/// sync machinery without any presentation backend.
+/// sync machinery without any presentation backend. The relay list
+/// arrives resolved (flags replace file, file beats nothing) with
+/// its provenance, so every guard below judges the effective set —
+/// a configured relay satisfies the requirement exactly like a flag.
 fn sync(
     drive_dir: PathBuf,
-    relays: Vec<String>,
+    resolution: RelayResolution,
+    config: Option<&LoadedConfig>,
     action: SyncAction,
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    let config_path = config.map(|c| c.path.as_path());
     match action {
         SyncAction::Status => {
             let engine = Engine::open_keystore(drive_dir, passphrase, identity)?;
-            let status = observe(&engine, relays.len())?;
+            let status = observe(&engine, resolution.relays.len())?;
             print!("{}", sync_status_render(&status));
+            print!("{}", relay_source_line(resolution.source, config_path));
             Ok(())
         }
         SyncAction::Now { offline, serve } => {
@@ -2986,11 +3218,21 @@ fn sync(
             // --relay is contradictory, and silently ignoring the flag
             // would lie about the run. (clap conflicts_with cannot
             // express this: --relay lives on the parent command via
-            // flatten, not on the `now` subcommand.)
-            if offline && !relays.is_empty() {
-                return Err(CliError::Usage(
-                    "--offline cannot be combined with --relay".into(),
-                ));
+            // flatten, not on the `now` subcommand.) A configured
+            // relay list contradicts --offline exactly like a flag —
+            // the refusal names the file so the operator knows which
+            // surface to change.
+            if offline && !resolution.relays.is_empty() {
+                return Err(CliError::Usage(match resolution.source {
+                    RelaySource::File => format!(
+                        "--offline cannot be combined with the relays configured in {}: \
+                         remove them from the file or drop --offline",
+                        config_path
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ),
+                    _ => "--offline cannot be combined with --relay".into(),
+                }));
             }
             // --serve publishes its route inside relay announcements,
             // so --offline (no relay, no send) would serve content
@@ -3005,14 +3247,29 @@ fn sync(
             // A relay-less run exits 0 with an idle intake, which a
             // cron or systemd unit keying on exit status cannot
             // distinguish from a converged sync. Refuse it before
-            // touching the keystore unless --offline opts in.
-            if relays.is_empty() && !offline {
-                return Err(CliError::Usage(
-                    "sync now needs at least one --relay, or --offline for a relay-less local run"
+            // touching the keystore unless --offline opts in. A file
+            // that declares no relays is still a consulted file, so
+            // the refusal names it — an empty-means-idle semantic
+            // that quietly became empty-means-offline would turn
+            // every misconfigured service into a silent no-op.
+            if resolution.relays.is_empty() && !offline {
+                return Err(CliError::Usage(match resolution.source {
+                    RelaySource::File => format!(
+                        "sync now needs at least one --relay (no relays in {}), \
+                         or --offline for a relay-less local run",
+                        config_path
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ),
+                    _ => "sync now needs at least one --relay, or --offline for a relay-less local run"
                         .into(),
-                ));
+                }));
             }
-            sync_now(drive_dir, relays, serve, passphrase, identity)
+            let RelayResolution { relays, source } = resolution;
+            let provenance = relay_source_line(source, config_path);
+            sync_now(drive_dir, relays, serve, passphrase, identity)?;
+            print!("{provenance}");
+            Ok(())
         }
     }
 }
@@ -3216,7 +3473,8 @@ fn shutdown_headless_serving(
 /// lifecycle prose was written for.
 fn vault(
     drive_dir: PathBuf,
-    relays: Vec<String>,
+    resolution: RelayResolution,
+    config: Option<&LoadedConfig>,
     log_file: Option<PathBuf>,
     passphrase: &str,
     identity: DeviceIdentitySecret,
@@ -3225,13 +3483,10 @@ fn vault(
     // converges: refuse it the way `sync now` refuses a bare
     // relay-less run. Unlike `sync now` there is no `--offline`
     // escape — an offline vault is a process that idles forever, not
-    // a run with a verdict.
-    if relays.is_empty() {
-        return Err(CliError::Usage(
-            "vault needs at least one --relay: a relay-less vault serves nothing peers can discover"
-                .into(),
-        ));
-    }
+    // a run with a verdict. The refusal judges the effective set, so
+    // a configured relay satisfies it exactly like a flag.
+    check_vault_relays(&resolution, config.map(|c| c.path.as_path()))?;
+    let relays = resolution.relays;
     // Diagnostics first: stderr always carries the ready line and the
     // failures for the supervisor to capture, plus an appended
     // operator-chosen file under `--log-file` — never a
@@ -4540,6 +4795,7 @@ fn main() {
     }
 }
 
+mod drive_config;
 mod logging;
 mod posture;
 mod probes;

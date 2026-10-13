@@ -27,6 +27,11 @@ nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Drive deployment configuration (`default.toml` in the drive
+# directory): strict TOML parsing for the relay list and credential
+# paths. The file holds no secrets, so this is parse-only — secret
+# material still travels through hardened credential files.
+toml.workspace = true
 # Mount diagnostics: structured events to stderr plus a per-mount file,
 # and a bridge so fuser's log records land in the same record.
 tracing.workspace = true

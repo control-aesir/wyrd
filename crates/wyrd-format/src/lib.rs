@@ -22,6 +22,7 @@ pub mod identity;
 pub mod manifest;
 pub mod membership;
 pub mod mutation;
+pub mod signing;
 pub mod snapshot;
 pub mod store;
 pub mod tree;
@@ -37,6 +38,10 @@ pub use manifest::{ChildManifest, Manifest, ManifestEntry, ManifestError, CHILD_
 pub use membership::{Change, MembershipError, MembershipTransition};
 pub use mutation::{
     mkdir, put, put_strict, remove, rename, rmdir, MutationError, PathError, MAX_PATH_DEPTH,
+};
+pub use signing::{
+    membership_challenge, owner_proof_challenge, snapshot_challenge, SignDomain, CHALLENGE_CONTEXT,
+    PROOF_CONTEXT, SNAPSHOT_CHALLENGE_CONTEXT,
 };
 pub use snapshot::{Snapshot, SnapshotError, RECOVERY_FLAG};
 pub use store::{

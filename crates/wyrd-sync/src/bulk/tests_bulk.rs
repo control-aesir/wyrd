@@ -1178,7 +1178,11 @@ fn capped_walk_pages_dial_hangs_one_per_pass() {
     // fulfills. Dial hangs page one per pass; transfer-phase hangs
     // never mark (only dial evidence trains the memory), so a tail
     // pinned behind stalled transfers waits on the strike/burn
-    // cooldowns instead. Shares are ~2 s, ~1 s, ~0.5 s per pass.
+    // cooldowns instead. Granted shares are ~2 s, ~1 s, ~1 s per
+    // pass: at index 2 the fair division gives the third attempt
+    // the whole remaining ~1 s and the 2/1/0.5 s floor series never
+    // binds — which is exactly why that attempt is Full-bound and
+    // marks.
     let content = b"live tail paged past hangs";
     let relays: Vec<RelayUrl> = (0..3)
         .map(|_| {

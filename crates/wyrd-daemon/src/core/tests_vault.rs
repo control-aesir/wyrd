@@ -420,22 +420,46 @@ fn failed_admission_keeps_pending_for_next_pass() {
     live.wants().register_unowned(chunk).unwrap();
     // Pass 2, read-only drive: intake, drain, and the walk all read
     // fine, but the admission commit fails — the pass must error
-    // and the demand must stand pending, not silently die.
+    // and the demand must stand pending, not silently die. Skipped
+    // where permission bits are advisory (CI runs containerised as
+    // root): the registry-level test above pins the property where
+    // chmod cannot reach. Probed behaviorally, not by uid: a
+    // read-only scratch dir that still accepts creates means the
+    // read-only drive below would not fail either.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let failed = live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert!(
-            failed.is_err(),
-            "a read-only drive fails the admission commit"
-        );
-        assert!(
-            live.wants().peek_pending().contains(&chunk),
-            "failed admission leaves the demand pending for next pass"
-        );
+        fn permissions_enforced() -> bool {
+            let probe = std::env::temp_dir().join(format!(
+                "wyrd-ro-probe-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&probe).unwrap();
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let enforced = std::fs::File::create(probe.join("w")).is_err();
+            let _ = std::fs::remove_dir_all(&probe);
+            enforced
+        }
+        if !permissions_enforced() {
+            eprintln!("skipping read-only section: permission bits are advisory here");
+        } else {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                failed.is_err(),
+                "a read-only drive fails the admission commit"
+            );
+            assert!(
+                live.wants().peek_pending().contains(&chunk),
+                "failed admission leaves the demand pending for next pass"
+            );
+        }
     }
     // Pass 3 (pass 2 off Unix), writable again: clear the claim
     // so the chunk is genuinely unheld, then the standing demand

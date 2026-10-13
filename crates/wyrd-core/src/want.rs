@@ -425,6 +425,29 @@ mod tests {
         assert!(registry.is_admitted(&content(1)));
     }
 
+    /// A failed admission commit leaves pending demand standing for
+    /// the next pass: the error propagates, but nothing retires what
+    /// was never admitted. Deterministic where a filesystem fault
+    /// is not (CI runs as root, for whom read-only directories are
+    /// writable): the closure stands in for the store-class error.
+    #[test]
+    fn failed_admission_keeps_pending_for_retry() {
+        use crate::live::admit_wants;
+
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        let failed: Result<Vec<ContentId>, &'static str> =
+            admit_wants(&registry, 10, &mut |_| Err("store-class failure"));
+        assert!(failed.is_err(), "the commit error propagates");
+        assert_eq!(
+            registry.peek_pending(),
+            vec![content(1)],
+            "un-admitted demand survives the failed pass"
+        );
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+    }
+
     #[test]
     fn overflow_fails_explicitly() {
         let registry = WantRegistry::default();

@@ -191,14 +191,17 @@ fn vault_install_releases_discharge_on_a_drained_mirror() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Installing the role directory also installs retention: a
-/// vault-role device composed the way production compositions
-/// compose it — role step beside serving, never through serving —
-/// admits demand for reachable unheld content with no explicit want
-/// anywhere. This is the test that would have caught an unwired
-/// composition: remove either install and it fails.
+/// The role directory installs beside serving, never through
+/// it: a vault-role device composed the way production
+/// compositions compose it — role step plus serving step, in that
+/// order — admits demand for reachable unheld content with no
+/// explicit want anywhere. This is the test that would have caught
+/// an unwired composition: remove the role install and both legs
+/// below fail. The mirror leg runs the identical composition with
+/// no role file and admits nothing, proving the demand is the
+/// role's doing.
 #[test]
-fn install_serving_wires_vault_retention() {
+fn install_role_dir_wires_vault_retention() {
     use wyrd_core::quarantine::VerificationFailure;
     use wyrd_core::role::{self, Role, RoleState, Transition};
     use wyrd_format::{EntryContent, ObjectKind, ObjectStore, Tree};
@@ -211,6 +214,7 @@ fn install_serving_wires_vault_retention() {
     fn unheld_setup(
         case: &str,
         role: Option<RoleState>,
+        serving: bool,
     ) -> (
         LiveNode<DriveView<MemoryObjectStore, RuntimeMaterialization>>,
         std::path::PathBuf,
@@ -254,16 +258,19 @@ fn install_serving_wires_vault_retention() {
             role::store(&dir, state).unwrap();
         }
         // Production order: the role directory installs beside
-        // serving, never through it.
+        // serving, never through it — and the serving-less leg
+        // below proves the role step alone suffices.
         install_role_dir(&mut live, &dir);
-        install_serving(
-            &mut live,
-            &StubSurface {
-                addr: vec![3u8; 32],
-                barrier: Arc::new(Ready),
-            },
-        )
-        .unwrap();
+        if serving {
+            install_serving(
+                &mut live,
+                &StubSurface {
+                    addr: vec![3u8; 32],
+                    barrier: Arc::new(Ready),
+                },
+            )
+            .unwrap();
+        }
         live.quarantine_queue()
             .submit(VerificationFailure::content_hash_mismatch(
                 chunk,
@@ -275,7 +282,7 @@ fn install_serving_wires_vault_retention() {
     // Control leg: identical composition, no role file. The
     // quarantine drain clears the claim and nothing re-demands it:
     // the fetch plan drops the never-wanted identity from tracking.
-    let (mut control, control_dir, _control_chunk) = unheld_setup("vault-wire-control", None);
+    let (mut control, control_dir, _control_chunk) = unheld_setup("vault-wire-control", None, true);
     let mut mailbox = AcceptingMailbox::default();
     let mut empty = MemoryBulkSource::default();
     let control_report = control.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
@@ -294,6 +301,7 @@ fn install_serving_wires_vault_retention() {
             role: Role::Vault,
             transition: Transition::Settled,
         }),
+        true,
     );
     let vault_report = vault.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
     assert!(
@@ -303,13 +311,32 @@ fn install_serving_wires_vault_retention() {
     assert_eq!(
         vault.wants().waiter_count(&vault_chunk),
         0,
-        "admission releases this pass's vault registrations: no phantom waiter survives"
+        "ownerless demand carries no waiter: nothing to leak"
+    );
+
+    // Serving-less leg: the composition `sync now` without `--serve`
+    // builds — role step, no serving surface. Retention must not
+    // depend on serving existing.
+    let (mut headless, headless_dir, _) = unheld_setup(
+        "vault-wire-headless",
+        Some(RoleState {
+            role: Role::Vault,
+            transition: Transition::Settled,
+        }),
+        false,
+    );
+    let headless_report = headless.sync_once(&mut mailbox, Some(&mut empty)).unwrap();
+    assert!(
+        headless_report.fetched.unfulfilled > 0,
+        "the role step alone suffices: no serving surface required"
     );
 
     drop(control);
     drop(vault);
+    drop(headless);
     std::fs::remove_dir_all(control_dir).unwrap();
     std::fs::remove_dir_all(vault_dir).unwrap();
+    std::fs::remove_dir_all(headless_dir).unwrap();
 }
 
 /// A torn role file degrades the loop without aborting it: the pass
@@ -318,7 +345,7 @@ fn install_serving_wires_vault_retention() {
 /// `role::load`; this pins the loop's half — sync must not stall on
 /// an operator-repairable file.
 #[test]
-fn install_serving_torn_role_file_degrades_without_aborting() {
+fn install_role_dir_torn_role_file_degrades_without_aborting() {
     // Reuse the unheld setup through a local copy: the shared
     // helper lives inside the wiring test above, so this leg
     // rebuilds the same shape with a torn file instead of a role.

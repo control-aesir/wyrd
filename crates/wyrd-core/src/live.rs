@@ -1012,20 +1012,22 @@ where
     /// Under an effective `vault` role every reachable unheld
     /// identity (never explicitly pinned ones — the pin paths own
     /// those, and admitting one here as `Cached` would downgrade the
-    /// promise) becomes a want, paced by the admission cap like any
-    /// other demand. Below vault-effective, or with no role
-    /// directory installed, this costs one `Option` test. A full
-    /// sweep with no new wants covers the durable revision, so a
-    /// converged vault pays nothing per pass until the next commit.
-    /// A torn role file warns and retains as mirror for the pass:
-    /// the loop must not stall sync on an operator-repairable file,
-    /// and nothing prunes under any role, so the degradation is
-    /// availability-only and self-heals on repair. Returns the
-    /// identities this pass newly registered, for release after
-    /// admission.
-    fn register_vault_wants(&mut self) -> Result<Vec<ContentId>, LiveError> {
+    /// promise) becomes ownerless demand through
+    /// [`WantRegistry::register_unowned`]: no waiter exists, so
+    /// re-registering every pass is free, pending persists until
+    /// admission with nothing to leak, and an admitted fetch
+    /// outlives waiters by the standing rule. Admission commits
+    /// Cached through the existing path and the fetch plan needs no
+    /// role knowledge, so no new fact kind exists. Skipped below
+    /// vault-effective (zero cost) and while a full sweep already
+    /// covers the durable revision. A torn role file warns and
+    /// retains as mirror for the pass: the loop must not stall sync
+    /// on an operator-repairable file, and nothing prunes under any
+    /// role, so the degradation is availability-only and self-heals
+    /// on repair.
+    fn register_vault_wants(&mut self) -> Result<(), LiveError> {
         let Some(dir) = self.role_dir.clone() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let role = match crate::role::load(&dir) {
             Ok(state) => state.effective(),
@@ -1035,21 +1037,16 @@ where
                     error = %error,
                     "unreadable role file: retaining as mirror until repaired"
                 );
-                return Ok(Vec::new());
+                return Ok(());
             }
         };
         if role != crate::role::Role::Vault {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let revision = self.engine.current();
         if self.vault_swept_revision == Some(revision) {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        // Never re-register in-flight identities: registration
-        // coalesces but still gains a waiter per call, so pending or
-        // admitted ids are skipped, not re-registered.
-        let pending: std::collections::BTreeSet<ContentId> =
-            self.wants.peek_pending().into_iter().collect();
         let projection = self.projection.read().map_err(|_| LiveError::Lock)?;
         // A broken namespace walk is a local data-path failure: map
         // it onto the store class (tight abort budget, like the
@@ -1066,26 +1063,24 @@ where
             ))
         })?;
         drop(projection);
-        let mut registered = Vec::new();
         for id in candidates {
-            if pending.contains(&id) || self.wants.is_admitted(&id) {
-                continue;
-            }
-            match self.wants.register(id) {
-                Ok(()) => registered.push(id),
+            match self.wants.register_unowned(id) {
+                Ok(_) => {}
                 // Past the bound the leftover waits for the next
-                // pass, exactly like backend demand past the bound.
-                Err(crate::want::WantError::Saturated) => return Ok(registered),
+                // pass, exactly like backend demand past the bound —
+                // and the sweep stays unrecorded, so the next pass
+                // re-walks rather than believing it covered them.
+                Err(crate::want::WantError::Saturated) => return Ok(()),
                 // Only the poisoned lock remains (TimedOut belongs
-                // to the waiting path; register never returns it):
-                // fail closed.
+                // to the waiting path; registration never returns
+                // it): fail closed.
                 Err(_) => return Err(LiveError::Lock),
             }
         }
         if completed {
             self.vault_swept_revision = Some(revision);
         }
-        Ok(registered)
+        Ok(())
     }
 
     /// Install this drive's retrieval route for announcements: the
@@ -1485,20 +1480,22 @@ where
         // the durable `Cached` policy.
         // Vault retention (24-materialization-roles): a vault-role
         // device wants every reachable unheld identity, paced by the
-        // admission cap. Registration coalesces with backend demand;
+        // admission cap. Registration is ownerless and coalescing;
         // admission commits Cached through the existing path and the
         // fetch plan needs no role knowledge, so no new fact kind
         // exists. Skipped below vault-effective (zero cost) and while
-        // a full sweep already covers the durable revision. The
-        // returned ids are this pass's registrations: released after
-        // admission below, so the loop holds no phantom waiter.
-        let vault_registered = self.register_vault_wants()?;
+        // a full sweep already covers the durable revision.
+        self.register_vault_wants()?;
         let mut admission = if self.wants.peek_pending().is_empty() {
             None
         } else {
             Some(self.engine.runtime_state()?)
         };
-        let admit_result = admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
+        // Ownerless demand needs no release: pending persists until
+        // admission on failure, and an admitted fetch outlives
+        // waiters by the standing rule — so no arm can leak a
+        // waiter, and a failed pass retries its pending next pass.
+        admit_wants(&self.wants, self.budgets.max_admit_per_pass, &mut |want| {
             let Some(snapshot) = admission.as_mut() else {
                 // Unreachable: the gate above took the snapshot exactly
                 // when pending was non-empty, and nothing else touches
@@ -1507,30 +1504,7 @@ where
             };
             self.engine
                 .set_materialization_from(snapshot, want, MaterializationState::Cached)
-        });
-        match &admit_result {
-            Ok(_) => {
-                // Admission marked them admitted (an admitted fetch
-                // keeps its in-flight mark and continues), so the
-                // loop must not keep a waiter on them.
-                for id in &vault_registered {
-                    self.wants.release(id);
-                }
-            }
-            Err(_) => {
-                // Admission failed partway: admitted ids keep their
-                // mark, but still-pending ones must not keep a waiter
-                // nobody owns — or the leak detector reports a leak
-                // and later sweeps skip them outright. The next pass
-                // re-registers what is still outstanding.
-                for id in &vault_registered {
-                    if !self.wants.is_admitted(id) {
-                        self.wants.release(id);
-                    }
-                }
-            }
-        }
-        admit_result?;
+        })?;
         // Local scrub, walk half (child 13): re-stat locally
         // claimed identities against the store from the rotating
         // cursor, submitting misses for the drain below. The

@@ -135,6 +135,28 @@ impl WantRegistry {
         Ok(())
     }
 
+    /// Register loop-originated demand with no owning waiter: the
+    /// loop itself is the demander, and it re-registers every pass
+    /// until admission, so a waiter count would be a leak by
+    /// construction. Returns whether the identity is newly pending
+    /// (false when already outstanding). Like [`WantRegistry::register`],
+    /// bounded and explicit: past the bound the demand is refused,
+    /// never dropped silently. Pending un-owned demand persists
+    /// until admission — with no waiter to leave, nothing retires
+    /// it — and an admitted fetch outlives waiters by the standing
+    /// rule, so ownerless demand is as durable as waited demand.
+    pub fn register_unowned(&self, content: ContentId) -> Result<bool, WantError> {
+        let mut state = self.state.lock().map_err(|_| WantError::Lock)?;
+        if state.pending.contains(&content) || state.admitted.contains(&content) {
+            return Ok(false);
+        }
+        if state.saturated(self.limit) {
+            return Err(WantError::Saturated);
+        }
+        state.pending.insert(content);
+        Ok(true)
+    }
+
     /// Retire one waiter: called when the waiter observed success or
     /// gave up. Poisoned locks skip the cleanup instead of panicking a
     /// waiter thread (fail closed: the leaked slot is bounded by the
@@ -349,6 +371,23 @@ mod tests {
         registry.release(&content(1));
         // Releasing an unknown identity is a no-op.
         registry.release(&content(9));
+    }
+
+    /// Ownerless demand carries no waiter: re-registering is free,
+    /// saturation is explicit, and pending persists until admission
+    /// with nothing to leak.
+    #[test]
+    fn unowned_registration_has_no_waiter() {
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        assert!(!registry.register_unowned(content(1)).unwrap());
+        assert_eq!(registry.waiter_count(&content(1)), 0);
+        assert_eq!(registry.peek_pending(), vec![content(1)]);
+        // Admission still moves it like any demand; the admitted
+        // fetch outlives waiters by the standing rule.
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+        assert_eq!(registry.waiter_count(&content(1)), 0);
     }
 
     #[test]

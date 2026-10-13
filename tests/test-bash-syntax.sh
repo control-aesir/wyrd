@@ -48,11 +48,21 @@ echo "  PASS: broken file rejected after clean ones"
 
 # The hook wiring itself is pinned too: the entry in devenv.nix
 # must point at the sweep wrapper, not bare `bash -n` (which parses
-# only its first file argument). Without this, the fixed regression
-# could silently return via a one-line hook edit.
-grep -q 'entry = "bash tests/check-bash-syntax.sh"' "$SCRIPT_DIR/../devenv.nix" \
+# only its first file argument), and filenames must actually be
+# passed (with pass_filenames off, the sweep iterates zero times
+# and exits 0 having checked nothing). Both greps run against the
+# bash-syntax block only — other hooks share these lines, so an
+# unscoped match would stay green while this hook regressed.
+# Without this pin, the fixed regression could silently return via
+# a one-line hook edit.
+HOOK_BLOCK="$(sed -n '/bash-syntax = {/,/};/p' "$SCRIPT_DIR/../devenv.nix")"
+printf '%s\n' "$HOOK_BLOCK" | grep -q 'entry = "bash tests/check-bash-syntax.sh"' \
   || { echo "FAIL: bash-syntax hook entry does not point at the sweep wrapper" >&2; exit 1; }
 PASS=$((PASS + 1))
 echo "  PASS: hook entry points at the sweep wrapper"
+printf '%s\n' "$HOOK_BLOCK" | grep -q 'pass_filenames = true' \
+  || { echo "FAIL: bash-syntax hook does not pass filenames" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: hook passes filenames"
 
 echo "bash-syntax: $PASS checks passed"

@@ -89,13 +89,19 @@ echo "  PASS: explicit bypass warns and proceeds"
 if command -v flock >/dev/null; then
   export WYRD_E2E_TOKEN="abc"
   export WYRD_E2E_LOCK="$TMP/guard.lock"
-  # The holder must exit by itself (wait), never by kill: killing
-  # the flock process orphans its `sleep` child, which inherits the
-  # locked fd and keeps the lock held — the "free" case below would
-  # then see a held lock and fail deterministically on Linux.
-  flock "$WYRD_E2E_LOCK" sleep 5 & HOLDER=$!
+  # Deterministic, no background job: hold the lock on this shell's
+  # own fd (mirroring the runner at nix/microvm/run-microvm.sh) so
+  # no scheduling barrier is needed — the guard's probe opens its
+  # own file description, which conflicts with fd 9 even in the same
+  # process. Closing fd 9 releases the lock outright: no sleep, no
+  # kill, no orphaned fd, and no `wait` status for set -e to trip
+  # on. (Two earlier forms failed on Linux: kill orphaned a sleep
+  # holding an inherited locked fd; a background holder raced the
+  # probe's open.)
+  exec 9>"$WYRD_E2E_LOCK"
+  flock -n 9 || { echo "FAIL: cannot hold $WYRD_E2E_LOCK" >&2; exit 1; }
   run_guard 0 "held lock accepted" "WYRD_E2E_TOKEN=abc"
-  wait "$HOLDER"
+  exec 9>&-
   run_guard 1 "free lock refused" "WYRD_E2E_TOKEN=abc"
   unset WYRD_E2E_LOCK
 else

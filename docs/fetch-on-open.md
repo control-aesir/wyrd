@@ -197,17 +197,23 @@ Decided properties:
    the truth; the daemon merges them at publish and the view exposes
    the result. FUSE never mutates materialization state, so
    "FUSE says Fetching while engine says Cached" cannot arise.
- 8. **Each pass attempts every eligible provider the walk reaches.**
-    A
+ 8. **Each pass attempts at most three eligible providers, freshness-ordered.**
+   A
    representation may name several providers (a dead route beside a
-   live one after a serving restart). Under a pass budget each
-   remaining candidate gets a fair share of the time left, floored so
+   live one after a serving restart). The walk orders candidates
+   from the source's provider memory (failed routes sink, order
+   stable within each tier) and attempts the first three
+   (`FETCH_WALK_CAP` in `bulk.rs`, retry policy). Under a pass budget each
+   attempted candidate gets a fair share of the time left, floored so
    an early slow-but-live candidate gets a usable attempt. No
    candidate takes more than half of what's left, so a dead-first
-   provider cannot spend the whole slice — but tails shrink
-   geometrically, so with several hanging candidates ahead a late
-   live route can get an unusably small slice, and a spent walk
-   leaves the remaining candidates unattempted until the next pass.
+   provider cannot spend the whole slice. Candidates past the cap
+   are not attempted this pass: they record nothing (no strike, no
+   burn) and retry next pass by republication — fault-failing heads
+   mark and sink, so consecutive passes page through a failing
+   tail. The accepted limit is a tail pinned behind K or more
+   persistently stalled transfers (transfer-phase hangs never mark);
+   it waits on the representation's strike/burn cooldowns.
    Candidate lists are
    short in practice (bounded by the distinct recorded providers for
    one address), so the walk reaches the live route. Two bounds
@@ -329,8 +335,8 @@ what retries:
   `Classification::Pending(Pendency::UnknownParent)`,
   and the stall heals cleanly once the bytes arrive).
 - **File content unavailable.** Chunks whose representations name no
-  reachable provider are absence at the object level: the fetch walk
-  tries every candidate the walk reaches (property 8), genuine
+   reachable provider are absence at the object level: the fetch walk
+   tries the first three freshness-ordered candidates each pass (property 8), genuine
   absence returns `Ok(None)`, and the waiter still fails bounded
   with `EIO` — absence is not an error in the transport, but it is a
   failed open at the boundary. Corrupt or unreachable

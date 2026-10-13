@@ -200,9 +200,10 @@ struct ProviderMark {
 
 /// Order one walk's candidates from the provider memory: marked
 /// providers sink behind unmarked ones, publication order stable
-/// within each tier, nobody dropped. The walk still tries every
-/// candidate — sinking only spends the dead route's dial later, so a
-/// live alternate is reached before the tail burns budget. Expired
+/// within each tier, nobody dropped. The walk attempts the first
+/// [`FETCH_WALK_CAP`] of this order per pass — sinking spends a
+/// dead route's dial from the tail's attempts instead of the head's,
+/// so a live alternate is reached before the cap closes. Expired
 /// marks prune here, so the map holds only live evidence. Pure over
 /// the map so tests pin the tiers without a network; the live walk
 /// passes its own memory with the current instant.
@@ -275,23 +276,28 @@ fn clear_provider_mark(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &
 }
 
 /// One candidate's share of the pass budget: the fair division of the
-/// time left across the candidates still unattempted, floored so an
-/// early-listed slow-but-live provider gets a usable attempt instead
-/// of a guaranteed expiry. The floor never exceeds half the remaining
+/// time left across the candidates the walk will still attempt,
+/// floored so an early-listed slow-but-live provider gets a usable
+/// attempt instead of a guaranteed expiry. The floor never exceeds half the remaining
 /// budget (and never the dial bound): no candidate takes more than
 /// half of what's left, so a dead-first provider cannot spend the
-/// whole slice. What it does not promise is a usable share for every
-/// candidate: tails shrink geometrically, so with several hanging
-/// candidates ahead a late live route can get an unusably small
-/// slice. Candidate lists are short in practice — bounded by the
+/// whole slice. The division counts only candidates inside the
+/// walk bound ([`FETCH_WALK_CAP`]): shares are never reserved for
+/// candidates this pass will not attempt. What it does not promise
+/// is a usable share for every listed candidate: only the first K
+/// are attempted per pass, so a tail past the cap rolls to the next
+/// pass — fault-failing heads mark and sink, so the walk pages
+/// through failing and dial-hung tails across passes, while
+/// persistently stalled transfer-phase heads never mark and pin
+/// the tail until they fault, clear, or the representation's
+/// strike/burn cooldowns trip (see [`FETCH_WALK_CAP`]).
+/// Candidate lists are short in practice — bounded by the
 /// distinct recorded providers for one address — so the walk reaches
-/// the live route; a deep hanging tail would starve, and fixing that
-/// needs route ordering, which belongs to retry-policy work, not to
-/// this division. The floor draws from the shared phase budget: at
+/// the live route; the floor draws from the shared phase budget: at
 /// N>=3 the first provider can take up to half the phase's remaining
 /// budget where the bare division gave it remaining/N, so intra-item
 /// fairness trades against inter-item fairness in the same change.
-/// The last candidate always gets everything left; a spent budget
+/// The last attempted candidate always gets everything left; a spent budget
 /// shares nothing (the caller stops the walk on a zero share rather
 /// than attempting).
 fn candidate_share(
@@ -353,6 +359,27 @@ const FETCH_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// for a slow-but-moving transfer; oversize and verified-invalid still
 /// short-circuit before any bytes buffer.
 const FETCH_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How many ordered candidates one pass attempts at most: the head
+/// plus two fallbacks (retry policy: the walk bound). Judgment, not
+/// measurement: three bounds the per-representation per-pass dial
+/// cost while today's short lists still fit inside the cap, so
+/// behavior changes only when lists grow past it. Fault-failing
+/// heads mark and sink, so across passes the walk pages through a
+/// failing tail — capped candidates are deferred, never dropped —
+/// and un-attempted candidates record nothing (no strike, no burn),
+/// retrying next pass by republication. Paging covers dial-phase
+/// hangs too: the K-th attempted head always holds the full
+/// remaining share, so its dial expiry classifies as fault evidence
+/// (like an uncapped walk's last candidate) and marks, sinking one
+/// hung head per pass. Transfer-phase hangs never mark — only dial
+/// evidence trains the memory — so K or more persistently stalled
+/// transfers pin a live tail behind them until they fault, clear,
+/// or the representation's strike/burn cooldowns trip (the pinned
+/// passes still strike-cool: the last attempted expiry reads as
+/// fault). Revisit when lists grow past three live routes or the
+/// forensics show pinned tails.
+const FETCH_WALK_CAP: usize = 3;
 
 /// Dial one provider with a deadline: the timeout above is the live
 /// value; the parameter exists so tests can prove boundedness fast
@@ -804,17 +831,21 @@ impl IrohBulkSource {
         }
     }
 
-    /// Fetch a representation by trying each recorded provider,
-    /// freshness-ordered: providers with a live failure mark sink
-    /// behind unmarked ones ([`order_candidates`]), publication order
-    /// stable within each tier. Absence and transport failure fall
-    /// through to the next candidate; oversize is terminal because
-    /// every provider serves the same immutable bytes, so the size is
-    /// a property of the representation, not of the route. With no
-    /// provider serving it, the last transport error is returned; no
-    /// candidates at all is absence; candidates with no completed
-    /// attempt (a budget spent before anything could be asked) is a
-    /// deadline, never a fabricated absence.
+    /// Fetch a representation by trying at most the first
+    /// [`FETCH_WALK_CAP`] freshness-ordered recorded providers:
+    /// providers with a live failure mark sink behind unmarked ones
+    /// ([`order_candidates`]), publication order stable within each
+    /// tier. Absence and transport failure fall through to the next
+    /// candidate; oversize is terminal because every provider serves
+    /// the same immutable bytes, so the size is a property of the
+    /// representation, not of the route. With no provider serving it,
+    /// the last transport error is returned; no candidates at all is
+    /// absence; candidates with no completed attempt (a budget spent
+    /// before anything could be asked) is a deadline, never a
+    /// fabricated absence. Candidates past the cap are not attempted
+    /// this pass: they record nothing — no strike, no burn — and
+    /// retry next pass by republication, paged forward by the marks
+    /// the attempted heads lay.
     ///
     /// Ordering moves which candidate holds the last (usually
     /// full-share) slot, so on total failure the surfaced error may
@@ -860,10 +891,14 @@ impl IrohBulkSource {
             std::time::Instant::now(),
         );
         let total = ordered.len();
-        for (index, blob) in ordered.iter().enumerate() {
+        // The walk bound: at most the first K ordered candidates
+        // per pass. The fair division counts only this reach, so no
+        // share is reserved for candidates the pass will not ask.
+        let reach = total.min(FETCH_WALK_CAP);
+        for (index, blob) in ordered.iter().take(reach).enumerate() {
             if let Some(deadline) = budget {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let share = candidate_share(remaining, index, total);
+                let share = candidate_share(remaining, index, reach);
                 if share.is_zero() {
                     // The budget is spent to ~1ns: stop the walk with no
                     // attempt and no strike. Attempting on a zero share
@@ -937,7 +972,8 @@ impl IrohBulkSource {
     /// bytes. With none serving, the last transport error returns (or
     /// absence when there were no candidates). Test-only: production
     /// goes through [`IrohBulkSource::fetch_candidates`], which
-    /// fair-shares the pass budget across the same loop.
+    /// freshness-orders the same loop, fair-shares the pass budget
+    /// across it, and attempts at most [`FETCH_WALK_CAP`].
     #[cfg(test)]
     fn fetch_candidates_with<F>(
         candidates: &[IrohBlobRef],

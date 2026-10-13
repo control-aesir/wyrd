@@ -924,15 +924,18 @@ fn split_transfer_timeout_records_phase_and_preserves_slice() {
 }
 
 #[test]
-fn budgeted_walk_reaches_the_live_last_candidate() {
+fn capped_walk_pages_through_dead_heads_across_passes() {
     use iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Seven dead providers (unroutable: no addresses, no lookup —
     // dialing fails fast without packets) in front of one live
-    // one, under a generous pass budget. Fulfillment through the
-    // last candidate proves the floored walk attempts every
-    // candidate instead of stalling behind the dead-first order;
+    // one, under a generous pass budget. The walk cap attempts the
+    // first three ordered candidates per pass: pass one fails the
+    // head three (completed dial failures — fault evidence, so they
+    // mark and sink), pass two fails the next three from the sunk
+    // order, pass three reaches the live tail. Fulfillment through
+    // paging proves capped candidates are deferred, never dropped;
     // the floor math itself (who gets how much) is pinned by the
     // candidate_share test, so this test needs no timing control —
     // the dead fail fast and the live serves fast.
@@ -977,9 +980,39 @@ fn budgeted_walk_reaches_the_live_last_candidate() {
     source.set_attempt_deadline(Some(
         std::time::Instant::now() + std::time::Duration::from_secs(30),
     ));
+    // Pass one: the head three fail fast as transport errors —
+    // instant dial failures complete their observation even under
+    // a subdivided share — and the walk stops at the cap.
+    let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        matches!(error, BulkError::Transport(_)),
+        "completed dial failures stay fault evidence: {error:?}"
+    );
+    assert_eq!(
+        source.fetch_stats().attempts,
+        3,
+        "pass one attempts the cap, not the list"
+    );
+    // Pass two: the marked heads sink, so the next three unmarked
+    // dead providers fail from the re-derived order.
+    let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        matches!(error, BulkError::Transport(_)),
+        "pass two fails the next three: {error:?}"
+    );
+    assert_eq!(source.fetch_stats().attempts, 6);
+    // Pass three: six sunk heads leave the seventh dead provider
+    // plus the live tail inside the cap — fulfillment through
+    // paging, eight attempts total.
     assert_eq!(
         source.fetch_transport(&root, usize::MAX).unwrap(),
         Some(content.to_vec())
+    );
+    let stats = source.fetch_stats();
+    assert_eq!(
+        (stats.attempts, stats.fulfilled),
+        (8, 1),
+        "three capped passes page through seven dead heads to the live tail"
     );
     source.set_attempt_deadline(None);
 
@@ -995,17 +1028,19 @@ fn budgeted_walk_reaches_live_behind_hanging_candidates() {
     use iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
-    // Three hanging providers (live-silent relays: each consumes
+    // Two hanging providers (live-silent relays: each consumes
     // its whole share) in front of one live one, under a 10 s
-    // pass budget. The floored shares are 5 s, 2.5 s, 1.25 s, so
-    // the live route gets ~1.25 s — plenty for a loopback serve —
-    // and the walk fulfills instead of burning the budget on the
-    // first hang. On the pre-floor code the first hang spends the
-    // whole remaining slice and the live route is never attempted.
-    // This pins the realistic shape (short lists); a deep hanging
-    // tail still shrinks geometrically — see `candidate_share`.
+    // pass budget. The three fit inside the walk cap, so one pass
+    // tries them all: the floored shares are 5 s and 2.5 s, the
+    // live route gets the remaining ~2.5 s — plenty for a loopback
+    // serve — and the walk fulfills instead of burning the budget
+    // on the first hang. On the pre-floor code the first hang
+    // spends the whole remaining slice and the live route is never
+    // attempted. This pins the realistic shape (short lists); a
+    // third hanging head would close the cap over the live route —
+    // see `capped_walk_pages_dial_hangs_one_per_pass`.
     let content = b"walk reaches live behind hangs";
-    let relays: Vec<RelayUrl> = (0..3)
+    let relays: Vec<RelayUrl> = (0..2)
         .map(|_| {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -1061,6 +1096,185 @@ fn budgeted_walk_reaches_live_behind_hanging_candidates() {
     );
     source.set_attempt_deadline(None);
 
+    runtime.block_on(async {
+        router.shutdown().await.unwrap();
+        server.close().await;
+    });
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn capped_walk_leaves_tail_unmarked_and_unattempted() {
+    use iroh::{endpoint::presets, Endpoint};
+
+    // Five routeless providers, no pass budget: the walk attempts
+    // the first three and stops at the cap. The attempted three
+    // fail fast as transport errors — completed dial observations
+    // — and lay marks; the capped tail records nothing (no
+    // attempt, no mark, hence no strike or burn evidence upstream)
+    // and retries next pass by republication.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = runtime
+        .block_on(async {
+            Endpoint::builder(presets::N0DisableRelay)
+                .clear_address_lookup()
+                .bind()
+                .await
+        })
+        .unwrap();
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime);
+    let refs: Vec<IrohBlobRef> = (0xE0..0xE5).map(dead_ref).collect();
+    let root = BaoRoot::from_bytes([0xAA; 32]);
+    for blob in &refs {
+        source.publish_transport(blob.clone());
+    }
+    let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        matches!(error, BulkError::Transport(_)),
+        "instant dial failures stay transport errors: {error:?}"
+    );
+    assert_eq!(
+        source.fetch_stats().attempts,
+        3,
+        "the walk stops at the cap, not at the list end"
+    );
+    for blob in refs.iter().take(3) {
+        assert!(
+            source.provider_mark(blob.provider.id.as_bytes()).is_some(),
+            "attempted heads lay marks"
+        );
+    }
+    for blob in refs.iter().skip(3) {
+        assert!(
+            source.provider_mark(blob.provider.id.as_bytes()).is_none(),
+            "the capped tail records nothing"
+        );
+    }
+    source.shutdown(std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn capped_walk_pages_dial_hangs_one_per_pass() {
+    use iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
+    use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
+
+    // Three hanging providers (live-silent relays: each consumes
+    // its whole share) in front of one live one, under a 4 s pass
+    // budget. Pass one closes the cap over the three hangs — the
+    // live tail is never attempted. The first two expire as
+    // subdivided Deadlines (budget evidence, never marked); the
+    // third holds the full remaining share, so its dial expiry
+    // classifies as fault evidence exactly like an uncapped walk's
+    // last candidate and marks. Pass two therefore meets the two
+    // unmarked hangs sunk past... the marked third sinks behind
+    // the live tail, the walk tries hang, hang, live, and
+    // fulfills. Dial hangs page one per pass; transfer-phase hangs
+    // never mark (only dial evidence trains the memory), so a tail
+    // pinned behind stalled transfers waits on the strike/burn
+    // cooldowns instead. Shares are ~2 s, ~1 s, ~0.5 s per pass.
+    let content = b"live tail paged past hangs";
+    let relays: Vec<RelayUrl> = (0..3)
+        .map(|_| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::mem::forget(listener);
+            format!("https://127.0.0.1:{port}").parse().unwrap()
+        })
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (server, client, router, hash) = runtime.block_on(async {
+        let server = Endpoint::builder(presets::N0DisableRelay)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        let store = MemStore::new();
+        let blobs = BlobsProtocol::new(&store, None);
+        let router = Router::builder(server.clone())
+            .accept(iroh_blobs::ALPN, blobs)
+            .spawn();
+        let tag = store.add_slice(content).await.unwrap();
+        let client = Endpoint::builder(presets::N0)
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        (server, client, router, tag.hash)
+    });
+    let runtime = Arc::new(runtime);
+    let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
+    let root = BaoRoot::from_bytes(*hash.as_bytes());
+    let mut hangs = Vec::new();
+    for (i, relay) in relays.into_iter().enumerate() {
+        let blob = IrohBlobRef {
+            provider: EndpointAddr::new(
+                iroh::SecretKey::from_bytes(&[0xEA + i as u8; 32]).public(),
+            )
+            .with_relay_url(relay),
+            hash: *hash.as_bytes(),
+        };
+        source.publish_transport(blob.clone());
+        hangs.push(blob);
+    }
+    source.publish_transport(IrohBlobRef {
+        provider: direct_addr(&server),
+        hash: *hash.as_bytes(),
+    });
+    source.set_attempt_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(4),
+    ));
+    // Pass one: the cap closes over the three hangs. The first two
+    // expire as subdivided Deadlines; the third holds the full
+    // remaining share, so its dial timeout reads as fault evidence.
+    let error = source.fetch_transport(&root, usize::MAX).unwrap_err();
+    assert!(
+        matches!(&error, BulkError::Transport(message) if message == "provider dial timed out"),
+        "the K-th hung head classifies like a last candidate, got {error:?}"
+    );
+    let stats = source.fetch_stats();
+    assert_eq!(
+        (stats.attempts, stats.fulfilled, stats.dial_timeouts),
+        (3, 0, 3),
+        "three hung dials counted by phase, live tail never attempted"
+    );
+    assert!(
+        source
+            .provider_mark(hangs[0].provider.id.as_bytes())
+            .is_none()
+            && source
+                .provider_mark(hangs[1].provider.id.as_bytes())
+                .is_none(),
+        "sliced expiries never mark"
+    );
+    assert!(
+        source
+            .provider_mark(hangs[2].provider.id.as_bytes())
+            .is_some(),
+        "the full-share K-th head marks and sinks"
+    );
+    // Pass two: the marked third hang sinks behind the live tail,
+    // so the cap covers hang, hang, live — and fulfills.
+    source.set_attempt_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(4),
+    ));
+    assert_eq!(
+        source.fetch_transport(&root, usize::MAX).unwrap(),
+        Some(content.to_vec())
+    );
+    let stats = source.fetch_stats();
+    assert_eq!(
+        (stats.attempts, stats.fulfilled),
+        (6, 1),
+        "dial hangs page one per pass to the live tail"
+    );
+    source.set_attempt_deadline(None);
     runtime.block_on(async {
         router.shutdown().await.unwrap();
         server.close().await;

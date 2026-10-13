@@ -34,6 +34,19 @@ version say exactly what changed.
   serving endpoint over the same vault (fetch-d shape, 0.8 s, no Phase-12 gate);
   and page-check drift/copy failures now print the slot's live copy and rules
   inline instead of an opaque slot id.
+- Bounded candidate walk (`docs/retry-policy.md`, walk-bound item of
+  `nostr:nevent1qqst96hdcjv8y9dj2e87rfesxaxn8lf07cxym2nkck7h4wtjgy3hzjqpz9mhxue69uhkwunpwdczuap49eehggnzphy`):
+  each pass attempts at most the first three freshness-ordered
+  providers (`FETCH_WALK_CAP`), so a long candidate tail can no
+  longer spend the pass's whole dial cost up front. Fault-failing
+  heads mark and sink, so consecutive passes page through a failing
+  tail (dial hangs page one per pass through the K-th head's
+  full-share expiry); un-attempted candidates record nothing — no
+  strike, no burn — and retry next pass by republication. The
+  accepted limit is a live tail pinned behind three or more
+  persistently stalled transfers, which waits on the
+  representation's strike/burn cooldowns. Property 8 in
+  `docs/fetch-on-open.md` now states the bounded walk.
 - Bounded incremental admission catch-up (`docs/resource-limits.md`,
   child 1 of `nostr:nevent1qqsqufuj24ttsndlug9usn904axmy4m2sslgs2hk3u9n592sy0hlvdspz9mhxue69uhkwunpwdczuap49eehg4rsmla`):
   admitting a device no longer commits one batch proportional to

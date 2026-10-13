@@ -86,6 +86,16 @@ version say exactly what changed.
   M obligations` or `catch-up already complete; 0 obligations`;
   `AdmitOutcome` carries `obligations_queued` and `batches` for the
   fresh path.
+- Device-local materialization roles (`wyrd role set|status`,
+  `crates/wyrd-core/src/role.rs`): a `mirror`/`vault` posture stored
+  in one `role` file beside the keystore — no fact, no snapshot,
+  nothing any peer can observe. The role is a retention default, not
+  an override: under `vault`, unpinned content is effectively
+  retained and `cache status` reports effective numbers; `evict`
+  under `vault` refuses; narrowing away from `vault` requires
+  `--yes` and keeps vault-effective posture until withdrawal
+  completes. Normative contract in `docs/sync-and-peers.md`
+  (Materialization policy vs peer role).
 - Observation × trust-position matrix (`docs/trust.md`):
   the 18 hidden/observable disclosure classes as normative rows
   over five trust positions (keyless replica, member-hosted

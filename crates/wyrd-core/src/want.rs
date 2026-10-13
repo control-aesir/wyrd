@@ -65,11 +65,20 @@ struct RegistryState {
     /// observes it local ([`WantRegistry::complete_local`]) — the
     /// slow first open makes the next one instant.
     admitted: BTreeSet<ContentId>,
-    /// Waiter count per outstanding identity (keys of `pending` ∪
-    /// `admitted`). When the last waiter of a pending identity
-    /// leaves, the demand dies — nothing fetches for a nobody. An
-    /// admitted fetch outlives its waiters.
+    /// Waiter count per outstanding waiter-carrying identity (a
+    /// subset of `pending` ∪ `admitted`). When the last waiter of a
+    /// pending identity leaves, the demand dies — nothing fetches
+    /// for a nobody — unless the identity is marked [`RegistryState::unowned`].
+    /// An admitted fetch outlives its waiters.
     waiting: BTreeMap<ContentId, usize>,
+    /// Pending identities with no owning waiter (loop-originated
+    /// demand, e.g. vault retention). `release` never retires these:
+    /// a coincident backend waiter timing out must not take loop
+    /// demand down with it. Entries leave on admission
+    /// ([`WantRegistry::mark_admitted`]), so the set holds only
+    /// un-admitted ownerless demand and cannot grow past the
+    /// admission bound.
+    unowned: BTreeSet<ContentId>,
     /// Sticky reopen demand since the last loop sweep: identities a
     /// reader observed terminal, noted for generation rotation.
     /// Unlike `pending`, a note survives its waiter — the waiter
@@ -135,6 +144,29 @@ impl WantRegistry {
         Ok(())
     }
 
+    /// Register loop-originated demand with no owning waiter: the
+    /// loop itself is the demander, and it re-registers every pass
+    /// until admission, so a waiter count would be a leak by
+    /// construction. Returns whether the identity is newly pending
+    /// (false when already outstanding). Like [`WantRegistry::register`],
+    /// bounded and explicit: past the bound the demand is refused,
+    /// never dropped silently. Pending un-owned demand persists
+    /// until admission — with no waiter to leave, nothing retires
+    /// it — and an admitted fetch outlives waiters by the standing
+    /// rule, so ownerless demand is as durable as waited demand.
+    pub fn register_unowned(&self, content: ContentId) -> Result<bool, WantError> {
+        let mut state = self.state.lock().map_err(|_| WantError::Lock)?;
+        if state.pending.contains(&content) || state.admitted.contains(&content) {
+            return Ok(false);
+        }
+        if state.saturated(self.limit) {
+            return Err(WantError::Saturated);
+        }
+        state.pending.insert(content);
+        state.unowned.insert(content);
+        Ok(true)
+    }
+
     /// Retire one waiter: called when the waiter observed success or
     /// gave up. Poisoned locks skip the cleanup instead of panicking a
     /// waiter thread (fail closed: the leaked slot is bounded by the
@@ -152,10 +184,15 @@ impl WantRegistry {
             if *slot.get() == 0 {
                 slot.remove();
                 // An unadmitted demand dies with its waiters — nothing
-                // fetches for a nobody. An admitted fetch keeps its
-                // in-flight mark and continues; the loop retires it
-                // when it lands.
-                state.pending.remove(content);
+                // fetches for a nobody — unless the loop owns it: an
+                // ownerless pending identity has no waiter to leave,
+                // so a coincident backend waiter timing out must not
+                // retire it. An admitted fetch keeps its in-flight
+                // mark and continues; the loop retires it when it
+                // lands.
+                if !state.unowned.contains(content) {
+                    state.pending.remove(content);
+                }
             }
         }
     }
@@ -191,6 +228,7 @@ impl WantRegistry {
             if state.pending.remove(content) {
                 state.admitted.insert(*content);
             }
+            state.unowned.remove(content);
         }
     }
 
@@ -349,6 +387,65 @@ mod tests {
         registry.release(&content(1));
         // Releasing an unknown identity is a no-op.
         registry.release(&content(9));
+    }
+
+    /// Ownerless demand carries no waiter: re-registering is free,
+    /// saturation is explicit, and pending persists until admission
+    /// with nothing to leak.
+    #[test]
+    fn unowned_registration_has_no_waiter() {
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        assert!(!registry.register_unowned(content(1)).unwrap());
+        assert_eq!(registry.waiter_count(&content(1)), 0);
+        assert_eq!(registry.peek_pending(), vec![content(1)]);
+        // Admission still moves it like any demand; the admitted
+        // fetch outlives waiters by the standing rule.
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+        assert_eq!(registry.waiter_count(&content(1)), 0);
+    }
+
+    /// A coincident backend waiter timing out must not take loop
+    /// demand down with it: the ownerless mark, not the waiter
+    /// count, decides whether a pending entry is retir-able.
+    #[test]
+    fn coincident_waiter_timeout_keeps_ownerless_demand() {
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        // A FUSE reader demands the same identity, then times out.
+        registry.register(content(1)).unwrap();
+        assert_eq!(registry.waiter_count(&content(1)), 1);
+        registry.release(&content(1));
+        // The backend waiter is gone, but the loop's demand stands:
+        // still pending, still admittable next pass.
+        assert_eq!(registry.waiter_count(&content(1)), 0);
+        assert_eq!(registry.peek_pending(), vec![content(1)]);
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
+    }
+
+    /// A failed admission commit leaves pending demand standing for
+    /// the next pass: the error propagates, but nothing retires what
+    /// was never admitted. Deterministic where a filesystem fault
+    /// is not (CI runs as root, for whom read-only directories are
+    /// writable): the closure stands in for the store-class error.
+    #[test]
+    fn failed_admission_keeps_pending_for_retry() {
+        use crate::live::admit_wants;
+
+        let registry = WantRegistry::default();
+        assert!(registry.register_unowned(content(1)).unwrap());
+        let failed: Result<Vec<ContentId>, &'static str> =
+            admit_wants(&registry, 10, &mut |_| Err("store-class failure"));
+        assert!(failed.is_err(), "the commit error propagates");
+        assert_eq!(
+            registry.peek_pending(),
+            vec![content(1)],
+            "un-admitted demand survives the failed pass"
+        );
+        assert_eq!(admit_all(&registry), vec![content(1)]);
+        assert!(registry.is_admitted(&content(1)));
     }
 
     #[test]

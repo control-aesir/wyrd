@@ -131,8 +131,17 @@ pub(crate) use store::fsync_dir;
 #[allow(unused_imports)]
 pub(crate) use store::CrashStage;
 pub use store::DurableStore;
-pub(crate) use store::{atomic_write_mode, ensure_owner_only_dir, SECRET_FILE_MODE};
+pub(crate) use store::{ensure_owner_only_dir, SECRET_FILE_MODE};
 pub use store::{probe_lock, LockProbe};
+
+/// Durably create-or-replace one device-local file in a drive
+/// directory: temp claimed at an explicit Unix mode + `fsync` +
+/// rename + directory `fsync`. The same sequencing custody files
+/// use, for operational files (like the materialization-role file)
+/// that live beside them: a crash leaves the previous file or the
+/// new one, never a torn half, and the temp is never world-readable
+/// whatever the process umask.
+pub use store::atomic_write_mode;
 
 use thiserror::Error;
 use wyrd_format::{

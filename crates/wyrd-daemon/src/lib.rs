@@ -23,6 +23,7 @@ pub use core::{
 };
 pub use lifecycle::{LoopError, LoopReturn, Supervisor, Wake, WakeSignal};
 pub use vault::{
-    install_serving, run_vault, shutdown_transport, ServeSurface, TransportDeadlines,
-    TransportShutdown, VaultEvent, VaultLoopEnd, VaultObserver, VaultOutcome, VaultRun,
+    install_role_dir, install_serving, run_vault, shutdown_transport, ServeSurface,
+    TransportDeadlines, TransportShutdown, VaultEvent, VaultLoopEnd, VaultObserver, VaultOutcome,
+    VaultRun,
 };

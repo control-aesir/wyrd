@@ -183,3 +183,132 @@ fn policy_renderers_name_counts_and_quadrants() {
         "policy totals name the subtrees they never walked"
     );
 }
+
+#[test]
+fn role_set_status_roundtrip_survives_reinvocation() {
+    use wyrd_core::role::{self, Role};
+
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    // A fresh device names the mirror default explicitly, never silent.
+    let mut status = vec!["role".into(), drive.clone(), "status".into()];
+    status.extend(creds.clone());
+    command(status).unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Mirror);
+    assert!(!role::is_configured(std::path::Path::new(&drive)));
+    // Widening is immediate and durable — and needs no credentials,
+    // so a role is settable with the keystore unavailable. A second
+    // invocation — the restart equivalent, with no in-memory state
+    // carried over — observes the same role from the file.
+    command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "vault".into(),
+    ])
+    .unwrap();
+    let mut status = vec!["role".into(), drive.clone(), "status".into()];
+    status.extend(creds.clone());
+    command(status).unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Vault);
+    assert_eq!(state.effective(), Role::Vault);
+    drop(temp);
+}
+
+#[test]
+fn role_set_rejects_garbage() {
+    let (temp, _creds) = authored_drive();
+    let drive = drive_of(&temp);
+    let error = command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "archivist".into(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "unknown roles fail as usage errors, got {error:?}"
+    );
+    drop(temp);
+}
+
+#[test]
+fn narrowing_requires_explicit_acknowledgement() {
+    use wyrd_core::role::{self, Role, Transition};
+
+    let (temp, _creds) = authored_drive();
+    let drive = drive_of(&temp);
+    command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "vault".into(),
+    ])
+    .unwrap();
+    // Leaving vault without --yes refuses: stopping being a
+    // provider must be explicit.
+    let error = command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "mirror".into(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "unacknowledged narrowing must refuse, got {error:?}"
+    );
+    // Acknowledged narrowing records intent but keeps vault
+    // effective: acknowledgement is not observability.
+    command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "mirror".into(),
+        "--yes".into(),
+    ])
+    .unwrap();
+    let state = role::load(std::path::Path::new(&drive)).unwrap();
+    assert_eq!(state.role, Role::Mirror);
+    assert_eq!(state.transition, Transition::NarrowingAcknowledged);
+    assert_eq!(state.effective(), Role::Vault);
+    // Re-narrowing an acknowledged transition names the way out
+    // instead of silently succeeding: widen first, then narrow.
+    let error = command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "mirror".into(),
+        "--yes".into(),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "re-narrowing must name the escape hatch, got {error:?}"
+    );
+    drop(temp);
+}
+
+#[test]
+fn evict_refuses_under_vault() {
+    let (temp, creds) = authored_drive();
+    let drive = drive_of(&temp);
+    command(vec![
+        "role".into(),
+        drive.clone(),
+        "set".into(),
+        "vault".into(),
+    ])
+    .unwrap();
+    let mut evict = vec!["evict".into(), drive.clone(), "a.txt".into()];
+    evict.extend(creds);
+    let error = command(evict).unwrap_err();
+    assert!(
+        matches!(error, CliError::Usage(_)),
+        "evict under vault must refuse naming the role, got {error:?}"
+    );
+    drop(temp);
+}

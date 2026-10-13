@@ -23,8 +23,8 @@ use wyrd_core::export::export_tree;
 use wyrd_core::mailbox::{LiveMailbox, MailboxHealth};
 use wyrd_core::mutation::WriteStats;
 use wyrd_core::policy::{
-    evict_subtree, pin_subtree, residency_census, unpin_subtree, LocalPresence, ResidencyCensus,
-    RetentionPolicy,
+    evict_subtree, pin_subtree, residency_census_with_role, unpin_subtree, LocalPresence,
+    ResidencyCensus, RetentionPolicy,
 };
 use wyrd_core::status::{observe, SyncStatus};
 use wyrd_core::vault::{observe_vault, VaultStatus};
@@ -32,8 +32,8 @@ use wyrd_core::view::NamespaceView;
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::{DriveView, FuseBackend};
 use wyrd_daemon::{
-    install_serving, run_vault, shutdown_transport, TransportDeadlines, VaultEvent, VaultLoopEnd,
-    VaultRun,
+    install_role_dir, install_serving, run_vault, shutdown_transport, TransportDeadlines,
+    VaultEvent, VaultLoopEnd, VaultRun,
 };
 use wyrd_daemon::{
     FailureClass, LiveConfig, LiveError, LiveNode, LoopError, ResourceBudgets, Supervisor,
@@ -284,6 +284,21 @@ enum Command {
         action: CacheAction,
         #[command(flatten)]
         credentials: Credentials,
+    },
+    /// Device-local materialization role: what this device intends to
+    /// be (`mirror`: prunable participant; `vault`: replicates every
+    /// object, never prunes). A role is retention posture, never
+    /// replicated state — setting one writes one local file, no fact,
+    /// no snapshot. It is not the `vault` process: a device can hold
+    /// the role without running one, and one can run without the
+    /// role. Setting needs no credentials, so a role is settable on
+    /// a machine whose keystore is unavailable; only status opens
+    /// the node.
+    Role {
+        /// Directory holding the drive's keystore and object store.
+        drive_dir: PathBuf,
+        #[command(subcommand)]
+        action: RoleAction,
     },
     /// Upgrade this installation from a local release archive:
     /// quiesce, flush, stop, swap the binary atomically, verify the
@@ -626,6 +641,34 @@ enum CacheAction {
     Policy,
 }
 
+/// One role action. `set` names the posture; `status` reports the
+/// configured role, any in-flight narrowing, and the effective
+/// retention posture — the same numbers `cache status` reports,
+/// because there is one effective policy, not two.
+#[derive(Debug, Subcommand)]
+enum RoleAction {
+    /// Set this device's materialization role, durably and offline.
+    /// Widening toward `vault` takes effect immediately. Narrowing
+    /// away from it requires `--yes` and records an acknowledged
+    /// transition: effective posture stays `vault` until withdrawal
+    /// completes, and completion is reported, never assumed.
+    Set {
+        /// The role to hold: `mirror` or `vault`.
+        role: String,
+        /// Acknowledge a narrowing (leaving `vault`). Intent only:
+        /// withdrawal still has to complete before the posture flips.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Report the configured role, transition, and effective
+    /// retention posture. Reads durable state only; never connects,
+    /// never mutates.
+    Status {
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn current_uid() -> u32 {
@@ -913,6 +956,20 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             credentials,
             ..
         } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
+        Command::Role {
+            drive_dir, action, ..
+        } => match action {
+            // Setting touches one local file and no key: return
+            // before credential loading, so a role is settable on
+            // a machine whose keystore is unavailable (OD-24-R).
+            // Status loads below like every other command.
+            RoleAction::Set { role, yes } => {
+                return role_set(drive_dir.clone(), role.clone(), *yes);
+            }
+            RoleAction::Status { credentials } => {
+                load_credentials(drive_dir, credentials, cli.config.as_deref())?
+            }
+        },
     };
 
     match cli.command {
@@ -1035,6 +1092,16 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 identity,
             )
         }
+        Command::Role {
+            drive_dir, action, ..
+        } => match action {
+            // Set returns before credential loading above; the arm
+            // exists only because the match is exhaustive.
+            RoleAction::Set { .. } => {
+                unreachable!("role set returns before credential loading")
+            }
+            RoleAction::Status { .. } => role_status(drive_dir, &passphrase, identity),
+        },
     }
 }
 
@@ -1366,6 +1433,7 @@ fn mount(
     // route, then the discharge barrier — one copy for every live
     // composer, so the order cannot drift between mount, headless
     // sync, and vault.
+    install_role_dir(&mut live, &drive_dir);
     install_serving(&mut live, &serving).map_err(CliError::Serving)?;
     // Endpoint ownership (and shutdown below) stays here; the loop
     // holds only the cloneable readiness handle the install took.
@@ -1771,6 +1839,12 @@ fn evict(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
+    let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    if state.effective() == wyrd_core::role::Role::Vault {
+        return Err(CliError::Usage(
+            "role 'vault' forbids eviction: the role promises no pruning. Narrow the role first (role set mirror --yes), or pin explicitly what must stay.".into(),
+        ));
+    }
     let mut node = open_policy_node(drive_dir, passphrase, identity)?;
     let report = {
         let (engine, view) = node.parts_mut();
@@ -1799,6 +1873,103 @@ fn evict_render(path: &str, report: &wyrd_core::policy::EvictReport) -> String {
     out
 }
 
+/// Map role-file failures onto CLI errors. A torn or unreadable
+/// file fails closed: the operator is told, never silently run as
+/// the wrong posture.
+fn role_err(error: wyrd_core::role::RoleError) -> CliError {
+    match error {
+        wyrd_core::role::RoleError::UnknownRole(_)
+        | wyrd_core::role::RoleError::Malformed { .. } => CliError::Usage(error.to_string()),
+        wyrd_core::role::RoleError::Io { path, source } => CliError::Io { path, source },
+    }
+}
+
+/// Set this device's materialization role without touching keys:
+/// exactly one local file is written — no fact, no snapshot, no
+/// membership transition, nothing any other device can observe.
+fn role_set(drive_dir: PathBuf, role: String, yes: bool) -> Result<(), CliError> {
+    use wyrd_core::role::{Role, RoleState, Transition};
+    let target = Role::parse(&role).map_err(|error| CliError::Usage(error.to_string()))?;
+    let current = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    if current.transition == Transition::Settled && current.role == target {
+        println!("role already {target} (settled); no change");
+        return Ok(());
+    }
+    if target == Role::Mirror && current.effective() == Role::Vault {
+        if current.transition == Transition::NarrowingAcknowledged {
+            return Err(CliError::Usage(
+                "narrowing is already acknowledged and still withdrawing as vault: to start over, widen back to vault first (role set vault), then narrow again with --yes.".into(),
+            ));
+        }
+        if !yes {
+            return Err(CliError::Usage(
+                "narrowing away from the vault role requires --yes: leaving vault stops being a provider, and that must be explicit. Acknowledgement records intent only; effective posture stays vault until withdrawal completes.".into(),
+            ));
+        }
+        let state = RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        };
+        wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+        println!(
+            "narrowing acknowledged: configured mirror, effective still vault until withdrawal completes\nnote: withdrawal completion (route publication drained, no old-role serve streams) is not yet wired; this device retains like vault"
+        );
+        return Ok(());
+    }
+    let state = RoleState {
+        role: target,
+        transition: Transition::Settled,
+    };
+    wyrd_core::role::store(&drive_dir, state).map_err(role_err)?;
+    println!("role set to {target}; effective immediately");
+    Ok(())
+}
+
+/// Report the configured role, any in-flight narrowing, and the
+/// effective retention posture. Reads durable state only; never
+/// connects, never mutates.
+fn role_status(
+    drive_dir: PathBuf,
+    passphrase: &str,
+    identity: DeviceIdentitySecret,
+) -> Result<(), CliError> {
+    let state = wyrd_core::role::load(&drive_dir).map_err(role_err)?;
+    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+    let (engine, view) = node.parts();
+    let census = residency_census_with_role(engine, view, "", state.effective())?;
+    print!("{}", role_status_render(&drive_dir, state, &census));
+    Ok(())
+}
+
+/// The configured role, any in-flight narrowing, and the effective
+/// retention posture with the numbers to back it: the same census
+/// `cache status` reports, because there is one effective policy.
+fn role_status_render(
+    drive_dir: &std::path::Path,
+    state: wyrd_core::role::RoleState,
+    census: &ResidencyCensus,
+) -> String {
+    use wyrd_core::role::Transition;
+    let mut out = format!(
+        "role: {}\ntransition: {}\neffective: {}\n",
+        state.role,
+        state.transition_word(),
+        state.effective(),
+    );
+    if !wyrd_core::role::is_configured(drive_dir) {
+        out.push_str(
+            "note: no role file: mirror names current behavior (prunable), not a choice\n",
+        );
+    }
+    if state.transition == Transition::NarrowingAcknowledged {
+        out.push_str(
+            "note: narrowing acknowledged; retains like vault until withdrawal completes\n",
+        );
+    }
+    out.push_str(&cache_quadrant_summary(census));
+    out
+}
+
 /// Report residency: per-file policy vs presence, or device totals
 /// plus the effective budgets.
 fn cache(
@@ -1810,17 +1981,20 @@ fn cache(
     passphrase: &str,
     identity: DeviceIdentitySecret,
 ) -> Result<(), CliError> {
-    let node = open_policy_node(drive_dir, passphrase, identity)?;
+    let node = open_policy_node(drive_dir.clone(), passphrase, identity)?;
+    let role = wyrd_core::role::load(&drive_dir)
+        .map_err(role_err)?
+        .effective();
     match action {
         CacheAction::Status { path } => {
             let (engine, view) = node.parts();
-            let census = residency_census(engine, view, &path)?;
+            let census = residency_census_with_role(engine, view, &path, role)?;
             print!("{}", cache_status_render(&path, &census));
             Ok(())
         }
         CacheAction::Policy => {
             let (engine, view) = node.parts();
-            let census = residency_census(engine, view, "")?;
+            let census = residency_census_with_role(engine, view, "", role)?;
             // Three walks at report time, never cached: the enforced
             // object-store count plus the two observational dimensions.
             let retained_content = view
@@ -3336,6 +3510,9 @@ fn sync_now(
         None
     };
     let (mut live, parts) = daemon.into_live(Duration::from_secs(30), &config)?;
+    // The role directory installs whether or not a serving surface
+    // exists: a serving-less `sync now` retains like its role too.
+    install_role_dir(&mut live, &drive_dir);
     if let Some(serving) = &serving {
         // Mount order, through the shared install step: flush before
         // announcing the address, so the first seal carries a route
@@ -3621,6 +3798,7 @@ fn vault(
     });
     let outcome = run_vault(VaultRun {
         live,
+        drive_dir: drive_dir.clone(),
         mailbox,
         bulk: Some(bulk),
         serving,

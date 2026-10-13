@@ -685,12 +685,42 @@ retention without fetching: a pinned-but-never-fetched subtree
 still fails closed offline (export names the unheld bytes) until
 a sync or mount lands the bytes.
 
+### `role` — device-local materialization role
+
+What this device intends to be: `mirror` (prunable participant) or
+`vault` (replicates every object, never prunes). A role is a
+retention posture, never replicated state — setting one writes one
+`role` file beside the keystore: no fact, no snapshot, nothing any
+peer can observe. It is not the `vault` process: a device can hold
+the role without running one, and one can run without the role.
+
+A role is a default, not an override: explicit pins mean exactly
+what they always meant. What the role changes is the baseline —
+under `vault`, content `mirror` would leave `REMOTE_ONLY` is
+effectively retained, and `cache status` reports those effective
+numbers. A device with no role file reports `mirror` explicitly:
+the default names current behavior, never a silent choice.
+
+- `role set <mirror|vault>`: widening toward `vault` takes effect
+  immediately. Narrowing away from it requires `--yes` and records
+  an acknowledged transition: effective posture stays `vault`
+  until withdrawal completes, and completion is reported, never
+  assumed.
+- `role status`: configured role, transition, effective posture,
+  and the quadrant totals to back it.
+- `evict` under an effective `vault` role refuses and says the
+  role forbids it: the role promises no pruning.
+
 ## Credential files
 
 All subcommands take `--identity-file` and `--passphrase-file`,
 optionally: each defaults to the drive configuration file's
 `identity_file` / `passphrase_file` when the flag is absent (see
-"Drive configuration file" below), and the flag always wins.
+"Drive configuration file" below), and the flag always wins —
+with one exception: `role set` writes one local file and touches
+no key, so it takes neither flag and reads no file. A role stays
+settable on a machine whose keystore is unavailable. (`role
+status` opens the node and takes both.)
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters

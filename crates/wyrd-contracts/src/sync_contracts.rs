@@ -1245,7 +1245,102 @@ fn daemon_write_publication_and_retry_converges_across_members() {
     std::fs::remove_dir_all(dir_b).unwrap();
 }
 
-/// Install one epoch capability on an engine through its relay: mint
+/// A vault-role device fetches what it reports: member B holds the
+/// vault role, converges over passes a mirror device idles through,
+/// and serves the file with no explicit `want()` anywhere — the
+/// issue's "effective, not declarative" bar, observed as bytes
+/// rather than as a stored string. (The mirror control is the
+/// preceding fetch test: the same file is not servable there until
+/// demanded.)
+#[test]
+fn vault_role_fetches_without_explicit_demand() {
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+
+    let mut rig = Rig::new();
+    let admit = rig.admit.clone();
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability(&admit, &secrets);
+    assert_eq!(rig.drain().accepted, 1, "the self-capability lands");
+    let mut daemon_a: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(rig.take_engine(), MemoryObjectStore::default()).unwrap();
+    let authored = daemon_a.put_file("shared.txt", b"shared bytes").unwrap();
+
+    let owner = rig.owner.id;
+    let dir_b = scratch_dir("member-b-vault");
+    let mut engine_b = Engine::open(
+        dir_b.clone(),
+        drive(),
+        owner,
+        "contracts",
+        rig.owner.identity.clone(),
+        rig.owner.encryption.clone(),
+    )
+    .unwrap();
+    engine_b.add_epoch_key(1, Zeroizing::new(rig.epoch1.control_key(&drive(), 1)));
+    engine_b.add_epoch_key(2, Zeroizing::new(rig.epoch2.control_key(&drive(), 2)));
+    engine_b.add_epoch_key(3, Zeroizing::new(rig.epoch3.control_key(&drive(), 3)));
+    let mut relay_b = Relay::new();
+    let genesis = rig.genesis.clone();
+    rig.enqueue_transition_for(&genesis, 1, owner, &mut relay_b);
+    let admit = rig.admit.clone();
+    rig.enqueue_transition_for(&admit, 1, owner, &mut relay_b);
+    let secrets = [rig.epoch1.clone(), rig.epoch2.clone()];
+    rig.enqueue_capability_for(&admit, &secrets, owner, &mut relay_b);
+    let daemon_b: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine_b, MemoryObjectStore::default()).unwrap();
+    let (mut live_b, parts_b) = daemon_b
+        .into_live(std::time::Duration::from_secs(30), &LiveConfig::default())
+        .unwrap();
+    let backend_b = serving_backend(parts_b);
+
+    // Vault posture before the first pass: one file, no facts.
+    role::store(
+        &dir_b,
+        RoleState {
+            role: Role::Vault,
+            transition: Transition::Settled,
+        },
+    )
+    .unwrap();
+    live_b.set_role_dir(dir_b.clone());
+
+    let sent = daemon_a
+        .announce_snapshot(&authored, &mut relay_b, None)
+        .unwrap();
+    assert_eq!(sent, 1, "the author announces to its one peer");
+
+    // Passes converge with no explicit want(): intake, then
+    // vault-registered demand admitted as Cached through the
+    // existing path and fetched from A's serving vault. A published
+    // path with bytes still in flight reads EIO — that is fetch
+    // converging, not failure, so only a matching read counts.
+    let mut peer = VaultPeer(daemon_a.serve().unwrap());
+    let mut served = false;
+    for _ in 0..6 {
+        live_b.sync_once(&mut relay_b, Some(&mut peer)).unwrap();
+        if let Ok(handle) = backend_b.open_at("shared.txt") {
+            if backend_b.read_handle(handle, 0, 64).unwrap_or_default() == b"shared bytes" {
+                served = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        served,
+        "a vault device fetches and serves without explicit demand"
+    );
+    assert_eq!(
+        role::load(&dir_b).unwrap().effective(),
+        Role::Vault,
+        "convergence leaves the role file untouched"
+    );
+
+    drop(daemon_a);
+    drop(live_b);
+    drop(backend_b);
+    rig.teardown();
+    std::fs::remove_dir_all(dir_b).unwrap();
+}
 /// from the fully observed chain, wrap, seal under the covered
 /// epoch's control key, queue, and drain. Mirrors the join owner
 /// setup; used where the rig's admit-scoped helper cannot reach

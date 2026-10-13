@@ -131,7 +131,10 @@ demand policy it serves):
 WantRegistry
   ├── pending identities   (demanded, not yet in flight)
   ├── in-flight identities (fetch admitted by the engine)
-  └── waiters by identity  (FUSE openers waiting for completion)
+  └── waiters by identity  (FUSE openers waiting for completion;
+      loop-originated demand, e.g. vault retention, carries none —
+      it is marked ownerless, so a coincident waiter timing out
+      never retires it)
 ```
 
 ```text

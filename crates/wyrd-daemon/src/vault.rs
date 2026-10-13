@@ -87,6 +87,22 @@ where
     Ok(addr)
 }
 
+/// Install the drive directory the loop reads the materialization
+/// role from. A composer step of its own, deliberately not a rider
+/// on [`install_serving`]: serving-optional compositions (`sync
+/// now` without `--serve`) retain like their role too, and a role
+/// obligation coupled to serving would silently skip exactly them.
+/// Every `into_live` caller in production performs this step;
+/// tests that skip it get mirror behavior.
+pub fn install_role_dir<V>(live: &mut LiveNode<V>, drive_dir: &std::path::Path)
+where
+    V: NamespaceView<Materialization = RuntimeMaterialization>,
+    <V as NamespaceView>::Store: ObjectStore,
+    <<V as NamespaceView>::Store as ObjectStore>::Error: std::fmt::Debug,
+{
+    live.set_role_dir(drive_dir.to_path_buf());
+}
+
 /// One event the vault observer emits to the process host: the host
 /// owns diagnostics (stderr, log file, journal), the composer owns
 /// the facts. Counts, never health claims — a posture line reports
@@ -338,6 +354,10 @@ pub struct VaultOutcome {
 pub struct VaultRun<V: NamespaceView, M, B> {
     /// The composed live node, serving not yet installed.
     pub live: LiveNode<V>,
+    /// The drive directory the loop reads the materialization role
+    /// from: installed on the loop with the serving surface, so the
+    /// vault process retains like its role.
+    pub drive_dir: std::path::PathBuf,
     /// The connected control-plane mailbox.
     pub mailbox: M,
     /// The bound bulk source, if the composer bound one.
@@ -382,6 +402,7 @@ where
 {
     let VaultRun {
         mut live,
+        drive_dir,
         mailbox,
         bulk,
         serving,
@@ -394,6 +415,9 @@ where
     // The surface the loop's barrier reads through is the bound
     // endpoint itself: flush before announcing the address, then
     // publish the route and gate discharge on mirror readiness.
+    // The role directory installs beside serving, never through
+    // it, so serving-optional compositions cannot forget it.
+    install_role_dir(&mut live, &drive_dir);
     install_serving(&mut live, &serving)?;
     // The observer's two ends: completed passes report through the
     // node's hook, failures through the loop's closure. Both ends

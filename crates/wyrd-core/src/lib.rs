@@ -19,6 +19,7 @@ pub mod node;
 pub mod policy;
 pub mod projection;
 pub mod quarantine;
+pub mod role;
 pub mod scrub;
 pub mod session;
 pub mod status;

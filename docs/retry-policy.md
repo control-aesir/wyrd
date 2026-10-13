@@ -37,9 +37,7 @@ walk in `wyrd-sync`.
    (an announcement attests addressing, never liveness — otherwise
    a dead route re-announced every pass would never sink);
    engine cooldowns are untouched (per-representation, above the
-   walk; strike counting unchanged); no K-cap (dropping candidates
-   would risk displacing a live alternate — sinking never skips).
-   One honest interaction: the walk returns the last error and
+   walk; strike counting unchanged). One honest interaction: the walk returns the last error and
    position sets the bound, so ordering moves which candidate's
    error class surfaces on total failure — in the evidence's
    direction (sunk dead tail reads fault, live head reads budget).
@@ -47,62 +45,103 @@ walk in `wyrd-sync`.
    walk or single-route: dial reachability is provider-level,
    independent of the representation asked for, and fulfillment
    clears from either path.
-3. **Cross-pass resume — deferred behind this note.** No
-   `BulkSource` trait change, no partial-buffer ledger, no
-   ranged-fetch implementation until the questions below are
-   settled **and** the evidence threshold is met.
+3. **Walk bound — implemented (`FETCH_WALK_CAP = 3`).** Each pass
+   attempts at most the first three freshness-ordered candidates.
+   This supersedes the earlier "no K-cap" ruling: the displacement
+   worry is answered by paging, not by attempting everything.
+   Fault-failing heads mark and sink, so consecutive passes page
+   through a failing tail; un-attempted candidates record nothing
+   (no strike, no burn) and retry next pass by republication. The
+   fair division counts only the capped reach, so no share is
+   reserved for candidates the pass will not ask. Paging covers
+   dial-phase hangs too — the K-th attempted head always holds the
+   full remaining share, so its dial expiry classifies as fault
+   evidence (like an uncapped walk's last candidate) and marks,
+   sinking one hung head per pass. The accepted limit:
+   transfer-phase hangs never mark, so K or more persistently
+   stalled transfers pin a live tail behind them until they fault,
+   clear, or the representation's strike/burn cooldowns trip (the
+   pinned passes still strike-cool through the last attempted
+   expiry). Revisit when lists grow past three live routes or the
+   forensics show pinned tails.
+4. **Cross-pass resume — spiked, no-go for implementation.**
+   The spike ran against the pinned sources (`iroh-blobs
+   =0.103.0`) and answered the four design questions below. All
+   answers are source-verified premises, none exercised by run
+   code in this repository. Verdict: do not implement — the
+   mechanism is buildable but the pressure it relieves has never
+   been observed, and the cheapest correct form still touches the
+   burn ledger's duty-cycle bound. The evidence threshold below
+   reopens the decision; no follow-up issue is filed (this note
+   is the tracker).
 
 Non-goals (unchanged): multi-provider dead-first ordering through
 intake (publication replaces per pass), single-route bypass
 behavior (pinned by
 `full_share_sliced_attempts_strike_like_master`).
 
-## Resume feasibility (spike premises, not run code)
+## Resume spike: the four questions answered
 
-Resume looks buildable without a protocol fork, on premises read
-from the pinned registry sources (`iroh-blobs =0.103.0`) during
-the spike — none of them exercised by a ranged fetch in this
-repository:
+**1. Range-request shape.** No protocol fork. `GetRequest::blob_ranges(hash,
+ranges)` (`protocol.rs`) builds a range request over
+`ChunkRanges`; `get::fsm` is a public module whose `start`
+accepts any `GetRequest`, so a ranged fetch mirrors
+`get_blob_impl`'s drive loop (`AtInitial → AtConnected →
+AtStartRoot → AtBlobHeader → AtBlobContent → AtEndBlob →
+AtClosing`) with a range request in place of `GetRequest::blob`.
+Ranged requests are exercised by iroh-blobs' own helpers
+(`random_hash_seq_ranges`, chunk probes), so providers serve
+arbitrary ranges. No high-level ranged getter exists beside
+`get_blob` — the mirror is handwritten, not configured.
 
-- The protocol source defines range constructors
-  (`GetRequest::blob_ranges`, plus a builder with `root`/`offset`
-  ranges) alongside range helpers for hash sequences and chunk
-  probes. No high-level ranged getter exists beside `get_blob`,
-  so a ranged stream would mirror `get_blob`'s internals.
-- `iroh_blobs::get::fsm` is a public module (`low level API for
-  getting data from a peer`), so that mirror needs no fork.
-- Leaves arrive with offsets and the parents for requested ranges
-  arrive inline per the Bao protocol, so a partial range should
-  verify independently against the same root hash — and remaining
-  ranges may come from a different provider. Size discovery
-  already runs first, so missing ranges are computable.
+**2. Partial-state ownership and lifetime.** Key by the complete
+representation identity — the transport root hash plus the
+verified size from size discovery (which already runs first),
+never a provider or address. Home: an in-memory map on
+`IrohBulkSource` beside `provider_memory` and `stats` —
+cross-pass state, not cross-restart (a restart loses partial
+work, correctly: it is an optimization, never durability). No
+`BulkSource` trait change: `fetch` consults the cache, requests
+only the missing chunk ranges, stitches, and returns complete
+bytes only when whole — the boundary contract is unchanged.
+Bounded use: a hard aggregate ceiling on buffered partial bytes
+(the 64 MiB per-object fetch ceiling is not an aggregate
+bound), oldest-first eviction, entries dropped on fulfillment,
+on size rediscovery disagreeing (representation changed —
+discard, never stitch across identities), and on representation
+cooldown. Resume granularity is whole verified chunks: a stream
+cut mid-chunk loses that chunk's tail (bao verifies per
+chunk), so only chunk-aligned prefixes are retainable and the
+progress probe's byte count overstates the resumable prefix.
 
-The source reading establishes feasibility; only a prototype
-fetch would establish it as run code. Worth is not established
-either way: a partial-state implementation is the most invasive
-of the three items (trait change, cross-call state, ledger
-interaction, a second fake) for a pressure that has never been
-observed — lists are short, no hanging tails on record.
+**3. Stream stitching and final verification.** Ranged responses
+carry their own bao proofs (parents inline), so every range
+verifies independently against the same root hash through the
+same fsm decoder — no new trust, and remaining ranges may come
+from a different provider than the prefix (ranges are
+hash-keyed, provider-independent). Leaves arrive offset-tagged
+(`Leaf { offset, data }`), so stitching is positional into the
+stored prefix; completion is coverage of `[0, size)`, and the
+assembled bytes return only then — the engine still never sees
+unverified bytes. Testing needs a second fake (a scripted
+range-serving source); the memory source's instant attempts
+have nothing to resume.
 
-## What the resume note must settle before implementation
-
-- **Identity and integrity:** key partial state by the complete
-  representation identity, not an ambiguous transport locator.
-  Every resumed range verifies against the same root and size.
-- **Bounded resource use:** a hard aggregate memory ceiling across
-  concurrent partial blobs, eviction behavior, and cleanup after
-  expiry or failure. The 64 MiB per-object fetch ceiling
-  (`Limits::V0.max_object_bytes`) is not an aggregate bound.
-- **Burn-ledger semantics:** distinguish lack of progress from
-  partial progress. Repeated slices must not cool a provider as
-  though every attempt made zero progress, but partial progress
-  must not grant a stalled transfer unlimited immunity.
-- **Expiry and classification:** preserve the `AttemptBound`
-  distinction. Expired partial work stays deadline evidence —
-  never misclassified as corruption or provider dishonesty.
-- **Compatibility and fallback:** when to discard partial state
-  and restart with a full-blob fetch (representation changes,
-  invalid stored ranges).
+**4. Pass-budget interaction.** The `AttemptBound` classification
+is unchanged: an expired ranged attempt is `Deadline` under a
+subdivided share and `Transport` on a full share by the same
+rule — expiry class is about budget, never about progress. The
+hard question is the burn ledger: burns accumulate per sliced
+expiry today, so a large blob making steady progress across
+passes would still cool mid-transfer and resume would be
+pointless for exactly the transfers it targets. Burns must
+become progress-aware — a progress-making pass resets or
+discounts the burn count — with a progress floor (whole chunks
+per pass, not bytes) so a drip-stall cannot hold a
+representation warm forever. That floor is the one judgment a
+follow-up implementation must set; everything else above is
+mechanism. Cooling stays progress-blind in the meantime, which
+is correct for restart-from-zero transfers.
 
 ## Evidence threshold
 

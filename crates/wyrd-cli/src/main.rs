@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::drive_config::{
-    load_drive_config, relay_source_line, resolve_credential_path, resolve_relays,
-    CredentialProvenance, LoadedConfig, RelayResolution, RelaySource,
+    check_vault_relays, load_drive_config, relay_source_line, resolve_credential_path,
+    resolve_relays, update_request_relays, CredentialProvenance, LoadedConfig, RelayResolution,
+    RelaySource,
 };
 use crate::logging::{init_mount_diagnostics, init_sync_diagnostics, init_vault_diagnostics};
 use crate::probes::combine_status;
@@ -771,10 +772,16 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 path: PathBuf::from("<current executable>"),
                 source,
             })?;
-            // The handoff child is another wyrd invocation in effect:
-            // it resolves the same configuration, so `--restart`
-            // without `--relay` works when the file names relays, and
-            // the refusal below judges the effective set.
+            // The handoff child never reads the configuration: the
+            // parent resolves the effective set and forwards it
+            // flattened as `--relay`/`--identity-file`/`--passphrase-file`
+            // argv, so the child takes no `--config` and inherits no
+            // file. The two update guards therefore judge different
+            // surfaces: "restart needs a relay" judges the effective
+            // set (a configured relay satisfies it), while
+            // "relay-is-restart-only" judges the flag list (a file the
+            // operator adopted for every other subcommand must not
+            // fail an update that never consumes relays).
             let update_config = load_drive_config(drive_dir, cli.config.as_deref())?;
             let update_config = update_config.as_ref();
             let identity_file = resolve_credential_path(
@@ -790,12 +797,17 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 "passphrase_file",
             )?;
             let resolution = resolve_relays(relays.relay.clone(), update_config);
+            // B1 shape: without `--restart` relays travel nowhere, so
+            // only explicitly passed flags can be a mistake worth
+            // refusing; with `--restart` the handoff consumes the
+            // effective set.
+            let request_relays = update_request_relays(*restart, &relays.relay, &resolution.relays);
             let outcome = update::update_run(&update::UpdateRequest {
                 drive_dir,
                 archive,
                 identity_file: &identity_file,
                 passphrase_file: &passphrase_file,
-                relays: &resolution.relays,
+                relays: request_relays,
                 restart: *restart,
                 exe: &exe,
             })?;
@@ -3473,19 +3485,7 @@ fn vault(
     // escape — an offline vault is a process that idles forever, not
     // a run with a verdict. The refusal judges the effective set, so
     // a configured relay satisfies it exactly like a flag.
-    if resolution.relays.is_empty() {
-        return Err(CliError::Usage(match resolution.source {
-            RelaySource::File => format!(
-                "vault needs at least one relay (no relays in {}): \
-                 a relay-less vault serves nothing peers can discover",
-                config
-                    .map(|c| c.path.display().to_string())
-                    .unwrap_or_default()
-            ),
-            _ => "vault needs at least one --relay: a relay-less vault serves nothing peers can discover"
-                .into(),
-        }));
-    }
+    check_vault_relays(&resolution, config.map(|c| c.path.as_path()))?;
     let relays = resolution.relays;
     // Diagnostics first: stderr always carries the ready line and the
     // failures for the supervisor to capture, plus an appended

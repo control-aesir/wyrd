@@ -273,7 +273,9 @@ iroh bulk source and publishes recorded routes each pass, and the
 mount opens the drive's serving endpoint, so a peer with a live
 announcement fetches over transport, while unavailable demand still
 surfaces `EIO` on its deadline. Relays arrive as repeatable
-`--relay` flags; parsing is clap-derive. Credential
+`--relay` flags defaulted from the drive's `default.toml`
+(`docs/cli.md` "Drive configuration file"); parsing is clap-derive
+for flags and strict TOML for the file. Credential
 files are supported on Unix, must be regular files owned by the current
 user with private permissions, and are bounded and zeroized at the CLI
 boundary.

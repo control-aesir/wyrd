@@ -310,6 +310,49 @@ fn cache_policy_reports_the_effective_configuration() {
     }
 }
 
+/// `--config` at a file elsewhere is honoured end to end: relays
+/// and both credential paths come from the override, with no relay
+/// or credential flag passed at all. This is also the configured
+/// drive's local-only escape — pointed at a relay-less file, the
+/// same override opts out of the refused `--offline` combination.
+#[test]
+fn config_override_elsewhere_is_honoured() {
+    let fixture = Fixture::new("override");
+    fixture.init();
+    let relay = TestRelay::spawn();
+    let url = relay.url.clone();
+    relay.shutdown();
+    let elsewhere = fixture.dir.join("elsewhere.toml");
+    std::fs::write(
+        &elsewhere,
+        format!(
+            "[drive]\nrelays = [\"{url}\"]\nidentity_file = \"{}\"\npassphrase_file = \"{}\"\n",
+            fixture.identity.display(),
+            fixture.passphrase.display(),
+        ),
+    )
+    .expect("override file writes");
+    let output = fixture
+        .wyrd(&[
+            "--config",
+            elsewhere.to_str().unwrap(),
+            "sync",
+            fixture.drive.to_str().unwrap(),
+            "status",
+        ])
+        .output()
+        .expect("wyrd sync status runs");
+    assert!(output.status.success(), "status honours the override file");
+    let stdout = String::from_utf8(output.stdout).expect("stdout renders text");
+    assert!(
+        stdout.contains(&format!(
+            "relays from: config file ({})",
+            elsewhere.display()
+        )),
+        "status names the override as the relay source, got:\n{stdout}"
+    );
+}
+
 /// A missing `--config` override is a named error, never an empty
 /// configuration — even against a drive that would otherwise open.
 #[test]

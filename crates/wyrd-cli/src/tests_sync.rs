@@ -1,4 +1,4 @@
-use super::tests_harness::{write_secret, TempDir};
+use super::tests_harness::{write_default_toml, write_secret, TempDir};
 use super::*;
 use wyrd_core::mutation::{FoldMember, MutationKind};
 use wyrd_core::quarantine::QuarantineReport;
@@ -62,10 +62,6 @@ impl Fixture {
     fn open(&self) -> Engine {
         let identity = read_identity(&self.identity_file).unwrap();
         Engine::open_keystore(self.drive.clone(), "test-pass", identity).unwrap()
-    }
-
-    fn write_default_toml(&self, text: &str) {
-        std::fs::write(self.drive.join("default.toml"), text).unwrap();
     }
 }
 
@@ -2087,11 +2083,14 @@ fn a_missing_config_override_is_a_named_error() {
 #[test]
 fn sync_status_without_credential_flags_reads_them_from_the_file() {
     let fixture = Fixture::new();
-    fixture.write_default_toml(&format!(
-        "[drive]\nidentity_file = \"{}\"\npassphrase_file = \"{}\"\n",
-        fixture.identity_file.display(),
-        fixture.passphrase_file.display(),
-    ));
+    write_default_toml(
+        &fixture.drive,
+        &format!(
+            "[drive]\nidentity_file = \"{}\"\npassphrase_file = \"{}\"\n",
+            fixture.identity_file.display(),
+            fixture.passphrase_file.display(),
+        ),
+    );
     let args = vec![
         "sync".into(),
         fixture.drive.display().to_string(),

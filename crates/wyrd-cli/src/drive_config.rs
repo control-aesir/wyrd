@@ -141,9 +141,24 @@ pub(crate) fn load_drive_config(
         Some(path) => path.to_path_buf(),
         None => drive_dir.join(DEFAULT_CONFIG_NAME),
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    // Bounded read, not read-then-reject: the bound is enforced by
+    // the read itself (`take` one past the limit), so a pathological
+    // file cannot buffer the unbounded before the refusal fires.
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && override_path.is_none() => {
+            // A dangling `default.toml` symlink reads as "no
+            // configuration" through `File::open` (the link resolves
+            // to nothing), which would silently drop an operator's
+            // relays. Distinguish it: anything the directory names
+            // but the read cannot reach is a named error, never an
+            // absent file.
+            if std::fs::symlink_metadata(&path).is_ok() {
+                return Err(CliError::Usage(format!(
+                    "{} is unreachable (dangling symlink?): refusing to run relay-less",
+                    path.display()
+                )));
+            }
             return Ok(None);
         }
         Err(source) => {
@@ -153,6 +168,14 @@ pub(crate) fn load_drive_config(
             });
         }
     };
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    file.take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| CliError::Io {
+            path: path.clone(),
+            source,
+        })?;
     if bytes.len() > MAX_CONFIG_BYTES {
         return Err(CliError::Usage(format!(
             "{} exceeds the 64 KiB size limit: a relay list and two paths never reach it",
@@ -203,6 +226,53 @@ pub(crate) fn resolve_relays(
             source: RelaySource::Neither,
         },
     }
+}
+
+/// Which relay list an update request consumes: with `--restart`
+/// the handoff serves peers, so it takes the effective set (a
+/// configured relay satisfies the need); without it relays travel
+/// nowhere, so only explicitly passed flags are a mistake worth
+/// refusing — a file the operator adopted must not fail an update
+/// that never consumes relays. Pure over the inputs so the split
+/// pins without a transaction.
+pub(crate) fn update_request_relays<'a>(
+    restart: bool,
+    flag_relays: &'a [String],
+    effective_relays: &'a [String],
+) -> &'a [String] {
+    if restart {
+        effective_relays
+    } else {
+        flag_relays
+    }
+}
+
+/// The vault's relay requirement as a pure guard: a relay-less
+/// vault serves routes nothing can discover and never converges,
+/// and unlike `sync now` there is no `--offline` escape — an
+/// offline vault idles forever instead of reporting a verdict. A
+/// consulted-but-empty file names itself in the refusal; no file at
+/// all keeps the bare flag-oriented message. Pure over the inputs
+/// so both arms pin without starting a vault.
+pub(crate) fn check_vault_relays(
+    resolution: &RelayResolution,
+    config_path: Option<&Path>,
+) -> Result<(), CliError> {
+    if !resolution.relays.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Usage(match resolution.source {
+        RelaySource::File => format!(
+            "vault needs at least one relay (no relays in {}): \
+             a relay-less vault serves nothing peers can discover",
+            config_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ),
+        _ => "vault needs at least one --relay: \
+              a relay-less vault serves nothing peers can discover"
+            .into(),
+    }))
 }
 
 /// Resolve one credential path: the flag wins, then the file, then
@@ -262,13 +332,13 @@ pub(crate) fn relay_source_line(source: RelaySource, config_path: Option<&Path>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests_harness::TempDir;
+    use crate::tests_harness::{write_default_toml, TempDir};
 
     fn drive_with(text: &str) -> (TempDir, PathBuf) {
         let temp = TempDir::new();
         let drive = temp.0.join("drive");
         std::fs::create_dir(&drive).unwrap();
-        std::fs::write(drive.join(DEFAULT_CONFIG_NAME), text).unwrap();
+        write_default_toml(&drive, text);
         (temp, drive)
     }
 
@@ -409,6 +479,87 @@ mod tests {
         let resolved = resolve_relays(Vec::new(), None);
         assert!(resolved.relays.is_empty());
         assert_eq!(resolved.source, RelaySource::Neither);
+    }
+
+    /// An update without `--restart` consumes no relays, so only
+    /// flags can trip its restart-only guard; with `--restart` the
+    /// handoff serves peers, so the effective set applies.
+    #[test]
+    fn update_judges_restart_and_relay_guards_off_different_surfaces() {
+        let flags = vec!["wss://flag.example".to_string()];
+        let filed = vec!["wss://file.example".to_string()];
+        let empty: Vec<String> = Vec::new();
+        // No restart: the flag list rules, whatever the file says.
+        assert_eq!(update_request_relays(false, &flags, &filed), &flags);
+        assert_eq!(update_request_relays(false, &empty, &filed), &empty);
+        // Restart: the effective set rules (flags already replaced
+        // the file upstream when both are present).
+        assert_eq!(update_request_relays(true, &flags, &flags), &flags);
+        assert_eq!(update_request_relays(true, &empty, &filed), &filed);
+        assert_eq!(update_request_relays(true, &empty, &empty), &empty);
+    }
+
+    /// The vault guard judges the effective set: configured relays
+    /// satisfy it, and each empty arm names its own surface.
+    #[test]
+    fn the_vault_guard_judges_the_effective_set() {
+        let relays = vec!["wss://one.example".to_string()];
+        let from_flags = RelayResolution {
+            relays: relays.clone(),
+            source: RelaySource::Flag,
+        };
+        let from_file = RelayResolution {
+            relays,
+            source: RelaySource::File,
+        };
+        assert!(check_vault_relays(&from_flags, None).is_ok());
+        assert!(check_vault_relays(&from_file, Some(Path::new("/d/default.toml"))).is_ok());
+        let bare = RelayResolution {
+            relays: Vec::new(),
+            source: RelaySource::Neither,
+        };
+        let error = check_vault_relays(&bare, None).unwrap_err();
+        let CliError::Usage(message) = error else {
+            panic!("expected a usage refusal, got: {error:?}");
+        };
+        assert!(
+            message.contains("--relay"),
+            "bare refusal names the flag: {message}"
+        );
+        let empty_file = RelayResolution {
+            relays: Vec::new(),
+            source: RelaySource::File,
+        };
+        let error =
+            check_vault_relays(&empty_file, Some(Path::new("/d/default.toml"))).unwrap_err();
+        let CliError::Usage(message) = error else {
+            panic!("expected a usage refusal, got: {error:?}");
+        };
+        assert!(
+            message.contains("no relays in /d/default.toml"),
+            "file refusal names the file: {message}"
+        );
+    }
+
+    /// A dangling `default.toml` symlink is a named error, never a
+    /// silent "no configuration": the operator's relays must not
+    /// vanish without a word.
+    #[test]
+    #[cfg(unix)]
+    fn a_dangling_config_symlink_is_refused_not_absent() {
+        let temp = TempDir::new();
+        let drive = temp.0.join("drive");
+        std::fs::create_dir(&drive).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("nowhere.toml"), drive.join(DEFAULT_CONFIG_NAME))
+            .unwrap();
+        let error = load_drive_config(&drive, None).unwrap_err();
+        let CliError::Usage(message) = error else {
+            panic!("expected a usage refusal, got: {error:?}");
+        };
+        assert!(
+            message.contains("dangling") && message.contains(DEFAULT_CONFIG_NAME),
+            "refusal names the cause and the file: {message}"
+        );
     }
 
     #[test]

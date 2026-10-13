@@ -11,19 +11,23 @@ this document is stale.
 ## Subcommands
 
 ```
-wyrd init --identity-file <path> --passphrase-file <path> <drive_dir>
-wyrd mount [--relay <url>...] [--verbose] [--interval <secs>] \
-    --identity-file <path> --passphrase-file <path> <drive_dir> <mountpoint>
-wyrd export --identity-file <path> --passphrase-file <path> <drive_dir> <out_dir>
-wyrd member --identity-file <path> --passphrase-file <path> <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
-wyrd device --identity-file <path> --passphrase-file <path> <drive_dir> (id | pairing-request <out> | join <invitation>)
-wyrd sync [--relay <url>...] --identity-file <path> --passphrase-file <path> <drive_dir> (status | now)
-wyrd vault --relay <url>... [--log-file <path>] --identity-file <path> --passphrase-file <path> <drive_dir> [start | status]
-wyrd pin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
-wyrd unpin --identity-file <path> --passphrase-file <path> <drive_dir> <path>
-wyrd evict --identity-file <path> --passphrase-file <path> <drive_dir> <path>
-wyrd cache --identity-file <path> --passphrase-file <path> <drive_dir> (status [path] | policy)
+wyrd [--config <path>] init [--identity-file <path>] [--passphrase-file <path>] <drive_dir>
+wyrd [--config <path>] mount [--relay <url>...] [--verbose] [--interval <secs>] \
+    [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <mountpoint>
+wyrd [--config <path>] export [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <out_dir>
+wyrd [--config <path>] member [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
+wyrd [--config <path>] device [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (id | pairing-request <out> | join <invitation>)
+wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status | now)
+wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
+wyrd [--config <path>] pin [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
+wyrd [--config <path>] unpin [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
+wyrd [--config <path>] evict [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
+wyrd [--config <path>] cache [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status [path] | policy)
 ```
+
+`--identity-file` and `--passphrase-file` are optional when the
+drive's configuration file names them (see "Drive configuration
+file" below); the flags always win when both are given.
 
 ### `init` — create a drive
 
@@ -683,7 +687,10 @@ a sync or mount lands the bytes.
 
 ## Credential files
 
-All subcommands take `--identity-file` and `--passphrase-file`.
+All subcommands take `--identity-file` and `--passphrase-file`,
+optionally: each defaults to the drive configuration file's
+`identity_file` / `passphrase_file` when the flag is absent (see
+"Drive configuration file" below), and the flag always wins.
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters
@@ -751,6 +758,11 @@ passphrase_file = "/etc/wyrd/passphrase"
 - The file reads without the store lock: it is deployment state,
   not store state. Offline commands still need the drive
   un-mounted where they always did.
+- A configured drive's local-only escape is `--config` pointed at
+  a relay-less file: with relays in the effective set, `sync now
+  --offline` is refused (the combination is contradictory no matter
+  which surface named the relays), so a deliberately relay-less run
+  names a file that declares none.
 
 ## Diagnostics and exit codes
 

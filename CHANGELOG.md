@@ -37,6 +37,14 @@ version say exactly what changed.
   violation fails closed with no fallback to membership replay or
   capability installation. Contract: `docs/release-read.md`.
 
+- Sync-convergence wave 2
+  (`nostr:nevent1qqs050vlflle96xqhm9yke5943dwr0579k86nmf29k8u935mdrhyhxqpz9mhxue69uhkwunpwdczuap49eehgy8qvr2`):
+  microvm phase 7 grows a second wave where the member converges with
+  headless `sync now` and no mount up, then reads the converged state
+  mount-free (`snapshot list` on both peers, diffed byte-identical by
+  the host — identical live heads mean identical manifests, hence
+  identical bytes by CAS), with one faulted-in wave-2 read tying the
+  heads to bytes through the serve route.
 - Shared drive-path semantics
   (`nostr:nevent1qqs854dvqpuuqx547p6gmyvxt25lslnrvt76l0zxxswgcayrt9cwd0qpz9mhxue69uhkwunpwdczuap49eehgpwq2qz`):
   `wyrd-contracts` contracts 42-49 run every namespace scenario twice —

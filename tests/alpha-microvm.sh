@@ -295,6 +295,26 @@ RUMORS="$( { printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" \
 [[ "$nak_status" != 124 ]] || die "9501 query timed out: leak check inconclusive (see logs/nak-9501.err)"
 [[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
+# Wave 2 (sync-convergence issue): the embedded consumer converges
+# without mounting. The owner writes a second wave through FUSE and
+# stays up serving; the member fetches it headless and reads the
+# converged state mount-free (`snapshot list`: heads with tree
+# hashes, no timestamps, so the host diff is exact). Identical
+# live heads mean identical manifests, hence identical bytes by
+# CAS. Placed after the opacity checks so wave-2 control traffic
+# cannot push the relay sample past the queries' limit headroom.
+rm -f "$RUN/owner-w2-written" "$RUN/member-w2-done" "$RUN"/wave2-*.txt
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh converge2-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-member-w2.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh converge2-owner $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-owner-w2.out" 2>&1 &
+LEG_O=$!
+wait "$LEG_N" || die "member wave-2 leg failed (see logs/leg-member-w2.out)"
+wait "$LEG_O" || die "owner wave-2 leg failed (see logs/leg-owner-w2.out)"
+diff "$RUN/wave2-owner-list.txt" "$RUN/wave2-member-list.txt" \
+  || die "embedded and FUSE views diverge on live heads (see wave2-*-list.txt)"
+pass "embedded consumer converges on identical live heads"
 fi # want_phase 7
 
 # --- phase 4: serving restart -------------------------------------------

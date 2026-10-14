@@ -79,6 +79,74 @@ leg_converge_member() {
   check_no_leaks "$LOGDIR/mount-xmember.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }
 
+# leg_converge2_owner <drive> <creds> <relay>: wave 2 of the
+# cross-host proof (the embedded consumer converges without
+# mounting): write the second wave through the FUSE adapter and
+# stay up serving until the member reports its headless
+# convergence — the stop must not precede the member's fetch, or
+# nothing serves wave-2 bodies. The mount-free capture happens
+# after the stop: the keystore is held by the running mount, so
+# the offline snapshot reads run on the free drive.
+leg_converge2_owner() {
+  local d="$1" c="$2" relay="$3"
+  step 7 "wave-2 owner leg (FUSE-authored)"
+  start_mount xowner-w2 "$c" "$d" "$MNTS/xowner-w2" --relay "$relay"
+  echo "wave2-a-bytes" > "$MNTS/xowner-w2/wave2-a.txt"
+  mkdir -p "$MNTS/xowner-w2/wave2-dir"
+  echo "wave2-b-bytes" > "$MNTS/xowner-w2/wave2-dir/wave2-b.txt"
+  echo "owner-write-2" > "$MNTS/xowner-w2/shared.txt"
+  pass "wave-2 written through the FUSE adapter"
+  touch "$E2E_ROOT/owner-w2-written"
+  poll_until 300 test -f "$E2E_ROOT/member-w2-done" \
+    || die "member never converged on wave 2"
+  stop_mount xowner-w2 INT
+  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-owner-list.txt" \
+    || die "owner snapshot list failed"
+  pass "owner converged state captured mount-free"
+  check_no_leaks "$LOGDIR/mount-xowner-w2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$E2E_ROOT/wave2-owner-list.txt" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
+# leg_converge2_member <drive> <creds> <relay>: the embedded
+# consumer half — converge on wave 2 with headless `sync now` and
+# no mount up, then read the converged state mount-free
+# (`snapshot list`: heads with their tree hashes). v0 promises no
+# headless materialization, so the proof is structural: identical
+# live heads mean identical manifests, hence identical bytes by
+# CAS. (`snapshot plan` cannot serve here: it refuses a single
+# head, and this wave converges to exactly one.) A mount follows
+# only to fault one wave-2 file in, tying this wave's heads to
+# bytes through the serving route (the step-12 pattern), before
+# the done-file releases the owner to stop.
+leg_converge2_member() {
+  local d="$1" c="$2" relay="$3"
+  step 7 "wave-2 member leg (embedded consumer)"
+  poll_until 300 test -f "$E2E_ROOT/owner-w2-written" \
+    || die "owner never wrote wave 2"
+  with_creds "$c" sync "$d" --relay "$relay" now \
+    >"$LOGDIR/member-w2-sync.out" 2>"$LOGDIR/member-w2-sync.err" \
+    || die "member wave-2 headless sync exited non-zero"
+  grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/member-w2-sync.out" \
+    || die "member wave-2 sync fetched no objects (see member-w2-sync.out)"
+  pass "member converges on wave 2 with no mount up"
+  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
+    || die "member snapshot list failed"
+  pass "member converged state captured mount-free"
+  start_mount xmember-w2 "$c" "$d" "$MNTS/xmember-w2" --relay "$relay"
+  [[ "$(cat "$MNTS/xmember-w2/wave2-a.txt")" == "wave2-a-bytes" ]] \
+    || die "member wave-2 mount lost wave2-a.txt"
+  [[ "$(cat "$MNTS/xmember-w2/shared.txt")" == "owner-write-2" ]] \
+    || die "member wave-2 mount lost the shared.txt overwrite"
+  pass "member faults wave-2 bytes in over the serve route"
+  stop_mount xmember-w2 INT
+  touch "$E2E_ROOT/member-w2-done"
+  check_no_content_ids "$LOGDIR/member-w2-sync.out"
+  check_no_leaks "$LOGDIR/member-w2-sync.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/member-w2-sync.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$E2E_ROOT/wave2-member-list.txt" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_leaks "$LOGDIR/mount-xmember-w2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+}
+
 # leg_restarted_owner <drive> <creds> <relay>: mount (endpoint 1),
 # write the pre-restart marker, wait for the member to converge on
 # it, then stop and mount fresh (endpoint 2): the stop+remount IS
@@ -1884,6 +1952,8 @@ leg_uparent_member() {
 case "${1:-}" in
   converge-owner) leg_converge_owner "$2" "$3" "$4" ;;
   converge-member) leg_converge_member "$2" "$3" "$4" ;;
+  converge2-owner) leg_converge2_owner "$2" "$3" "$4" ;;
+  converge2-member) leg_converge2_member "$2" "$3" "$4" ;;
   restarted-owner) leg_restarted_owner "$2" "$3" "$4" ;;
   restart-member) leg_restart_member "$2" "$3" "$4" ;;
   upgrade-owner) leg_upgrade_owner "$2" "$3" "$4" "$5" ;;
@@ -1902,7 +1972,7 @@ case "${1:-}" in
   headless-serve) leg_headless_serve "$2" "$3" "$4" ;;
   headless-fetch) leg_headless_fetch "$2" "$3" "$4" "$5" "$6" "$7" ;;
   headless-setup) leg_headless_setup "$2" "$3" ;;
-  *) echo "usage: $0 converge-owner|converge-member|restarted-owner|restart-member|upgrade-member|fetch-owner|fetch-member|conflict-owner|conflict-member|crash-owner|steady-member|crash-member|steady-owner|exhaustion|uparent-owner|uparent-member|headless-serve <drive> <creds> <relay> | upgrade-owner <drive> <creds> <relay> <archive> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
+  *) echo "usage: $0 converge-owner|converge-member|converge2-owner|converge2-member|restarted-owner|restart-member|upgrade-member|fetch-owner|fetch-member|conflict-owner|conflict-member|crash-owner|steady-member|crash-member|steady-owner|exhaustion|uparent-owner|uparent-member|headless-serve <drive> <creds> <relay> | upgrade-owner <drive> <creds> <relay> <archive> | headless-fetch <drive> <creds> <relay> <tag> <ready-file> <done-file> | headless-setup <drive> <creds>" >&2; exit 2 ;;
 esac
 e2e_timing_report
 echo "legs: $PASS_COUNT checks passed"

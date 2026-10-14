@@ -479,13 +479,15 @@ version say exactly what changed.
   Each refusal site now logs a debug line naming its `layer` (which
   resource) and `stage` (which write-path step it precedes) with the
   deciding numbers — including a `backing-store-capacity` / `commit`
-  line when authoring maps the failure to `StorageFull`, so the
-  commit-stage disk path no longer rides only the generic variant.
-  Errno contract unchanged (`ENOSPC` for
-  all), no behavior change, no new error variants. Pinned by four
-  log-capture emission tests, documented in `write-path.md` ("ENOSPC
-  attribution"), and the exhaustion e2e leg now captures the backend
-  target and asserts the failing fill names its layer.
+  line on every commit-phase store write that maps to `StorageFull`
+  (chunk inserts, tree writes, and the authoring outcome), so the disk
+  path names its layer wherever the refusal lands. Errno contract
+  unchanged (`ENOSPC` for all), no behavior change, no new error
+  variants. Pinned by five log-capture emission tests plus two
+  end-to-end wiring tests that drive commits into a write-refusing
+  store, documented in `write-path.md` ("ENOSPC attribution"), and the
+  exhaustion e2e leg now captures the backend target and asserts the
+  failing fill names its layer.
 - Review helper names the missing argument on an empty id
   (`nostr:nevent1qqsqgnnlt9akul5d0n7590y7kl2kg8gx97c5aafks8nqy8kaaq4mfncpz9mhxue69uhkwunpwdczuap49eehgae50uz`):
   `review pr-context` / `post-comment` with an unset variable printed only

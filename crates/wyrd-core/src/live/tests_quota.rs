@@ -1,7 +1,7 @@
-use super::prereq_tests::{live_over_configured, scratch_file_drive};
+use super::prereq_tests::{live_over_configured, live_over_store, scratch_file_drive};
 use super::*;
 
-use wyrd_format::{FsObjectStore, ObjectKind};
+use wyrd_format::{FsObjectStore, MemoryObjectStore, ObjectKind};
 
 use std::sync::atomic::AtomicU64;
 
@@ -157,4 +157,113 @@ fn a_backing_store_refusal_names_its_layer_and_stage() {
             "no backing-store line for a non-capacity outcome ({quiet:?}):\n{silent}"
         );
     }
+}
+
+/// An object store that reads honestly but refuses every write as a
+/// full disk: drives the commit into its step-2 store refusals, so
+/// the wiring tests below observe which layer the trace names when
+/// the bytes — not the quota — run out.
+#[derive(Debug)]
+struct WriteFull {
+    inner: MemoryObjectStore,
+}
+
+#[derive(Debug)]
+struct WriteFullError;
+
+impl wyrd_format::StoreError for WriteFullError {
+    fn failure(&self) -> StoreFailure {
+        StoreFailure::StorageFull
+    }
+}
+
+impl wyrd_format::ObjectStore for WriteFull {
+    type Error = WriteFullError;
+
+    fn insert(&mut self, _kind: ObjectKind, _data: &[u8]) -> Result<ContentId, WriteFullError> {
+        Err(WriteFullError)
+    }
+
+    fn insert_verified(
+        &mut self,
+        _kind: ObjectKind,
+        _expected: &ContentId,
+        _data: &[u8],
+    ) -> Result<(), WriteFullError> {
+        Err(WriteFullError)
+    }
+
+    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, WriteFullError> {
+        self.inner.get(id).map_err(|_| WriteFullError)
+    }
+
+    fn has(&self, id: &ContentId) -> Result<bool, WriteFullError> {
+        self.inner.has(id).map_err(|_| WriteFullError)
+    }
+}
+
+/// A commit whose content chunks do not fit the disk fails at the
+/// step-2 chunk insert — before authoring — and the trace names the
+/// backing store, not the quota and not the budget. This is the
+/// ordering the exhaustion leg depends on: the fill bytes refuse at
+/// `insert_chunks`, so the leg's `layer="` grep must match here.
+#[test]
+fn a_step_two_chunk_refusal_names_the_backing_store() {
+    let (engine, dir, store, chunk, _root, head) = scratch_file_drive("step-two-chunks");
+    let held = store.get(&chunk).unwrap().unwrap();
+    let config = LiveConfig::default();
+    let mut node = live_over_store(engine, WriteFull { inner: store }, &[head], &config);
+    let (error, logged) = with_capture(tracing::Level::DEBUG, || {
+        node.apply_mutation(
+            &MutationKind::CommitFile {
+                path: "f".into(),
+                base: FileIdentity::new(held.len() as u64, false, vec![chunk]),
+                executable: false,
+                content: b"new bytes that do not fit the disk".to_vec(),
+            },
+            None,
+        )
+        .unwrap_err()
+    });
+    assert_eq!(
+        error,
+        MutationError::Store(StoreFailure::StorageFull),
+        "the errno contract is unchanged: {error:?}"
+    );
+    assert!(
+        logged.contains("backing-store-capacity"),
+        "the step-2 refusal names its layer:\n{logged}"
+    );
+    assert!(
+        !logged.contains("retained-bytes-quota"),
+        "no quota line: the quota is unset, the disk refused:\n{logged}"
+    );
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A namespace write on a full disk fails at the step-2 tree insert
+/// and names the backing store too: `Mkdir` and the leg's `CreateFile`
+/// share the `from_format` mapping helper, so both land on the same
+/// line.
+#[test]
+fn a_step_two_tree_refusal_names_the_backing_store() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("step-two-tree");
+    let config = LiveConfig::default();
+    let mut node = live_over_store(engine, WriteFull { inner: store }, &[head], &config);
+    let (error, logged) = with_capture(tracing::Level::DEBUG, || {
+        node.apply_mutation(&MutationKind::Mkdir { path: "d".into() }, None)
+            .unwrap_err()
+    });
+    assert_eq!(
+        error,
+        MutationError::Store(StoreFailure::StorageFull),
+        "the errno contract is unchanged: {error:?}"
+    );
+    assert!(
+        logged.contains("backing-store-capacity"),
+        "the step-2 refusal names its layer:\n{logged}"
+    );
+    drop(node);
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -61,17 +61,28 @@
   # the mount would hide it, failing invisibly in exactly the way
   # this unit exists to fix (same race common.nix's ssh-key unit
   # poll-waits around). The heartbeat timestamp next to the dump
-  # distinguishes "relay logged nothing" from "the dump never ran".
+  # distinguishes "relay logged nothing" from "the dump never ran" —
+  # written only after a successful dump (via temp-file rename, so a
+  # failed journalctl can never leave a fresh heartbeat over a
+  # truncated log). Note the timestamp is guest-clock time (observed
+  # ~11min ahead of the host on odin): cross-layer correlation
+  # against host-availability.log must use the host-side file mtime
+  # as the skew reference, never compare the two directly.
   systemd.services.wyrd-relay-journal = {
     after = [ "mnt-wyrd\\x2dstate.mount" ];
     requires = [ "mnt-wyrd\\x2dstate.mount" ];
     script = ''
       mkdir -p /mnt/wyrd-state/run/logs
-      date -u +%Y-%m-%dT%H:%M:%SZ > /mnt/wyrd-state/run/logs/relay-journal.ts
-      ${pkgs.systemd}/bin/journalctl -b --no-pager > /mnt/wyrd-state/run/logs/relay-journal.log
+      ${pkgs.systemd}/bin/journalctl -b --no-pager > /mnt/wyrd-state/run/logs/.relay-journal.tmp \
+        && mv /mnt/wyrd-state/run/logs/.relay-journal.tmp /mnt/wyrd-state/run/logs/relay-journal.log \
+        && date -u +%Y-%m-%dT%H:%M:%SZ > /mnt/wyrd-state/run/logs/relay-journal.ts
     '';
     serviceConfig = {
       Type = "oneshot";
+      # A wedged journalctl stalls the oneshot and systemd skips
+      # timer elapses while it runs — silently ending the dump
+      # series. Bound the read instead.
+      TimeoutStartSec = "30s";
     };
   };
   systemd.timers.wyrd-relay-journal = {

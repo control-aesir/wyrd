@@ -56,6 +56,19 @@ grep -q 'mnt-wyrd' "$RELAY_NIX" \
   || { echo "FAIL: relay journal unit is not ordered on the state-share mount" >&2; exit 1; }
 PASS=$((PASS + 1))
 echo "  PASS: relay journal unit waits for the state-share mount"
+# The heartbeat must mean a successful dump: staged through a temp
+# file and renamed on success, so a failed journalctl can never
+# leave a fresh heartbeat over a truncated log. The read is bounded
+# too — a wedged journalctl stalls the oneshot and systemd skips
+# timer elapses while it runs, silently ending the dump series.
+grep -q '\.relay-journal\.tmp' "$RELAY_NIX" \
+  || { echo "FAIL: relay journal dump is not staged through a temp file" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay journal dump stages through a temp file"
+grep -q 'TimeoutStartSec' "$RELAY_NIX" \
+  || { echo "FAIL: relay journal unit has no read bound" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay journal read is bounded"
 
 # The host logger backgrounds with the lock fd closed: an orphaned
 # logger holding fd 9 would wedge the flock for every later run and

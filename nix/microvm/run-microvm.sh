@@ -122,8 +122,10 @@ BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
 WORK="$STATE_DIR/work"
-# Build logs live outside $RUN: phase 1's guest pre-clean empties the
-# shared state root, so anything under $RUN/logs is gone post-run.
+# Build logs live outside $RUN: phase 1's guest pre-clean empties
+# $RUN (the run dir: drives, creds, logs), so anything under
+# $RUN/logs is gone post-run. e2e-env.sh, build-logs, and the key
+# material beside $RUN are untouched by the wipe.
 BUILD_LOGS="$STATE_DIR/build-logs"
 SSH_KEY="$STATE_DIR/sshkey"
 
@@ -164,6 +166,12 @@ kill_stale_daemons() {
 }
 
 teardown() {
+  # The availability logger dies first: it appends to $RUN/logs on
+  # its own cadence and must not outlive the run (a surviving logger
+  # would write a torn-down run's file, and inherit the lock fd —
+  # see the 9>&- rule at its launch). Unset outside a full run
+  # (--teardown mode), so the guard defaults empty under set -u.
+  [[ -n "${LOGGER_PID:-}" ]] && kill "$LOGGER_PID" 2>/dev/null || true
   if [[ "$KEEP" == 0 ]]; then
     kill_stale_daemons
     for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
@@ -344,6 +352,46 @@ RELAY_S=$(( $(date +%s) - RELAY_START ))
 echo "    relay control plane reachable (wait took ${RELAY_S}s)"
 echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 
+# Host availability witness for relay-flap forensics. The 2026-10-08
+# ~30s relay outages had no guest logs (teardown destroys the relay
+# VM; fixed by the relay journal timer in relay.nix) and no host
+# load record (the prime suspect is CI contention on the host), so
+# neither layer could be classified afterwards. This background loop
+# logs one line per 5s — timestamp, host loadavg, relay TCP state —
+# into the run logs. Per-tick open-append-close: the phase-1 guest
+# pre-clean unlinks $RUN/logs once per run, and a held fd would keep
+# writing the unlinked inode invisibly past the wipe. 9>&-: the loop
+# must never inherit the run lock fd — an orphaned logger would hold
+# the flock after the runner dies and wedge every later run plus
+# --teardown (same class as the daemon fd rule at boot).
+AVAIL_LOG="$RUN/logs/host-availability.log"
+availability_loop() {
+  while true; do
+    # Liveness without a pid watch: the runner holds the run lock
+    # for the whole run, so if this logger can acquire it the runner
+    # is gone on an untrapped signal — exit instead of appending to
+    # a dead run's file forever (and double-writing beside the next
+    # run's logger). Append-mode open: never truncate the lock file.
+    if exec 8>>"$LOCK" && flock -n 8; then exit 0; fi
+    exec 8>&-
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Comma-joined triple: a space-joined loadavg leaves the line
+    # with no stable field boundaries for the machine-classified
+    # timeline this witness exists for.
+    load="$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')"
+    if timeout 2 bash -c "</dev/tcp/$NET.10/18761" 2>/dev/null; then relay=ok; else relay=FAIL; fi
+    printf '%s load=%s relay=%s\n' "$ts" "$load" "$relay" >> "$AVAIL_LOG"
+    sleep 5
+  done
+}
+# Stdout/stderr join the log file too: the loop must hold no pipe
+# the runner's readers wait on past an abnormal exit (same class as
+# the AGENTS.md pipe rule). 9>&- as before: an orphaned logger must
+# never inherit the run lock fd.
+availability_loop >>"$AVAIL_LOG" 2>&1 9>&- &
+LOGGER_PID=$!
+echo "    host availability witness logging to logs/host-availability.log (pid $LOGGER_PID)"
+
 echo "==> running the suite"
 set +e
 timeout 7200 env \
@@ -361,6 +409,11 @@ timeout 7200 env \
   bash "$ROOT/tests/alpha-microvm.sh" 9>&-
 STATUS=$?
 set -e
+# Stop the witness with the suite: teardown() (EXIT trap) covers the
+# failure path, but a green run must not log through the report and
+# teardown into the file. Cleared so teardown's kill is a no-op.
+kill "$LOGGER_PID" 2>/dev/null || true
+LOGGER_PID=""
 [[ "$STATUS" == 0 ]] || die "microvm suite failed (exit $STATUS, logs under $RUN/logs)"
 echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 echo "microvm: suite green, logs under $RUN/logs"

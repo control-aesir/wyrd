@@ -27,6 +27,7 @@ mod fuzz;
 pub mod ingest;
 pub mod keys;
 pub mod membership;
+pub mod public_read;
 pub mod runtime;
 pub mod seal;
 pub mod serving;

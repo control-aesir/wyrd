@@ -88,7 +88,10 @@ pub enum Transition {
     /// device's own announcements name no route and serving is idle —
     /// then the loop stores settled `mirror` and the effective role
     /// flips. A withdrawal that cannot complete reports this with
-    /// its reason, never success.
+    /// its reason, never success. Completion is not de-listing: the
+    /// settle pass publishes with the real route again, so the
+    /// settled mirror re-addresses held snapshots as an ordinary
+    /// mirror.
     WithdrawalPending,
 }
 

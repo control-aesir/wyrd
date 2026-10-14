@@ -685,7 +685,12 @@ fn narrowing_withdraws_through_route_publication_then_completes() {
         "the narrowing pass discharges the route-less withdrawal"
     );
     // The withdrawal discharged and serving is idle: the next pass
-    // finds nothing outstanding and completes.
+    // finds nothing outstanding and completes. Completion is not
+    // de-listing: the settle pass itself publishes with the real
+    // route again, so the settled mirror re-addresses held snapshots
+    // as an ordinary mirror — the withdrawal was the transient
+    // window, and the transition stays settled through it.
+    let sent_before = mailbox.sent;
     live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
         .unwrap();
     let state = role::load(&dir).unwrap();
@@ -695,6 +700,155 @@ fn narrowing_withdraws_through_route_publication_then_completes() {
         state.effective(),
         Role::Mirror,
         "the effective posture flips only at withdrawal-complete"
+    );
+    assert!(
+        mailbox.sent > sent_before,
+        "the settle pass re-addresses held snapshots under the real route"
+    );
+    // Quenched after the re-address: a further pass sends nothing
+    // and the completed transition never reopens.
+    let sent_before = mailbox.sent;
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        mailbox.sent, sent_before,
+        "the re-address quenches under the recorded route"
+    );
+    let state = role::load(&dir).unwrap();
+    assert_eq!(
+        (state.role, state.transition),
+        (Role::Mirror, Transition::Settled),
+        "re-addressing never reopens the completed transition"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A withdrawal that cannot complete reports pending with its
+/// reason, never success: two legs. A backed-up serving mirror
+/// holds the transition at pending with nothing outstanding, and
+/// a relay that refuses every send holds it with the routed
+/// version still out — both across passes, both vault-effective
+/// throughout. Remove either hold and the next pass completes.
+#[test]
+fn withdrawal_that_cannot_complete_stays_pending() {
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+
+    /// Refuses every send without failing the pass: the relay is
+    /// unreachable everywhere, so obligations stay pending and no
+    /// discharge ever commits.
+    #[derive(Default)]
+    struct RefusingMailbox {
+        attempts: usize,
+    }
+
+    impl Mailbox for RefusingMailbox {
+        fn send(&mut self, _envelope: MailboxEnvelope) -> Result<SendReport, MailboxError> {
+            self.attempts += 1;
+            Ok(SendReport { accepted: 0 })
+        }
+
+        fn recv(&mut self) -> Result<Option<Delivery>, MailboxError> {
+            Ok(None)
+        }
+
+        fn settle(
+            &mut self,
+            _id: DeliveryId,
+            _disposition: Disposition,
+        ) -> Result<(), MailboxError> {
+            Ok(())
+        }
+    }
+
+    // Leg 1, serving busy: the discharge stalls behind the mirror,
+    // so narrowing parks at pending with nothing outstanding yet.
+    let (mut live, dir) = live_owing_announcement("withdrawal-stuck-busy");
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: vec![13u8; 32],
+            barrier: Arc::new(NeverReady),
+        },
+    )
+    .unwrap();
+    install_role_dir(&mut live, &dir);
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+    let mut mailbox = AcceptingMailbox::default();
+    for _ in 0..2 {
+        live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+            .unwrap();
+    }
+    let state = role::load(&dir).unwrap();
+    assert_eq!(
+        state.transition,
+        Transition::WithdrawalPending,
+        "a busy mirror parks the narrowing at pending"
+    );
+    assert_eq!(
+        state.effective(),
+        Role::Vault,
+        "a parked withdrawal retains like vault"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+
+    // Leg 2, routes undrainable: discharged routed under a real
+    // route, then every withdrawal send refused — the routed
+    // version stays out and the transition never flips.
+    let (mut live, dir) = live_owing_announcement("withdrawal-stuck-routes");
+    let id = iroh::SecretKey::from_bytes(&[0x0Du8; 32]).public();
+    let route = wyrd_sync::transport::encode_node_addr(&iroh::EndpointAddr::new(id));
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: route,
+            barrier: Arc::new(Ready),
+        },
+    )
+    .unwrap();
+    install_role_dir(&mut live, &dir);
+    let mut mailbox = AcceptingMailbox::default();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "the routed first discharge clears the backlog"
+    );
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+    let mut refusing = RefusingMailbox::default();
+    for _ in 0..2 {
+        live.sync_once(&mut refusing, None::<&mut MemoryBulkSource>)
+            .unwrap();
+    }
+    assert!(
+        refusing.attempts > 0,
+        "the narrowing passes attempt the withdrawal discharge"
+    );
+    let state = role::load(&dir).unwrap();
+    assert_eq!(
+        state.transition,
+        Transition::WithdrawalPending,
+        "refused withdrawal sends never complete the transition"
+    );
+    assert_eq!(
+        state.effective(),
+        Role::Vault,
+        "a stuck withdrawal retains like vault indefinitely"
     );
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();

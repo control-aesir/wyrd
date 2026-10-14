@@ -543,7 +543,11 @@ never happen silently:
   snapshots with no real-route discharge left, plus an idle serving
   barrier. Out-of-scope history is accepted stale — the redelivery
   gate never resends it, so the predicate never waits for it, exactly
-  as endpoint rotation leaves old routes behind.
+  as endpoint rotation leaves old routes behind. Completion is not
+  de-listing: the settle pass itself publishes with the real route
+  again, so a settled mirror re-addresses held snapshots as an
+  ordinary mirror. The withdrawal is the transient window in which
+  a vault-effective device stops offering, not a durable silence.
 
 ### Role effects on pin, evict, quota, and serving
 

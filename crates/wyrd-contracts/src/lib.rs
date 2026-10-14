@@ -122,6 +122,21 @@
 //!     identical-bytes redelivery across an engine restart commits
 //!     nothing: dedupe is durable, and the one head stands.
 //!
+//! The shared drive-path semantics (embedded consumer versus FUSE
+//! adapter; sibling testing issue): each scenario runs through the
+//! core channel plus `LiveReader` and through `FuseBackend` over
+//! identically seeded drives, and the normalized outcome traces must
+//! match. Documented divergences assert per-path tags instead.
+//!
+//! 42. `embedded_and_adapter_paths_agree_on_create_write_read`
+//! 43. `embedded_and_adapter_paths_agree_on_rename_and_delete`
+//! 44. `embedded_and_adapter_paths_agree_on_error_classes`
+//! 45. `embedded_and_adapter_paths_agree_on_publication`
+//! 46. `embedded_and_adapter_readers_agree_on_conflicts_and_materialization`
+//! 47. `committed_bytes_survive_restart_without_a_running_daemon`
+//! 48. `shutdown_closes_the_mutation_channel_for_both_paths`
+//! 49. `adapter_write_folding_matches_embedded_fold_script`
+//!
 //! The layering contracts (workspace extraction program):
 //!
 //! 34. `crate_dependencies_follow_the_layered_dag` — every member's
@@ -295,6 +310,8 @@ mod policy_contracts;
 mod removal_contracts;
 #[cfg(test)]
 mod serving_contracts;
+#[cfg(test)]
+mod shared_drive_semantics;
 #[cfg(test)]
 mod support;
 #[cfg(test)]

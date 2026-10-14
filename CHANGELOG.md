@@ -450,6 +450,13 @@ version say exactly what changed.
 
 ### Fixed
 
+- Review helper names the missing argument on an empty id
+  (`nostr:nevent1qqsqgnnlt9akul5d0n7590y7kl2kg8gx97c5aafks8nqy8kaaq4mfncpz9mhxue69uhkwunpwdczuap49eehgae50uz`):
+  `review pr-context` / `post-comment` with an unset variable printed only
+  the generic usage text, which reads as an arg-parsing failure and sends
+  the operator debugging quoting instead of the variable. Both now print
+  `missing id (resolve it first: review resolve-pr)` before usage.
+  Pinned by two stub cases in `.ngit/scripts/tests/test-review.sh`.
 - ngit-workflow triage tool success result referenced an undefined
   `removals` binding (every success threw ReferenceError after applying
   labels): the reported shape is now built by `triageSuccessResult` in

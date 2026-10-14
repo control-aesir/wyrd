@@ -243,6 +243,27 @@ else
 fi
 unset STUB_VIEW_FIRST
 
+# 15. pr-context with an empty id names the missing argument (an
+# unset variable reads as an arg-parsing failure otherwise).
+out="$("$REVIEW_SH" pr-context "" 2>"$T/err")"
+code=$?
+if [ $code -ne 0 ] && [ -z "$out" ] && grep -q "pr-context: missing id" "$T/err"; then
+  ok "pr-context empty id names the missing argument"
+else
+  bad "pr-context empty id: code=$code out=[$out]"
+fi
+
+# 16. post-comment with an empty id names the missing argument
+# before reading stdin or calling ngit.
+: > "$STUB_LOG"
+printf 'hello review' | "$REVIEW_SH" post-comment "" >/dev/null 2>"$T/err"
+code=$?
+if [ $code -ne 0 ] && [ ! -s "$STUB_LOG" ] && grep -q "post-comment: missing id" "$T/err"; then
+  ok "post-comment empty id names the missing argument without calling ngit"
+else
+  bad "post-comment empty id: code=$code logbytes=$(wc -c <"$STUB_LOG")"
+fi
+
 echo "---"
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -143,6 +143,20 @@ impl LiveReader {
         self
     }
 
+    /// Wire only the quarantine drain: rejections name and wait,
+    /// losses surface untouched.
+    pub fn with_quarantine(mut self, quarantine: Arc<QuarantineQueue>) -> Self {
+        self.quarantine = Some(quarantine);
+        self
+    }
+
+    /// Wire only the scrub drain: losses name and wait, rejections
+    /// surface untouched.
+    pub fn with_scrub(mut self, scrub: Arc<ScrubQueue>) -> Self {
+        self.scrub = Some(scrub);
+        self
+    }
+
     /// Read the whole file at `path`: lookup, demand-driven open,
     /// then windowed reads to the declared size. Reads hold their
     /// open-time file, so head advancement mid-read never silently
@@ -158,18 +172,44 @@ impl LiveReader {
         let size = match &node {
             Node::File { size, .. } => *size,
             // Symlinks resolve at the presentation boundary and
-            // conflicts address through version-qualified paths;
-            // the view names the real failure on open.
-            _ => return Err(ReadError::View(view.open_file(&node).unwrap_err())),
+            // conflicts address through version-qualified paths.
+            // The view names the real failure on open; a view that
+            // wrongly opens a non-file still fails here, never with
+            // a library panic.
+            _ => {
+                let error = match view.open_file(&node) {
+                    Err(error) => error,
+                    Ok(_) => ViewError::NotAFile,
+                };
+                return Err(ReadError::View(error));
+            }
         };
         let file = self.open_with_demand(view, &node)?;
-        let mut bytes = Vec::with_capacity(size.min(usize::MAX as u64) as usize);
+        // Never preallocate from the declared size: the declaration
+        // is read before a single byte is, and a lying tree entry
+        // would turn metadata into an out-of-memory abort (the
+        // mount is immune — it fills the kernel-supplied request).
+        // Grow per window instead, capped at one window ahead.
+        let mut bytes = Vec::new();
         let mut offset = 0u64;
         while offset < size {
-            let window = ((size - offset) as usize).min(READ_WINDOW);
+            // A declaration that does not fit the address space is
+            // a corrupt projection, not a short read: fail rather
+            // than truncate.
+            let window = usize::try_from(size - offset)
+                .map_err(|_| ViewError::Corrupt)?
+                .min(READ_WINDOW);
             let chunk = self.read_with_demand(view, &file, offset, window)?;
             if chunk.is_empty() {
-                break;
+                // A window that serves nothing served a lie about
+                // the declared size: only the declared end may
+                // legitimately read empty, and the loop condition
+                // already excludes it. Non-`DriveView`
+                // implementations whose windows can come back
+                // empty fail here instead of silently truncating
+                // (`DriveView::read` fails such walks `Corrupt`
+                // itself).
+                return Err(ReadError::View(ViewError::Corrupt));
             }
             offset += chunk.len() as u64;
             bytes.extend_from_slice(&chunk);
@@ -177,22 +217,24 @@ impl LiveReader {
         Ok(bytes)
     }
 
-    /// Open with the mount's demand flow: repair-on-demand entry
-    /// for observed-invalid bytes, first-touch terminal fast path,
-    /// then bounded blocking with terminal-aware retries.
-    fn open_with_demand<V>(&self, view: &V, node: &Node) -> Result<OpenFile, ReadError>
-    where
-        V: NamespaceView,
-        V::Store: ObjectStore,
-        <V::Store as ObjectStore>::Error: std::fmt::Debug,
-    {
-        let first = view.open_file(node);
-        // Repair-on-demand entry: observed-invalid bytes are named
-        // to the loop before anything else reads them again, then
-        // become `NotMaterialized` so the reader waits on the fresh
-        // generation, not on doomed bytes. Without repair wiring
-        // there is no loop to repair through, so the rejection
-        // surfaces untouched — and nothing is submitted.
+    /// Repair-on-demand entry shared by opens and windowed
+    /// reads: observed-invalid bytes are named to the loop before
+    /// anything else reads them again, then become
+    /// `NotMaterialized` so the reader waits on the fresh
+    /// generation, not on doomed bytes. Without repair wiring
+    /// there is no loop to repair through, so rejections surface
+    /// untouched — and nothing is submitted. A first-touch
+    /// `Unavailable` with a fresh repair observation is the same
+    /// repair seen one observation later (claim cleared or
+    /// clearing, projection lagging), so the identity enters the
+    /// demand flow and waits it out. The recency consults only
+    /// the owning queue's observations — a rejection noted
+    /// without a quarantine drain behind it (or a loss without
+    /// scrub) is not a repair in flight, and the verdict stays
+    /// fast. This mirrors the mount, whose arms require the
+    /// owning queue alongside demand (`backend.rs` first-touch
+    /// matches).
+    fn enter_demand<T>(&self, first: Result<T, ViewError>) -> Result<T, ViewError> {
         let first = match (&self.quarantine, &self.wants, &first) {
             (
                 Some(quarantine),
@@ -213,21 +255,31 @@ impl LiveReader {
             }
             _ => first,
         };
-        // A first-touch `Unavailable` with a fresh repair observation
-        // is the same repair seen one observation later: the claim
-        // is cleared (or clearing) and the projection lags, so the
-        // identity enters the demand flow and waits it out. Without
-        // a recent observation this stays the fast terminal verdict
-        // it has always been.
-        let first = match (&self.wants, &first) {
-            (Some(_), Err(ViewError::Unavailable { content }))
-                if self.recent_rejections.contains(content)
-                    || self.recent_losses.contains(content) =>
+        match (&self.quarantine, &self.scrub, &self.wants, &first) {
+            (Some(_), _, Some(_), Err(ViewError::Unavailable { content }))
+                if self.recent_rejections.contains(content) =>
+            {
+                Err(ViewError::NotMaterialized { content: *content })
+            }
+            (_, Some(_), Some(_), Err(ViewError::Unavailable { content }))
+                if self.recent_losses.contains(content) =>
             {
                 Err(ViewError::NotMaterialized { content: *content })
             }
             _ => first,
-        };
+        }
+    }
+
+    /// Open with the mount's demand flow: repair-on-demand entry
+    /// for observed-invalid bytes, first-touch terminal fast path,
+    /// then bounded blocking with terminal-aware retries.
+    fn open_with_demand<V>(&self, view: &V, node: &Node) -> Result<OpenFile, ReadError>
+    where
+        V: NamespaceView,
+        V::Store: ObjectStore,
+        <V::Store as ObjectStore>::Error: std::fmt::Debug,
+    {
+        let first = self.enter_demand(view.open_file(node));
         let (Some(registry), Err(ViewError::NotMaterialized { content })) = (&self.wants, &first)
         else {
             return self.finish_first(first);
@@ -321,7 +373,7 @@ impl LiveReader {
         V::Store: ObjectStore,
         <V::Store as ObjectStore>::Error: std::fmt::Debug,
     {
-        let first = view.read(file, offset, len);
+        let first = self.enter_demand(view.read(file, offset, len));
         let (Some(registry), Err(ViewError::NotMaterialized { content })) = (&self.wants, &first)
         else {
             return self.finish_first_read(first);

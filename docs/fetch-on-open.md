@@ -278,6 +278,16 @@ not demand: a path no installed head contains is `ENOENT` immediately —
 open blocks for content *after* announce, never for announcements
 themselves.
 
+The demand path is not FUSE-only. `wyrd_core::read::LiveReader`
+(`crates/wyrd-core/src/read.rs`) is the same sequence — lookup, open,
+materialization check, want registration, bounded block, windowed
+reads through the pinned handle — over any namespace view, with
+typed errors instead of errno, so embedders read remote-only
+content with fetch demand and no kernel mount. Same projection,
+same bytes, same failure classes: pinned by the equivalence tests
+in `crates/wyrd-daemon/src/core/tests_mount_free.rs` and the
+demand-class tests in `crates/wyrd-core/src/read/tests_read.rs`.
+
 ## No provider reaches the known snapshot
 
 History-visible and provider-reachable are separate facts. An

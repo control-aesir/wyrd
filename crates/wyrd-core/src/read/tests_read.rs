@@ -32,6 +32,14 @@ enum Outcome {
         fulfill: Arc<AtomicBool>,
         bytes: Vec<u8>,
     },
+    /// Open succeeds; windows report a rejected representation
+    /// until the flag flips, pinning the read-side demand arms
+    /// (`DriveView::open` is lazy, so this is the shape the real
+    /// view always takes).
+    OpenOkReadRejected {
+        fulfill: Arc<AtomicBool>,
+        bytes: Vec<u8>,
+    },
     Unavailable(Vec<u8>),
     Corrupt(Vec<u8>),
     Rejected(Vec<u8>),
@@ -43,6 +51,7 @@ impl Outcome {
         match self {
             Outcome::Served(bytes)
             | Outcome::RemoteOnly { bytes, .. }
+            | Outcome::OpenOkReadRejected { bytes, .. }
             | Outcome::Unavailable(bytes)
             | Outcome::Corrupt(bytes)
             | Outcome::Rejected(bytes)
@@ -53,6 +62,7 @@ impl Outcome {
 
 struct FakeView {
     files: Mutex<BTreeMap<String, Outcome>>,
+    dirs: Mutex<Vec<String>>,
     store: Arc<RwLock<MemoryObjectStore>>,
 }
 
@@ -82,6 +92,7 @@ impl NamespaceView for FakeView {
     ) -> Self {
         FakeView {
             files: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(Vec::new()),
             store: Arc::new(RwLock::new(store)),
         }
     }
@@ -93,6 +104,7 @@ impl NamespaceView for FakeView {
     ) -> Self {
         FakeView {
             files: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(Vec::new()),
             store,
         }
     }
@@ -118,13 +130,27 @@ impl NamespaceView for FakeView {
     }
 
     fn lookup(&self, path: &str) -> Result<Node, ViewError> {
-        let guard = self.outcome(path).ok_or(ViewError::NotFound)?;
-        let outcome = guard.get(path).ok_or(ViewError::NotFound)?;
-        Ok(Node::File {
-            size: outcome.bytes().len() as u64,
-            executable: false,
-            chunks: vec![Self::file_id(path)],
-        })
+        if let Some(guard) = self.outcome(path) {
+            let outcome = guard.get(path).ok_or(ViewError::NotFound)?;
+            return Ok(Node::File {
+                size: outcome.bytes().len() as u64,
+                executable: false,
+                chunks: vec![Self::file_id(path)],
+            });
+        }
+        if self
+            .dirs
+            .lock()
+            .map_err(|_| {
+                ViewError::Store(wyrd_format::StoreFailure::Transient, "fake lock".into())
+            })?
+            .contains(&path.to_string())
+        {
+            return Ok(Node::Dir {
+                subtree: Self::file_id(path),
+            });
+        }
+        Err(ViewError::NotFound)
     }
 
     fn stat(&self, path: &str) -> Result<Attr, ViewError> {
@@ -164,6 +190,7 @@ impl NamespaceView for FakeView {
                 Ok(OpenFile::new(chunks, size))
             }
             Outcome::RemoteOnly { .. } => Err(ViewError::NotMaterialized { content }),
+            Outcome::OpenOkReadRejected { .. } => Ok(OpenFile::new(chunks, size)),
             Outcome::Unavailable(_) => Err(ViewError::Unavailable { content }),
             Outcome::Corrupt(_) => Err(ViewError::Corrupt),
             Outcome::Rejected(_) => Err(ViewError::RejectedRepresentation {
@@ -191,6 +218,15 @@ impl NamespaceView for FakeView {
             Outcome::RemoteOnly { .. } => {
                 return Err(ViewError::NotMaterialized {
                     content: Self::file_id(path),
+                })
+            }
+            Outcome::OpenOkReadRejected { fulfill, bytes } if fulfill.load(Ordering::SeqCst) => {
+                bytes
+            }
+            Outcome::OpenOkReadRejected { .. } => {
+                return Err(ViewError::RejectedRepresentation {
+                    content: Self::file_id(path),
+                    kind: ObjectKind::Chunk,
                 })
             }
             Outcome::Unavailable(_) => {
@@ -231,6 +267,15 @@ fn view_with(files: Vec<(&str, Outcome)>) -> FakeView {
         guard.insert(path.to_string(), outcome);
     }
     drop(guard);
+    view
+}
+
+fn view_with_dirs(dirs: Vec<&str>) -> FakeView {
+    let view = FakeView::open(MemoryObjectStore::default(), AllLocal, Vec::new());
+    view.dirs
+        .lock()
+        .unwrap()
+        .extend(dirs.into_iter().map(str::to_string));
     view
 }
 
@@ -379,6 +424,139 @@ fn read_missing_path_maps_lookup_error() {
         Err(ReadError::View(ViewError::NotFound)) => {}
         other => panic!("expected NotFound passthrough, got {other:?}"),
     }
+}
+
+#[test]
+fn read_directory_path_fails_as_view_error_without_panic() {
+    let view = view_with_dirs(vec!["/d"]);
+    let reader = LiveReader::new(Duration::from_secs(5));
+    match reader.read_file(&view, "/d") {
+        Err(ReadError::View(ViewError::NotAFile)) => {}
+        other => panic!("expected NotAFile, got {other:?}"),
+    }
+}
+
+#[test]
+fn read_remote_only_without_demand_fails_fast_as_view_error() {
+    let view = view_with(vec![(
+        "/a",
+        Outcome::RemoteOnly {
+            fulfill: Arc::new(AtomicBool::new(false)),
+            bytes: b"never".to_vec(),
+        },
+    )]);
+    // No wants wired: no waiter blocks, the view error rides
+    // through exactly as reported.
+    let reader = LiveReader::new(Duration::from_secs(5));
+    match reader.read_file(&view, "/a") {
+        Err(ReadError::View(ViewError::NotMaterialized { .. })) => {}
+        other => panic!("expected fast NotMaterialized, got {other:?}"),
+    }
+}
+
+#[test]
+fn read_windowed_rejection_heals_through_read_side_demand() {
+    let fulfill = Arc::new(AtomicBool::new(false));
+    let view = Arc::new(view_with(vec![(
+        "/a",
+        Outcome::OpenOkReadRejected {
+            fulfill: Arc::clone(&fulfill),
+            bytes: b"healed".to_vec(),
+        },
+    )]));
+    let quarantine = Arc::new(QuarantineQueue::default());
+    let (reader, _wants) = reader_with_wants(Duration::from_secs(10));
+    let reader = reader.with_repair(Arc::clone(&quarantine), Arc::new(ScrubQueue::default()));
+    // Open succeeds outright (lazy, like the real view); the first
+    // window reports the rejection, which the read-side demand
+    // names to quarantine and waits out.
+    let healer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        fulfill.store(true, Ordering::SeqCst);
+    });
+    let bytes = reader.read_file(&*view, "/a").unwrap();
+    healer.join().unwrap();
+    assert_eq!(bytes, b"healed");
+    assert!(!quarantine.is_empty());
+}
+
+/// The rejection arm of the first-touch recency gate consults the
+/// quarantine drain: with only quarantine wired, a repair observed
+/// through it still holds the waiter past a stale terminal
+/// verdict.
+#[test]
+fn read_unavailable_behind_rejection_waits_with_quarantine_only() {
+    let view = Arc::new(view_with(vec![(
+        "/a",
+        Outcome::Rejected(b"healed".to_vec()),
+    )]));
+    let reader = LiveReader::new(Duration::from_secs(10))
+        .with_wants(Arc::new(WantRegistry::default()))
+        .with_quarantine(Arc::new(QuarantineQueue::default()));
+    let seeder_view = Arc::clone(&view);
+    let seeder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        seeder_view
+            .files
+            .lock()
+            .unwrap()
+            .insert("/a".to_string(), Outcome::Served(b"healed".to_vec()));
+    });
+    assert_eq!(reader.read_file(&*view, "/a").unwrap(), b"healed");
+    seeder.join().unwrap();
+    view.files
+        .lock()
+        .unwrap()
+        .insert("/a".to_string(), Outcome::Unavailable(b"healed".to_vec()));
+    let healer_view = Arc::clone(&view);
+    let healer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        healer_view
+            .files
+            .lock()
+            .unwrap()
+            .insert("/a".to_string(), Outcome::Served(b"healed".to_vec()));
+    });
+    let bytes = reader.read_file(&*view, "/a").unwrap();
+    healer.join().unwrap();
+    assert_eq!(bytes, b"healed");
+}
+
+/// The loss arm consults the scrub drain the same way: with only
+/// scrub wired, a repair observed through it holds the waiter.
+#[test]
+fn read_unavailable_behind_loss_waits_with_scrub_only() {
+    let view = Arc::new(view_with(vec![("/a", Outcome::Lost(b"healed".to_vec()))]));
+    let reader = LiveReader::new(Duration::from_secs(10))
+        .with_wants(Arc::new(WantRegistry::default()))
+        .with_scrub(Arc::new(ScrubQueue::default()));
+    let seeder_view = Arc::clone(&view);
+    let seeder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        seeder_view
+            .files
+            .lock()
+            .unwrap()
+            .insert("/a".to_string(), Outcome::Served(b"healed".to_vec()));
+    });
+    assert_eq!(reader.read_file(&*view, "/a").unwrap(), b"healed");
+    seeder.join().unwrap();
+    view.files
+        .lock()
+        .unwrap()
+        .insert("/a".to_string(), Outcome::Unavailable(b"healed".to_vec()));
+    let healer_view = Arc::clone(&view);
+    let healer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        healer_view
+            .files
+            .lock()
+            .unwrap()
+            .insert("/a".to_string(), Outcome::Served(b"healed".to_vec()));
+    });
+    let bytes = reader.read_file(&*view, "/a").unwrap();
+    healer.join().unwrap();
+    assert_eq!(bytes, b"healed");
 }
 
 #[test]

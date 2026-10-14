@@ -51,7 +51,7 @@ arbitrary subsets of that drive locally.
 | `wyrd-sync` | iroh transport, snapshot announcements, encrypted manifests, fetch/evict, peer roles | `wyrd-format`, `wyrd-namespace` (verification-proof token), iroh stack, nostr crate (BIP-340, NIP-44, NIP-46) |
 | `wyrd-namespace` | Provider-neutral namespace model: value types, verified-head handle, read surface every presentation backend serves | `wyrd-format`, thiserror only — never sync, never iroh |
 | `wyrd-fuse` | Mount-free drive view: lookup, readdir, open, read, stat, conflict surfacing | `wyrd-format`, `wyrd-namespace` (namespace value model) |
-| `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control; no presentation, no process supervision | `wyrd-format`, `wyrd-namespace`, `wyrd-sync` |
+| `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control, and the mount-free demand-driven read surface (`read::LiveReader`: same fetch-on-open sequence as the mount, no kernel mount); no presentation, no process supervision | `wyrd-format`, `wyrd-namespace`, `wyrd-sync` |
 | `wyrd-daemon` | Composition library: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
 | `wyrd-cli` | The `wyrd` process host: argument parsing, credential files, mount orchestration, diagnostics, exit codes | `wyrd-daemon` (+ `wyrd-core`/`wyrd-sync`/`wyrd-format` surfaces), `clap`, `fuser`, `libc` |
 | `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |

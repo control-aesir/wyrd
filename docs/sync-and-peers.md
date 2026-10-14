@@ -535,8 +535,8 @@ never happen silently:
   underway. `role status` names what is outstanding. Obligations retire
   only through the reconciliation contract (delivered ∪ reconciled) —
   never because the operator acknowledged.
-- **Withdrawal complete.** No serve streams originated under the old role
-  remain open and route publication no longer names this device for new
+- **Withdrawal complete.** The serving queue is drained with nothing
+  queued to serve, and route publication no longer names this device for new
   snapshots. Only then does the effective role flip. A withdrawal that
   cannot complete reports pending with its reason, never success. The
   loop derives both halves off durable state each pass: own in-scope

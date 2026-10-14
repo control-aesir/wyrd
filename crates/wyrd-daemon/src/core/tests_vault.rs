@@ -853,3 +853,87 @@ fn withdrawal_that_cannot_complete_stays_pending() {
     drop(live);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A torn role file freezes the driver mid-withdrawal and resumes
+/// serving: the loop leaves the file untouched (no advancement, no
+/// completion) while announcements fall back to the composed route —
+/// the deliberate degrade-not-abort trade, now pinned for the new
+/// state. Repairing the file resumes the withdrawal where it stood.
+#[test]
+fn withdrawal_pending_torn_file_freezes_driver_and_resumes_serving() {
+    use wyrd_core::role::{self, Role, RoleState, Transition};
+    let (mut live, dir) = live_owing_announcement("withdrawal-torn-pending");
+    let id = iroh::SecretKey::from_bytes(&[0x0Eu8; 32]).public();
+    let route = wyrd_sync::transport::encode_node_addr(&iroh::EndpointAddr::new(id));
+    install_serving(
+        &mut live,
+        &StubSurface {
+            addr: route,
+            barrier: Arc::new(Ready),
+        },
+    )
+    .unwrap();
+    install_role_dir(&mut live, &dir);
+    let mut mailbox = AcceptingMailbox::default();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert!(
+        live.pending_announcements().unwrap().is_empty(),
+        "the routed first discharge clears the backlog"
+    );
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        role::load(&dir).unwrap().transition,
+        Transition::WithdrawalPending,
+        "parked mid-withdrawal before the corruption"
+    );
+    // External corruption: the driver must not advance, complete,
+    // or heal the file — and announcements fall back to serving.
+    std::fs::write(dir.join("role"), "vaul").unwrap();
+    let sent_before = mailbox.sent;
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("role")).unwrap(),
+        b"vaul",
+        "the driver leaves a torn file untouched"
+    );
+    assert!(
+        mailbox.sent > sent_before,
+        "unreadable role falls back to the composed route and re-addresses"
+    );
+    // Repair resumes where the narrowing stood: acknowledgement
+    // re-parks at pending with the routed version still out.
+    role::store(
+        &dir,
+        RoleState {
+            role: Role::Mirror,
+            transition: Transition::NarrowingAcknowledged,
+        },
+    )
+    .unwrap();
+    live.sync_once(&mut mailbox, None::<&mut MemoryBulkSource>)
+        .unwrap();
+    let state = role::load(&dir).unwrap();
+    assert_eq!(
+        state.transition,
+        Transition::WithdrawalPending,
+        "repair resumes the parked withdrawal"
+    );
+    assert_eq!(
+        state.effective(),
+        Role::Vault,
+        "the resumed withdrawal still retains like vault"
+    );
+    drop(live);
+    std::fs::remove_dir_all(dir).unwrap();
+}

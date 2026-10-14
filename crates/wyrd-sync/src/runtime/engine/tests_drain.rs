@@ -899,6 +899,66 @@ fn route_change_redelivers_discharged_announcements() {
     );
 }
 
+/// Withdrawal-outstanding survives reopen: a routed discharge
+/// followed by a crash still counts the snapshot outstanding (the
+/// route half rebuilds from facts, so a stuck narrowing stays
+/// stuck across restart), the route-less redelivery clears it, and
+/// the cleared count survives a second reopen.
+#[test]
+fn withdrawal_outstanding_survives_reopen() {
+    let (mut pair, controls, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.b).accepted, 6);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let authored = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let route_a = live_route(0xA1);
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a
+            .engine
+            .announce_snapshot(&authored, &mut mailbox, Some(route_a.as_slice()))
+            .unwrap()
+    };
+    assert_eq!(sent, 2, "discharge routed, both members served");
+    assert_eq!(
+        pair.a.engine.withdrawal_outstanding().unwrap(),
+        1,
+        "the routed discharge is outstanding"
+    );
+    // Crash: memory drops, the route record replays — the stuck
+    // count survives reopen.
+    restart(&mut pair.a, &controls);
+    assert_eq!(
+        pair.a.engine.withdrawal_outstanding().unwrap(),
+        1,
+        "outstanding survives reopen off durable facts"
+    );
+    // Withdraw route-less: the resend clears the count, and the
+    // cleared count survives a second reopen.
+    let sent = {
+        let mut mailbox = MemoryMailbox {
+            relay: &mut pair.relay,
+            owner: pair.a.device,
+        };
+        pair.a.engine.announce_pending(&mut mailbox, None).unwrap()
+    };
+    assert_eq!(sent, 2, "the withdrawal redelivers route-less");
+    assert_eq!(
+        pair.a.engine.withdrawal_outstanding().unwrap(),
+        0,
+        "the withdrawal discharge clears the count"
+    );
+    restart(&mut pair.a, &controls);
+    assert_eq!(
+        pair.a.engine.withdrawal_outstanding().unwrap(),
+        0,
+        "the cleared count stays cleared across reopen"
+    );
+}
 /// Closure-scoped redelivery (22b): on a serving-route change the
 /// current head AND its reachable closure reopen — the retained
 /// history a late peer needs to discover content, not just the head.

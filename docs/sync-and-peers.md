@@ -535,10 +535,21 @@ never happen silently:
   underway. `role status` names what is outstanding. Obligations retire
   only through the reconciliation contract (delivered ∪ reconciled) —
   never because the operator acknowledged.
-- **Withdrawal complete.** No serve streams originated under the old role
-  remain open and route publication no longer names this device for new
+- **Withdrawal complete.** The serving queue is drained with nothing
+  queued to serve, and route publication no longer names this device for new
   snapshots. Only then does the effective role flip. A withdrawal that
-  cannot complete reports pending with its reason, never success.
+  cannot complete reports pending with its reason, never success. Each
+  pass the loop checks the route half off durable state — own in-scope
+  snapshots with no real-route discharge left — plus an idle serving
+  barrier, which is memory-only per composition: a restart re-derives
+  the route half from facts and re-reads serving readiness live.
+  Out-of-scope history is accepted stale — the redelivery
+  gate never resends it, so the predicate never waits for it, exactly
+  as endpoint rotation leaves old routes behind. Completion is not
+  de-listing: the settle pass itself publishes with the real route
+  again, so a settled mirror re-addresses held snapshots as an
+  ordinary mirror. The withdrawal is the transient window in which
+  a vault-effective device stops offering, not a durable silence.
 
 ### Role effects on pin, evict, quota, and serving
 

@@ -1377,9 +1377,10 @@ fn announcement_route_seals_round_trip_per_pair_first_wins() {
 /// reopens only in-scope pairs whose recorded route differs from
 /// the live one — unknown routes count as changed, the live route
 /// quenches, out-of-scope history stays discharged, and no route at
-/// all degrades to plain pending. (The caller computes the scope as
-/// live heads plus their reachable closure; at the fact level the
-/// scope is just the gating set.)
+/// all reopens only pairs withdrawn from a real route (the
+/// withdrawal repair) plus plain pending. (The caller computes the
+/// scope as live heads plus their reachable closure; at the fact
+/// level the scope is just the gating set.)
 #[test]
 fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
     use std::collections::BTreeSet;
@@ -1429,8 +1430,9 @@ fn announcement_delivered_routes_round_trip_and_scope_eligibility() {
     );
     assert_eq!(
         rebuilt.runtime.announce_eligible_for(None, &scope),
-        vec![(snapshot, carol)],
-        "no route: plain pending, repair toward nothing"
+        vec![(snapshot, alice), (snapshot, carol)],
+        "no route: pending plus the routed pair, reopened once for withdrawal; \
+         never-routed bob and out-of-scope history stay shut"
     );
 
     // Overwrite: last write wins on replay, quenching under the new

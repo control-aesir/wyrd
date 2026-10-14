@@ -39,6 +39,19 @@ version say exactly what changed.
   argument), after a stray `done` shipped and invalidated a 40-minute
   suite run past all its evidence. Pinned by a stub that fails a
   broken fixture even behind clean files.
+- Role-narrowing withdrawal driver
+  (`nostr:nevent1qqsxsskuhzne6qgv4ndw6hsssmqmdhxu8kaz5mtnx4s49ny53l88f3qpz9mhxue69uhkwunpwdczuap49eehgjpqlyw`):
+  an acknowledged narrowing now advances through the route-publication
+  gate instead of resting there. While narrowing the live loop announces
+  route-less, so the signed route-update channel drops the device from
+  peers' maps (never a silent endpoint stop — in-flight fetches keep
+  serving); withdrawing a live route redelivers once per pair and
+  quenches under a recorded withdrawn sentinel, so re-widening
+  re-addresses like any route change. Pending completes to settled
+  `mirror` exactly when no own in-scope snapshot still names a route at
+  a peer and serving idles; `role status` names the outstanding count,
+  effective stays vault until that commit, and a stuck withdrawal
+  reports pending with its reason.
 - Post-upgrade convergence leg
   (`nostr:nevent1qqsr9arqyq4vjvcvtfsqrqf3r5h0wp0zju2zrf7h42uzggl950e0h8qpz9mhxue69uhkwunpwdczuap49eehg57t5zx`):
   microVM phase 8 gains an upgrade-rejoin leg pair — the owner upgrades its

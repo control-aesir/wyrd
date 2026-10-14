@@ -174,6 +174,16 @@ impl ReconciliationCounters {
     }
 }
 
+/// The delivered-route record for a route-less send: withdrawing a
+/// live route (or sending headless) records that the pair was last
+/// discharged with no route, so the repair quenches instead of
+/// resending every pass. All-zero is not a live endpoint identity —
+/// endpoint ids are generated endpoint public keys, never the zero
+/// secret's degenerate point — so the sentinel can never collide
+/// with a real route. A later send under a real route overwrites it,
+/// which is what makes re-widening re-address like any route change.
+pub(crate) const WITHDRAWN_ROUTE: [u8; 32] = [0u8; 32];
+
 /// Durably retained runtime sync state: the live view rebuilds from
 /// committed durable facts (transitions, announcements, manifests,
 /// residency mutations) via the fact/replay path, so this struct
@@ -487,12 +497,12 @@ impl RuntimeState {
     /// pending pairs (never sent) are unaffected by the gate.
     ///
     /// `None` (no live serving route — an offline or headless run)
-    /// degrades to plain pending: repair toward no route is
-    /// meaningless, and the run must not resend what it cannot
-    /// re-address. Unknown recorded routes (sends with no live
-    /// route, chains predating the record) always count as changed.
-    /// Transitions and capabilities are untouched — only
-    /// announcements carry a route.
+    /// degrades to plain pending, plus the withdrawal repair below:
+    /// repair toward no route is meaningless for pairs never routed,
+    /// but withdrawing a live route must redeliver once or peers keep
+    /// dialing the dead provider. Unknown recorded routes (chains
+    /// predating the record) always count as changed. Transitions and
+    /// capabilities are untouched — only announcements carry a route.
     pub fn announce_eligible_for(
         &self,
         route: Option<[u8; 32]>,
@@ -516,8 +526,80 @@ impl RuntimeState {
                 .collect();
             eligible.append(&mut stale);
             eligible.sort();
+        } else {
+            // Withdrawing to no route redelivers once: discharged
+            // pairs in scope whose recorded route is a real route
+            // reopen, so the route-less reseal reaches the peers that
+            // hold the routed version and their next publication pass
+            // drops this device as a provider. Pairs never routed (no
+            // record) or already withdrawn stay ineligible — repair
+            // toward no route is still meaningless for them — and the
+            // withdrawal send re-records the route as withdrawn, so
+            // the repair quenches like every other redelivery.
+            let mut withdrawing: Vec<(SnapshotId, DeviceId)> = self
+                .announcement_delivered
+                .iter()
+                .copied()
+                .filter(|pair| {
+                    scope.contains(&pair.0)
+                        && self
+                            .announcement_delivered_route
+                            .get(pair)
+                            .is_some_and(|recorded| *recorded != WITHDRAWN_ROUTE)
+                })
+                .collect();
+            eligible.append(&mut withdrawing);
+            eligible.sort();
         }
         eligible
+    }
+
+    /// Own-authored in-scope snapshots with a queued recipient whose
+    /// last discharge carried a real route: the withdrawal-completion
+    /// half of a role narrowing, read off durable state only. Each
+    /// counted snapshot still names this device as a provider at some
+    /// peer (its routed version is recorded there), so the narrowing
+    /// must not complete; the withdrawal resend re-records the pair
+    /// as withdrawn, which is what drives the count down. Never
+    /// counts: foreign snapshots (someone else's routes never hold a
+    /// narrowing open), undelivered pairs (nothing reached a peer, and
+    /// they discharge route-less under the driver), already-withdrawn
+    /// pairs, and out-of-scope history (the redelivery gate never
+    /// resends it, so waiting for it would stall forever — same
+    /// acceptance as endpoint rotation).
+    pub fn route_withdrawal_outstanding(
+        &self,
+        device: &DeviceId,
+        scope: &BTreeSet<SnapshotId>,
+    ) -> usize {
+        let mut snapshots: Vec<SnapshotId> = self
+            .announcement_queued
+            .iter()
+            .map(|(snapshot, _)| *snapshot)
+            .filter(|snapshot| scope.contains(snapshot))
+            .collect();
+        snapshots.sort();
+        snapshots.dedup();
+        let mut outstanding = 0usize;
+        for snapshot in snapshots {
+            let Some(body) = self.snapshot_body(&snapshot) else {
+                continue;
+            };
+            if body.author != *device {
+                continue;
+            }
+            let still_routed = self.announcement_queued.iter().any(|(id, recipient)| {
+                *id == snapshot
+                    && self
+                        .announcement_delivered_route
+                        .get(&(*id, *recipient))
+                        .is_some_and(|recorded| *recorded != WITHDRAWN_ROUTE)
+            });
+            if still_routed {
+                outstanding += 1;
+            }
+        }
+        outstanding
     }
 
     /// The sealed announcement bytes for one snapshot, if the first

@@ -1961,6 +1961,25 @@ impl Engine {
             .pending_announcements())
     }
 
+    /// Own in-scope snapshots still naming a serving route at some
+    /// peer: the withdrawal-completion half of a role narrowing
+    /// (`docs/sync-and-peers.md`, role transitions). Rebuilds from
+    /// the store, so the count is committed facts only —
+    /// restart-equivalent by construction, and the narrowing driver
+    /// and `role status` observe the same value. The counting rule
+    /// lives on [`RuntimeState`](super::RuntimeState) so holders of
+    /// an already-rebuilt state do not rebuild again; the scope here
+    /// is the same redelivery-scope derivation the send path gates
+    /// on, so the predicate can never wait for a pair the gate would
+    /// not resend.
+    pub fn withdrawal_outstanding(&self) -> Result<usize, EngineError> {
+        let rebuilt = self.store.rebuild(self.device)?;
+        let scope = super::author::redelivery_scope_set(self, &rebuilt);
+        Ok(rebuilt
+            .runtime
+            .route_withdrawal_outstanding(&self.device, &scope))
+    }
+
     /// The durability level the drive reached (DG-2): Working with
     /// no recorded snapshot body, Committed while the drive
     /// announcement outbox is non-empty, Published once it is quiet

@@ -38,6 +38,7 @@ use crate::mutation::{
 };
 use crate::projection::{Projection, SharedProjection};
 use crate::quarantine::{drain_quarantine, QuarantineQueue, QuarantineReport};
+use crate::role::{Role, RoleState, Transition};
 use crate::scrub::{drain_scrub, probe_presence, ScrubQueue, ScrubReport};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
@@ -1024,23 +1025,36 @@ where
     /// retains as mirror for the pass: the loop must not stall sync
     /// on an operator-repairable file, and nothing prunes under any
     /// role, so the degradation is availability-only and self-heals
-    /// on repair.
-    fn register_vault_wants(&mut self) -> Result<(), LiveError> {
-        let Some(dir) = self.role_dir.clone() else {
-            return Ok(());
-        };
-        let role = match crate::role::load(&dir) {
-            Ok(state) => state.effective(),
+    /// on repair. The role read itself is shared with the withdrawal
+    /// driver below (one read discipline, one warning).
+    ///
+    /// This pass's role: the file beside the keystore, read fresh so
+    /// `role set` lands on a running loop with no restart
+    /// reconciliation. `None` when no role dir is composed or the
+    /// file is unreadable (warned): callers leave everything as-is —
+    /// the sweep skips, announcements keep the composed route, the
+    /// driver advances nothing. A torn file fails closed, never
+    /// toward vault and never toward completion.
+    fn role_state(&self) -> Option<(std::path::PathBuf, RoleState)> {
+        let dir = self.role_dir.clone()?;
+        match crate::role::load(&dir) {
+            Ok(state) => Some((dir, state)),
             Err(error) => {
                 tracing::warn!(
                     path = ?dir,
                     error = %error,
                     "unreadable role file: retaining as mirror until repaired"
                 );
-                return Ok(());
+                None
             }
+        }
+    }
+
+    fn register_vault_wants(&mut self) -> Result<(), LiveError> {
+        let Some((_, state)) = self.role_state() else {
+            return Ok(());
         };
-        if role != crate::role::Role::Vault {
+        if state.effective() != Role::Vault {
             return Ok(());
         }
         let revision = self.engine.current();
@@ -1083,6 +1097,83 @@ where
         Ok(())
     }
 
+    /// Advance an in-flight narrowing one step, once per pass. Runs
+    /// right after the vault sweep, on the same role-file read
+    /// discipline: acknowledgement becomes pending as soon as there
+    /// is something to withdraw, and pending completes — storing
+    /// settled `mirror`, which is what flips the effective posture —
+    /// exactly when no own in-scope snapshot still names a route at
+    /// a peer ([`crate::role::withdrawal_outstanding`], durable
+    /// state only) and the serving barrier flushes clean (mirror
+    /// drained, nothing queued to serve — memory-only per
+    /// composition, re-read live after a restart). A withdrawal that
+    /// cannot complete stays pending with its reason at debug;
+    /// obligations keep retiring through reconciliation, never
+    /// because the operator acknowledged.
+    /// Store-class failures error the pass (tight abort budget, like
+    /// admission): a narrowing that cannot persist its step must be
+    /// operator-visible, never silently stalled.
+    fn drive_withdrawal(&mut self) -> Result<(), LiveError> {
+        let Some((dir, state)) = self.role_state() else {
+            return Ok(());
+        };
+        match state.transition {
+            Transition::Settled => return Ok(()),
+            Transition::NarrowingAcknowledged | Transition::WithdrawalPending => {}
+        }
+        let outstanding = crate::role::withdrawal_outstanding(&self.engine)?;
+        if outstanding > 0 {
+            if state.transition == Transition::NarrowingAcknowledged {
+                self.store_role(
+                    &dir,
+                    RoleState {
+                        role: Role::Mirror,
+                        transition: Transition::WithdrawalPending,
+                    },
+                )?;
+            }
+            tracing::debug!(
+                outstanding,
+                "withdrawal pending: own announcements still name a route"
+            );
+            return Ok(());
+        }
+        if !self.flush_serving_barrier()? {
+            if state.transition == Transition::NarrowingAcknowledged {
+                self.store_role(
+                    &dir,
+                    RoleState {
+                        role: Role::Mirror,
+                        transition: Transition::WithdrawalPending,
+                    },
+                )?;
+            }
+            tracing::debug!("withdrawal pending: serving still busy");
+            return Ok(());
+        }
+        self.store_role(
+            &dir,
+            RoleState {
+                role: Role::Mirror,
+                transition: Transition::Settled,
+            },
+        )?;
+        tracing::info!("withdrawal complete: effective role is now mirror");
+        Ok(())
+    }
+
+    /// Persist one withdrawal step. Role writes ride the custody-grade
+    /// primitive, so a crash leaves the previous step or the new one,
+    /// never a torn half — and the driver re-derives every step from
+    /// durable state, so a repeated step is a no-op.
+    fn store_role(&self, dir: &std::path::Path, state: RoleState) -> Result<(), LiveError> {
+        crate::role::store(dir, state).map_err(|error| {
+            LiveError::Engine(wyrd_sync::runtime::EngineError::ObjectStore(
+                error.to_string(),
+            ))
+        })
+    }
+
     /// Install this drive's retrieval route for announcements: the
     /// composer calls this after flushing its serving endpoint, so the
     /// first seal carries a dialable address. Replacing the route
@@ -1099,6 +1190,30 @@ where
     /// route-less by construction (known-but-unfetchable to peers).
     pub fn node_addr(&self) -> Option<&[u8]> {
         self.node_addr.as_deref()
+    }
+
+    /// The retrieval route this pass's announcements discharge with:
+    /// the composed endpoint route — except while narrowing, when
+    /// the pass announces route-less. That is the withdrawal: the
+    /// route-update mechanism reseals own announcements without a
+    /// route and peers drop this device as a provider on their next
+    /// publication pass, all through the signed announcement channel
+    /// (never by silently stopping the endpoint, which keeps serving
+    /// in-flight fetches). Unreadable role file keeps the composed
+    /// route: the driver already warned, and announcing routed is
+    /// the fail-closed direction while narrowing is unwired.
+    fn announce_route(&self) -> Option<&[u8]> {
+        match self.role_state() {
+            Some((_, state))
+                if matches!(
+                    state.transition,
+                    Transition::NarrowingAcknowledged | Transition::WithdrawalPending
+                ) =>
+            {
+                None
+            }
+            _ => self.node_addr.as_deref(),
+        }
     }
 
     /// The quarantine channel readers submit verification failures
@@ -1208,10 +1323,11 @@ where
         if !self.engine.pending_announcements()?.is_empty() && !self.flush_serving_barrier()? {
             return Ok(sent);
         }
-        sent += match self
-            .engine
-            .announce_pending(mailbox, self.node_addr.as_deref())
-        {
+        // The route is copied out first: selecting it reads the role
+        // file through `self` while the discharge below needs the
+        // engine mutably, and a route is a hundred bytes per pass.
+        let route = self.announce_route().map(|bytes| bytes.to_vec());
+        sent += match self.engine.announce_pending(mailbox, route.as_deref()) {
             Ok(n) => n,
             Err(EngineError::Mailbox(_)) => 0,
             Err(other) => return Err(LiveError::Engine(other)),
@@ -1486,6 +1602,11 @@ where
         // exists. Skipped below vault-effective (zero cost) and while
         // a full sweep already covers the durable revision.
         self.register_vault_wants()?;
+        // Role-narrowing withdrawal (24-materialization-roles): advance
+        // acknowledgement toward pending and pending toward settled
+        // mirror off durable state, so the announce route below is
+        // already route-less while anything is outstanding.
+        self.drive_withdrawal()?;
         let mut admission = if self.wants.peek_pending().is_empty() {
             None
         } else {

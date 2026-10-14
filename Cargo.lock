@@ -5264,6 +5264,7 @@ name = "wyrd-daemon"
 version = "0.2.0-alpha"
 dependencies = [
  "fuser",
+ "iroh",
  "libc",
  "thiserror 2.0.20",
  "tracing",

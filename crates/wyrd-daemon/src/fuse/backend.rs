@@ -23,6 +23,7 @@ use wyrd_core::mutation::{
 use wyrd_core::projection::Projection;
 use wyrd_core::quarantine::{QuarantineQueue, VerificationFailure};
 use wyrd_core::scrub::{ScrubObservation, ScrubQueue};
+use wyrd_core::session::BudgetError;
 
 /// How long a reported repair keeps a later boundary verdict
 /// from completing its waiter. The window covers the repair the
@@ -219,6 +220,41 @@ pub(super) fn current_owner() -> (u32, u32) {
 /// authoring, or a poisoned lock. Debug-gated; mutations are rare.
 fn log_refused(error: &MutationError) {
     tracing::debug!(error = ?error, "mutation refused");
+}
+
+/// Log a daemon write-budget refusal's underlying reason: every
+/// budget (`Handle`, `Aggregate`, `DirtyHandles`, `Lock`) reaches
+/// the mount as the same `ENOSPC`, and the errno alone cannot tell
+/// a RAM-budget refusal from a full disk. Debug-gated like
+/// [`log_refused`](log_refused); budget refusals are rare outside
+/// fill runs. The `stage` names the write-path step the refusal
+/// precedes (buffering, before step 1): nothing was buffered and
+/// the handle is unchanged, so there is nothing to roll back.
+fn log_budget_refusal(op: &'static str, reason: BudgetError) {
+    tracing::debug!(
+        stage = "buffer",
+        layer = "daemon-write-budget",
+        op,
+        reason = ?reason,
+        "buffer reservation refused; ENOSPC at the boundary, handle unchanged"
+    );
+}
+
+/// Log an open-capture ceiling refusal: the aggregate retained
+/// bytes across open handles, not the write budget, is exhausted.
+/// Same boundary (`ENOSPC`), same gate (debug), same consequence
+/// (the handle is never created): `stage` names the write-path
+/// step the refusal precedes (open, before step 1).
+fn log_capture_refusal(op: &'static str, retained: usize, newcomer: usize, ceiling: usize) {
+    tracing::debug!(
+        stage = "open",
+        layer = "open-capture-budget",
+        op,
+        retained,
+        newcomer,
+        ceiling,
+        "open-capture ceiling refused; ENOSPC at the boundary, handle not created"
+    );
 }
 
 pub(super) fn mutation_errno(error: &MutationError) -> fuser::Errno {
@@ -1013,7 +1049,9 @@ where
         // ceiling is enforced alongside it. A handle is never cheap
         // merely because its data is not materialized yet.
         let retained = files.captured_bytes().ok_or(fuser::Errno::EIO)?;
-        if retained.saturating_add(file.capture_bytes()) > self.max_open_capture_bytes {
+        let newcomer = file.capture_bytes();
+        if retained.saturating_add(newcomer) > self.max_open_capture_bytes {
+            log_capture_refusal("open", retained, newcomer, self.max_open_capture_bytes);
             return Err(fuser::Errno::ENOSPC);
         }
         let handle = Self::next_file_handle(&mut files)?;
@@ -1084,6 +1122,7 @@ where
         let newcomer = handle.retained_bytes().ok_or(fuser::Errno::EIO)?;
         let retained = files.captured_bytes().ok_or(fuser::Errno::EIO)?;
         if retained.saturating_add(newcomer) > self.max_open_capture_bytes {
+            log_capture_refusal("insert", retained, newcomer, self.max_open_capture_bytes);
             return Err(fuser::Errno::ENOSPC);
         }
         let fh = Self::next_file_handle(&mut files)?;
@@ -1792,7 +1831,8 @@ where
                 .len()
                 .checked_add(data.len())
                 .ok_or(fuser::Errno::EFBIG)?;
-            if self.budget.reserve(write.id, new_len).is_err() {
+            if let Err(error) = self.budget.reserve(write.id, new_len) {
+                log_budget_refusal("write", error);
                 write.image = Some(image);
                 return Err(fuser::Errno::ENOSPC);
             }
@@ -1820,7 +1860,8 @@ where
                 // Dirty handle: the image is already materialized and
                 // budgeted, so account the extension before mutating.
                 let new_len = image.len().max(end);
-                if self.budget.reserve(write.id, new_len).is_err() {
+                if let Err(error) = self.budget.reserve(write.id, new_len) {
+                    log_budget_refusal("write", error);
                     write.image = Some(image);
                     return Err(fuser::Errno::ENOSPC);
                 }
@@ -1838,7 +1879,8 @@ where
                 let projected = usize::try_from(write.base.size())
                     .unwrap_or(usize::MAX)
                     .max(end);
-                if self.budget.reserve(write.id, projected).is_err() {
+                if let Err(error) = self.budget.reserve(write.id, projected) {
+                    log_budget_refusal("write", error);
                     return Err(fuser::Errno::ENOSPC);
                 }
                 let capture = write.capture.clone();
@@ -2034,7 +2076,8 @@ where
     /// until the settle completes.
     fn lease_fold(&self, taken: &[TakenMember]) -> Result<FoldLease<'_>, fuser::Errno> {
         let bytes = taken.iter().map(|taken| taken.content.len()).sum();
-        self.budget.reserve_fold(bytes).map_err(|_| {
+        self.budget.reserve_fold(bytes).map_err(|error| {
+            log_budget_refusal("fold-lease", error);
             for taken in taken {
                 settle_restored(self, taken);
             }
@@ -3076,7 +3119,8 @@ where
         // metadata-only change would commit an empty file.
         if write.image.is_none() {
             let projected = usize::try_from(write.base.size()).unwrap_or(usize::MAX);
-            if self.budget.reserve(write.id, projected).is_err() {
+            if let Err(error) = self.budget.reserve(write.id, projected) {
+                log_budget_refusal("set-exec", error);
                 return Err(fuser::Errno::ENOSPC);
             }
             let capture = write.capture.clone();
@@ -3136,7 +3180,8 @@ where
             let projected = usize::try_from(write.base.size())
                 .unwrap_or(usize::MAX)
                 .max(target);
-            if self.budget.reserve(write.id, projected).is_err() {
+            if let Err(error) = self.budget.reserve(write.id, projected) {
+                log_budget_refusal("truncate", error);
                 return Err(fuser::Errno::ENOSPC);
             }
             let capture = write.capture.clone();
@@ -3151,7 +3196,8 @@ where
         } else {
             write.image.take().unwrap_or_default()
         };
-        if self.budget.reserve(write.id, target).is_err() {
+        if let Err(error) = self.budget.reserve(write.id, target) {
+            log_budget_refusal("truncate", error);
             if was_clean {
                 self.budget.release(write.id);
             } else {

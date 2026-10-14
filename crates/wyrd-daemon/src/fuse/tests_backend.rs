@@ -135,6 +135,92 @@ fn first_write_over_the_handle_budget_does_not_materialize() {
     );
 }
 
+/// In-memory tracing writer: captures the budget-refusal line so the
+/// test below can assert on the emitted layer and reason — the
+/// diagnostic-emission contract. Same shape as the core
+/// mirror-diagnostics and quota captures.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn with_capture<T>(max: tracing::Level, run: impl FnOnce() -> T) -> (T, String) {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(max)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, run);
+    let logged =
+        String::from_utf8(capture.0.lock().expect("log lock").clone()).expect("log is UTF-8");
+    (value, logged)
+}
+
+/// A budget refusal names its layer and reason in the trace: without
+/// the line a RAM-budget refusal is indistinguishable from a full
+/// disk in both the errno and the logs. The errno contract is
+/// unchanged — still `ENOSPC` at the boundary.
+#[test]
+fn a_budget_refusal_names_its_layer_and_reason() {
+    let mut store = MemoryObjectStore::default();
+    let root = Tree::from_entries(vec![Entry::file(
+        "big",
+        100,
+        false,
+        vec![ContentId::from_bytes([0x01; 32])],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+    // A tiny budget and a channel so `open_write` is permitted; the
+    // write itself must be refused before any base read.
+    let mut backend = FuseBackend::new(view);
+    backend.budget = Arc::new(WriteBudget::with_limits(4, 100, 8));
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+
+    let fh = backend.open_write("big", libc::O_RDWR).unwrap();
+    let (errno, logged) = with_capture(tracing::Level::DEBUG, || {
+        backend.write_handle(fh, 0, b"x").unwrap_err()
+    });
+    assert_eq!(
+        errno,
+        fuser::Errno::ENOSPC,
+        "the errno contract is unchanged"
+    );
+    assert!(
+        logged.contains("daemon-write-budget"),
+        "the refusal names its layer:\n{logged}"
+    );
+    assert!(
+        logged.contains("buffer"),
+        "the refusal names its write-path stage:\n{logged}"
+    );
+    assert!(
+        logged.contains("Handle"),
+        "the refusal names the exhausted budget:\n{logged}"
+    );
+}
+
 #[test]
 fn mounted_readlink_refuses_symlink_traversal() {
     use wyrd_format::Entry;

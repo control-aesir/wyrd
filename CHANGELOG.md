@@ -470,6 +470,20 @@ version say exactly what changed.
 
 ### Fixed
 
+- ENOSPC attribution across the write path
+  (`nostr:nevent1qqs2rnte3r0tqlfhmtfv56hwuxrqez6z6jrv0hc7usj40puvv0trscqpz9mhxue69uhkwunpwdczuap49eehgmle0y8`):
+  every `ENOSPC` source — daemon write budget, open-capture ceiling,
+  retained-bytes quota, backing-store capacity — reached the mount as
+  the same errno with nothing in the logs saying which refused, so
+  exhaustion runs could not tell a full disk from a daemon budget.
+  Each refusal site now logs a debug line naming its `layer` (which
+  resource) and `stage` (which write-path step it precedes) with the
+  deciding numbers; commit-stage disk failures keep their existing
+  full-`EngineError` trace. Errno contract unchanged (`ENOSPC` for
+  all), no behavior change, no new error variants. Pinned by two
+  log-capture emission tests, documented in `write-path.md` ("ENOSPC
+  attribution"), and the exhaustion e2e leg now captures the backend
+  target and asserts the failing fill names its layer.
 - Review helper names the missing argument on an empty id
   (`nostr:nevent1qqsqgnnlt9akul5d0n7590y7kl2kg8gx97c5aafks8nqy8kaaq4mfncpz9mhxue69uhkwunpwdczuap49eehgae50uz`):
   `review pr-context` / `post-comment` with an unset variable printed only

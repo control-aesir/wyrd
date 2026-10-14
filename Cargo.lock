@@ -5268,6 +5268,7 @@ dependencies = [
  "libc",
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "wyrd-core",
  "wyrd-format",
  "wyrd-fuse",

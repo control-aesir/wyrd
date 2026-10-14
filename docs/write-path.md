@@ -754,11 +754,41 @@ Write-time and commit-time failures are distinct surfaces:
   budget is exceeded, or when the fold's own transient submission memory
   would exceed the write aggregate (all taken images restored, handles
   unchanged and retryable). A `write` that succeeded never implies the later
-  commit will. (A configured per-device retained-bytes quota reports
-  `ENOSPC` here, reusing this reporting path unchanged. The check runs
-  before the commit's first write to disk, not at the durability
-  boundary, so a refused commit spends nothing — see
-  `storage-growth.md`.)
+   commit will. (A configured per-device retained-bytes quota reports
+   `ENOSPC` here, reusing this reporting path unchanged. The check runs
+   before the commit's first write to disk, not at the durability
+   boundary, so a refused commit spends nothing — see
+   `storage-growth.md`.)
+
+### ENOSPC attribution (diagnostic)
+
+Every source above reaches the mount as the same `ENOSPC` — the errno
+contract is one value by design, so scripts and callers branch on
+nothing new. Telling the sources apart is a trace-logging matter, not
+an errno matter: each refusal site logs a debug line naming its
+`layer` (which resource refused) and its `stage` (which write-path
+step the refusal precedes), with the numbers that decided it. The
+mount's verbose mode (`wyrd=debug,wyrd_daemon=debug`) and the
+exhaustion e2e leg both capture these lines; the default `info`
+level does not.
+
+| Source | Trace line (`layer` / `stage`) | Durable consequence |
+|---|---|---|
+| Daemon write budget (`write`, `truncate`, `set-exec`, `fold-lease`) | `daemon-write-budget` / `buffer`, with `op` and the `BudgetError` `reason` (`Handle`, `Aggregate`, `DirtyHandles`, `Lock`) | Nothing buffered; the handle is unchanged. Pre-step-1: no snapshot, no obligation. |
+| Open-capture ceiling (`open`, `insert`) | `open-capture-budget` / `open`, with `retained`, `newcomer`, `ceiling` | The handle is never created. Pre-step-1: nothing to roll back. |
+| Retained-bytes quota (commit gate) | `retained-bytes-quota` / `commit-gate`, with `retained`, `quota`, `estimate` | Refused before the commit's first write: nothing retained, no snapshot authored, no obligation recorded. Pre-step-2. |
+| Backing-store capacity during authoring (steps 2-3) | the existing `mutation authoring refused` line carries the full `EngineError`: `Store(StorageFull)` for object-store writes, `Durable`/`Vault` I/O with a full-disk kind for the fact log and vault | Before step 3: no snapshot exists (see "Failure at each stage"). Sealed-but-uncommitted objects may sit in the append-only store, unreferenced — that is dead weight, not state to roll back. |
+| Post-commit stages (publication, serving, discharge; steps 4-6) | no refusal line: these stages run after the mount call returns, so their failures never surface as that call's errno | The monotonicity invariant governs: "Later-stage failure never rolls back an earlier durable state." A discharge that never completes leaves the durable snapshot plus its recorded obligation, which a later pass or restart reconciles — never a rollback. |
+
+Two correlations to read the log by: a quota refusal is followed by
+the generic `mutation refused` line with `Store(StorageFull)` — the
+quota line just above it is what says "quota, not disk". And a
+commit-stage disk failure names its failing store in the `EngineError`
+source (`Store` vs `Durable` vs `Vault`), which maps to the step-2/3
+boundary above. Nothing in this section changes what any caller
+observes: same errno, same fail-closed behavior, same no-rollback
+contract — only the trace says which layer refused, at which stage,
+leaving what behind.
 
 ## Namespace operations
 

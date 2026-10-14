@@ -2095,6 +2095,21 @@ where
             // disk" to every reader of this store, and it reaches the
             // mount as ENOSPC — so a quota reads as the smaller disk it
             // is, with no new error variant and no new errno mapping.
+            // The refusal is logged with its numbers: without this line
+            // a quota refusal is indistinguishable from a full disk in
+            // both the errno and the trace. Debug-gated like the
+            // authoring refusal below; quota refusals are rare outside
+            // fill runs. The `stage` names the write-path step the
+            // refusal precedes (the commit gate, before step 2): the
+            // commit retains nothing, so there is nothing to roll back.
+            tracing::debug!(
+                stage = "commit-gate",
+                layer = "retained-bytes-quota",
+                retained = retained.get(),
+                quota = limit,
+                estimate,
+                "retained-bytes quota refused before the commit's first write; ENOSPC at the boundary, nothing retained"
+            );
             return Err(MutationError::Store(StoreFailure::StorageFull));
         }
         Ok(())

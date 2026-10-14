@@ -135,6 +135,7 @@
 //! 46. `embedded_and_adapter_readers_agree_on_conflicts_and_materialization`
 //! 47. `committed_bytes_survive_restart_without_a_running_daemon`
 //! 48. `shutdown_closes_the_mutation_channel_for_both_paths`
+//! 49. `adapter_write_folding_matches_embedded_fold_script`
 //!
 //! The layering contracts (workspace extraction program):
 //!

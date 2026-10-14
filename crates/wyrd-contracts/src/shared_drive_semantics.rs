@@ -344,6 +344,25 @@ impl Embedded {
         })
     }
 
+    /// Append `chunks` as one fold: the channel-side shape of the
+    /// adapter's merged append run — one member carrying the merged
+    /// content, forcing. (Unmerged same-path fold members each
+    /// evaluate against the pre-fold image with the forcer winning
+    /// ties, so the backend merges runs before submitting; the
+    /// contract pins the merged form against the channel primitive.)
+    fn fold_appends(&self, path: &str, chunks: &[&[u8]]) -> Outcome {
+        let merged: Vec<u8> = chunks.concat();
+        self.submit(MutationKind::Fold {
+            members: vec![wyrd_core::mutation::FoldMember {
+                kind: MutationKind::AppendFile {
+                    path: path.to_string(),
+                    content: merged,
+                },
+                forcer: true,
+            }],
+        })
+    }
+
     /// A create on a parent token captured before the directory was
     /// reincarnated: tokens survive descendant changes but rotate when
     /// the directory itself is replaced, so moving the directory away
@@ -503,6 +522,42 @@ impl Adapter {
             Ok(gen) => Outcome::Gen(gen),
             Err(error) => Outcome::Err(errno_tag(error)),
         }
+    }
+
+    /// Open `name` under `parent` for buffered writes: the namespace
+    /// half only, no commit yet.
+    fn begin_create(&self, parent: u64, name: &str) -> Result<fuser::FileHandle, Outcome> {
+        match self.backend.create_at(parent, name, libc::O_RDWR) {
+            Ok((handle, _, _)) => Ok(handle),
+            Err(error) => Err(Outcome::Err(errno_tag(error))),
+        }
+    }
+
+    /// Buffer `chunks` onto an open write handle and commit once: the
+    /// adapter's fold path — several writes, one snapshot. Writes land
+    /// at successive offsets, so the image concatenates like separate
+    /// buffered appends. First error wins; the handle releases either
+    /// way.
+    fn commit_writes(&self, handle: fuser::FileHandle, chunks: &[&[u8]]) -> Outcome {
+        let mut result = Outcome::Ok;
+        let mut offset = 0u64;
+        for chunk in chunks {
+            match self.backend.write_handle(handle, offset, chunk) {
+                Ok(_) => offset += chunk.len() as u64,
+                Err(error) => {
+                    result = Outcome::Err(errno_tag(error));
+                    break;
+                }
+            }
+        }
+        if result == Outcome::Ok {
+            result = match self.backend.commit_handle(handle) {
+                Ok(()) => Outcome::Ok,
+                Err(error) => Outcome::Err(errno_tag(error)),
+            };
+        }
+        let _ = self.backend.release_handle(handle);
+        result
     }
 
     fn idle(&self) -> Outcome {
@@ -994,4 +1049,70 @@ fn shutdown_closes_the_mutation_channel_for_both_paths() {
         Outcome::Bytes(b"pre-shutdown".to_vec())
     );
     assert_eq!(be.read("before.txt"), emb.read("before.txt"));
+}
+
+/// Contract 49 (review F-1): fold coalescing agrees — several
+/// buffered writes collapse into one snapshot at commit on the
+/// adapter, matching one fold submit on the channel. Both traces
+/// carry the same generation advances and the coalesced bytes.
+#[test]
+fn adapter_write_folding_matches_embedded_fold_script() {
+    let chunks: &[&[u8]] = &[b"aa", b"bb", b"cc"];
+    let run = |session: &LiveSession| {
+        let emb = Embedded::new(session);
+        let baseline = emb.generation();
+        let created = emb.submit(MutationKind::CreateFile {
+            path: "fold.txt".to_string(),
+            parent: emb.queue.capture_parent("").expect("root token"),
+        });
+        let after_create = emb.generation();
+        let folded = emb.fold_appends("fold.txt", chunks);
+        vec![
+            baseline,
+            created,
+            after_create,
+            folded,
+            emb.generation(),
+            emb.read("fold.txt"),
+        ]
+    };
+    let run_adapter = |session: &LiveSession| {
+        let be = Adapter::new(session);
+        let baseline = be.generation();
+        let handle = be.begin_create(1, "fold.txt").expect("create opens");
+        let after_create = be.generation();
+        let committed = be.commit_writes(handle, chunks);
+        vec![
+            baseline,
+            Outcome::Ok,
+            after_create,
+            committed,
+            be.generation(),
+            be.read("fold.txt"),
+        ]
+    };
+
+    let embedded_session = LiveSession::fresh("fold-embedded");
+    let embedded_trace = run(&embedded_session);
+    let adapter_session = LiveSession::fresh("fold-adapter");
+    let adapter_trace = run_adapter(&adapter_session);
+
+    assert_same_traces(&embedded_trace, &adapter_trace);
+    assert_eq!(
+        embedded_trace[5],
+        Outcome::Bytes(b"aabbcc".to_vec()),
+        "the fold serves the coalesced bytes"
+    );
+    let gens: Vec<u64> = embedded_trace
+        .iter()
+        .filter_map(|o| match o {
+            Outcome::Gen(g) => Some(*g),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        gens.len(),
+        3,
+        "create plus one fold is two snapshots: {gens:?}"
+    );
 }

@@ -25,11 +25,11 @@ version say exactly what changed.
 
 - Shared drive-path semantics
   (`nostr:nevent1qqs854dvqpuuqx547p6gmyvxt25lslnrvt76l0zxxswgcayrt9cwd0qpz9mhxue69uhkwunpwdczuap49eehgpwq2qz`):
-  `wyrd-contracts` contracts 42-48 run every namespace scenario twice —
+  `wyrd-contracts` contracts 42-49 run every namespace scenario twice —
   once through the core mutation channel plus `LiveReader`, once through
   `FuseBackend` — and assert identical outcome traces (create/write/read
   incl. multi-window files, rename/delete, error classes, publication
-  generations, conflict version reads, materialization classes, restart
+  generations, write-fold coalescing, conflict version reads, materialization classes, restart
   from custody, shutdown). Where the surfaces are documentedly different
   (plain-conflict opens, remote-only and terminal demand failures, stale
   descriptors, closed-channel submits) each side's own tag is pinned, and

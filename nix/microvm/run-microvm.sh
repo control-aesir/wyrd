@@ -102,10 +102,21 @@ fi
 # and SOCK_PAT are all host-global, so two runs under different
 # --state-dir would still reap each other's daemons and fight over
 # br-wyrd. The lock path is fixed for the same reason. Held for the
-# whole script via fd 9.
+# whole script via fd 9. The path also travels to the suite as
+# WYRD_E2E_LOCK so the orchestrator can prove a wrapper is alive
+# (see tests/e2e-guard.sh); keep the literal in one place.
+LOCK="/var/lib/wyrd-microvm/lock"
 mkdir -p /var/lib/wyrd-microvm
-exec 9>/var/lib/wyrd-microvm/lock
-flock -n 9 || { echo "error: another run holds /var/lib/wyrd-microvm/lock" >&2; exit 2; }
+exec 9>"$LOCK"
+flock -n 9 || { echo "error: another run holds $LOCK" >&2; exit 2; }
+
+# Per-run ownership token: minted here, published in the guest env
+# file, handed to the suite in the environment. Suite scripts compare
+# the caller-supplied token against the published one and refuse
+# direct execution without it (tests/e2e-guard.sh). Minted hex, so
+# ssh env-prefixing needs no quoting; /dev/urandom exists on the
+# Linux host this runner requires.
+E2E_TOKEN="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 BRIDGE="br-wyrd"
 NET="10.0.7"
@@ -258,6 +269,12 @@ cp "$SSH_KEY.pub" "$STATE_DIR/authorized_keys.pub"
   printf 'RELAY_MANAGED=%q\n' "0"
   printf 'CHECKOUT=%q\n' "/etc/wyrd-tests"
   printf 'E2E_ROOT=%q\n' "/mnt/wyrd-state/run"
+  printf 'WYRD_E2E_TOKEN=%q\n' "$E2E_TOKEN"
+  # Owner pid for the guard's liveness tie: the orchestrator shares
+  # this pid namespace, so kill -0 proves the minting wrapper is the
+  # live lock holder (guests must never check this — their pids are
+  # a different namespace).
+  printf 'WYRD_E2E_PID=%q\n' "$$"
   printf 'E2E_RUST_LOG=%q\n' "${E2E_RUST_LOG:-}"
   printf 'E2E_INTERVAL=%q\n' "${E2E_INTERVAL:-}"
 } > "$STATE_DIR/e2e-env.sh"
@@ -335,6 +352,8 @@ timeout 7200 env \
   "MICROVM_ONLY_STEP=$ONLY_STEP" \
   "WYRD_BIN=$WYRD_BIN" \
   "NAK_BIN=$NAK_BIN" \
+  "WYRD_E2E_TOKEN=$E2E_TOKEN" \
+  "WYRD_E2E_LOCK=$LOCK" \
   "E2E_INTERVAL=${E2E_INTERVAL:-}" \
   "RELAY_URL=ws://$NET.10:18761" \
   "PEER_O=e2e@$NET.11" \

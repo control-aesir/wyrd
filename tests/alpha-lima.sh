@@ -11,6 +11,15 @@ set -euo pipefail
 # and the checkout rides the 9p share.
 HOST_LOGS="/tmp/lima/logs/$(date +%Y%m%d-%H%M%S)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Wrapper-only entry, before alpha-common.sh sources the env file
+# (sourcing first would install the published token into this shell
+# and make the comparison vacuous). lima/run-alpha.sh passes the run
+# token on invocation (microVM phases 1-5 arrive via the host
+# orchestrator the same way); anything else dies here.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/e2e-guard.sh"
+e2e_require_wrapped "${E2E_ENV_FILE:-/tmp/lima/e2e-env.sh}" "./lima/run-alpha.sh" \
+  || { echo "  FAIL: unwrapped suite invocation refused" >&2; exit 2; }
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/alpha-common.sh"
 # shellcheck source=/dev/null

@@ -23,6 +23,22 @@ version say exactly what changed.
 
 ### Added
 
+- Wrapper-only e2e gate entry
+  (`nostr:nevent1qqs95k4x4s2cw4c6a95w42xasmw0vegtucj26agj2kzrahgajvwpmzgpz9mhxue69uhkwunpwdczuap49eehghvrm23`):
+  each wrapper mints a random per-run token, publishes it in the run's env
+  file, and hands it to its direct child; the orchestrator, the guest legs,
+  and the Lima suite compare the caller-supplied token against the published
+  one via `tests/e2e-guard.sh` and refuse direct execution without it. The
+  microVM orchestrator additionally requires the runner's flock to be held,
+  so stale tokens from dead or kept runs cannot authorize a suite, and
+  binds the token to the minting wrapper's pid. `WYRD_E2E_UNWRAPPED=1`
+  is the explicit bypass for deliberate debugging (an accident barrier,
+  not an authorization boundary: the token is a bearer value).
+- Pre-commit bash syntax gate: a wrapper sweeps `bash -n` over every
+  staged shell script (`bash -n` alone parses only its first file
+  argument), after a stray `done` shipped and invalidated a 40-minute
+  suite run past all its evidence. Pinned by a stub that fails a
+  broken fixture even behind clean files.
 - Post-upgrade convergence leg
   (`nostr:nevent1qqsr9arqyq4vjvcvtfsqrqf3r5h0wp0zju2zrf7h42uzggl950e0h8qpz9mhxue69uhkwunpwdczuap49eehg57t5zx`):
   microVM phase 8 gains an upgrade-rejoin leg pair — the owner upgrades its

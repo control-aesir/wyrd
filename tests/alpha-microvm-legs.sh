@@ -120,18 +120,28 @@ leg_converge2_owner() {
 # the done-file releases the owner to stop.
 leg_converge2_member() {
   local d="$1" c="$2" relay="$3"
+  local round check
   step 7 "wave-2 member leg (embedded consumer)"
   poll_until 300 test -f "$E2E_ROOT/owner-w2-written" \
     || die "owner never wrote wave 2"
-  with_creds "$c" sync "$d" --relay "$relay" now \
-    >"$LOGDIR/member-w2-sync.out" 2>"$LOGDIR/member-w2-sync.err" \
-    || die "member wave-2 headless sync exited non-zero"
-  grep -qE "fetch [0-9]+ manifests, [0-9]+ bodies, [1-9][0-9]* objects" "$LOGDIR/member-w2-sync.out" \
-    || die "member wave-2 sync fetched no objects (see member-w2-sync.out)"
+  # Convergence poll on the embedded path (review F1): the
+  # release barrier above fires on the write, but announcements
+  # are async — a single sync can drain an empty relay while the
+  # owner's commit is still in flight. Sync until the live-head
+  # set moves past the pre-wave capture (bounded): only the owner
+  # authors, so any movement is wave 2 observed, never raced.
+  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/member-w2-pre.txt" \
+    || die "member pre-wave snapshot list failed"
+  for round in 1 2 3 4 5 6; do
+    with_creds "$c" sync "$d" --relay "$relay" now \
+      >"$LOGDIR/member-w2-sync-$round.out" 2>"$LOGDIR/member-w2-sync-$round.err" \
+      || die "member wave-2 headless sync exited non-zero (round $round)"
+    with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
+      || die "member snapshot list failed (round $round)"
+    cmp -s "$E2E_ROOT/member-w2-pre.txt" "$E2E_ROOT/wave2-member-list.txt" || break
+    [[ "$round" == 6 ]] && die "member live heads never moved past wave 1 after 6 headless syncs"
+  done
   pass "member converges on wave 2 with no mount up"
-  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
-    || die "member snapshot list failed"
-  pass "member converged state captured mount-free"
   start_mount xmember-w2 "$c" "$d" "$MNTS/xmember-w2" --relay "$relay"
   [[ "$(cat "$MNTS/xmember-w2/wave2-a.txt")" == "wave2-a-bytes" ]] \
     || die "member wave-2 mount lost wave2-a.txt"
@@ -140,9 +150,10 @@ leg_converge2_member() {
   pass "member faults wave-2 bytes in over the serve route"
   stop_mount xmember-w2 INT
   touch "$E2E_ROOT/member-w2-done"
-  check_no_content_ids "$LOGDIR/member-w2-sync.out"
-  check_no_leaks "$LOGDIR/member-w2-sync.out" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
-  check_no_leaks "$LOGDIR/member-w2-sync.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  check_no_content_ids "$LOGDIR/member-w2-sync-$round.out"
+  for check in "$LOGDIR"/member-w2-sync-*.out "$LOGDIR"/member-w2-sync-*.err; do
+    check_no_leaks "$check" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
+  done
   check_no_leaks "$E2E_ROOT/wave2-member-list.txt" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$LOGDIR/mount-xmember-w2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
 }

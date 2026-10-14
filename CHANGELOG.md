@@ -520,6 +520,17 @@ version say exactly what changed.
 
 ### Changed
 
+- View and backend test suites split by topic
+  (`nostr:nevent1qqs9ntumnt0l5fcycq7vxct2m2947j28a4mdmxslg359llprkchdccspz9mhxue69uhkwunpwdczuap49eehg0yykgn`):
+  `wyrd-fuse`'s `view/tests.rs` is now `tests_harness.rs` (fixtures only)
+  plus `tests_read.rs`, `tests_merge.rs`, `tests_symlink.rs`,
+  `tests_chunks.rs`, and `tests_grammar.rs`; `wyrd-daemon`'s
+  `fuse/tests_backend.rs` is now `tests_readonly.rs`, `tests_budget.rs`,
+  `tests_write.rs`, and `tests_handles.rs`, with the backend-level inode
+  lifecycle tests appended to the existing `tests_inode.rs` and the
+  cross-cluster `kind_changing_backend`/`publish` fixtures moved into
+  `tests_harness.rs`. Pure move: no test renamed, no assertion edited,
+  and the nextest test-name set is identical before and after.
 - Signing-domain home (`crates/wyrd-format/src/signing.rs`,
   `nostr:nevent1qqs2eg9qr56egtqz8k7jvuarlkm8gjn0lgkuq3j6arsmxvkvxec46lgpz9mhxue69uhkwunpwdczuap49eehgyn7anc`):
   `SignDomain` and the membership/snapshot/owner-proof challenge

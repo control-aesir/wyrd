@@ -12,17 +12,23 @@ mod backend;
 mod inode;
 
 #[cfg(test)]
-mod tests_backend;
+mod tests_budget;
 #[cfg(test)]
 mod tests_conflicts;
 #[cfg(test)]
 mod tests_errors;
 #[cfg(test)]
+mod tests_handles;
+#[cfg(test)]
 mod tests_harness;
 #[cfg(test)]
 mod tests_inode;
 #[cfg(test)]
+mod tests_readonly;
+#[cfg(test)]
 mod tests_want;
+#[cfg(test)]
+mod tests_write;
 
 pub use backend::FuseBackend;
 pub use wyrd_fuse::DriveView;

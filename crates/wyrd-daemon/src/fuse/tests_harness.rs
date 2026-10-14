@@ -131,3 +131,63 @@ pub(super) fn chunky_backend(chunks: usize) -> FuseBackend<MemoryObjectStore, No
         heads(vec![snapshot_of(root)]),
     ))
 }
+
+/// Fixtures shared across the backend behavior suites: multi-generation
+/// stores need the same publish helper in the inode, write, and create
+/// clusters, so they live here rather than in any one suite.
+/// Three generations over one store: v0 serves `f.txt` as a file
+/// beside an empty `sub`, v1 repurposes `f.txt` as a directory and
+/// adds `new.txt`, v2 deletes `f.txt`. Each step publishes a new
+/// backend generation without touching the durable revision.
+pub(super) fn kind_changing_backend() -> (
+    FuseBackend<MemoryObjectStore, NoMaterialization>,
+    Snapshot,
+    Snapshot,
+    Snapshot,
+) {
+    let mut store = MemoryObjectStore::default();
+    let chunk = store.insert(ObjectKind::Chunk, b"data").unwrap();
+    let empty = Tree::from_entries(Vec::new())
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let file_entry = || Entry::file("f.txt", 4, false, vec![chunk]).unwrap();
+    let root_file = Tree::from_entries(vec![file_entry(), Entry::dir("sub", empty).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let root_dir = Tree::from_entries(vec![
+        Entry::dir("f.txt", empty).unwrap(),
+        Entry::dir("sub", empty).unwrap(),
+        Entry::file("new.txt", 4, false, vec![chunk]).unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let root_gone = Tree::from_entries(vec![Entry::dir("sub", empty).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let backend = FuseBackend::new(DriveView::new(
+        store,
+        NoMaterialization,
+        heads(vec![snapshot_of(root_file)]),
+    ));
+    (
+        backend,
+        snapshot_of(root_dir),
+        snapshot_of(root_gone),
+        snapshot_of(root_file),
+    )
+}
+
+/// Publish `next` as the backend's new generation.
+pub(super) fn publish(backend: &FuseBackend<MemoryObjectStore, NoMaterialization>, next: Snapshot) {
+    backend
+        .publish_without_revision(DriveView::shared(
+            backend.store_handle().unwrap(),
+            NoMaterialization,
+            heads(vec![next]),
+        ))
+        .unwrap();
+}

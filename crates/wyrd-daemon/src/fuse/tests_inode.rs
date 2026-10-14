@@ -235,3 +235,99 @@ fn attrs_present_files_dirs_and_conflicts() {
     let (kind, _, _) = attr_of(&Node::Conflict { versions: vec![] });
     assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
 }
+
+use super::tests_harness::{kind_changing_backend, publish};
+/// A file repurposed as a directory mints a fresh ino: the lookup
+/// after publication resolves the new kind under a new identity,
+/// and the retired ino fails instead of serving the new occupant.
+#[test]
+fn kind_change_retires_the_ino() {
+    let (backend, as_dir, _, _) = kind_changing_backend();
+    let (file_ino, file_node, _) = backend.resolve_inode("f.txt").unwrap();
+    assert!(matches!(file_node, Node::File { .. }));
+
+    publish(&backend, as_dir);
+    assert_eq!(backend.generation().unwrap(), 1);
+    let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
+    assert!(matches!(dir_node, Node::Dir { .. }));
+    assert_ne!(
+        file_ino, dir_ino,
+        "a repurposed path must not keep its identity"
+    );
+
+    // The retired ino no longer validates, even against the new
+    // node: holders re-resolve instead of serving stale identity.
+    assert_eq!(
+        backend.validate_inode(file_ino, "f.txt", &dir_node, 1),
+        Err(fuser::Errno::ENOENT)
+    );
+    assert!(backend
+        .validate_inode(dir_ino, "f.txt", &dir_node, 1)
+        .is_ok());
+}
+
+/// Deletion retires the mapping: resolution fails, the old ino
+/// stops validating, and recreating the path mints a fresh ino
+/// that never reattaches to the deleted content's identity.
+#[test]
+fn deletion_retires_and_recreation_mints_fresh() {
+    let (backend, as_dir, gone, file_again) = kind_changing_backend();
+    let (file_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    publish(&backend, as_dir);
+    let (dir_ino, dir_node, _) = backend.resolve_inode("f.txt").unwrap();
+
+    publish(&backend, gone);
+    assert_eq!(
+        backend.resolve_inode("f.txt"),
+        Err(fuser::Errno::ENOENT),
+        "a deleted path resolves to nothing"
+    );
+    // Retirement is lazy: the deleted mapping lingers until the
+    // path resolves again (a getattr on the stale ino re-resolves,
+    // fails, and retires it — the callback path, not this helper).
+    // Recreation is what observably retires it here: the fresh
+    // resolve finds the kind mismatch, drops the deleted mapping,
+    // and mints a new identity.
+    publish(&backend, file_again);
+    let (fresh_ino, fresh_node, _) = backend.resolve_inode("f.txt").unwrap();
+    assert!(matches!(fresh_node, Node::File { .. }));
+    assert_ne!(fresh_ino, file_ino);
+    assert_ne!(fresh_ino, dir_ino, "recreation never reuses a retired ino");
+    assert_eq!(
+        backend.validate_inode(dir_ino, "f.txt", &dir_node, 3),
+        Err(fuser::Errno::ENOENT),
+        "the deleted path's ino stopped validating on recreation"
+    );
+}
+
+/// A same-kind delete/recreate cycle mints a fresh ino: the
+/// failed resolution between the generations retires the mapping
+/// by path, so the recreated file never inherits the deleted
+/// file's identity — even with no getattr on the stale ino in
+/// between.
+#[test]
+fn same_kind_recreate_mints_fresh_ino() {
+    let (backend, _, gone, file_again) = kind_changing_backend();
+    // Skip the repurpose generation: file -> deleted -> file.
+    let (first_ino, first_node, _) = backend.resolve_inode("f.txt").unwrap();
+    assert!(matches!(first_node, Node::File { .. }));
+
+    publish(&backend, gone);
+    assert_eq!(
+        backend.resolve_inode("f.txt"),
+        Err(fuser::Errno::ENOENT),
+        "the failed resolution retires the mapping by path"
+    );
+
+    publish(&backend, file_again);
+    let (second_ino, second_node, _) = backend.resolve_inode("f.txt").unwrap();
+    assert!(matches!(second_node, Node::File { .. }));
+    assert_ne!(
+        first_ino, second_ino,
+        "same-kind recreation must not reuse the deleted identity"
+    );
+    assert_eq!(
+        backend.validate_inode(first_ino, "f.txt", &second_node, 2),
+        Err(fuser::Errno::ENOENT)
+    );
+}

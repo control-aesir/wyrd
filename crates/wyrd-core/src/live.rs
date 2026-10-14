@@ -1102,13 +1102,14 @@ where
     /// discipline: acknowledgement becomes pending as soon as there
     /// is something to withdraw, and pending completes — storing
     /// settled `mirror`, which is what flips the effective posture —
-    /// exactly when the completion predicate holds off durable state
-    /// only: no own in-scope snapshot still names a route at a peer
-    /// ([`crate::role::withdrawal_outstanding`]) and the serving
-    /// barrier flushes clean (mirror drained, nothing queued to
-    /// serve). A withdrawal that cannot complete stays pending with
-    /// its reason at debug; obligations keep retiring through
-    /// reconciliation, never because the operator acknowledged.
+    /// exactly when no own in-scope snapshot still names a route at
+    /// a peer ([`crate::role::withdrawal_outstanding`], durable
+    /// state only) and the serving barrier flushes clean (mirror
+    /// drained, nothing queued to serve — memory-only per
+    /// composition, re-read live after a restart). A withdrawal that
+    /// cannot complete stays pending with its reason at debug;
+    /// obligations keep retiring through reconciliation, never
+    /// because the operator acknowledged.
     /// Store-class failures error the pass (tight abort budget, like
     /// admission): a narrowing that cannot persist its step must be
     /// operator-visible, never silently stalled.

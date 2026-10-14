@@ -105,7 +105,10 @@ cmd_resolve_pr() {
 # Print the PR view with its full comment thread as one JSON document.
 cmd_pr_context() {
   local id="${1:-}"
-  [ -n "$id" ] || usage
+  if [ -z "$id" ]; then
+    echo "pr-context: missing id (resolve it first: review resolve-pr)" >&2
+    usage
+  fi
   local online="${2:-}"
   [ "$online" = "--online" ] || [ -z "$online" ] || usage
 
@@ -121,7 +124,10 @@ cmd_pr_context() {
 # publication method.
 cmd_post_comment() {
   local id="${1:-}"
-  [ -n "$id" ] || usage
+  if [ -z "$id" ]; then
+    echo "post-comment: missing id (resolve it first: review resolve-pr)" >&2
+    usage
+  fi
   [ -z "${2:-}" ] || usage
 
   local body

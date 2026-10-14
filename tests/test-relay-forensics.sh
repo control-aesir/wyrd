@@ -69,6 +69,15 @@ grep -q 'TimeoutStartSec' "$RELAY_NIX" \
   || { echo "FAIL: relay journal unit has no read bound" >&2; exit 1; }
 PASS=$((PASS + 1))
 echo "  PASS: relay journal read is bounded"
+# The ordering is the property, not the two files: the heartbeat
+# must be the last && segment of the dump chain, so moving the date
+# line back to the front (the exact R2 regression) fails even
+# though both filenames are still present.
+LAST_SEG="$(sed -n '/wyrd-relay-journal = {/,/};/p' "$RELAY_NIX" | tr '\n' ' ' | sed 's/.*&& //')"
+printf '%s\n' "$LAST_SEG" | grep -q 'relay-journal\.ts' \
+  || { echo "FAIL: relay heartbeat is not written after the dump" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay heartbeat is written after the dump"
 
 # The host logger backgrounds with the lock fd closed: an orphaned
 # logger holding fd 9 would wedge the flock for every later run and

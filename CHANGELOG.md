@@ -27,7 +27,9 @@ version say exactly what changed.
   (`nostr:nevent1qqsxtrye00qccpa6dtsx8xczyjrvn3xm8fwecf06tvt7tvd4wmev56cpz9mhxue69uhkwunpwdczuap49eehgm4t73u`):
   after two ~30s relay outages left neither guest logs nor a host load
   record, the relay guest now dumps its current-boot journal into the
-  run logs on a 60s timer (teardown destroys the VM and the relay
+  run logs on a ~60s timer (up to ~90s after a bounded or failed
+  dump; a silent heartbeat beside an aging log means dumps keep
+  failing — teardown destroys the VM and the relay
   carries no ssh key by design, so this is the only post-mortem
   path), and the runner logs timestamp, host loadavg, and relay TCP
   state every 5s. Pinned by a stub covering the timer, the dump path,

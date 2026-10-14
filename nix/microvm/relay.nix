@@ -51,9 +51,12 @@
   # 2026-10-08 ~30s relay flaps left no guest-side evidence: teardown
   # destroys the VM, and the relay carries no ssh key by design (see
   # above), so the host cannot pull logs out. A 60s timer overwrites
-  # the current-boot journal into the state share, so the latest dump
-  # is never more than a minute stale at teardown (AccuracySec=1s —
-  # systemd's default 1min slop would make that bound a lie).
+  # the current-boot journal into the state share — roughly every
+  # minute in the success case (AccuracySec=1s; systemd's default 1min
+  # slop would make even that a lie), up to ~90s after a bounded or
+  # failed dump since the elapse re-arms from deactivation. A silent
+  # heartbeat with an aging log is the signal that dumps keep
+  # failing, not that the relay is quiet.
   # Overwrite, not append: bounded size, and the phase-1 pre-clean
   # wipes $RUN/logs once per run — the next tick recreates the file.
   # Ordered on the virtiofs mount, not merely timed: an early tick

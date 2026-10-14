@@ -23,7 +23,7 @@ use wyrd_sync::{
     transport::mailbox::Mailbox,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -42,7 +42,7 @@ use crate::role::{Role, RoleState, Transition};
 use crate::scrub::{drain_scrub, probe_presence, ScrubQueue, ScrubReport};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
-use crate::want::WantRegistry;
+use crate::want::{WantError, WantRegistry};
 
 /// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
@@ -1473,30 +1473,22 @@ where
                     batch.record(index, Err(MutationError::Engine));
                     return ApplyEntry::Recorded;
                 };
-                // One waiter per chunk, but one evaluation may name
-                // many: the authoring walk collects its whole miss
-                // set, so a cold device registers all of its demand
-                // here and converges in one fetch round instead of
-                // one chunk per pass. Re-registering a held chunk
-                // would accumulate counts against one release.
-                for chunk in &chunks {
-                    if batch.wanted(index).contains(chunk) {
-                        continue;
+                let refused = match self.register_demand(batch, index, &chunks) {
+                    Ok(refused) => refused,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = ?error,
+                            "mutation demand refused"
+                        );
+                        batch.record(index, Err(error));
+                        return ApplyEntry::Recorded;
                     }
-                    match self.wants.register(*chunk) {
-                        Ok(()) => batch.note_want(index, *chunk),
-                        Err(error) => {
-                            tracing::debug!(
-                                error = ?error,
-                                "mutation demand refused"
-                            );
-                            batch.record(index, Err(MutationError::Engine));
-                            return ApplyEntry::Recorded;
-                        }
-                    }
-                }
+                };
+                // Count, not content: a large miss set would flood
+                // the debug log the e2e legs collect on every pass.
                 tracing::debug!(
-                    chunks = ?chunks,
+                    named = chunks.len(),
+                    refused = refused.len(),
                     base = ?base,
                     "mutation deferred for authoring content"
                 );
@@ -1507,6 +1499,48 @@ where
                 ApplyEntry::Recorded
             }
         }
+    }
+
+    /// Register fetch demand for one evaluation's whole miss set:
+    /// every named chunk the entry does not already hold gains
+    /// exactly one waiter. One evaluation may name many (the
+    /// authoring walk collects its miss set), so a cold device
+    /// registers all of its demand here and converges over fetch
+    /// rounds instead of one chunk per pass. The held set is hoisted
+    /// out of the loop, so registration is linear in the set size,
+    /// not quadratic in the entry's accumulated wants.
+    ///
+    /// Chunks a saturated registry refuses come back as the
+    /// unregistered remainder for the caller to defer, never dropped:
+    /// the retry re-names them while the registered prefix fetches,
+    /// so a past-bound miss set still converges instead of failing
+    /// fast. A poisoned registry lock fails closed.
+    fn register_demand(
+        &self,
+        batch: &mut MutationBatch<'_>,
+        index: usize,
+        chunks: &[ContentId],
+    ) -> Result<Vec<ContentId>, MutationError> {
+        let mut held: BTreeSet<ContentId> = batch.wanted(index).into_iter().collect();
+        let mut refused = Vec::new();
+        for chunk in chunks {
+            // Already held: re-registering would accumulate counts
+            // against one release.
+            if !held.insert(*chunk) {
+                continue;
+            }
+            match self.wants.register(*chunk) {
+                Ok(()) => batch.note_want(index, *chunk),
+                Err(WantError::Saturated) => refused.push(*chunk),
+                // Unreachable through `register` today (that is the
+                // waiter's error, not the registrar's): grouped with
+                // saturation so a future refusal kind defaults to a
+                // patient retry, never a silent drop.
+                Err(WantError::TimedOut) => refused.push(*chunk),
+                Err(WantError::Lock) => return Err(MutationError::Engine),
+            }
+        }
+        Ok(refused)
     }
 
     /// One pass body: intake, fetch, conditional republication, then

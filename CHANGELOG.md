@@ -479,7 +479,9 @@ version say exactly what changed.
   retry converges over fetch rounds (paced by the per-pass admission cap)
   instead of rediscovering one miss per pass. Fail-closed semantics and
   the 30s value are unchanged: nothing authors until every named chunk
-  lands. Single-miss sites (view lookups, the merge locality pre-pass) name one.
+  lands. Chunks a saturated want registry refuses defer with the mutation
+  instead of failing it, so a past-bound miss set still converges.
+  Single-miss sites (view lookups, the merge locality pre-pass) name one.
 
 - ngit-workflow triage tool success result referenced an undefined
   `removals` binding (every success threw ReferenceError after applying

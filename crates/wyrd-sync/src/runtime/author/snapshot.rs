@@ -568,7 +568,7 @@ where
     /// faulty store's reference cycle terminates on the visited set
     /// instead of failing the walk's in-progress check — any real fault
     /// still surfaces on the retry's seal walk.
-    fn collect_missing(&mut self, tree_id: ContentId) -> Result<BTreeSet<ContentId>, EngineError> {
+    fn collect_missing(&self, tree_id: ContentId) -> Result<BTreeSet<ContentId>, EngineError> {
         let mut missing = BTreeSet::new();
         let mut seen = BTreeSet::from([tree_id]);
         let mut stack = vec![tree_id];

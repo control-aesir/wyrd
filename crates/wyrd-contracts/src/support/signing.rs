@@ -9,16 +9,16 @@ use wyrd_format::membership::{
     set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
 };
 use wyrd_format::{
+    signing::{membership_challenge_for, snapshot_challenge_for},
     Change, ContentId, DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, Snapshot,
     SnapshotId, TransitionId,
 };
 use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 
-// The snapshot challenge context has no public spelling in wyrd-sync
-// (the membership one does), so the fixture pins the normative string
-// and `fixture_signatures_verify_through_the_public_path` fails with
-// a local diagnostic if it drifts.
-const SNAPSHOT_CHALLENGE: &str = "wyrd snapshot challenge v1";
+// The fixtures ride the production challenge finalizations in
+// `wyrd_format::signing`, so a drift in either fails here with a local
+// diagnostic instead of as a generic rejection in whichever contract
+// runs first.
 
 pub(crate) fn drive() -> DriveId {
     DriveId::from_bytes([0xEE; 32])
@@ -61,10 +61,7 @@ fn xonly_device_id(sk: &SecretKey) -> DeviceId {
 
 pub(crate) fn sign_transition(t: &mut MembershipTransition, sk: &SecretKey, drive: &DriveId) {
     let kp = Keypair::from_secret_key(secp256k1::SECP256K1, sk);
-    let challenge = blake3::derive_key(
-        wyrd_sync::membership::CHALLENGE_CONTEXT,
-        &t.signing_message(drive),
-    );
+    let challenge = membership_challenge_for(t, drive);
     t.signature = secp256k1::SECP256K1
         .sign_schnorr_no_aux_rand(&challenge, &kp)
         .to_byte_array();
@@ -72,7 +69,7 @@ pub(crate) fn sign_transition(t: &mut MembershipTransition, sk: &SecretKey, driv
 
 pub(crate) fn sign_snapshot(s: &mut Snapshot, sk: &SecretKey, drive: &DriveId) {
     let kp = Keypair::from_secret_key(secp256k1::SECP256K1, sk);
-    let challenge = blake3::derive_key(SNAPSHOT_CHALLENGE, &s.signing_message(drive));
+    let challenge = snapshot_challenge_for(s, drive);
     s.signature = secp256k1::SECP256K1
         .sign_schnorr_no_aux_rand(&challenge, &kp)
         .to_byte_array();

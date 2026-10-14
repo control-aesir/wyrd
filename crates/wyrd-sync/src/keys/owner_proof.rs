@@ -45,17 +45,22 @@ use wyrd_format::{DeviceId, DriveId, TransitionId};
 use zeroize::Zeroizing;
 
 use super::epoch::EpochSecret;
-use crate::control::nip46::{SignDomain, SignMessageRequest};
+use crate::control::nip46::SignMessageRequest;
 use crate::keys::CryptoError;
 use crate::transport::signer::{SignerError, SignerSession};
+use wyrd_format::signing::{owner_proof_challenge, SignDomain};
 
-/// Domain context for the signed preimage (T12: every derived constant
-/// agrees byte-for-byte across implementations).
-pub const PROOF_CONTEXT: &str = "wyrd owner proof v1";
+// The proof context lives in `wyrd_format::signing` (the signer needs
+// it without the transport). Compatibility alias: no in-tree consumer
+// remains, but the public spelling stays so external users do not
+// break.
+pub use wyrd_format::signing::PROOF_CONTEXT;
 
 /// Domain context for the secret-vector commitment, separate from the
 /// signature context so a digest can never be replayed as a preimage or
-/// vice versa.
+/// vice versa. Stays sync-side with the commitment it tags: both touch
+/// `EpochSecret` key material, and a clear-signing remote session
+/// receives full preimages rather than rebuilding them.
 pub const SECRET_VECTOR_CONTEXT: &str = "wyrd epoch secret vector v1";
 
 /// The signed preimage's leading domain tag.
@@ -155,7 +160,7 @@ impl OwnerProof {
     ) -> Result<Self, SignerError> {
         let digest = secret_vector_digest(secrets);
         let preimage = owner_proof_preimage(drive, recipient, transition, epoch, &digest);
-        let challenge = blake3::derive_key(PROOF_CONTEXT, &preimage);
+        let challenge = owner_proof_challenge(&preimage);
         let response = session.sign_message(SignMessageRequest {
             domain: SignDomain::OwnerProofV1,
             drive: *drive,
@@ -195,7 +200,7 @@ impl OwnerProof {
             .map_err(|_| CryptoError::Malformed)?;
         let digest = secret_vector_digest(secrets);
         let preimage = owner_proof_preimage(drive, recipient, transition, epoch, &digest);
-        let challenge = blake3::derive_key(PROOF_CONTEXT, &preimage);
+        let challenge = owner_proof_challenge(&preimage);
         let signature =
             Signature::from_slice(&self.signature).map_err(|_| CryptoError::Malformed)?;
         SECP256K1

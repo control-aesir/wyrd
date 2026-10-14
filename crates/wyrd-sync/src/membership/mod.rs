@@ -35,7 +35,11 @@ use wyrd_format::{Change, DeviceId, DriveId, MembershipTransition, TransitionId}
 
 pub use state::{apply, ApplyError, MembershipState};
 pub(crate) use validate::sign_transition;
-pub use validate::CHALLENGE_CONTEXT;
+// The challenge context lives in `wyrd_format::signing` (the signer
+// needs it without the transport). Compatibility alias: no in-tree
+// consumer remains — fixtures ride the format path — but the public
+// spelling stays so external users do not break.
+pub use wyrd_format::signing::CHALLENGE_CONTEXT;
 
 // Test seam for the intake recovery path: forces
 // [`MembershipLog::status`] to report its subject unclassified

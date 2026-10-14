@@ -434,6 +434,19 @@ version say exactly what changed.
 
 ### Changed
 
+- Signing-domain home (`crates/wyrd-format/src/signing.rs`,
+  `nostr:nevent1qqs2eg9qr56egtqz8k7jvuarlkm8gjn0lgkuq3j6arsmxvkvxec46lgpz9mhxue69uhkwunpwdczuap49eehgyn7anc`):
+  `SignDomain` and the membership/snapshot/owner-proof challenge
+  contexts plus finalizations move from `wyrd-sync` into `wyrd-format`,
+  so a minimal remote signer recomputes digests depending only on
+  `wyrd-format` plus `secp256k1`/`blake3`. `wyrd-sync` re-exports every
+  publicly reachable moved path, so no public spelling changes. The v2 request/response
+  envelope codec stays sync-side (session framing, per the review
+  amendment), as do the epoch-secret vector commitment and the
+  owner-proof preimage builder (sync-side key material and `Zeroizing`
+  buffers). Pinned bytes identical: no contract change. A scratch crate
+  on `wyrd-format` + `blake3` recomputes all three challenges,
+  including the full canonical owner-proof preimage.
 - Serving surface split (`crates/wyrd-sync/src/serving/`): the 1,145-line
   `serving.rs` is now `vault.rs` (raw byte CAS, no iroh/tokio dependency),
   `mirror.rs` (bounded write-through queue, backpressure, readiness

@@ -9,10 +9,8 @@ use secp256k1::{Keypair, XOnlyPublicKey, SECP256K1};
 use wyrd_format::membership::{
     set_root, MEMBER_SET_CONTEXT, OWNER_SET_CONTEXT, READER_SET_CONTEXT,
 };
+use wyrd_format::signing::membership_challenge_for;
 use wyrd_format::{DriveId, MembershipTransition};
-
-/// BIP-340 challenge context for membership transitions (trust.md).
-pub const CHALLENGE_CONTEXT: &str = "wyrd membership challenge v1";
 
 /// Sign a transition in place with canonical BIP-340 nonces (trust.md,
 /// "Exact signing construction"). The genesis bootstrap is the production
@@ -23,7 +21,7 @@ pub(crate) fn sign_transition(
     drive: &DriveId,
 ) {
     let keypair = Keypair::from_secret_key(SECP256K1, sk);
-    let challenge = blake3::derive_key(CHALLENGE_CONTEXT, &t.signing_message(drive));
+    let challenge = membership_challenge_for(t, drive);
     let sig = SECP256K1.sign_schnorr_no_aux_rand(&challenge, &keypair);
     t.signature = sig.to_byte_array();
 }
@@ -33,7 +31,7 @@ pub(crate) fn sign_transition(
 /// implementation; Wyrd-owned code never touches the arithmetic (trust.md
 /// T11).
 pub(crate) fn signature_verifies(drive: &DriveId, t: &MembershipTransition) -> bool {
-    let challenge = blake3::derive_key(CHALLENGE_CONTEXT, &t.signing_message(drive));
+    let challenge = membership_challenge_for(t, drive);
     let (Ok(pk), Ok(sig)) = (
         XOnlyPublicKey::from_slice(t.author.as_bytes()),
         Signature::from_slice(&t.signature),

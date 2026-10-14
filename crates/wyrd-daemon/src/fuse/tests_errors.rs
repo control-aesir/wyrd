@@ -76,7 +76,7 @@ fn mutation_errors_map_to_posix_errors() {
         MutationError::Engine,
         MutationError::Shutdown,
         MutationError::NeedContent {
-            chunk: ContentId::from_bytes([0; 32]),
+            chunks: vec![ContentId::from_bytes([0; 32])],
             base: None,
         },
     ] {

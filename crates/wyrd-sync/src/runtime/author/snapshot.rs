@@ -226,7 +226,24 @@ where
         sealed: BTreeMap::new(),
         local: BTreeSet::new(),
     };
-    let root = authoring.walk(tree)?;
+    let root = match authoring.walk(tree) {
+        Ok(root) => root,
+        Err(EngineError::ChunkUnavailable(first)) => {
+            // Batch the demand: the walk names only its first miss,
+            // but the retry needs every miss to converge in one fetch
+            // round — one miss per evaluation is what paces a cold
+            // join past the mutation deadline. The collection walks
+            // the same tree the walk just failed on; the first miss
+            // joins defensively, so any traversal divergence still
+            // demands it. Partial seals from the failed walk stand in
+            // the vault exactly like today's fail-fast leaves them:
+            // content-addressed and idempotent under the retry.
+            let mut missing = authoring.collect_missing(tree)?;
+            missing.insert(first);
+            return Err(EngineError::ChunksUnavailable(missing));
+        }
+        Err(other) => return Err(other),
+    };
     let children = std::mem::take(&mut authoring.children);
     let local = std::mem::take(&mut authoring.local);
     drop(authoring);
@@ -491,18 +508,9 @@ where
         if let Some(entry) = self.sealed.get(&chunk) {
             return Ok(entry.clone());
         }
-        for entry in self.runtime.recorded_mappings(&chunk) {
-            let held = self.keyring.secret(entry.encryption_epoch).is_some();
-            let served = self
-                .engine
-                .vault
-                .sealed(&entry.transport)
-                .map_err(EngineError::from)?
-                .is_some();
-            if held && served {
-                self.sealed.insert(chunk, entry.clone());
-                return Ok(entry);
-            }
+        if let Some(entry) = self.recorded_entry(chunk)? {
+            self.sealed.insert(chunk, entry.clone());
+            return Ok(entry);
         }
         let plaintext = self
             .objects
@@ -522,6 +530,83 @@ where
         self.sealed.insert(chunk, entry.clone());
         self.local.insert(chunk);
         Ok(entry)
+    }
+
+    /// The recorded-mapping door, without sealing: the first recorded
+    /// representation the device both holds the epoch capability for
+    /// and holds the vault copy of, if any. Shared by sealing (which
+    /// caches the hit) and miss collection (which only counts it), so
+    /// both accept exactly the same set.
+    fn recorded_entry(&self, chunk: ContentId) -> Result<Option<ManifestEntry>, EngineError> {
+        for entry in self.runtime.recorded_mappings(&chunk) {
+            let held = self.keyring.secret(entry.encryption_epoch).is_some();
+            let served = self
+                .engine
+                .vault
+                .sealed(&entry.transport)
+                .map_err(EngineError::from)?
+                .is_some();
+            if held && served {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every chunk the seal walk would need that neither door opens
+    /// for, collected over the whole tree in one pass: the demand set
+    /// one evaluation registers, so a cold device fetches everything
+    /// its authorship needs together. Check-only (no sealing, no vault
+    /// writes) — the retry's seal walk still does the authoring.
+    /// Traversal mirrors the walk (every file chunk in every reachable
+    /// subtree), so the set is exactly what the walk would resolve; the
+    /// session seal cache counts as served, like the walk. A subtree
+    /// whose tree node is itself missing is skipped, not failed: trees
+    /// are structural and drain through head-following on their own,
+    /// and the next evaluation walks further. Other tree faults
+    /// (misaddress, decode, limits) propagate like the walk's, and a
+    /// faulty store's reference cycle terminates on the visited set
+    /// instead of failing the walk's in-progress check — any real fault
+    /// still surfaces on the retry's seal walk.
+    fn collect_missing(&self, tree_id: ContentId) -> Result<BTreeSet<ContentId>, EngineError> {
+        let mut missing = BTreeSet::new();
+        let mut seen = BTreeSet::from([tree_id]);
+        let mut stack = vec![tree_id];
+        while let Some(id) = stack.pop() {
+            let tree = match self.load_tree(id) {
+                Ok((_, tree)) => tree,
+                Err(EngineError::TreeUnavailable(_)) if id != tree_id => continue,
+                Err(other) => return Err(other),
+            };
+            for entry in tree.entries() {
+                match &entry.content {
+                    wyrd_format::EntryContent::File { chunks, .. } => {
+                        for chunk in chunks {
+                            if self.sealed.contains_key(chunk) {
+                                continue;
+                            }
+                            if self.recorded_entry(*chunk)?.is_some() {
+                                continue;
+                            }
+                            let present = self
+                                .objects
+                                .has(chunk)
+                                .map_err(|e| EngineError::ObjectStore(format!("{e:?}")))?;
+                            if !present {
+                                missing.insert(*chunk);
+                            }
+                        }
+                    }
+                    wyrd_format::EntryContent::Dir { subtree } => {
+                        if seen.insert(*subtree) {
+                            stack.push(*subtree);
+                        }
+                    }
+                    wyrd_format::EntryContent::Symlink { .. } => {}
+                }
+            }
+        }
+        Ok(missing)
     }
 
     /// The sealed representation mapping one tree node: sealed under this

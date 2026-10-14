@@ -395,8 +395,11 @@ MutationRequest {
    nevertheless applies later.
 4. **Held for authoring prerequisites, with a deadline.** A mutation
    whose base closure references remote-only content cannot author:
-   the resolver (`ChunkUnavailable`) names the missing chunk, the loop
-   registers it as an ordinary fetch want, and the mutation waits —
+   the resolver names the missing content — the authoring walk
+   collects its whole miss set in one evaluation
+   (`EngineError::ChunksUnavailable`), while single-miss sites (view
+   lookups, the merge locality pre-pass) name one — the loop registers
+   every named chunk as an ordinary fetch want, and the mutation waits —
    pinned to the single head its first evaluation used, so the retry
    can never silently rebase onto newer state. Content lost
    out of band waits the same wait (the scrub unclaims the stale
@@ -414,6 +417,11 @@ MutationRequest {
    already ran out fails the same way instead of starting a fresh
    wait. A mutation evaluated headless or multi-head never
    holds: nothing meaningful pins, so it fails closed as before.
+   Chunks a saturated want registry refuses are deferred with the
+   rest, never dropped: the retry re-names them while the registered
+   prefix fetches, so a past-bound miss set still converges instead
+   of failing fast (only a poisoned registry lock fails the mutation
+   closed as `Engine`).
    The wait is a wall-clock bound on the loop, not just on the
    check: while any mutation is held, the pass's fetch runs under the
    nearest deadline's remaining time — each attempt is capped at what

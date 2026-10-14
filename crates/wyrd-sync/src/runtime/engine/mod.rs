@@ -250,6 +250,15 @@ pub enum EngineError {
     Store(wyrd_format::StoreFailure),
     #[error("chunk {0} is neither locally sealed nor covered by a held recorded mapping")]
     ChunkUnavailable(ContentId),
+    /// The authoring walk's collected miss set: every chunk the
+    /// mutated tree needs that is neither locally sealed nor covered
+    /// by a held recorded mapping, named in one evaluation so a cold
+    /// device demands the whole set together instead of one chunk per
+    /// pass (which outwaits the mutation deadline on a fresh join).
+    /// Fail-closed like the single miss: nothing authors until every
+    /// named chunk lands.
+    #[error("chunks {0:?} are neither locally sealed nor covered by held recorded mappings")]
+    ChunksUnavailable(BTreeSet<ContentId>),
     #[error("authored manifest {0} holds no sealed representation to link")]
     RepresentationMissing(ContentId),
     #[error("no root manifest record for snapshot {0}: author the manifest before announcing")]

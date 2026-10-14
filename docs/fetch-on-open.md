@@ -172,7 +172,10 @@ Decided properties:
    `max_pending_wants` distinct identities (default 4096). A
    registration beyond the bound fails and the caller gets `EIO`
    (same POSIX surface as a timeout; distinguished in daemon
-   diagnostics only). Identical outstanding wants coalesce: N
+   diagnostics only) — except the mutation caller, whose refused
+   chunks defer with the held mutation instead (its POSIX outcome is
+   the 30s `ETIMEDOUT`; see `write-path.md` section 4). Identical
+   outstanding wants coalesce: N
    registrations for identity X produce one in-flight
    materialization and N waiter wakeups on success or terminal
    failure. Admission itself is paced per pass

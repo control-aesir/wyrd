@@ -23,7 +23,7 @@ use wyrd_sync::{
     transport::mailbox::Mailbox,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -42,7 +42,7 @@ use crate::role::{Role, RoleState, Transition};
 use crate::scrub::{drain_scrub, probe_presence, ScrubQueue, ScrubReport};
 use crate::view::{Head, NamespaceView, Node, RuntimeMaterialization, ViewError};
 use crate::wake::{Wake, WakeSignal};
-use crate::want::WantRegistry;
+use crate::want::{WantError, WantRegistry};
 
 /// Draw a random duration in `[0, bound)`. Entropy comes from the OS
 /// CSPRNG (the approved substrate); a draw failure falls back to zero
@@ -1445,8 +1445,17 @@ where
     /// needs. Shared by the sync pass and the teardown drain so both
     /// apply identical semantics; the caller owns the batch lifecycle
     /// (the sync pass finishes only after publication, the drain
-    /// finishes immediately).
-    fn apply_entry(&mut self, batch: &mut MutationBatch<'_>, index: usize) -> ApplyEntry {
+    /// finishes immediately). `demand` is whether a deferral
+    /// registers: the sync pass sets it (a later pass fetches), the
+    /// teardown drain clears it (no pass runs after the return, so
+    /// registered demand could never fetch and finish would discard
+    /// it — the drain fails the entry closed instead).
+    fn apply_entry(
+        &mut self,
+        batch: &mut MutationBatch<'_>,
+        index: usize,
+        demand: bool,
+    ) -> ApplyEntry {
         // Prerequisite deadline: wall-clock from admission (the
         // caller has been blocked since), checked every pass and
         // on the first evaluation too — a request whose budget
@@ -1465,7 +1474,7 @@ where
         let pinned = batch.pinned(index);
         let kind = batch.request(index).kind().clone();
         match self.apply_mutation(&kind, pinned) {
-            Err(MutationError::NeedContent { chunk, base }) => {
+            Err(MutationError::NeedContent { chunks, base }) => {
                 let Some(base) = base else {
                     // No pinnable head (headless or conflicted
                     // evaluation): fail closed, never defer what
@@ -1473,28 +1482,36 @@ where
                     batch.record(index, Err(MutationError::Engine));
                     return ApplyEntry::Recorded;
                 };
-                // One waiter per chunk: retries name new chunks as
-                // the walk advances, but re-registering a held
-                // chunk would accumulate counts against one
-                // release.
-                if !batch.wanted(index).contains(&chunk) {
-                    match self.wants.register(chunk) {
-                        Ok(()) => batch.note_want(index, chunk),
+                if demand {
+                    let refused = match self.register_demand(batch, index, &chunks) {
+                        Ok(refused) => refused,
                         Err(error) => {
                             tracing::debug!(
                                 error = ?error,
                                 "mutation demand refused"
                             );
-                            batch.record(index, Err(MutationError::Engine));
+                            batch.record(index, Err(error));
                             return ApplyEntry::Recorded;
                         }
-                    }
+                    };
+                    // Count, not content: a large miss set would flood
+                    // the debug log the e2e legs collect on every pass.
+                    tracing::debug!(
+                        named = chunks.len(),
+                        refused = refused.len(),
+                        base = ?base,
+                        "mutation deferred for authoring content"
+                    );
+                } else {
+                    // The teardown drain evaluates only to settle the
+                    // entry: registering demand here could never fetch,
+                    // so the miss set is named and skipped.
+                    tracing::debug!(
+                        named = chunks.len(),
+                        base = ?base,
+                        "mutation deferred without demand (teardown)"
+                    );
                 }
-                tracing::debug!(
-                    chunk = ?chunk,
-                    base = ?base,
-                    "mutation deferred for authoring content"
-                );
                 ApplyEntry::Deferred(base)
             }
             other => {
@@ -1502,6 +1519,46 @@ where
                 ApplyEntry::Recorded
             }
         }
+    }
+
+    /// Register fetch demand for one evaluation's whole miss set:
+    /// every named chunk the entry does not already hold gains
+    /// exactly one waiter. One evaluation may name many (the
+    /// authoring walk collects its miss set), so a cold device
+    /// registers all of its demand here and converges over fetch
+    /// rounds instead of one chunk per pass. The held set is hoisted
+    /// out of the loop, so registration is linear in the set size,
+    /// not quadratic in the entry's accumulated wants.
+    ///
+    /// Chunks a saturated registry refuses come back as the
+    /// unregistered remainder for the caller to defer, never dropped:
+    /// the retry re-names them while the registered prefix fetches,
+    /// so a past-bound miss set still converges instead of failing
+    /// fast. A poisoned registry lock fails closed.
+    fn register_demand(
+        &self,
+        batch: &mut MutationBatch<'_>,
+        index: usize,
+        chunks: &[ContentId],
+    ) -> Result<Vec<ContentId>, MutationError> {
+        let mut held: BTreeSet<ContentId> = batch.wanted(index).into_iter().collect();
+        let mut refused = Vec::new();
+        for chunk in chunks {
+            // Already held: re-registering would accumulate counts
+            // against one release.
+            if !held.insert(*chunk) {
+                continue;
+            }
+            match self.wants.register(*chunk) {
+                Ok(()) => batch.note_want(index, *chunk),
+                // `TimedOut` is the waiter's error, never the
+                // registrar's: grouped with saturation so a refusal
+                // of any kind retries patiently, never drops silently.
+                Err(WantError::Saturated | WantError::TimedOut) => refused.push(*chunk),
+                Err(WantError::Lock) => return Err(MutationError::Engine),
+            }
+        }
+        Ok(refused)
     }
 
     /// One pass body: intake, fetch, conditional republication, then
@@ -1744,7 +1801,7 @@ where
             // so everything after it in this batch goes back
             // untouched — never executed past the defer. The pass
             // then ends.
-            if let ApplyEntry::Deferred(base) = self.apply_entry(&mut batch, index) {
+            if let ApplyEntry::Deferred(base) = self.apply_entry(&mut batch, index, true) {
                 batch.defer_and_release_rest(index, base);
                 break;
             }
@@ -2903,7 +2960,13 @@ where
             tracing::debug!(error = ?error, "mutation authoring refused");
             match error {
                 EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
-                    chunk,
+                    chunks: vec![chunk],
+                    base: Self::pin_head(heads),
+                },
+                EngineError::ChunksUnavailable(missing) => MutationError::NeedContent {
+                    // BTreeSet iteration is ascending: the demand
+                    // order is deterministic under replay.
+                    chunks: missing.into_iter().collect(),
                     base: Self::pin_head(heads),
                 },
                 error => authoring_error(error),
@@ -3007,7 +3070,7 @@ where
         let status = crate::view::overlay_terminal(base, self.engine.terminal_state(chunk));
         match status {
             FetchStatus::RemoteOnly | FetchStatus::Fetching => MutationError::NeedContent {
-                chunk: *chunk,
+                chunks: vec![*chunk],
                 base: Self::pin_head(heads),
             },
             FetchStatus::Unavailable(_) | FetchStatus::Available | FetchStatus::Corrupt => {
@@ -3095,14 +3158,14 @@ where
         let view = self.view_for(heads)?;
         let node = view.lookup(path).map_err(|error| match error {
             ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             },
             _ => MutationError::NotFound(path.to_string()),
         })?;
         let file = view.open_file(&node).map_err(|error| match error {
             ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             },
             _ => MutationError::IsDirectory(path.to_string()),
@@ -3158,7 +3221,7 @@ where
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {
                 ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                    chunk: content,
+                    chunks: vec![content],
                     base: Self::pin_head(heads),
                 },
                 // A classified store failure keeps its errno; every
@@ -3194,7 +3257,7 @@ where
             Ok(node) => Ok(Some(node)),
             Err(ViewError::NotFound) => Ok(None),
             Err(ViewError::NotMaterialized { content }) => Err(MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             }),
             Err(ViewError::NotADirectory) => Err(MutationError::NotADirectory(path.to_string())),
@@ -3467,7 +3530,7 @@ where
                 continue;
             }
             for index in 0..batch.len() {
-                match self.apply_entry(&mut batch, index) {
+                match self.apply_entry(&mut batch, index, false) {
                     ApplyEntry::Recorded => {}
                     ApplyEntry::Deferred(_) => {
                         // Teardown cannot fetch: no pass runs after the

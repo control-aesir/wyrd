@@ -46,7 +46,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 
 | Boundary | Bound (default) | Past it |
 |---|---|---|
-| Want registry identities (pending + admitted) | `max_pending_wants` (4096) | registration fails; `EIO` at the POSIX boundary, never a silent drop |
+| Want registry identities (pending + admitted) | `max_pending_wants` (4096) | registration fails; `EIO` at the POSIX boundary, never a silent drop — except refused mutation demand, which defers with the held mutation (`ETIMEDOUT`; see `write-path.md` section 4) |
 | Want admission per sync pass | `max_admit_per_pass` (1024) | remainder stays pending for the next pass — paced, never dropped |
 | Quarantine repairs per sync pass | `max_quarantine_per_pass` (64) | remainder stays queued for the next pass — paced, never dropped |
 | Scrub probes plus scrub repairs per sync pass | `max_scrub_per_pass` (64) | the walk stats at most this many claims from its rotating cursor (O(claims) scan, one log replay only when admission took no snapshot) and the drain repairs at most this many losses — remainder waits for the next pass, never dropped |

@@ -252,7 +252,7 @@ fn prefix_read_on_remote_only_file_defers_with_the_evaluated_pin() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk,
+            chunks: vec![chunk],
             base: Some(base),
         }
     );
@@ -275,7 +275,7 @@ fn lookup_on_remote_only_subtree_defers_with_the_evaluated_pin() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk: root,
+            chunks: vec![root],
             base: Some(base),
         }
     );
@@ -1853,7 +1853,7 @@ fn fold_defers_for_remote_content_and_retries_pinned() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk,
+            chunks: vec![chunk],
             base: Some(base),
         }
     );
@@ -1990,6 +1990,260 @@ fn write_stats_count_snapshots_by_source() {
     assert!(
         stats.commit_latency_us_mean() <= stats.commit_latency_us_max,
         "mean never exceeds max: {stats:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// One evaluation registers its whole miss set with one waiter each:
+/// every named chunk becomes a want in a single pass, and a second
+/// registration of the same set adds no waiter (the held set is what
+/// keeps re-registration from accumulating counts against one
+/// release). Completion releases every noted want.
+#[test]
+fn one_evaluation_registers_the_whole_miss_set_once() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("register-set");
+    let node = live_over_fake(engine, store, &[head]);
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(crate::mutation::MutationKind::Mkdir { path: "d".into() })
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    let chunks = vec![
+        ContentId::from_bytes([0xA1; 32]),
+        ContentId::from_bytes([0xB1; 32]),
+        ContentId::from_bytes([0xC1; 32]),
+    ];
+    let refused = node.register_demand(&mut batch, 0, &chunks).unwrap();
+    assert!(refused.is_empty(), "an empty registry refuses nothing");
+    assert_eq!(batch.wanted(0), chunks, "every named chunk noted in order");
+    for chunk in &chunks {
+        assert_eq!(
+            node.wants().waiter_count(chunk),
+            1,
+            "exactly one waiter per chunk"
+        );
+    }
+    // Re-registration is a no-op: held chunks gain no second waiter.
+    let refused = node.register_demand(&mut batch, 0, &chunks).unwrap();
+    assert!(refused.is_empty());
+    for chunk in &chunks {
+        assert_eq!(node.wants().waiter_count(chunk), 1);
+    }
+    batch.finish();
+    for chunk in &chunks {
+        assert_eq!(
+            node.wants().waiter_count(chunk),
+            0,
+            "completion releases every noted want"
+        );
+    }
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Registry saturation defers the remainder instead of failing the
+/// mutation: refused chunks come back unregistered (never dropped —
+/// the retry re-names them while the registered prefix fetches), and
+/// only a poisoned lock still fails closed.
+#[test]
+fn saturation_defers_the_remainder_instead_of_failing() {
+    let (engine, dir, store, _chunk, _root, head) = scratch_file_drive("register-saturation");
+    let node = live_over_fake(engine, store, &[head]);
+    // Fill the registry to its bound with unrelated demand.
+    for i in 0..crate::want::MAX_PENDING_WANTS {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        node.wants()
+            .register(ContentId::from_bytes(bytes))
+            .expect("fill stays within the bound");
+    }
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(crate::mutation::MutationKind::Mkdir { path: "d".into() })
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    let chunks = vec![
+        ContentId::from_bytes([0xA1; 32]),
+        ContentId::from_bytes([0xB1; 32]),
+    ];
+    let refused = node.register_demand(&mut batch, 0, &chunks).unwrap();
+    assert_eq!(refused, chunks, "a full registry refuses the whole set");
+    assert!(batch.wanted(0).is_empty(), "nothing refused is ever noted");
+    // One freed slot registers the prefix and defers only the rest.
+    let mut filler = [0u8; 32];
+    filler[..4].copy_from_slice(&0u32.to_le_bytes());
+    node.wants().release(&ContentId::from_bytes(filler));
+    let refused = node.register_demand(&mut batch, 0, &chunks).unwrap();
+    assert_eq!(refused, vec![chunks[1]], "only the remainder defers");
+    assert_eq!(batch.wanted(0), vec![chunks[0]]);
+    assert_eq!(node.wants().waiter_count(&chunks[0]), 1);
+    assert_eq!(node.wants().waiter_count(&chunks[1]), 0);
+    batch.finish();
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A real evaluation defers through the refactored arm: the fold
+/// member's single miss becomes one want, and the entry holds pending
+/// with the evaluated head pinned.
+#[test]
+fn apply_entry_defers_a_real_evaluation_with_its_want() {
+    let (engine, dir, mut store, chunk, root, head) = scratch_file_drive("entry-defer");
+    // The tree resolves; the chunk does not.
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let base = head.snapshot().snapshot_id();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let fold = crate::mutation::MutationKind::Fold {
+        members: vec![FoldMember {
+            kind: crate::mutation::MutationKind::AppendFile {
+                path: "f".into(),
+                content: b"more".to_vec(),
+            },
+            forcer: true,
+        }],
+    };
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(fold)
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    match node.apply_entry(&mut batch, 0, true) {
+        ApplyEntry::Deferred(pinned) => {
+            assert_eq!(pinned, base, "the retry pins the evaluated head")
+        }
+        ApplyEntry::Recorded => panic!("a cold evaluation defers, but the entry recorded"),
+    }
+    assert_eq!(batch.wanted(0), vec![chunk]);
+    assert_eq!(node.wants().waiter_count(&chunk), 1);
+    batch.finish();
+    assert_eq!(node.wants().waiter_count(&chunk), 0);
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The teardown drain evaluates without registering: the same cold
+/// miss defers for settling, but no want is noted and no waiter is
+/// left behind for a pass that will never run.
+#[test]
+fn apply_entry_without_demand_names_but_registers_nothing() {
+    let (engine, dir, mut store, _chunk, root, head) = scratch_file_drive("entry-no-demand");
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let fold = crate::mutation::MutationKind::Fold {
+        members: vec![FoldMember {
+            kind: crate::mutation::MutationKind::AppendFile {
+                path: "f".into(),
+                content: b"more".to_vec(),
+            },
+            forcer: true,
+        }],
+    };
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(fold)
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    match node.apply_entry(&mut batch, 0, false) {
+        ApplyEntry::Deferred(_) => {}
+        ApplyEntry::Recorded => panic!("a cold evaluation defers, but the entry recorded"),
+    }
+    assert!(
+        batch.wanted(0).is_empty(),
+        "demand-free evaluation notes nothing"
+    );
+    batch.finish();
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Saturation at the loop boundary still defers a real evaluation:
+/// the fold's miss is refused, nothing is noted, and the entry holds
+/// pending instead of failing terminal — the retry re-names the
+/// remainder while the registry drains.
+#[test]
+fn apply_entry_under_saturation_still_defers() {
+    let (engine, dir, mut store, _chunk, root, head) = scratch_file_drive("entry-saturation");
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let mut node = live_over_fake(engine, store, &[head]);
+    for i in 0..crate::want::MAX_PENDING_WANTS {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&(i as u32).to_le_bytes());
+        node.wants()
+            .register(ContentId::from_bytes(bytes))
+            .expect("fill stays within the bound");
+    }
+    let fold = crate::mutation::MutationKind::Fold {
+        members: vec![FoldMember {
+            kind: crate::mutation::MutationKind::AppendFile {
+                path: "f".into(),
+                content: b"more".to_vec(),
+            },
+            forcer: true,
+        }],
+    };
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(fold)
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    match node.apply_entry(&mut batch, 0, true) {
+        ApplyEntry::Deferred(_) => {}
+        ApplyEntry::Recorded => panic!("saturation defers a real miss, but the entry recorded"),
+    }
+    assert!(batch.wanted(0).is_empty(), "nothing refused is ever noted");
+    assert_eq!(
+        queue.outstanding(),
+        1,
+        "the submitter stays blocked on its held entry"
+    );
+    batch.finish();
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

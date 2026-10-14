@@ -959,6 +959,7 @@ fn withdrawal_outstanding_survives_reopen() {
         "the cleared count stays cleared across reopen"
     );
 }
+
 /// Closure-scoped redelivery (22b): on a serving-route change the
 /// current head AND its reachable closure reopen — the retained
 /// history a late peer needs to discover content, not just the head.

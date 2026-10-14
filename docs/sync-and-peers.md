@@ -538,10 +538,12 @@ never happen silently:
 - **Withdrawal complete.** The serving queue is drained with nothing
   queued to serve, and route publication no longer names this device for new
   snapshots. Only then does the effective role flip. A withdrawal that
-  cannot complete reports pending with its reason, never success. The
-  loop derives both halves off durable state each pass: own in-scope
-  snapshots with no real-route discharge left, plus an idle serving
-  barrier. Out-of-scope history is accepted stale — the redelivery
+  cannot complete reports pending with its reason, never success. Each
+  pass the loop checks the route half off durable state — own in-scope
+  snapshots with no real-route discharge left — plus an idle serving
+  barrier, which is memory-only per composition: a restart re-derives
+  the route half from facts and re-reads serving readiness live.
+  Out-of-scope history is accepted stale — the redelivery
   gate never resends it, so the predicate never waits for it, exactly
   as endpoint rotation leaves old routes behind. Completion is not
   de-listing: the settle pass itself publishes with the real route

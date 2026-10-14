@@ -23,6 +23,15 @@ version say exactly what changed.
 
 ### Added
 
+- Relay-flap forensics
+  (`nostr:nevent1qqsxtrye00qccpa6dtsx8xczyjrvn3xm8fwecf06tvt7tvd4wmev56cpz9mhxue69uhkwunpwdczuap49eehgm4t73u`):
+  after two ~30s relay outages left neither guest logs nor a host load
+  record, the relay guest now dumps its current-boot journal into the
+  run logs on a 60s timer (teardown destroys the VM and the relay
+  carries no ssh key by design, so this is the only post-mortem
+  path), and the runner logs timestamp, host loadavg, and relay TCP
+  state every 5s. Pinned by a stub covering the timer, the dump path,
+  and the logger's lock-fd and lifecycle wiring.
 - Wrapper-only e2e gate entry
   (`nostr:nevent1qqs95k4x4s2cw4c6a95w42xasmw0vegtucj26agj2kzrahgajvwpmzgpz9mhxue69uhkwunpwdczuap49eehghvrm23`):
   each wrapper mints a random per-run token, publishes it in the run's env

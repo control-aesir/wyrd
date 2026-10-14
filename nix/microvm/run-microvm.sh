@@ -164,6 +164,12 @@ kill_stale_daemons() {
 }
 
 teardown() {
+  # The availability logger dies first: it appends to $RUN/logs on
+  # its own cadence and must not outlive the run (a surviving logger
+  # would write a torn-down run's file, and inherit the lock fd —
+  # see the 9>&- rule at its launch). Unset outside a full run
+  # (--teardown mode), so the guard defaults empty under set -u.
+  [[ -n "${LOGGER_PID:-}" ]] && kill "$LOGGER_PID" 2>/dev/null || true
   if [[ "$KEEP" == 0 ]]; then
     kill_stale_daemons
     for t in tap-o tap-n tap-r; do ip link del "$t" 2>/dev/null || true; done
@@ -344,6 +350,32 @@ RELAY_S=$(( $(date +%s) - RELAY_START ))
 echo "    relay control plane reachable (wait took ${RELAY_S}s)"
 echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 
+# Host availability witness for relay-flap forensics. The 2026-10-08
+# ~30s relay outages had no guest logs (teardown destroys the relay
+# VM; fixed by the relay journal timer in relay.nix) and no host
+# load record (the prime suspect is CI contention on the host), so
+# neither layer could be classified afterwards. This background loop
+# logs one line per 5s — timestamp, host loadavg, relay TCP state —
+# into the run logs. Per-tick open-append-close: the phase-1 guest
+# pre-clean unlinks $RUN/logs once per run, and a held fd would keep
+# writing the unlinked inode invisibly past the wipe. 9>&-: the loop
+# must never inherit the run lock fd — an orphaned logger would hold
+# the flock after the runner dies and wedge every later run plus
+# --teardown (same class as the daemon fd rule at boot).
+AVAIL_LOG="$RUN/logs/host-availability.log"
+availability_loop() {
+  while true; do
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    load="$(cut -d' ' -f1-3 /proc/loadavg)"
+    if timeout 2 bash -c "</dev/tcp/$NET.10/18761" 2>/dev/null; then relay=ok; else relay=FAIL; fi
+    printf '%s load=%s relay=%s\n' "$ts" "$load" "$relay" >> "$AVAIL_LOG"
+    sleep 5
+  done
+}
+availability_loop 9>&- &
+LOGGER_PID=$!
+echo "    host availability witness logging to logs/host-availability.log (pid $LOGGER_PID)"
+
 echo "==> running the suite"
 set +e
 timeout 7200 env \
@@ -361,6 +393,11 @@ timeout 7200 env \
   bash "$ROOT/tests/alpha-microvm.sh" 9>&-
 STATUS=$?
 set -e
+# Stop the witness with the suite: teardown() (EXIT trap) covers the
+# failure path, but a green run must not log through the report and
+# teardown into the file. Cleared so teardown's kill is a no-op.
+kill "$LOGGER_PID" 2>/dev/null || true
+LOGGER_PID=""
 [[ "$STATUS" == 0 ]] || die "microvm suite failed (exit $STATUS, logs under $RUN/logs)"
 echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_wait=${RELAY_S}s"
 echo "microvm: suite green, logs under $RUN/logs"

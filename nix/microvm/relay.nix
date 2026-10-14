@@ -46,4 +46,29 @@
       StateDirectory = "wyrd-relay";
     };
   };
+
+  # Relay-guest journal persistence for post-mortem forensics. The
+  # 2026-10-08 ~30s relay flaps left no guest-side evidence: teardown
+  # destroys the VM, and the relay carries no ssh key by design (see
+  # above), so the host cannot pull logs out. A 60s timer overwrites
+  # the current-boot journal into the state share, so the latest dump
+  # is never more than a minute stale at teardown. Overwrite, not
+  # append: bounded size, and the phase-1 pre-clean wipes the share
+  # once per run — the next tick recreates the file.
+  systemd.services.wyrd-relay-journal = {
+    script = ''
+      mkdir -p /mnt/wyrd-state/run/logs
+      ${pkgs.systemd}/bin/journalctl -b --no-pager > /mnt/wyrd-state/run/logs/relay-journal.log
+    '';
+    serviceConfig = {
+      Type = "oneshot";
+    };
+  };
+  systemd.timers.wyrd-relay-journal = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "1min";
+      OnUnitActiveSec = "1min";
+    };
+  };
 }

@@ -910,6 +910,9 @@ fn authoring_error(error: EngineError) -> MutationError {
 /// exists, so there is nothing to roll back — only
 /// sealed-but-uncommitted objects, unreferenced. Silent for every
 /// other outcome: only the `StorageFull` mapping names this layer.
+/// Reads classify silently by design; only writes name the layer —
+/// the read-side `has` checks keep the plain mapping, since a store
+/// read cannot refuse with capacity.
 fn log_backing_store_refusal(mapped: &MutationError) {
     if *mapped != MutationError::Store(StoreFailure::StorageFull) {
         return;

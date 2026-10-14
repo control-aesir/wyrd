@@ -839,7 +839,7 @@ where
         Duration::from_secs(30),
         config,
     )
-    .expect("the default config carries no quota, so composition cannot be refused")
+    .expect("live composition with the passed config and store")
     .0
 }
 

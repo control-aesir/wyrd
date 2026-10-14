@@ -22,10 +22,10 @@
 //! `wyrd manifest key v1` / `wyrd object key v1` derivations, the seal
 //! envelopes, and the transport-root fetch addresses (object-model.md
 //! decision 26). That is why an old client keeps reading release drives
-//! while the rest of the protocol evolves around the frozen subset —
-//! and why the subset is the floor of the capability-negotiation matrix
-//! (`feat(sync): capability negotiation and mixed-version peer policy`):
-//! negotiation never offers less than release-read v1.
+//! while the rest of the protocol evolves around the frozen subset. The
+//! profile is a subset of what peers already speak, so a future
+//! capability-negotiation matrix can take it as its floor — no
+//! negotiation exists yet, and the subset does not depend on one.
 //!
 //! Verification is not authenticity by itself. A valid signature proves
 //! the pinned maintainer signed the announcement; it does not prove the
@@ -42,6 +42,7 @@
 //! with no fallback to membership replay, capability installation, or a
 //! more permissive reader mode.
 
+use secp256k1::XOnlyPublicKey;
 use thiserror::Error;
 use wyrd_format::{
     BaoRoot, DeviceId, DriveId, Manifest, ManifestEntry, Snapshot, SnapshotId, TransitionId,
@@ -51,7 +52,6 @@ use crate::bulk::{BulkError, BulkSource};
 use crate::control::{verify_announcement, SnapshotAnnouncement};
 use crate::keys::EpochSecret;
 use crate::seal::{self, EncryptedObject};
-
 /// The frozen profile version: release-read v1. Carried as the first
 /// byte of the release-metadata encoding so a future profile is
 /// distinguishable, never silently accepted as v1.
@@ -113,18 +113,24 @@ impl PublicRelease {
     /// genesis transition id, and the epoch-1 secret to publish.
     /// Callers must only publish the result as explicitly public release
     /// metadata — never as an ordinary capability, invitation, or backup.
+    ///
+    /// Fails closed on a maintainer key no signature can verify against:
+    /// without this, a malformed pinned npub would report every valid
+    /// release as [`PublicReadError::NotMaintainer`] instead of naming
+    /// the malformed metadata.
     pub fn new(
         drive: DriveId,
         maintainer: DeviceId,
         genesis: TransitionId,
         epoch_secret: EpochSecret,
-    ) -> Self {
-        PublicRelease {
+    ) -> Result<Self, PublicReadError> {
+        check_maintainer_key(&maintainer)?;
+        Ok(PublicRelease {
             drive,
             maintainer,
             genesis,
             epoch_secret,
-        }
+        })
     }
 
     /// The canonical release-metadata encoding: `version ‖ drive ‖
@@ -141,9 +147,10 @@ impl PublicRelease {
         out
     }
 
-    /// Decode release metadata. Rejects truncation, trailing bytes, and
-    /// any version but [`RELEASE_READ_VERSION`]: a future profile must
-    /// fail here, never parse as v1.
+    /// Decode release metadata. Rejects truncation, trailing bytes, a
+    /// malformed maintainer key, and any version but
+    /// [`RELEASE_READ_VERSION`]: a future profile must fail here, never
+    /// parse as v1.
     pub fn decode(bytes: &[u8]) -> Result<Self, PublicReadError> {
         if bytes.len() != PUBLIC_RELEASE_LEN {
             return Err(PublicReadError::MalformedRelease);
@@ -151,14 +158,18 @@ impl PublicRelease {
         if bytes[0] != RELEASE_READ_VERSION {
             return Err(PublicReadError::UnsupportedVersion(bytes[0]));
         }
-        let id32 =
-            |pos: usize| -> [u8; 32] { bytes[pos..pos + 32].try_into().expect("length checked") };
-        Ok(PublicRelease {
-            drive: DriveId::from_bytes(id32(1)),
-            maintainer: DeviceId::from_bytes(id32(33)),
-            genesis: TransitionId::from_bytes(id32(65)),
-            epoch_secret: EpochSecret::from_bytes(id32(97)),
-        })
+        let id32 = |pos: usize| -> Result<[u8; 32], PublicReadError> {
+            bytes
+                .get(pos..pos + 32)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or(PublicReadError::MalformedRelease)
+        };
+        Self::new(
+            DriveId::from_bytes(id32(1)?),
+            DeviceId::from_bytes(id32(33)?),
+            TransitionId::from_bytes(id32(65)?),
+            EpochSecret::from_bytes(id32(97)?),
+        )
     }
 
     /// The manifest key for one release snapshot: epoch 1, always. The
@@ -168,6 +179,16 @@ impl PublicRelease {
         self.epoch_secret
             .manifest_key(&self.drive, RELEASE_EPOCH, snapshot)
     }
+}
+
+/// The maintainer key must name a curve point a BIP-340 signature can
+/// verify against. Checked at the metadata boundary (both constructors),
+/// so a malformed pinned npub fails as malformed metadata — never as a
+/// `NotMaintainer` on every release read thereafter.
+fn check_maintainer_key(maintainer: &DeviceId) -> Result<(), PublicReadError> {
+    XOnlyPublicKey::from_slice(maintainer.as_bytes())
+        .map(|_| ())
+        .map_err(|_| PublicReadError::MalformedRelease)
 }
 
 /// What a failed public read means. Scope violations (authorship,
@@ -303,22 +324,36 @@ pub fn fetch_public_snapshot<S: BulkSource>(
     if snapshot.snapshot_id() != announcement.snapshot {
         return Err(PublicReadError::SnapshotMismatch);
     }
-    // The body's own signature and scope: the announcement gate checked
-    // the author's *statement*; the body check keeps a body fetched by id
-    // from smuggling an out-of-scope snapshot past the reader.
+    // Scope before signature, matching the frozen order: a body outside
+    // the release scope reports as such even when its signature would
+    // also fail. Unreachable through this path by construction — the id
+    // above already covers the scope fields, so any scope change reports
+    // as `SnapshotMismatch` first — and retained as a backstop: the check
+    // is what makes the scope rule hold for bodies that arrive by any
+    // other route, and its branch is pinned directly below.
+    check_body_scope(release, &snapshot)?;
     crate::authorization::predicates::verify_snapshot(&release.drive, &snapshot)
         .map_err(|_| PublicReadError::BadSnapshotSignature)?;
+    let manifest = fetch_root_manifest(release, announcement, source, max)?;
+    if manifest.snapshot() != announcement.snapshot {
+        return Err(PublicReadError::ManifestMismatch);
+    }
+    Ok(VerifiedPublicSnapshot { snapshot, manifest })
+}
+
+/// The body's scope rule: the announcement gate checked the author's
+/// *statement*; this keeps a body fetched by id from smuggling an
+/// out-of-scope snapshot past the reader. Factored out so the branch is
+/// directly testable (through [`fetch_public_snapshot`] it is a
+/// backstop — see the call site).
+fn check_body_scope(release: &PublicRelease, snapshot: &Snapshot) -> Result<(), PublicReadError> {
     if snapshot.author != release.maintainer
         || snapshot.membership != release.genesis
         || snapshot.epoch != RELEASE_EPOCH
     {
         return Err(PublicReadError::BodyOutsideScope);
     }
-    let manifest = fetch_root_manifest(release, announcement, source, max)?;
-    if manifest.snapshot() != announcement.snapshot {
-        return Err(PublicReadError::ManifestMismatch);
-    }
-    Ok(VerifiedPublicSnapshot { snapshot, manifest })
+    Ok(())
 }
 
 /// Fetch and verify one object named by a release manifest entry: the
@@ -418,6 +453,7 @@ mod tests {
             TransitionId::from_bytes([0x13; 32]),
             EpochSecret::from_bytes([0x17; 32]),
         )
+        .expect("fixture metadata is well-formed")
     }
 
     /// One sealed chunk plus its manifest entry, under the fixture epoch.
@@ -690,10 +726,14 @@ mod tests {
         let release = fixture_release();
         let (_, _, _, mut announcement) = published(&release, Vec::new());
         // A stranger's announcement, signed by the stranger: well-formed,
-        // correctly signed — and refused on authorship alone.
+        // correctly signed — and refused on authorship alone. The
+        // stranger's own signature verifies first, so the test proves a
+        // genuinely stranger-signed statement, not hand-built bytes.
         announcement.author = stranger_identity().device_id();
         announcement.signature = [0; 64];
         sign_announcement(&mut announcement, &stranger_identity(), &release.drive);
+        verify_announcement(&release.drive, &announcement)
+            .expect("stranger signature is well-formed");
         let mut source = MemoryBulkSource::default();
         assert_eq!(
             fetch_public_snapshot(&release, &announcement, &mut source, 1 << 20),
@@ -751,7 +791,8 @@ mod tests {
             release.maintainer,
             release.genesis,
             EpochSecret::from_bytes([0x99; 32]),
-        );
+        )
+        .expect("fixture metadata is well-formed");
         let mut source = serving(&snapshot, root_sealed, vec![obj]);
         assert!(matches!(
             fetch_public_snapshot(&wrong, &announcement, &mut source, 1 << 20),
@@ -790,5 +831,86 @@ mod tests {
         assert!(rendered.contains("1111"), "drive is public metadata");
         assert!(rendered.contains("PUBLISHED-SEPARATELY"));
         assert!(!rendered.contains("1717"), "secret bytes stay out of logs");
+    }
+
+    #[test]
+    fn malformed_maintainer_key_fails_as_malformed_metadata() {
+        // 32 arbitrary bytes are not an x-only key: the constructors fail
+        // closed here, so a bad pinned npub never reports every valid
+        // release as NotMaintainer downstream.
+        let bad = DeviceId::from_bytes([0xFF; 32]);
+        assert_eq!(
+            PublicRelease::new(
+                DriveId::from_bytes([0x11; 32]),
+                bad,
+                TransitionId::from_bytes([0x13; 32]),
+                EpochSecret::from_bytes([0x17; 32]),
+            ),
+            Err(PublicReadError::MalformedRelease)
+        );
+        let mut encoded = fixture_release().encode();
+        encoded[33..65].copy_from_slice(&[0xFF; 32]);
+        assert_eq!(
+            PublicRelease::decode(&encoded),
+            Err(PublicReadError::MalformedRelease)
+        );
+    }
+
+    #[test]
+    fn body_scope_backstop_reports_each_axis() {
+        // `check_body_scope` directly: through the fetch path the id check
+        // covers these fields first, so this pins the backstop branch
+        // itself — one axis at a time.
+        let release = fixture_release();
+        let (snapshot, _, _, _) = published(&release, Vec::new());
+        assert_eq!(check_body_scope(&release, &snapshot), Ok(()));
+        let mut wrong_author = snapshot.clone();
+        wrong_author.author = stranger_identity().device_id();
+        assert_eq!(
+            check_body_scope(&release, &wrong_author),
+            Err(PublicReadError::BodyOutsideScope)
+        );
+        let mut wrong_membership = snapshot.clone();
+        wrong_membership.membership = TransitionId::from_bytes([0x77; 32]);
+        assert_eq!(
+            check_body_scope(&release, &wrong_membership),
+            Err(PublicReadError::BodyOutsideScope)
+        );
+        let mut wrong_epoch = snapshot.clone();
+        wrong_epoch.epoch = 2;
+        assert_eq!(
+            check_body_scope(&release, &wrong_epoch),
+            Err(PublicReadError::BodyOutsideScope)
+        );
+    }
+
+    #[test]
+    fn corrupted_maintainer_signature_fails_on_evidence() {
+        // Author, epoch, and membership all match: only the signature is
+        // wrong, so the gate reports evidence failure, not a scope
+        // violation.
+        let release = fixture_release();
+        let (_, _, _, mut announcement) = published(&release, Vec::new());
+        announcement.signature[0] ^= 0xFF;
+        assert_eq!(
+            verify_public_announcement(&release, &announcement),
+            Err(PublicReadError::BadAnnouncementSignature)
+        );
+    }
+
+    #[test]
+    fn announcement_for_another_drive_does_not_verify() {
+        // Same maintainer key, different drive: the signature is
+        // drive-bound, so a release announcement never authorizes a
+        // snapshot on another drive.
+        let release = fixture_release();
+        let other_drive = DriveId::from_bytes([0x2A; 32]);
+        let (_, _, _, mut announcement) = published(&release, Vec::new());
+        announcement.signature = [0; 64];
+        sign_announcement(&mut announcement, &maintainer_identity(), &other_drive);
+        assert_eq!(
+            verify_public_announcement(&release, &announcement),
+            Err(PublicReadError::BadAnnouncementSignature)
+        );
     }
 }

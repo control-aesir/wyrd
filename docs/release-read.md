@@ -33,15 +33,18 @@ Consequences, accepted up front:
 Two things, both public: the release metadata (`PublicRelease`:
 `version ‖ drive ‖ maintainer ‖ genesis ‖ epoch-1 secret`, 129 bytes)
 and signed-but-unsealed snapshot announcements (the ordinary
-`SnapshotAnnouncement` encoding, published in the clear). The reader
+`SnapshotAnnouncement` encoding, published in the clear — members keep
+receiving announcements through the sealed control-plane envelopes; the
+public posting is an additional cleartext publication of the same
+signed statement, never a claim that announcements are never sealed). The reader
 holds no identity, no mailbox, no membership log, and no capability —
 by construction the module imports none of those surfaces.
 
 ## The authorship rule
 
 `author == maintainer && membership == genesis && epoch == 1`, then the
-maintainer's announcement signature, the snapshot id, the body's own
-signature, and the body's scope — in that order, so scope violations
+maintainer's announcement signature, the snapshot id, the body's scope,
+and the body's own signature — in that order, so scope violations
 report as scope violations even when the signature would also fail.
 Every violation fails closed (`NotMaintainer`, `NotGenesis`,
 `WrongEpoch`, ...); there is no fallback to membership replay,
@@ -58,10 +61,19 @@ release manifest, not to this reader.
 
 ## Negotiation floor
 
-Release-read v1 is the floor of the capability-negotiation matrix: a
-newer node reads release drives through this profile, and negotiation
-never offers less. The profile reuses the existing construction
+Release-read v1 is a subset of what peers already speak, so a node
+implementing capability negotiation can express it — no negotiation
+exists yet, and the subset does not depend on one. When negotiation
+lands, this profile is its floor: a newer node reads release drives
+through v1, and negotiation never offers less. The profile reuses the
+existing construction
 byte-for-byte (`wyrd announcement v1`, `wyrd snapshot v1`,
 `wyrd manifest key v1`, `wyrd object key v1`, seal envelopes,
 transport-root addressing), so the floor is a pinned subset of what
 peers already speak — never a parallel protocol.
+
+Publisher duty: ship sealed bytes, never re-seal. A manifest entry's
+`storage_id` names one exact sealed representation — a well-meaning
+re-seal by another seeder mints a fresh nonce, so the bytes no longer
+match the entry and fail the identity check. Replicas distribute the
+publisher's bytes bit-for-bit.

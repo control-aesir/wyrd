@@ -23,6 +23,15 @@ version say exactly what changed.
 
 ### Added
 
+- Live mount-free reads
+  (`nostr:nevent1qqs9v3gervmm9putjafptv94a0qna9xlllve4s7l4aahej5a0p95wucpz9mhxue69uhkwunpwdczuap49eehg3r8q9l`):
+  `wyrd_core::read::LiveReader` is the demand-driven open/read sequence
+  over any namespace view — want registration, bounded blocking,
+  repair-on-demand entry, terminal fast paths with reopen demand —
+  with the same rules the FUSE mount follows, so embedders read
+  remote-only content without a kernel mount and both paths share
+  one read semantics, proven by equivalence tests over a real
+  `DriveView`.
 - Relay-flap forensics
   (`nostr:nevent1qqsxtrye00qccpa6dtsx8xczyjrvn3xm8fwecf06tvt7tvd4wmev56cpz9mhxue69uhkwunpwdczuap49eehgm4t73u`):
   after two ~30s relay outages left neither guest logs nor a host load

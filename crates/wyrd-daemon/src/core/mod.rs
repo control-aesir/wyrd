@@ -18,6 +18,8 @@ mod tests_harness;
 #[cfg(test)]
 mod tests_mount;
 #[cfg(test)]
+mod tests_mount_free;
+#[cfg(test)]
 mod tests_policy;
 #[cfg(test)]
 mod tests_publish;

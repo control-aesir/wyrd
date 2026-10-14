@@ -97,7 +97,13 @@ leg_converge2_owner() {
   echo "owner-write-2" > "$MNTS/xowner-w2/shared.txt"
   pass "wave-2 written through the FUSE adapter"
   touch "$E2E_ROOT/owner-w2-written"
-  poll_until 300 test -f "$E2E_ROOT/member-w2-done" \
+  # Release budget (review F2): 420 covers the member's three 120s
+  # mount polls (360) plus a minute of headless sync rounds — the
+  # normal case resolves in seconds. Deeper pathology (slow syncs
+  # AND exhausted polls) can still expire this first; the host's
+  # both-status die then names both logs, so the false report here
+  # never stands alone.
+  poll_until 420 test -f "$E2E_ROOT/member-w2-done" \
     || die "member never converged on wave 2"
   stop_mount xowner-w2 INT
   with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-owner-list.txt" \
@@ -155,6 +161,10 @@ leg_converge2_member() {
     || die "member never converged wave2-a.txt's size through its mount"
   [[ "$(cat "$MNTS/xmember-w2/wave2-a.txt")" == "wave2-a-bytes" ]] \
     || die "member wave-2 mount lost wave2-a.txt"
+  poll_until 120 bash -c "[[ \"\$(stat -c %s '$MNTS/xmember-w2/wave2-dir/wave2-b.txt')\" == 14 ]]" \
+    || die "member never converged wave2-b.txt's size through its mount"
+  [[ "$(cat "$MNTS/xmember-w2/wave2-dir/wave2-b.txt")" == "wave2-b-bytes" ]] \
+    || die "member wave-2 mount lost wave2-b.txt"
   poll_until 120 converged "$MNTS/xmember-w2/shared.txt" "owner-write-2" \
     || die "member never converged the shared.txt overwrite through its mount"
   [[ "$(cat "$MNTS/xmember-w2/shared.txt")" == "owner-write-2" ]] \
@@ -167,7 +177,6 @@ leg_converge2_member() {
   with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
     || die "member final snapshot list failed"
   touch "$E2E_ROOT/member-w2-done"
-  local sync_out
   for sync_out in "$LOGDIR"/member-w2-sync-*.out; do
     check_no_content_ids "$sync_out"
   done

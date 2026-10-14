@@ -23,6 +23,17 @@ version say exactly what changed.
 
 ### Added
 
+- Shared drive-path semantics
+  (`nostr:nevent1qqs854dvqpuuqx547p6gmyvxt25lslnrvt76l0zxxswgcayrt9cwd0qpz9mhxue69uhkwunpwdczuap49eehgpwq2qz`):
+  `wyrd-contracts` contracts 42-48 run every namespace scenario twice —
+  once through the core mutation channel plus `LiveReader`, once through
+  `FuseBackend` — and assert identical outcome traces (create/write/read
+  incl. multi-window files, rename/delete, error classes, publication
+  generations, conflict version reads, materialization classes, restart
+  from custody, shutdown). Where the surfaces are documentedly different
+  (plain-conflict opens, remote-only and terminal demand failures, stale
+  descriptors, closed-channel submits) each side's own tag is pinned, and
+  a negative control keeps the comparator from passing vacuously.
 - Live mount-free reads
   (`nostr:nevent1qqs9v3gervmm9putjafptv94a0qna9xlllve4s7l4aahej5a0p95wucpz9mhxue69uhkwunpwdczuap49eehg3r8q9l`):
   `wyrd_core::read::LiveReader` is the demand-driven open/read sequence

@@ -460,14 +460,18 @@ pub enum MutationError {
     #[error("engine failed")]
     Engine,
     /// Authoring needs content that is not locally available: the base
-    /// closure references a chunk with no sealed representation and no
+    /// closure references chunks with no sealed representation and no
     /// plaintext here. Never reaches the POSIX boundary — the loop
-    /// registers a want for the chunk and holds the mutation pending.
-    /// Carries the single head the mutation was evaluated against so
-    /// the retry can pin it without re-reading the head set.
-    #[error("authoring needs remote content {chunk:?}")]
+    /// registers a want for every named chunk and holds the mutation
+    /// pending. One evaluation names the whole set it discovered (the
+    /// authoring walk collects every miss, single-miss sites name one),
+    /// so a cold device demands everything together instead of one
+    /// chunk per pass. Carries the single head the mutation was
+    /// evaluated against so the retry can pin it without re-reading
+    /// the head set.
+    #[error("authoring needs remote content {chunks:?}")]
     NeedContent {
-        chunk: ContentId,
+        chunks: Vec<ContentId>,
         base: Option<wyrd_format::SnapshotId>,
     },
     /// A deferred mutation waited past `max_mutation_wait` for its

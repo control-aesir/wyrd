@@ -466,6 +466,21 @@ version say exactly what changed.
   the operator debugging quoting instead of the variable. Both now print
   `missing id (resolve it first: review resolve-pr)` before usage.
   Pinned by two stub cases in `.ngit/scripts/tests/test-review.sh`.
+- Fresh-join authorship outwaiting the mutation deadline
+  (`crates/wyrd-sync/src/runtime/author/snapshot.rs`,
+  `crates/wyrd-core/src/live.rs`,
+  `nostr:nevent1qqspxn54twzd3a206lw38vx94scw4nunjy0ahapj6yvzsxt84df0ngqpz9mhxue69uhkwunpwdczuap49eehgvsehv5`):
+  the authoring walk named only its first missing chunk per evaluation,
+  so a cold device discovered one miss per sync pass and a first-minute
+  write routinely outwaited the 30s `max_mutation_wait` while its closure
+  drained. The failed walk now collects every miss over the whole tree
+  (`EngineError::ChunksUnavailable`) and `MutationError::NeedContent`
+  carries the set, so one evaluation registers all of its demand and the
+  retry converges over fetch rounds (paced by the per-pass admission cap)
+  instead of rediscovering one miss per pass. Fail-closed semantics and
+  the 30s value are unchanged: nothing authors until every named chunk
+  lands. Single-miss sites (view lookups, the merge locality pre-pass) name one.
+
 - ngit-workflow triage tool success result referenced an undefined
   `removals` binding (every success threw ReferenceError after applying
   labels): the reported shape is now built by `triageSuccessResult` in

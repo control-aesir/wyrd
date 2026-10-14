@@ -252,7 +252,7 @@ fn prefix_read_on_remote_only_file_defers_with_the_evaluated_pin() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk,
+            chunks: vec![chunk],
             base: Some(base),
         }
     );
@@ -275,7 +275,7 @@ fn lookup_on_remote_only_subtree_defers_with_the_evaluated_pin() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk: root,
+            chunks: vec![root],
             base: Some(base),
         }
     );
@@ -1853,7 +1853,7 @@ fn fold_defers_for_remote_content_and_retries_pinned() {
     assert_eq!(
         error,
         MutationError::NeedContent {
-            chunk,
+            chunks: vec![chunk],
             base: Some(base),
         }
     );

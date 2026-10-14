@@ -1465,7 +1465,7 @@ where
         let pinned = batch.pinned(index);
         let kind = batch.request(index).kind().clone();
         match self.apply_mutation(&kind, pinned) {
-            Err(MutationError::NeedContent { chunk, base }) => {
+            Err(MutationError::NeedContent { chunks, base }) => {
                 let Some(base) = base else {
                     // No pinnable head (headless or conflicted
                     // evaluation): fail closed, never defer what
@@ -1473,13 +1473,18 @@ where
                     batch.record(index, Err(MutationError::Engine));
                     return ApplyEntry::Recorded;
                 };
-                // One waiter per chunk: retries name new chunks as
-                // the walk advances, but re-registering a held
-                // chunk would accumulate counts against one
-                // release.
-                if !batch.wanted(index).contains(&chunk) {
-                    match self.wants.register(chunk) {
-                        Ok(()) => batch.note_want(index, chunk),
+                // One waiter per chunk, but one evaluation may name
+                // many: the authoring walk collects its whole miss
+                // set, so a cold device registers all of its demand
+                // here and converges in one fetch round instead of
+                // one chunk per pass. Re-registering a held chunk
+                // would accumulate counts against one release.
+                for chunk in &chunks {
+                    if batch.wanted(index).contains(chunk) {
+                        continue;
+                    }
+                    match self.wants.register(*chunk) {
+                        Ok(()) => batch.note_want(index, *chunk),
                         Err(error) => {
                             tracing::debug!(
                                 error = ?error,
@@ -1491,7 +1496,7 @@ where
                     }
                 }
                 tracing::debug!(
-                    chunk = ?chunk,
+                    chunks = ?chunks,
                     base = ?base,
                     "mutation deferred for authoring content"
                 );
@@ -2903,7 +2908,13 @@ where
             tracing::debug!(error = ?error, "mutation authoring refused");
             match error {
                 EngineError::ChunkUnavailable(chunk) => MutationError::NeedContent {
-                    chunk,
+                    chunks: vec![chunk],
+                    base: Self::pin_head(heads),
+                },
+                EngineError::ChunksUnavailable(missing) => MutationError::NeedContent {
+                    // BTreeSet iteration is ascending: the demand
+                    // order is deterministic under replay.
+                    chunks: missing.into_iter().collect(),
                     base: Self::pin_head(heads),
                 },
                 error => authoring_error(error),
@@ -3007,7 +3018,7 @@ where
         let status = crate::view::overlay_terminal(base, self.engine.terminal_state(chunk));
         match status {
             FetchStatus::RemoteOnly | FetchStatus::Fetching => MutationError::NeedContent {
-                chunk: *chunk,
+                chunks: vec![*chunk],
                 base: Self::pin_head(heads),
             },
             FetchStatus::Unavailable(_) | FetchStatus::Available | FetchStatus::Corrupt => {
@@ -3095,14 +3106,14 @@ where
         let view = self.view_for(heads)?;
         let node = view.lookup(path).map_err(|error| match error {
             ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             },
             _ => MutationError::NotFound(path.to_string()),
         })?;
         let file = view.open_file(&node).map_err(|error| match error {
             ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             },
             _ => MutationError::IsDirectory(path.to_string()),
@@ -3158,7 +3169,7 @@ where
         view.read(&file, 0, usize::try_from(len).unwrap_or(usize::MAX))
             .map_err(|error| match error {
                 ViewError::NotMaterialized { content } => MutationError::NeedContent {
-                    chunk: content,
+                    chunks: vec![content],
                     base: Self::pin_head(heads),
                 },
                 // A classified store failure keeps its errno; every
@@ -3194,7 +3205,7 @@ where
             Ok(node) => Ok(Some(node)),
             Err(ViewError::NotFound) => Ok(None),
             Err(ViewError::NotMaterialized { content }) => Err(MutationError::NeedContent {
-                chunk: content,
+                chunks: vec![content],
                 base: Self::pin_head(heads),
             }),
             Err(ViewError::NotADirectory) => Err(MutationError::NotADirectory(path.to_string())),

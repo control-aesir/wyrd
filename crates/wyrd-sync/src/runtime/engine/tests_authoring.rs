@@ -451,3 +451,52 @@ fn recovery_authoring_requires_the_current_owner() {
         Err(EngineError::RecoveryNotOwner)
     ));
 }
+
+/// Cold-join authorship names every missing chunk in one evaluation:
+/// a member whose trees are local but whose file content never
+/// arrived defers on the whole missing set, not one chunk per pass.
+/// One-chunk-per-pass pacing is what outwaits `max_mutation_wait` on
+/// a fresh join (the closure drains single objects per pass while
+/// the walk re-discovers the next miss each time), so the walk
+/// collects the set the fetch plan drains together.
+#[test]
+fn cold_authoring_collects_every_missing_chunk() {
+    use std::collections::BTreeSet;
+
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    // Trees local, chunk bytes never stored: the cold-join shape.
+    // Chunk ids derive from bytes the store never sees.
+    let cold = |byte: u8| ContentId::derive(ObjectKind::Chunk, &[byte; 64]);
+    let (a, b, c) = (cold(0xA1), cold(0xB1), cold(0xC1));
+    let mut objects = MemoryObjectStore::default();
+    let leaf = Tree::from_entries(vec![Entry::file("leaf.txt", 64, false, vec![c]).unwrap()])
+        .unwrap()
+        .insert_into(&mut objects)
+        .unwrap();
+    let root = Tree::from_entries(vec![
+        Entry::file("a.txt", 64, false, vec![a]).unwrap(),
+        Entry::file("b.txt", 64, false, vec![b]).unwrap(),
+        Entry::dir("nested", leaf).unwrap(),
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let error = pair.a.engine.author_snapshot(&objects, root).unwrap_err();
+    let missing = match error {
+        EngineError::ChunksUnavailable(missing) => missing,
+        other => panic!("cold authoring must name the missing set, got {other:?}"),
+    };
+    assert_eq!(missing, BTreeSet::from([a, b, c]));
+    // The set is complete: landing exactly those bytes authors clean,
+    // with no second miss hiding behind the first.
+    for (id, byte) in [(a, 0xA1), (b, 0xB1), (c, 0xC1)] {
+        objects
+            .insert_verified(ObjectKind::Chunk, &id, &[byte; 64])
+            .unwrap();
+    }
+    pair.a
+        .engine
+        .author_snapshot(&objects, root)
+        .expect("the named set was complete");
+}

@@ -310,8 +310,15 @@ LEG_N=$!
 on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh converge2-owner $OD $OC $RELAY_URL" \
   >"$RUN/logs/leg-owner-w2.out" 2>&1 &
 LEG_O=$!
-wait "$LEG_N" || die "member wave-2 leg failed (see logs/leg-member-w2.out)"
-wait "$LEG_O" || die "owner wave-2 leg failed (see logs/leg-owner-w2.out)"
+# Both statuses captured (review F3): the member-first wait would
+# otherwise report the member's exhausted retry loop while the
+# owner's real failure sits unmentioned in its own log. Name both
+# logs in the one die that fires.
+n_rc=0; o_rc=0
+wait "$LEG_N" || n_rc=$?
+wait "$LEG_O" || o_rc=$?
+[[ "$n_rc" == 0 ]] || die "member wave-2 leg failed (see logs/leg-member-w2.out; owner status $o_rc, see logs/leg-owner-w2.out)"
+[[ "$o_rc" == 0 ]] || die "owner wave-2 leg failed (see logs/leg-owner-w2.out)"
 diff "$RUN/wave2-owner-list.txt" "$RUN/wave2-member-list.txt" \
   || die "embedded and FUSE views diverge on live heads (see wave2-*-list.txt)"
 pass "embedded consumer converges on identical live heads"

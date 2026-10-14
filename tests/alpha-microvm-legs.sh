@@ -120,7 +120,7 @@ leg_converge2_owner() {
 # the done-file releases the owner to stop.
 leg_converge2_member() {
   local d="$1" c="$2" relay="$3"
-  local round check
+  local round check sync_out
   step 7 "wave-2 member leg (embedded consumer)"
   poll_until 300 test -f "$E2E_ROOT/owner-w2-written" \
     || die "owner never wrote wave 2"
@@ -142,15 +142,35 @@ leg_converge2_member() {
     [[ "$round" == 6 ]] && die "member live heads never moved past wave 1 after 6 headless syncs"
   done
   pass "member converges on wave 2 with no mount up"
+  # Self-synchronizing reads (review F1-R): the loop breaks on any
+  # head movement, but the wave publishes as a sequence (each write
+  # its own snapshot), so the member may hold only a prefix when it
+  # mounts. The mount runs its own live loop, so polling its view
+  # drains the rest — an immediate compare would report a
+  # convergence loss that never happened. Size first for the new
+  # file (an observed empty create serves a converged empty file),
+  # content for the overwrite.
   start_mount xmember-w2 "$c" "$d" "$MNTS/xmember-w2" --relay "$relay"
+  poll_until 120 bash -c "[[ \"\$(stat -c %s '$MNTS/xmember-w2/wave2-a.txt')\" == 14 ]]" \
+    || die "member never converged wave2-a.txt's size through its mount"
   [[ "$(cat "$MNTS/xmember-w2/wave2-a.txt")" == "wave2-a-bytes" ]] \
     || die "member wave-2 mount lost wave2-a.txt"
+  poll_until 120 converged "$MNTS/xmember-w2/shared.txt" "owner-write-2" \
+    || die "member never converged the shared.txt overwrite through its mount"
   [[ "$(cat "$MNTS/xmember-w2/shared.txt")" == "owner-write-2" ]] \
     || die "member wave-2 mount lost the shared.txt overwrite"
   pass "member faults wave-2 bytes in over the serve route"
   stop_mount xmember-w2 INT
+  # Re-capture after the mount cycle: the sync loop may have broken
+  # on a wave prefix, and the mount's own sync drained the rest —
+  # the host diff must compare the full wave, not the prefix.
+  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
+    || die "member final snapshot list failed"
   touch "$E2E_ROOT/member-w2-done"
-  check_no_content_ids "$LOGDIR/member-w2-sync-$round.out"
+  local sync_out
+  for sync_out in "$LOGDIR"/member-w2-sync-*.out; do
+    check_no_content_ids "$sync_out"
+  done
   for check in "$LOGDIR"/member-w2-sync-*.out "$LOGDIR"/member-w2-sync-*.err; do
     check_no_leaks "$check" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   done

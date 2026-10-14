@@ -122,8 +122,10 @@ BRIDGE="br-wyrd"
 NET="10.0.7"
 RUN="$STATE_DIR/run"
 WORK="$STATE_DIR/work"
-# Build logs live outside $RUN: phase 1's guest pre-clean empties the
-# shared state root, so anything under $RUN/logs is gone post-run.
+# Build logs live outside $RUN: phase 1's guest pre-clean empties
+# $RUN (the run dir: drives, creds, logs), so anything under
+# $RUN/logs is gone post-run. e2e-env.sh, build-logs, and the key
+# material beside $RUN are untouched by the wipe.
 BUILD_LOGS="$STATE_DIR/build-logs"
 SSH_KEY="$STATE_DIR/sshkey"
 
@@ -365,14 +367,28 @@ echo "HOST sections: build=${BUILD_S}s boot=${BOOT_S}s ssh_wait=${SSH_S}s relay_
 AVAIL_LOG="$RUN/logs/host-availability.log"
 availability_loop() {
   while true; do
+    # Liveness without a pid watch: the runner holds the run lock
+    # for the whole run, so if this logger can acquire it the runner
+    # is gone on an untrapped signal — exit instead of appending to
+    # a dead run's file forever (and double-writing beside the next
+    # run's logger). Append-mode open: never truncate the lock file.
+    if exec 8>>"$LOCK" && flock -n 8; then exit 0; fi
+    exec 8>&-
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    load="$(cut -d' ' -f1-3 /proc/loadavg)"
+    # Comma-joined triple: a space-joined loadavg leaves the line
+    # with no stable field boundaries for the machine-classified
+    # timeline this witness exists for.
+    load="$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')"
     if timeout 2 bash -c "</dev/tcp/$NET.10/18761" 2>/dev/null; then relay=ok; else relay=FAIL; fi
     printf '%s load=%s relay=%s\n' "$ts" "$load" "$relay" >> "$AVAIL_LOG"
     sleep 5
   done
 }
-availability_loop 9>&- &
+# Stdout/stderr join the log file too: the loop must hold no pipe
+# the runner's readers wait on past an abnormal exit (same class as
+# the AGENTS.md pipe rule). 9>&- as before: an orphaned logger must
+# never inherit the run lock fd.
+availability_loop >>"$AVAIL_LOG" 2>&1 9>&- &
 LOGGER_PID=$!
 echo "    host availability witness logging to logs/host-availability.log (pid $LOGGER_PID)"
 

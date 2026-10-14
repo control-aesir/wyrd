@@ -52,12 +52,22 @@
   # destroys the VM, and the relay carries no ssh key by design (see
   # above), so the host cannot pull logs out. A 60s timer overwrites
   # the current-boot journal into the state share, so the latest dump
-  # is never more than a minute stale at teardown. Overwrite, not
-  # append: bounded size, and the phase-1 pre-clean wipes the share
-  # once per run — the next tick recreates the file.
+  # is never more than a minute stale at teardown (AccuracySec=1s —
+  # systemd's default 1min slop would make that bound a lie).
+  # Overwrite, not append: bounded size, and the phase-1 pre-clean
+  # wipes $RUN/logs once per run — the next tick recreates the file.
+  # Ordered on the virtiofs mount, not merely timed: an early tick
+  # before the mount is up would write onto the guest-local root and
+  # the mount would hide it, failing invisibly in exactly the way
+  # this unit exists to fix (same race common.nix's ssh-key unit
+  # poll-waits around). The heartbeat timestamp next to the dump
+  # distinguishes "relay logged nothing" from "the dump never ran".
   systemd.services.wyrd-relay-journal = {
+    after = [ "mnt-wyrd\\x2dstate.mount" ];
+    requires = [ "mnt-wyrd\\x2dstate.mount" ];
     script = ''
       mkdir -p /mnt/wyrd-state/run/logs
+      date -u +%Y-%m-%dT%H:%M:%SZ > /mnt/wyrd-state/run/logs/relay-journal.ts
       ${pkgs.systemd}/bin/journalctl -b --no-pager > /mnt/wyrd-state/run/logs/relay-journal.log
     '';
     serviceConfig = {
@@ -69,6 +79,7 @@
     timerConfig = {
       OnBootSec = "1min";
       OnUnitActiveSec = "1min";
+      AccuracySec = "1s";
     };
   };
 }

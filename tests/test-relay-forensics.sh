@@ -35,15 +35,44 @@ grep -q 'relay-journal.log' "$RELAY_NIX" \
   || { echo "FAIL: relay journal dump target path missing" >&2; exit 1; }
 PASS=$((PASS + 1))
 echo "  PASS: relay journal dump lands in the run logs"
+# The destination must be the host-visible run log dir, not just a
+# file with the right name: a one-segment change to the share path
+# keeps every name assertion green while writing where no run reads.
+grep -q '/mnt/wyrd-state/run/logs/relay-journal.log' "$RELAY_NIX" \
+  || { echo "FAIL: relay journal dump is not aimed at the host-visible run logs" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay journal dump aims at the host-visible run logs"
+# The 60s freshness bound needs AccuracySec: systemd's default 1min
+# scheduling slop would otherwise make the worst-case gap ~2min.
+grep -q 'AccuracySec' "$RELAY_NIX" \
+  || { echo "FAIL: relay journal timer has no accuracy bound" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay journal timer bounds its scheduling slop"
+# Ordered on the share mount, not merely timed: an early tick before
+# the virtiofs mount lands writes onto the guest-local root, where
+# the mount then hides it — failing invisibly in exactly the way the
+# dump exists to fix.
+grep -q 'mnt-wyrd' "$RELAY_NIX" \
+  || { echo "FAIL: relay journal unit is not ordered on the state-share mount" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: relay journal unit waits for the state-share mount"
 
 # The host logger backgrounds with the lock fd closed: an orphaned
 # logger holding fd 9 would wedge the flock for every later run and
 # --teardown (the exact fd-inheritance class the e2e-guard stubs
 # pin). Without this pin the rule returns via a one-line edit.
-grep -q 'availability_loop 9>&-' "$RUNNER" \
+grep -q '9>&-' "$RUNNER" \
   || { echo "FAIL: availability logger backgrounds without closing the lock fd" >&2; exit 1; }
 PASS=$((PASS + 1))
 echo "  PASS: availability logger closes the lock fd"
+# Self-exit when the runner is gone on an untrapped signal: the
+# runner holds the run lock for the whole run, so an acquirable lock
+# means the logger is orphaned — it must stop instead of appending
+# to a dead run's file (and double-writing beside the next run).
+grep -q 'flock -n 8' "$RUNNER" \
+  || { echo "FAIL: availability logger has no orphan self-exit" >&2; exit 1; }
+PASS=$((PASS + 1))
+echo "  PASS: availability logger exits when orphaned"
 # Per-tick open-append-close: the phase-1 guest pre-clean unlinks
 # $RUN/logs once per run, and a held fd would keep writing the
 # unlinked inode invisibly past the wipe.

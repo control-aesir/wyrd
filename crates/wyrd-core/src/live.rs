@@ -1445,8 +1445,17 @@ where
     /// needs. Shared by the sync pass and the teardown drain so both
     /// apply identical semantics; the caller owns the batch lifecycle
     /// (the sync pass finishes only after publication, the drain
-    /// finishes immediately).
-    fn apply_entry(&mut self, batch: &mut MutationBatch<'_>, index: usize) -> ApplyEntry {
+    /// finishes immediately). `demand` is whether a deferral
+    /// registers: the sync pass sets it (a later pass fetches), the
+    /// teardown drain clears it (no pass runs after the return, so
+    /// registered demand could never fetch and finish would discard
+    /// it — the drain fails the entry closed instead).
+    fn apply_entry(
+        &mut self,
+        batch: &mut MutationBatch<'_>,
+        index: usize,
+        demand: bool,
+    ) -> ApplyEntry {
         // Prerequisite deadline: wall-clock from admission (the
         // caller has been blocked since), checked every pass and
         // on the first evaluation too — a request whose budget
@@ -1473,25 +1482,36 @@ where
                     batch.record(index, Err(MutationError::Engine));
                     return ApplyEntry::Recorded;
                 };
-                let refused = match self.register_demand(batch, index, &chunks) {
-                    Ok(refused) => refused,
-                    Err(error) => {
-                        tracing::debug!(
-                            error = ?error,
-                            "mutation demand refused"
-                        );
-                        batch.record(index, Err(error));
-                        return ApplyEntry::Recorded;
-                    }
-                };
-                // Count, not content: a large miss set would flood
-                // the debug log the e2e legs collect on every pass.
-                tracing::debug!(
-                    named = chunks.len(),
-                    refused = refused.len(),
-                    base = ?base,
-                    "mutation deferred for authoring content"
-                );
+                if demand {
+                    let refused = match self.register_demand(batch, index, &chunks) {
+                        Ok(refused) => refused,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = ?error,
+                                "mutation demand refused"
+                            );
+                            batch.record(index, Err(error));
+                            return ApplyEntry::Recorded;
+                        }
+                    };
+                    // Count, not content: a large miss set would flood
+                    // the debug log the e2e legs collect on every pass.
+                    tracing::debug!(
+                        named = chunks.len(),
+                        refused = refused.len(),
+                        base = ?base,
+                        "mutation deferred for authoring content"
+                    );
+                } else {
+                    // The teardown drain evaluates only to settle the
+                    // entry: registering demand here could never fetch,
+                    // so the miss set is named and skipped.
+                    tracing::debug!(
+                        named = chunks.len(),
+                        base = ?base,
+                        "mutation deferred without demand (teardown)"
+                    );
+                }
                 ApplyEntry::Deferred(base)
             }
             other => {
@@ -1531,12 +1551,10 @@ where
             }
             match self.wants.register(*chunk) {
                 Ok(()) => batch.note_want(index, *chunk),
-                Err(WantError::Saturated) => refused.push(*chunk),
-                // Unreachable through `register` today (that is the
-                // waiter's error, not the registrar's): grouped with
-                // saturation so a future refusal kind defaults to a
-                // patient retry, never a silent drop.
-                Err(WantError::TimedOut) => refused.push(*chunk),
+                // `TimedOut` is the waiter's error, never the
+                // registrar's: grouped with saturation so a refusal
+                // of any kind retries patiently, never drops silently.
+                Err(WantError::Saturated | WantError::TimedOut) => refused.push(*chunk),
                 Err(WantError::Lock) => return Err(MutationError::Engine),
             }
         }
@@ -1783,7 +1801,7 @@ where
             // so everything after it in this batch goes back
             // untouched — never executed past the defer. The pass
             // then ends.
-            if let ApplyEntry::Deferred(base) = self.apply_entry(&mut batch, index) {
+            if let ApplyEntry::Deferred(base) = self.apply_entry(&mut batch, index, true) {
                 batch.defer_and_release_rest(index, base);
                 break;
             }
@@ -3512,7 +3530,7 @@ where
                 continue;
             }
             for index in 0..batch.len() {
-                match self.apply_entry(&mut batch, index) {
+                match self.apply_entry(&mut batch, index, false) {
                     ApplyEntry::Recorded => {}
                     ApplyEntry::Deferred(_) => {
                         // Teardown cannot fetch: no pass runs after the

@@ -2128,7 +2128,7 @@ fn apply_entry_defers_a_real_evaluation_with_its_want() {
     let stop = AtomicBool::new(false);
     queue.wait_for_work(&stop, Duration::from_secs(5));
     let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
-    match node.apply_entry(&mut batch, 0) {
+    match node.apply_entry(&mut batch, 0, true) {
         ApplyEntry::Deferred(pinned) => {
             assert_eq!(pinned, base, "the retry pins the evaluated head")
         }
@@ -2138,6 +2138,52 @@ fn apply_entry_defers_a_real_evaluation_with_its_want() {
     assert_eq!(node.wants().waiter_count(&chunk), 1);
     batch.finish();
     assert_eq!(node.wants().waiter_count(&chunk), 0);
+    assert_eq!(
+        submitter.join().unwrap(),
+        Err(MutationError::Engine),
+        "the unrecorded entry fails closed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The teardown drain evaluates without registering: the same cold
+/// miss defers for settling, but no want is noted and no waiter is
+/// left behind for a pass that will never run.
+#[test]
+fn apply_entry_without_demand_names_but_registers_nothing() {
+    let (engine, dir, mut store, _chunk, root, head) = scratch_file_drive("entry-no-demand");
+    let tree_bytes = store.get(&root).unwrap().unwrap();
+    store = MemoryObjectStore::default();
+    store
+        .insert_verified(ObjectKind::Tree, &root, &tree_bytes)
+        .unwrap();
+    let mut node = live_over_fake(engine, store, &[head]);
+    let fold = crate::mutation::MutationKind::Fold {
+        members: vec![FoldMember {
+            kind: crate::mutation::MutationKind::AppendFile {
+                path: "f".into(),
+                content: b"more".to_vec(),
+            },
+            forcer: true,
+        }],
+    };
+    let queue = Arc::clone(node.mutations());
+    let submitter = std::thread::spawn({
+        let queue = Arc::clone(&queue);
+        move || queue.submit(fold)
+    });
+    let stop = AtomicBool::new(false);
+    queue.wait_for_work(&stop, Duration::from_secs(5));
+    let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
+    match node.apply_entry(&mut batch, 0, false) {
+        ApplyEntry::Deferred(_) => {}
+        ApplyEntry::Recorded => panic!("a cold evaluation defers, but the entry recorded"),
+    }
+    assert!(
+        batch.wanted(0).is_empty(),
+        "demand-free evaluation notes nothing"
+    );
+    batch.finish();
     assert_eq!(
         submitter.join().unwrap(),
         Err(MutationError::Engine),
@@ -2183,7 +2229,7 @@ fn apply_entry_under_saturation_still_defers() {
     let stop = AtomicBool::new(false);
     queue.wait_for_work(&stop, Duration::from_secs(5));
     let mut batch = queue.take_batch().with_wants(Arc::clone(node.wants()));
-    match node.apply_entry(&mut batch, 0) {
+    match node.apply_entry(&mut batch, 0, true) {
         ApplyEntry::Deferred(_) => {}
         ApplyEntry::Recorded => panic!("saturation defers a real miss, but the entry recorded"),
     }

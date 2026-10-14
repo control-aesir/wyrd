@@ -478,9 +478,11 @@ version say exactly what changed.
   exhaustion runs could not tell a full disk from a daemon budget.
   Each refusal site now logs a debug line naming its `layer` (which
   resource) and `stage` (which write-path step it precedes) with the
-  deciding numbers; commit-stage disk failures keep their existing
-  full-`EngineError` trace. Errno contract unchanged (`ENOSPC` for
-  all), no behavior change, no new error variants. Pinned by two
+  deciding numbers — including a `backing-store-capacity` / `commit`
+  line when authoring maps the failure to `StorageFull`, so the
+  commit-stage disk path no longer rides only the generic variant.
+  Errno contract unchanged (`ENOSPC` for
+  all), no behavior change, no new error variants. Pinned by four
   log-capture emission tests, documented in `write-path.md` ("ENOSPC
   attribution"), and the exhaustion e2e leg now captures the backend
   target and asserts the failing fill names its layer.

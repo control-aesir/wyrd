@@ -198,10 +198,10 @@ fn probe_skips_the_queue_lock_below_debug() {
 }
 
 /// A capturing subscriber for probe-line assertions: records each
-/// event's fields as `name=value` pairs with no formatting
-/// dependency — `tracing-subscriber` stays out of the crate, so the
-/// debug probe cannot smuggle in the metrics pipeline it reports
-/// pressure against.
+/// event's fields as `name=value` pairs with a hand-rolled visitor —
+/// no formatting pipeline between the event and the assertion, so the
+/// debug probe cannot smuggle in the machinery it reports pressure
+/// against.
 #[derive(Clone, Default)]
 struct Capture {
     events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,

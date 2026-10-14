@@ -777,15 +777,16 @@ level does not.
 | Daemon write budget (`write`, `truncate`, `set-exec`, `fold-lease`) | `daemon-write-budget` / `buffer`, with `op` and the `BudgetError` `reason` (`Handle`, `Aggregate`, `DirtyHandles`, `Lock`) | Nothing buffered; the handle is unchanged. Pre-step-1: no snapshot, no obligation. |
 | Open-capture ceiling (`open`, `insert`) | `open-capture-budget` / `open`, with `retained`, `newcomer`, `ceiling` | The handle is never created. Pre-step-1: nothing to roll back. |
 | Retained-bytes quota (commit gate) | `retained-bytes-quota` / `commit-gate`, with `retained`, `quota`, `estimate` | Refused before the commit's first write: nothing retained, no snapshot authored, no obligation recorded. Pre-step-2. |
-| Backing-store capacity during authoring (steps 2-3) | the existing `mutation authoring refused` line carries the full `EngineError`: `Store(StorageFull)` for object-store writes, `Durable`/`Vault` I/O with a full-disk kind for the fact log and vault | Before step 3: no snapshot exists (see "Failure at each stage"). Sealed-but-uncommitted objects may sit in the append-only store, unreferenced — that is dead weight, not state to roll back. |
+| Backing-store capacity during authoring (steps 2-3) | `backing-store-capacity` / `commit`: emitted when authoring maps the failure to `StorageFull` — object-store, fact-log, and vault writes all classify through the one store rule, so this outcome is always the disk (or its quota), never the daemon budget and never the retained-bytes quota. The adjacent `mutation authoring refused` line carries the full `EngineError`, whose source (`Store` vs `Durable` vs `Vault`) names the failing store | Before step 3: no snapshot exists (see "Failure at each stage"). Sealed-but-uncommitted objects may sit in the append-only store, unreferenced — that is dead weight, not state to roll back. |
 | Post-commit stages (publication, serving, discharge; steps 4-6) | no refusal line: these stages run after the mount call returns, so their failures never surface as that call's errno | The monotonicity invariant governs: "Later-stage failure never rolls back an earlier durable state." A discharge that never completes leaves the durable snapshot plus its recorded obligation, which a later pass or restart reconciles — never a rollback. |
 
 Two correlations to read the log by: a quota refusal is followed by
 the generic `mutation refused` line with `Store(StorageFull)` — the
 quota line just above it is what says "quota, not disk". And a
-commit-stage disk failure names its failing store in the `EngineError`
-source (`Store` vs `Durable` vs `Vault`), which maps to the step-2/3
-boundary above. Nothing in this section changes what any caller
+commit-stage disk failure pairs its `backing-store-capacity` line
+with the adjacent `mutation authoring refused` line, whose
+`EngineError` source (`Store` vs `Durable` vs `Vault`) names the
+failing store. Nothing in this section changes what any caller
 observes: same errno, same fail-closed behavior, same no-rollback
 contract — only the trace says which layer refused, at which stage,
 leaving what behind.

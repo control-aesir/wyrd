@@ -124,3 +124,37 @@ fn a_quota_refusal_names_its_layer_and_numbers() {
     drop(node);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A commit-stage disk refusal names the backing store in the trace:
+/// without the line a full disk during authoring emits only the
+/// generic variant, indistinguishable from a quota refusal at the
+/// same classification. Every other outcome stays silent: only the
+/// `StorageFull` mapping names this layer.
+#[test]
+fn a_backing_store_refusal_names_its_layer_and_stage() {
+    let full = MutationError::Store(StoreFailure::StorageFull);
+    let (_, logged) = with_capture(tracing::Level::DEBUG, || {
+        log_backing_store_refusal(&full);
+    });
+    assert!(
+        logged.contains("backing-store-capacity"),
+        "the refusal names its layer:\n{logged}"
+    );
+    assert!(
+        logged.contains("commit"),
+        "the refusal names its write-path stage:\n{logged}"
+    );
+    for quiet in [
+        MutationError::Engine,
+        MutationError::Store(StoreFailure::Transient),
+        MutationError::Store(StoreFailure::PermissionDenied),
+    ] {
+        let (_, silent) = with_capture(tracing::Level::DEBUG, || {
+            log_backing_store_refusal(&quiet);
+        });
+        assert!(
+            silent.is_empty(),
+            "no backing-store line for a non-capacity outcome ({quiet:?}):\n{silent}"
+        );
+    }
+}

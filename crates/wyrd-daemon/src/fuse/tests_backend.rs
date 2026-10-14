@@ -221,6 +221,88 @@ fn a_budget_refusal_names_its_layer_and_reason() {
     );
 }
 
+/// An aggregate refusal names its reason too: the per-handle bound
+/// is clear, but the handles' combined images exceed the global
+/// bound. Same helper, same errno — the family differs only by
+/// which inequality failed.
+#[test]
+fn an_aggregate_refusal_names_its_reason() {
+    let mut store = MemoryObjectStore::default();
+    // A real chunk: the first write succeeds and so materializes its
+    // base, unlike the refusal-first fixture above.
+    let chunk = store.insert(ObjectKind::Chunk, &[0xAB; 100]).unwrap();
+    let root = Tree::from_entries(vec![Entry::file("big", 100, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(&mut store)
+        .unwrap();
+    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+    let mut backend = FuseBackend::new(view);
+    backend.budget = Arc::new(WriteBudget::with_limits(1000, 150, 8));
+    backend.mutations = Some(Arc::new(MutationQueue::default()));
+
+    // First handle reserves 100 of the 150 aggregate bytes.
+    let first = backend.open_write("big", libc::O_RDWR).unwrap();
+    backend.write_handle(first, 0, b"x").unwrap();
+    // Second handle fits its per-handle bound (projected 100 of
+    // 1000) but would take the aggregate to 200 of 150.
+    let second = backend.open_write("big", libc::O_RDWR).unwrap();
+    let (errno, logged) = with_capture(tracing::Level::DEBUG, || {
+        backend.write_handle(second, 0, b"y").unwrap_err()
+    });
+    assert_eq!(
+        errno,
+        fuser::Errno::ENOSPC,
+        "the errno contract is unchanged"
+    );
+    assert!(
+        logged.contains("daemon-write-budget"),
+        "the refusal names its layer:\n{logged}"
+    );
+    assert!(
+        logged.contains("Aggregate"),
+        "the refusal names the exhausted budget:\n{logged}"
+    );
+}
+
+/// An open-capture refusal names its own layer: the write budget is
+/// untouched, but the retained bytes across open handles exceed the
+/// open ceiling, so the handle is never created.
+#[test]
+fn a_capture_refusal_names_its_layer() {
+    let mut store = MemoryObjectStore::default();
+    let root = Tree::from_entries(vec![Entry::file(
+        "big",
+        100,
+        false,
+        vec![ContentId::from_bytes([0x01; 32])],
+    )
+    .unwrap()])
+    .unwrap()
+    .insert_into(&mut store)
+    .unwrap();
+    let view = DriveView::new(store, NoMaterialization, heads(vec![snapshot_of(root)]));
+    let mut backend = FuseBackend::new(view);
+    // Zero ceiling: any captured chunk list exceeds it.
+    backend.max_open_capture_bytes = 0;
+
+    let (errno, logged) = with_capture(tracing::Level::DEBUG, || {
+        backend.open_at("big").unwrap_err()
+    });
+    assert_eq!(
+        errno,
+        fuser::Errno::ENOSPC,
+        "the errno contract is unchanged"
+    );
+    assert!(
+        logged.contains("open-capture-budget"),
+        "the refusal names its layer:\n{logged}"
+    );
+    assert!(
+        logged.contains("open"),
+        "the refusal names its write-path stage:\n{logged}"
+    );
+}
+
 #[test]
 fn mounted_readlink_refuses_symlink_traversal() {
     use wyrd_format::Entry;

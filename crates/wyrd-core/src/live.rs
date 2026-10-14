@@ -894,6 +894,31 @@ fn authoring_error(error: EngineError) -> MutationError {
     }
 }
 
+/// Log a commit-stage backing-store refusal: authoring mapped the
+/// failure to `StorageFull`, so the commit reached the backing store
+/// and the disk (or its quota) refused. Object-store, fact-log, and
+/// vault writes all classify through the one store rule, so a
+/// `StorageFull` outcome here is always backing-store capacity —
+/// never the daemon budget (buffer refusals never reach authoring)
+/// and never the retained-bytes quota (that gate returns before
+/// authoring). Debug-gated like the authoring refusal above;
+/// commit-stage disk failures are rare outside fill runs. The
+/// `stage` names the write-path steps the failure falls inside
+/// (authoring into the step-3 commit): without step 3 no snapshot
+/// exists, so there is nothing to roll back — only
+/// sealed-but-uncommitted objects, unreferenced. Silent for every
+/// other outcome: only the `StorageFull` mapping names this layer.
+fn log_backing_store_refusal(mapped: &MutationError) {
+    if *mapped != MutationError::Store(StoreFailure::StorageFull) {
+        return;
+    }
+    tracing::debug!(
+        stage = "commit",
+        layer = "backing-store-capacity",
+        "backing store refused the commit; ENOSPC at the boundary, no snapshot without the step-3 commit"
+    );
+}
+
 impl<V> LiveNode<V>
 where
     V: NamespaceView<Materialization = RuntimeMaterialization>,
@@ -2984,7 +3009,11 @@ where
                     chunks: missing.into_iter().collect(),
                     base: Self::pin_head(heads),
                 },
-                error => authoring_error(error),
+                error => {
+                    let mapped = authoring_error(error);
+                    log_backing_store_refusal(&mapped);
+                    mapped
+                }
             }
         })?;
         // The single choke point every authored snapshot passes, so

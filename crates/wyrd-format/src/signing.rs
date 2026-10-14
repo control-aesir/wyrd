@@ -150,13 +150,13 @@ mod tests {
         );
     }
 
-    /// The typed wrappers pin their own wiring, not just the raw
-    /// finalization: these prove the hashed bytes are the object's
-    /// `signing_message` for this drive. An edit that swapped in a
-    /// different preimage (or a different drive binding) breaks these
-    /// while leaving the raw-finalization pins above green, and the
-    /// sync-side round trips would move sign and verify together —
-    /// so without these, nothing in the tree would fail.
+    // The typed wrappers pin their own wiring, not just the raw
+    // finalization: the tests below prove the hashed bytes are the
+    // object's `signing_message` for this drive. An edit that swapped
+    // in a different preimage (or a different drive binding) breaks
+    // those tests while leaving the raw-finalization pins above green,
+    // and the sync-side round trips would move sign and verify
+    // together — so without them, nothing in the tree would fail.
     fn fixture_drive() -> DriveId {
         DriveId::from_bytes([0xEE; 32])
     }

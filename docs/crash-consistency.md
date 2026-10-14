@@ -525,7 +525,7 @@ Pinned by
 (`wyrd-daemon/src/lifecycle.rs`),
 `destroy_commits_dirty_write_handles_while_queue_live`,
 `destroy_after_queue_shutdown_clears_without_hanging`
-(`wyrd-daemon/src/fuse/tests_backend.rs`),
+(`wyrd-daemon/src/fuse/tests_write.rs`),
 `close_deadline_reports_a_stalled_close`,
 `zero_deadline_trips_a_stalled_stop_but_spares_a_ready_one`,
 `graceful_close_inside_the_deadline_reports_finished`, and

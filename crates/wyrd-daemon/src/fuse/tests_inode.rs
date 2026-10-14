@@ -1,5 +1,6 @@
 use super::backend::{attr_of, join};
 use super::inode::{statfs_capacity, InodeError, InodeTable};
+use super::tests_harness::{kind_changing_backend, publish};
 
 use wyrd_fuse::Node;
 
@@ -236,7 +237,6 @@ fn attrs_present_files_dirs_and_conflicts() {
     assert_eq!(kind, fuser::FileType::Directory, "conflicts stay navigable");
 }
 
-use super::tests_harness::{kind_changing_backend, publish};
 /// A file repurposed as a directory mints a fresh ino: the lookup
 /// after publication resolves the new kind under a new identity,
 /// and the retired ino fails instead of serving the new occupant.

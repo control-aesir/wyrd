@@ -894,6 +894,66 @@ fn authoring_error(error: EngineError) -> MutationError {
     }
 }
 
+/// Log a commit-stage backing-store refusal: the commit reached the
+/// backing store and the disk (or its quota) refused. Called with a
+/// mapped `StorageFull` outcome from the commit's store-write sites
+/// (`store_write_error`, `format_write_error`) and from the authoring
+/// outcome below: object-store, fact-log, and vault writes all
+/// classify through the one store rule, so that outcome is always
+/// backing-store capacity — never the daemon budget (buffer refusals
+/// never reach the core) and never the retained-bytes quota (that
+/// gate returns before any of these sites run). Debug-gated like the
+/// `mutation authoring refused` line at the `author_traced` call
+/// below; commit-stage disk failures are rare outside fill runs. The
+/// `stage` names the write-path steps the failure falls inside (the
+/// step-2 writes into the step-3 commit): without step 3 no snapshot
+/// exists, so there is nothing to roll back — only
+/// sealed-but-uncommitted objects, unreferenced. Silent for every
+/// other outcome: only the `StorageFull` mapping names this layer.
+/// Reads classify silently by design; only writes name the layer —
+/// the read-side `has` checks keep the plain mapping, since a store
+/// read cannot refuse with capacity.
+fn log_backing_store_refusal(mapped: &MutationError) {
+    if *mapped != MutationError::Store(StoreFailure::StorageFull) {
+        return;
+    }
+    tracing::debug!(
+        stage = "commit",
+        layer = "backing-store-capacity",
+        "backing store refused the commit; ENOSPC at the boundary, no snapshot without the step-3 commit"
+    );
+}
+
+/// Map a commit-phase object-store write failure to the boundary
+/// error, emitting the backing-store attribution when the disk
+/// refused. Every caller is a post-quota commit path (`boot_tree`,
+/// `build_root`'s chunk inserts), so a `StorageFull` outcome is
+/// backing-store capacity by construction: the quota gate returned
+/// before any of them run, and daemon budget refusals never reach
+/// the core. Silent for every other classification, like the
+/// outcome helper above.
+fn store_write_error<E>(error: E) -> MutationError
+where
+    E: std::fmt::Debug + wyrd_format::StoreError,
+{
+    let mapped = MutationError::Store(error.failure());
+    log_backing_store_refusal(&mapped);
+    mapped
+}
+
+/// Map a commit-phase format-mutation failure the same way:
+/// `from_format`'s store arm carries the same classification, so the
+/// same construction applies. Every caller is `build_root` (all
+/// eight sites), itself only ever called on post-quota commit paths.
+fn format_write_error<E>(error: wyrd_format::MutationError<E>) -> MutationError
+where
+    E: std::fmt::Debug + wyrd_format::StoreError,
+{
+    let mapped = MutationError::from_format(error);
+    log_backing_store_refusal(&mapped);
+    mapped
+}
+
 impl<V> LiveNode<V>
 where
     V: NamespaceView<Materialization = RuntimeMaterialization>,
@@ -2095,6 +2155,21 @@ where
             // disk" to every reader of this store, and it reaches the
             // mount as ENOSPC — so a quota reads as the smaller disk it
             // is, with no new error variant and no new errno mapping.
+            // The refusal is logged with its numbers: without this line
+            // a quota refusal is indistinguishable from a full disk in
+            // both the errno and the trace. Debug-gated like the
+            // authoring refusal below; quota refusals are rare outside
+            // fill runs. The `stage` names the write-path step the
+            // refusal precedes (the commit gate, before step 2): the
+            // commit retains nothing, so there is nothing to roll back.
+            tracing::debug!(
+                stage = "commit-gate",
+                layer = "retained-bytes-quota",
+                retained = retained.get(),
+                quota = limit,
+                estimate,
+                "retained-bytes quota refused before the commit's first write; ENOSPC at the boundary, nothing retained"
+            );
             return Err(MutationError::Store(StoreFailure::StorageFull));
         }
         Ok(())
@@ -2126,7 +2201,7 @@ where
         Tree::from_entries(Vec::new())
             .map_err(|_| MutationError::Store(StoreFailure::Transient))?
             .insert_into(&mut *store)
-            .map_err(|error| MutationError::Store(error.failure()))
+            .map_err(store_write_error)
     }
 
     /// Apply one mutation to the current single live head and author a
@@ -2324,7 +2399,7 @@ where
                 self.demand_path_trees(heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::mkdir(&mut *store, tree, path)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((root, MutationOutcome::Done))
             }
             MutationKind::CreateFile { path, parent } => {
@@ -2345,7 +2420,7 @@ where
                 let entry = Entry::file(name, 0, false, Vec::new())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put_strict(&mut *store, tree, path, entry)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((
                     root,
                     MutationOutcome::Created(FileIdentity::new(0, false, Vec::new())),
@@ -2374,13 +2449,13 @@ where
                     _ => return Err(MutationError::Stale(path.clone())),
                 }
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let chunks = chunk::insert_chunks(&mut *store, content)
-                    .map_err(|error| MutationError::Store(error.failure()))?;
+                let chunks =
+                    chunk::insert_chunks(&mut *store, content).map_err(store_write_error)?;
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, content.len() as u64, *executable, chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((
                     root,
                     MutationOutcome::Committed(FileIdentity::new(
@@ -2412,13 +2487,13 @@ where
                 )?;
                 image.extend_from_slice(content);
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                let chunks = chunk::insert_chunks(&mut *store, &image)
-                    .map_err(|error| MutationError::Store(error.failure()))?;
+                let chunks =
+                    chunk::insert_chunks(&mut *store, &image).map_err(store_write_error)?;
                 let name = path.rsplit('/').next().unwrap_or(path);
                 let entry = Entry::file(name, image.len() as u64, executable, chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 if root == tree {
                     return Ok((root, MutationOutcome::Done));
                 }
@@ -2441,14 +2516,14 @@ where
                 }
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::remove(&mut *store, tree, path)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((root, MutationOutcome::Done))
             }
             MutationKind::Rmdir { path } => {
                 self.demand_path_trees(heads, path)?;
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rmdir(&mut *store, tree, path)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((root, MutationOutcome::Done))
             }
             MutationKind::Rename {
@@ -2463,7 +2538,7 @@ where
                 }
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
                 let root = wyrd_format::mutation::rename(&mut *store, tree, from, to)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 Ok((root, MutationOutcome::Done))
             }
             MutationKind::SetAttrs {
@@ -2522,8 +2597,7 @@ where
                             .map_err(|_| MutationError::TooLarge(*target))?;
                         image.resize(target, 0);
                         let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
-                        chunk::insert_chunks(&mut *store, &image)
-                            .map_err(|error| MutationError::Store(error.failure()))?
+                        chunk::insert_chunks(&mut *store, &image).map_err(store_write_error)?
                     }
                 };
                 let mut store = self.store.write().map_err(|_| MutationError::Lock)?;
@@ -2531,7 +2605,7 @@ where
                 let entry = Entry::file(name, new_size, want_exec, new_chunks.clone())
                     .map_err(|error| MutationError::Invalid(error.to_string()))?;
                 let root = wyrd_format::mutation::put(&mut *store, tree, path, entry)
-                    .map_err(MutationError::from_format)?;
+                    .map_err(format_write_error)?;
                 if root == tree {
                     return Ok((root, MutationOutcome::Done));
                 }
@@ -2969,7 +3043,11 @@ where
                     chunks: missing.into_iter().collect(),
                     base: Self::pin_head(heads),
                 },
-                error => authoring_error(error),
+                error => {
+                    let mapped = authoring_error(error);
+                    log_backing_store_refusal(&mapped);
+                    mapped
+                }
             }
         })?;
         // The single choke point every authored snapshot passes, so

@@ -20,6 +20,9 @@ tracing.workspace = true
 # Downstream tests build a real `Engine` per test; enabling the fast KDF
 # profile here keeps that affordable without touching production builds.
 wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+# Refusal-emission tests capture the backend's trace lines around the
+# refusing call; production logging stays on `tracing` alone.
+tracing-subscriber = "0.3"
 # Withdrawal tests seal under a real route (fake bytes decode to no
 # route and would record the withdrawal sentinel on first discharge,
 # completing vacuously). Pinned to the workspace set, like every

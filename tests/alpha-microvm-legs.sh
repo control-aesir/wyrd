@@ -1626,19 +1626,28 @@ leg_exhaustion() {
   # That something may be the disk or the daemon's 256 MiB write
   # budget (budgets.rs: ENOSPC past the aggregate) — both reach the
   # mount as fail-closed ENOSPC, and the recovery retries below
-  # cover either.
+  # cover either. The attribution check after the failing fill
+  # records which refused (write-path.md "ENOSPC attribution").
   filler_bytes=$(( (avail_kb - 262144) * 1024 ))
   rm -f "$d/../exhaustion-filler.bin" "$d/exhaustion-filler.bin"
   fallocate -l "$filler_bytes" "$d/exhaustion-filler.bin" \
     || die "filler preallocation failed"
   pass "filesystem filled, 256 MiB headroom left"
+  local old_e2e_log="${E2E_RUST_LOG-__unset}"
+  # wyrd_daemon=debug for the backend's ENOSPC attribution lines
+  # (layer + stage per refusal): the failing fill's refused layer —
+  # disk or daemon budget — lives there, which wyrd_core=debug does
+  # not cover.
+  export E2E_RUST_LOG="wyrd_core=debug,wyrd_daemon=debug"
   start_mount xexh "$c" "$d" "$MNTS/xexh"
+  if [[ "$old_e2e_log" == "__unset" ]]; then unset E2E_RUST_LOG; else export E2E_RUST_LOG="$old_e2e_log"; fi
   echo "pre-fill" > "$MNTS/xexh/small.txt" \
     || die "pre-fill anchor write failed"
   [[ "$(cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \
     || die "pre-fill anchor never committed"
   pass "pre-fill anchor committed before exhaustion"
-  local i=0 rc=0 failed=0
+  local i=0 rc=0 failed=0 exh_log_from
+  exh_log_from=$(wc -l < "$LOGDIR/mount-xexh.err")
   while (( i < 24 )); do
     i=$((i + 1))
     rc=0
@@ -1657,6 +1666,15 @@ leg_exhaustion() {
   echo "$i" > "$E2E_ROOT/exh-failed-fill" \
     || die "could not record the failing fill index"
   pass "write fails closed with ENOSPC after $i fills"
+  # Attribution: the failing fill must name its refusing layer in the
+  # mount log. Which layer refused is load-dependent — disk or daemon
+  # budget — so assert a refusal line exists and record which, rather
+  # than predicting it.
+  tail -n +"$((exh_log_from + 1))" "$LOGDIR/mount-xexh.err" | grep -q 'layer="' \
+    || die "no ENOSPC attribution in mount-xexh.err past line $exh_log_from"
+  local refusal
+  refusal="$(tail -n +"$((exh_log_from + 1))" "$LOGDIR/mount-xexh.err" | grep -o 'layer="[a-z-]*"' | sort -u | tr '\n' ' ')"
+  pass "failing fill attributed to $refusal"
   # Readable under exhaustion: the failure must not take the drive's
   # read path down with it.
   [[ "$(timeout 60 cat "$MNTS/xexh/small.txt")" == "pre-fill" ]] \

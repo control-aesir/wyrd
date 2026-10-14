@@ -804,6 +804,22 @@ pub(super) fn live_over_configured(
     heads: &[AuthorizedSnapshot],
     config: &LiveConfig,
 ) -> LiveNode<FileView> {
+    live_over_store(engine, store, heads, config)
+}
+
+/// A live node over an explicit object store: the wiring tests drive
+/// commits into a store that refuses writes, which the default
+/// in-memory store cannot do.
+pub(super) fn live_over_store<S>(
+    engine: Engine,
+    store: S,
+    heads: &[AuthorizedSnapshot],
+    config: &LiveConfig,
+) -> LiveNode<FileView<S>>
+where
+    S: wyrd_format::ObjectStore,
+    S::Error: std::fmt::Debug,
+{
     let revision = engine.current();
     let materialization = RuntimeMaterialization {
         runtime: engine.runtime_state().unwrap(),
@@ -823,7 +839,7 @@ pub(super) fn live_over_configured(
         Duration::from_secs(30),
         config,
     )
-    .expect("the default config carries no quota, so composition cannot be refused")
+    .expect("live composition with the passed config and store")
     .0
 }
 

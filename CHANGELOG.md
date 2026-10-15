@@ -562,6 +562,19 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI vault/member/snapshot/device families extracted from `main.rs`
+  (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
+  phase 4): `vault` with the status renderer, durable-probe helpers,
+  and vault-position report, `member` with the invite/resume renderers,
+  carry/invitation-file helpers, and member reports, `snapshot` with
+  the merge-path guards and snapshot/recovery renderers, and `device`
+  with the bounded reader, identity reports, and the shared `parse_*`
+  hex helpers (moved as-is; consolidation stays a follow-up) move to
+  `cli/src/commands/`, one module per family. `main.rs` (1,941 → 595
+  lines) keeps the dispatcher, `CliError`, and the process host. Pure
+  move with `pub(crate)` visibility: no dispatch, lifecycle,
+  exit-code, ordering, or error-path change, and the full `--help`
+  tree plus error paths are byte-identical before and after.
 - CLI sync family extracted from `main.rs`
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   phase 3): `sync` / `sync_now` with `SyncRunReport`, the pass cap and

@@ -232,7 +232,7 @@ pub(crate) fn member(
 /// transition never touches it. A failed drain reports loudly with
 /// the transition already durable at its epoch and the obligation
 /// still pending.
-pub(crate) fn transition_with_carry(
+fn transition_with_carry(
     engine: &mut Engine,
     drive_dir: &Path,
     author: impl FnOnce(&mut Engine) -> Result<MembershipTransition, EngineError>,
@@ -245,7 +245,7 @@ pub(crate) fn transition_with_carry(
 
 /// Drain the durable carry queue, returning the number carried. The
 /// store opens only when obligations are pending.
-pub(crate) fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usize, CliError> {
+fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usize, CliError> {
     if engine.pending_carries()?.is_empty() {
         return Ok(0);
     }
@@ -259,7 +259,7 @@ pub(crate) fn carry_pending(engine: &mut Engine, drive_dir: &Path) -> Result<usi
 /// membership change), and an uncreatable path fails here with
 /// nothing authored. Callers remove the claim when their fallible
 /// step fails so a retry starts clean.
-pub(crate) fn claim_out(out: &Path) -> Result<fs::File, CliError> {
+fn claim_out(out: &Path) -> Result<fs::File, CliError> {
     if out.exists() {
         return Err(CliError::Usage(
             "invitation destination already exists; remove it or choose another path".into(),
@@ -286,11 +286,7 @@ pub(crate) fn claim_out(out: &Path) -> Result<fs::File, CliError> {
 /// failure past the commit removes the claim and reports the
 /// standing state (for invite, the admission; for reissue, nothing
 /// changed at all).
-pub(crate) fn write_invitation(
-    out: &Path,
-    file: &mut fs::File,
-    bytes: &[u8],
-) -> Result<(), CliError> {
+fn write_invitation(out: &Path, file: &mut fs::File, bytes: &[u8]) -> Result<(), CliError> {
     if let Err(source) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(out);
         return Err(CliError::Io {
@@ -305,7 +301,7 @@ pub(crate) fn write_invitation(
 /// empties the owner set and no future transition can be authorized.
 /// Refuse without explicit confirmation; the protocol stays
 /// authoritative and would accept the transition either way.
-pub(crate) fn require_last_owner_confirmation(
+fn require_last_owner_confirmation(
     engine: &Engine,
     device: &DeviceId,
     yes: bool,
@@ -430,7 +426,7 @@ pub(crate) fn member_status_report(engine: &Engine) -> Result<String, CliError> 
 
 /// One-word canonical status for the log view; invalid transitions
 /// carry their machine reason.
-pub(crate) fn render_status(status: &TransitionStatus) -> String {
+fn render_status(status: &TransitionStatus) -> String {
     match status {
         TransitionStatus::Canonical => "canonical".into(),
         TransitionStatus::Contested => "contested".into(),

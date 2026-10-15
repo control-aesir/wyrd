@@ -168,10 +168,7 @@ pub(crate) fn snapshot(
 /// explicit id subset. Sorted ascending, so `@N` numbers the
 /// selection in SnapshotId byte order — the basis `merge` and
 /// `plan` share.
-pub(crate) fn select_merge_heads(
-    engine: &Engine,
-    heads: &[String],
-) -> Result<Vec<SnapshotId>, CliError> {
+fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotId>, CliError> {
     let mut selected: Vec<SnapshotId> = if heads.is_empty() {
         engine
             .live_heads()?
@@ -211,7 +208,7 @@ pub(crate) fn map_merge_error(error: EngineError) -> CliError {
 /// canonical owner. Reads the same membership projection the
 /// engine enforces, and the engine still wins any race — a pass
 /// here never authorizes anything.
-pub(crate) fn check_recovery_owner(engine: &Engine) -> Result<(), CliError> {
+fn check_recovery_owner(engine: &Engine) -> Result<(), CliError> {
     let log = engine.membership_log();
     let known = log
         .known_state()
@@ -225,7 +222,7 @@ pub(crate) fn check_recovery_owner(engine: &Engine) -> Result<(), CliError> {
 /// One merge-spec path: a root entry name. v0 merges at root-entry
 /// granularity (a conflicting subtree is taken or dropped whole),
 /// so anything deeper is refused at the argument boundary.
-pub(crate) fn check_merge_path(path: &str) -> Result<String, CliError> {
+fn check_merge_path(path: &str) -> Result<String, CliError> {
     if path.is_empty() || path.contains('/') {
         return Err(CliError::Usage(format!(
             "merge paths are root entries, got {path:?}"
@@ -236,7 +233,7 @@ pub(crate) fn check_merge_path(path: &str) -> Result<String, CliError> {
 
 /// One recovery-selection path: the same root-entry granularity
 /// as the merge spec, so a grafted subtree travels whole.
-pub(crate) fn check_recover_path(path: &str) -> Result<String, CliError> {
+fn check_recover_path(path: &str) -> Result<String, CliError> {
     if path.is_empty() || path.contains('/') {
         return Err(CliError::Usage(format!(
             "recover paths are root entries, got {path:?}"
@@ -347,7 +344,7 @@ pub(crate) fn snapshot_plan_report(plan: &wyrd_sync::runtime::MergePlan) -> Stri
 /// The recovery audit marker: a recovery-flagged snapshot names
 /// itself in both head views, so grafts stay visible as long as the
 /// snapshot is listed at all.
-pub(crate) fn recovery_marker(flags: u8) -> &'static str {
+fn recovery_marker(flags: u8) -> &'static str {
     if flags & RECOVERY_FLAG != 0 {
         " recovery"
     } else {

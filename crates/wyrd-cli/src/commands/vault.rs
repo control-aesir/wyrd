@@ -31,7 +31,7 @@ use wyrd_sync::runtime::{Engine, EngineError};
 /// no tip transition id, no held epochs, no head ids or authors, no
 /// peer handles, no mailbox line. A vault surface on every
 /// composition (matrix rule), even when the process holds keys.
-pub(crate) fn vault_status_render(status: &VaultStatus) -> String {
+fn vault_status_render(status: &VaultStatus) -> String {
     let mut out = String::new();
     let totals = &status.outbox;
     out.push_str(&format!(
@@ -316,7 +316,7 @@ pub(crate) fn vault_status(
 /// conservative: `Io` covers the LOCK creation as well as post-lock
 /// reads, and `MalformedKeystore` covers the pre-lock existence
 /// probe as well as the post-lock custody decode.
-pub(crate) fn open_error_proves_free(error: &EngineError) -> bool {
+fn open_error_proves_free(error: &EngineError) -> bool {
     match error {
         // Contention proves occupancy, never freedom (the caller
         // handles it in its own arm; listed so the wildcard below
@@ -334,7 +334,7 @@ pub(crate) fn open_error_proves_free(error: &EngineError) -> bool {
 /// plus its lock provenance: the process section renders either way,
 /// but only a proven-free failure reclassifies a fresh sidecar as
 /// retained history.
-pub(crate) enum DurableProbe {
+enum DurableProbe {
     Stopped(Box<VaultStatus>),
     Held,
     Unreadable {

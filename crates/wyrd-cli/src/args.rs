@@ -1,6 +1,7 @@
 //! The `wyrd` command line: clap argument definitions. The doc
 //! comments here are the `--help` text, so this module moves only
-//! with a byte-identical help comparison (see the CLI-split issue).
+//! with a byte-identical help comparison (see the CLI-split issue,
+//! `nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`).
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 

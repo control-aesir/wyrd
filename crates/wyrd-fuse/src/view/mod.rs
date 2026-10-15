@@ -58,7 +58,17 @@ mod merge;
 mod types;
 
 #[cfg(test)]
-mod tests;
+mod tests_chunks;
+#[cfg(test)]
+mod tests_grammar;
+#[cfg(test)]
+mod tests_harness;
+#[cfg(test)]
+mod tests_merge;
+#[cfg(test)]
+mod tests_read;
+#[cfg(test)]
+mod tests_symlink;
 
 pub use drive::DriveView;
 pub use head::{VerifiedSnapshot, ViewHead};

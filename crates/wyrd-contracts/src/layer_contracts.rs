@@ -1421,14 +1421,14 @@ mod policy_tests {
     #[test]
     fn mint_count_rejects_a_second_mint() {
         let holders = [
-            ("crates/wyrd-fuse/src/view/tests.rs".to_owned(), 1),
+            ("crates/wyrd-fuse/src/view/tests_harness.rs".to_owned(), 1),
             ("crates/wyrd-namespace/src/view.rs".to_owned(), 1),
             ("crates/wyrd-sync/src/durable/mod.rs".to_owned(), 1),
         ];
         let violations = check_proof_mint(&holders);
         assert_eq!(violations.len(), 1, "one rogue mint: {violations:?}");
         assert!(
-            violations[0].contains("crates/wyrd-fuse/src/view/tests.rs"),
+            violations[0].contains("crates/wyrd-fuse/src/view/tests_harness.rs"),
             "names the rogue file: {violations:?}"
         );
     }

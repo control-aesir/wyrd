@@ -555,3 +555,5 @@ mod tests_fetch;
 mod tests_limits;
 #[cfg(test)]
 mod tests_limits_e2e;
+#[cfg(test)]
+mod tests_strikes;

@@ -1,4 +1,12 @@
 use super::*;
+
+// --- engine-level fetch behavior -------------------------------------
+//
+// The publisher side seals manifests and objects under keys derived
+// from the epoch secret the capability delivers; the engine side
+// ingests the control plane, pins the content, and executes the
+// plan against the in-memory bulk peer.
+
 use crate::bulk::{BulkError, MemoryBulkSource, SealedManifest};
 use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};

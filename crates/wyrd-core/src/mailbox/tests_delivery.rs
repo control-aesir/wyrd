@@ -15,6 +15,8 @@ use wyrd_sync::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use wyrd_sync::runtime::Engine;
 use wyrd_sync::transport::mailbox::{check_outbound_size, MAX_MAILBOX_OPEN_BYTES};
 
+// --- integration tests over an in-process relay ---
+
 fn maximum_node_addr(drive: &DriveId, epoch: u64) -> Vec<u8> {
     let fits = |len: usize| {
         let message = Message::SnapshotAnnouncement(SnapshotAnnouncement {

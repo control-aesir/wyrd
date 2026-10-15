@@ -24,11 +24,11 @@ in any mode. Three reasons, in order:
    `36-vault-packaging`'s job and would make the update's
    correctness depend on incidental timing (forbidden by condition
    4 below).
-3. Quiesce/flush/unmount already exists as tested behavior on the
-   vault's own SIGINT/SIGTERM path (the `SHUTDOWN` latch at
-   `main.rs:1007`, armed by `install_shutdown_handler` at
-   `main.rs:1043`; SIGTERM exits 0 on a clean stop per the
-   teardown at `main.rs:3314`, pinned by
+ 3. Quiesce/flush/unmount already exists as tested behavior on the
+   vault's own SIGINT/SIGTERM path (the `SHUTDOWN` latch in
+   `crates/wyrd-cli/src/live.rs`, armed by `install_shutdown_handler`
+   there; SIGTERM exits 0 on a clean stop per the ordered teardown in
+   `mount` (`crates/wyrd-cli/src/commands/mount.rs`), pinned by
    `crates/wyrd-cli/tests/vault_process.rs`). Re-implementing that
    teardown inside the updater duplicates it badly.
 

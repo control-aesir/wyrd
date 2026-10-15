@@ -5,7 +5,9 @@ credential files, mount orchestration, diagnostics, and exit codes
 over the daemon's public surface. It never implements drive logic
 itself — every subcommand opens the drive through `WyrdNode` and the
 behavior lives in `wyrd-core` / `wyrd-daemon`. This document mirrors
-`crates/wyrd-cli/src/main.rs`; when they disagree, the code wins and
+the `crates/wyrd-cli/src` module tree (`main.rs` dispatches; argument
+parsing lives in `args.rs`, each command family in `commands/`, and the
+process host in `credentials.rs` / `live.rs`); when they disagree, the code wins and
 this document is stale.
 
 ## Subcommands

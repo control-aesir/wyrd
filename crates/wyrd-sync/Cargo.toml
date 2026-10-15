@@ -45,6 +45,8 @@ insecure-fast-kdf = []
 
 [dev-dependencies]
 proptest.workspace = true
+# Hex literals for the release-read freeze-pin vectors.
+hex.workspace = true
 # umask control for the custody-permission tests (Unix-only).
 libc.workspace = true
 

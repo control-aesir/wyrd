@@ -36,6 +36,9 @@ One page. Read this, then the focused docs:
 - `upgrade-contract.md` — **normative** upgrade and migration contract:
   compatibility levels, read-vs-write compatibility, the ten upgrade
   invariants, what upgrades forbid, and how `wyrd-contracts` will prove them
+- `release-read.md` — **frozen** public-read subset (release-read v1):
+  the byte layouts, authorship rule, and confidentiality waiver every
+  distribution item builds on
 
 ## The system in one sentence
 

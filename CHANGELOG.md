@@ -23,6 +23,20 @@ version say exactly what changed.
 
 ### Added
 
+- Frozen public-read subset, release-read v1
+  (`nostr:nevent1qqsykx7wc5tv2wu2j7gsee3ml9lygp426f55tlsc43jy37gn6h8e49cpz9mhxue69uhkwunpwdczuap49eehghl83gt`):
+  `wyrd-sync/src/public_read.rs` is the keyless release reader — scope
+  gate (pinned maintainer, genesis membership, epoch 1), snapshot fetch
+  by transport root with id-exchange fallback, manifest and object opens
+  under the published epoch-1 secret, all reusing the existing
+  construction byte-for-byte. Release drives are explicitly public
+  distribution surfaces (per-drive, irreversible confidentiality waiver),
+  never a weaker mode for ordinary drives. Byte-exact freeze vectors pin
+  the announcement encoding, both signing regions, both epoch-1 key
+  families, and the 129-byte release-metadata layout; every scope
+  violation fails closed with no fallback to membership replay or
+  capability installation. Contract: `docs/release-read.md`.
+
 - Shared drive-path semantics
   (`nostr:nevent1qqs854dvqpuuqx547p6gmyvxt25lslnrvt76l0zxxswgcayrt9cwd0qpz9mhxue69uhkwunpwdczuap49eehgpwq2qz`):
   `wyrd-contracts` contracts 42-49 run every namespace scenario twice —

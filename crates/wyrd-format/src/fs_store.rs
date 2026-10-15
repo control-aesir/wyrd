@@ -149,8 +149,8 @@ struct VerifiedCache {
     order: VecDeque<ContentId>,
     /// Per-store fast-path accounting (test builds only): how many
     /// inserts skipped the revalidation read via a matching stamp, and
-    /// how many fell through to the full re-derive. The committed
-    /// counter behind the no-op-insert cost claim.
+    /// how many did not take the fast path (first publish, stamp miss,
+    /// or heal). The committed counter behind the no-op-insert cost claim.
     #[cfg(test)]
     stats: CacheStats,
 }
@@ -185,8 +185,9 @@ impl VerifiedCache {
         self.stamps.remove(id);
     }
 
-    /// Record whether an insert took the stamp fast path or the full
-    /// re-derive. Test builds only; production pays no counting branch.
+    /// Record whether an insert took the stamp fast path or not (first
+    /// publish, stamp miss, or heal). Test builds only; production pays
+    /// no counting branch.
     #[cfg(test)]
     fn record_check(&mut self, stamped: bool) {
         if stamped {
@@ -476,8 +477,9 @@ impl FsObjectStore {
         }
     }
 
-    /// Fast-path accounting for tests: `(stamp hits, full re-derives)`.
-    /// A poisoned lock reports zeros rather than failing the assertion.
+    /// Fast-path accounting for tests: `(stamp hits, inserts that missed
+    /// the fast path)`. A poisoned lock reports zeros rather than failing
+    /// the assertion.
     #[cfg(test)]
     fn cache_stats(&self) -> CacheStats {
         self.verified

@@ -171,10 +171,25 @@ pub fn record_path(store_dir: &Path, epoch: u64) -> PathBuf {
 /// Persist one epoch's record atomically (temp + fsync + rename, like
 /// every other drive file). Call only after the epoch's transition
 /// commits — see the ordering note at the top of this module.
+///
+/// Creation hardens both leaves the write establishes: the `escrow/`
+/// directory through [`ensure_owner_only_dir`](crate::durable::ensure_owner_only_dir)
+/// (owner-only from creation, never the umask's business) and the
+/// record file through [`atomic_write_mode`](crate::durable::atomic_write_mode)
+/// at [`SECRET_FILE_MODE`](crate::durable::SECRET_FILE_MODE), so a
+/// crash between temp creation and rename never strands a
+/// group-readable sidecar holding a wrapped epoch secret. Like every
+/// custody write, creation hardens and opening never chmods: a
+/// pre-existing directory or record keeps the mode it has.
 pub fn persist_record(store_dir: &Path, record: &EscrowRecord) -> std::io::Result<()> {
     let dir = store_dir.join(ESCROW_DIR);
-    std::fs::create_dir_all(&dir)?;
-    crate::durable::atomic_write(&dir, &record.epoch.to_string(), &record.encode())
+    crate::durable::ensure_owner_only_dir(&dir)?;
+    crate::durable::atomic_write_mode(
+        &dir,
+        &record.epoch.to_string(),
+        &record.encode(),
+        crate::durable::SECRET_FILE_MODE,
+    )
 }
 
 /// Read one epoch's sidecar: `None` when no record was written (the
@@ -255,6 +270,99 @@ mod tests {
         assert_eq!(
             unwrap(&root().escrow_key(&drive(), 3), &forged),
             Err(CryptoError::OpenFailed)
+        );
+    }
+
+    /// The custody suite's shape, applied to operational state: the
+    /// escrow sidecar is the custody-adjacent write the custody fix
+    /// left alone, so both leaves it establishes are owner-only from
+    /// creation and the modes are chosen, not umask-derived.
+    #[cfg(unix)]
+    #[test]
+    fn a_persisted_escrow_record_is_not_group_or_world_readable() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        let mut modes = Vec::new();
+        for mask in [0o000, 0o077] {
+            let _guard = UmaskGuard::set(mask);
+            let dir = TestDir::new("escrow-mode");
+            let secret = EpochSecret::from_bytes([0xAA; 32]);
+            let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+            persist_record(&dir.path, &record).unwrap();
+            let record_mode = mode_of(&record_path(&dir.path, 1));
+            let dir_mode = mode_of(&dir.path.join(ESCROW_DIR));
+            assert_eq!(
+                record_mode & 0o777,
+                crate::durable::SECRET_FILE_MODE,
+                "record, umask {mask:03o}"
+            );
+            assert_eq!(dir_mode & 0o777, 0o700, "escrow dir, umask {mask:03o}");
+            modes.push((record_mode, dir_mode));
+        }
+        assert_eq!(
+            modes[0], modes[1],
+            "the modes are chosen, not umask-derived"
+        );
+        assert_eq!(modes[0].0 & 0o777, crate::durable::SECRET_FILE_MODE);
+    }
+
+    /// The custody suite's crash-window shape: a stale temp stranded
+    /// by a pre-fix crash is reclaimed, and the record it precedes
+    /// lands owner-only — the escrow write inherits the primitive's
+    /// create-time mode rather than a post-hoc chmod.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_during_escrow_write_leaves_no_readable_temp() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = UmaskGuard::set(0o000);
+        let dir = TestDir::new("escrow-crash-temp");
+        std::fs::create_dir(dir.path.join(ESCROW_DIR)).unwrap();
+        let stale = dir.path.join(ESCROW_DIR).join("1.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let secret = EpochSecret::from_bytes([0xAA; 32]);
+        let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+        persist_record(&dir.path, &record).unwrap();
+        drop(_guard);
+        assert_eq!(
+            mode_of(&record_path(&dir.path, 1)) & 0o777,
+            crate::durable::SECRET_FILE_MODE,
+            "the completed record is never readable"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale temp is reclaimed, not published"
+        );
+    }
+
+    /// Creation-only, same contract as the vault leaf: a pre-existing
+    /// loose `escrow/` keeps its mode across a persist, while the
+    /// sidecar it then holds still lands hardened. Repairing the
+    /// directory is an operator action, never a side effect of
+    /// writing one record.
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_escrow_directory_keeps_its_mode_but_the_record_still_lands_hardened() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = UmaskGuard::set(0o000);
+        let dir = TestDir::new("escrow-loose-dir");
+        let escrow_dir = dir.path.join(ESCROW_DIR);
+        std::fs::create_dir(&escrow_dir).unwrap();
+        std::fs::set_permissions(&escrow_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let secret = EpochSecret::from_bytes([0xAA; 32]);
+        let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+        persist_record(&dir.path, &record).unwrap();
+        drop(_guard);
+        assert_eq!(
+            mode_of(&escrow_dir) & 0o777,
+            0o755,
+            "opening and writing change nothing about a pre-existing directory"
+        );
+        assert_eq!(
+            mode_of(&record_path(&dir.path, 1)) & 0o777,
+            crate::durable::SECRET_FILE_MODE,
+            "the record still lands owner-only inside it"
         );
     }
 

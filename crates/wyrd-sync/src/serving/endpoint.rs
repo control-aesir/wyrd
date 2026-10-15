@@ -75,7 +75,10 @@ impl ServingEndpoint {
         builder: iroh::endpoint::Builder,
     ) -> std::io::Result<Self> {
         let serve_dir = drive_dir.join(SERVE_DIR);
-        std::fs::create_dir_all(&serve_dir)?;
+        // Owner-only from creation when this call establishes the leaf;
+        // a pre-existing directory keeps its mode. The vault holds the
+        // ciphertext, this directory holds its serving mirror.
+        crate::durable::ensure_owner_only_dir(&serve_dir)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

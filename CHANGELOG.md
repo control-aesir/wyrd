@@ -553,6 +553,16 @@ version say exactly what changed.
   with `pub(crate)` visibility: no dispatch, exit-code, ordering, or
   error-path change, and the full `--help` tree plus error paths are
   byte-identical before and after.
+- No-op inserts skip the revalidation read for verified objects
+  (`nostr:nevent1qqsrvaekqjr6tpp3426lsm2mjc0ehrnx8z3gcmls7wccqg24rd5kz7gpz9mhxue69uhkwunpwdczuap49eehgd9hdgt`):
+  the store keeps a bounded in-process map of length-plus-mtime stamps for
+  objects it has already verified, so a repeated insert of unchanged bytes
+  pays a `stat` instead of a full file read and BLAKE3 re-derive (about
+  half the per-op cost at 1-16 MiB on the measured path; the remaining
+  cost is hashing the caller's input, which the `insert` API needs to
+  address the object). Any stamp drift falls back to the full re-derive
+  that heals bitrot, and a `get` that observes corruption retires the
+  stamp so the next insert heals rather than trusting it.
 - Tree lookups binary-search the canonical entry order
   (`nostr:nevent1qqsx6h0h9ztknvcyc6e76d5sgzymlednsp4vey4tmnqjl573qnpexzgpz9mhxue69uhkwunpwdczuap49eehgglwlpu`):
   `Tree::get` resolves a component with `binary_search_by` over the same

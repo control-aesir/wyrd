@@ -542,6 +542,14 @@ version say exactly what changed.
 
 ### Changed
 
+- Tree lookups binary-search the canonical entry order
+  (`nostr:nevent1qqsx6h0h9ztknvcyc6e76d5sgzymlednsp4vey4tmnqjl573qnpexzgpz9mhxue69uhkwunpwdczuap49eehgglwlpu`):
+  `Tree::get` resolves a component with `binary_search_by` over the same
+  bytewise `Component` order entries are sorted by at construction, and
+  the mount-free view's per-component path walk uses it in place of a
+  linear `iter().find`. A lookup on an N-entry directory drops from O(N)
+  to O(log N) per component; the comparator is the construction sort, so
+  it can never disagree with a scan. No format or public-API change.
 - Sync contracts split by theme
   (`nostr:nevent1qqsvq5j5lmgvgzy7x4ay22zmcj4hc530u09eyardhzvs2qd8sjagwdcpz9mhxue69uhkwunpwdczuap49eehgmqylse`):
   `wyrd-contracts`' 3,096-line `sync_contracts.rs` is now a

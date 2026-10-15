@@ -208,6 +208,19 @@ impl Tree {
         &self.entries
     }
 
+    /// Look up one entry by component name over the canonical bytewise
+    /// order. Entries are sorted at construction and `decode` rejects
+    /// unsorted payloads, so this is a binary search; the comparator is
+    /// the same [`Component`] order [`Tree::from_entries`] sorts by, so
+    /// it can never disagree with a linear scan. Returns the entry when
+    /// present.
+    pub fn get(&self, name: &Component) -> Option<&Entry> {
+        self.entries
+            .binary_search_by(|entry| entry.name.cmp(name))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
     /// The canonical payload encoding (see the module docs).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -411,6 +424,56 @@ mod tests {
         // Bytewise (case-sensitive) sort: "Alpha" < "beta" < "zeta".
         let names: Vec<&str> = tree.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn get_matches_linear_scan_on_canonical_order() {
+        // Names exercising bytewise ordering: case, separators, digit
+        // and symbol placement, shared prefixes, and multibyte UTF-8.
+        let names = [
+            "Alpha",
+            "alpha",
+            "a",
+            "a.b",
+            "a-b",
+            "a_b",
+            "a0",
+            "b",
+            "z",
+            "É",
+            "é",
+            "日本語",
+            "ünïcode",
+        ];
+        let entries: Vec<Entry> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| file_entry(name, i as u64, false))
+            .collect();
+        // Input order must not matter: from_entries canonicalizes first,
+        // and get must track that canonical order for every rotation.
+        for rotation in [0usize, 1, 7] {
+            let mut ordered = entries.clone();
+            let len = ordered.len();
+            ordered.rotate_left(rotation % len);
+            let tree = Tree::from_entries(ordered).unwrap();
+            for name in names {
+                let component = Component::new(name).unwrap();
+                let linear = tree
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name.as_str() == name);
+                assert_eq!(tree.get(&component), linear, "present name {name:?}");
+            }
+            for missing in ["A", "aa", "b0", "zzz", "ünïcodf"] {
+                let component = Component::new(missing).unwrap();
+                assert!(tree.get(&component).is_none(), "absent name {missing:?}");
+            }
+        }
+        // An empty tree resolves no name.
+        assert!(Tree::empty()
+            .get(&Component::new("anything").unwrap())
+            .is_none());
     }
 
     #[test]

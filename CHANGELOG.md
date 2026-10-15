@@ -542,6 +542,17 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI argument and runtime helpers extracted from `main.rs`
+  (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
+  phase 1): the clap types (`Cli`, `Credentials`, `RelayArgs`, `Command`,
+  the eight action enums) move to `cli/src/args.rs`, the credential and
+  identity readers (plus `current_uid`, which only they use) to
+  `cli/src/credentials.rs`, and the live-node plumbing (shutdown latch
+  and installer, teardown bounds, retention cross-check, loop config,
+  bulk binding, serving park/shutdown) to `cli/src/live.rs`. Pure move
+  with `pub(crate)` visibility: no dispatch, exit-code, ordering, or
+  error-path change, and the full `--help` tree plus error paths are
+  byte-identical before and after.
 - Tree lookups binary-search the canonical entry order
   (`nostr:nevent1qqsx6h0h9ztknvcyc6e76d5sgzymlednsp4vey4tmnqjl573qnpexzgpz9mhxue69uhkwunpwdczuap49eehgglwlpu`):
   `Tree::get` resolves a component with `binary_search_by` over the same

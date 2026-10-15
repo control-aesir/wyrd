@@ -193,9 +193,18 @@ fn embedded_drive_lifecycle_needs_no_fuse_and_no_daemon() {
     );
 
     // The durable witnesses the reopen comparison reads against,
-    // captured while this session's engine is still alive.
+    // captured while this session's engine is still alive. The bound
+    // below is what keeps the comparison honest: if the commits tree
+    // ever stopped being readable, both sides would read zero and
+    // compare equal vacuously — so the witness must prove non-empty
+    // before it is allowed to compare anything.
     let heads_before = live_head_ids(node.engine());
     let segments_before = committed_fact_segments(&dir);
+    assert!(
+        segments_before > 0,
+        "the drive has committed facts, so the reopen witness cannot \
+         degenerate into 0 == 0"
+    );
     drop(node);
 
     // -- Session 3: reopen again, compare, then shut down in order.
@@ -329,7 +338,10 @@ fn live_head_ids(engine: &Engine) -> Vec<SnapshotId> {
 
 /// Committed fact-log segments on disk: the durable-store layout
 /// keeps one file per fact-commit, so this is the count a reopen
-/// would have to leave alone.
+/// would have to leave alone. An unreadable `commits/` reads zero —
+/// fail-closed rather than fail-open, and the caller asserts a
+/// non-zero before comparing so the witness can never pass
+/// vacuously.
 fn committed_fact_segments(dir: &std::path::Path) -> usize {
     let commits = dir.join("commits");
     let Ok(entries) = std::fs::read_dir(&commits) else {

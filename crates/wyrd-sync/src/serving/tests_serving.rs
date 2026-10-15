@@ -1270,3 +1270,53 @@ fn the_source_serves_recorded_state_only() {
         Some(sealed_chunk.encode())
     );
 }
+
+/// Operational state lands owner-only from creation, same contract as
+/// the custody files: the vault leaf and the serve leaf are
+/// established at `0o700` under both a permissive and a masking
+/// umask, and the chosen modes are umask-independent. The serve
+/// directory is a fresh leaf under the pre-existing drive directory,
+/// so the helper's create path — not its early return — is what
+/// runs.
+#[cfg(unix)]
+#[test]
+fn vault_and_serve_directories_land_owner_only() {
+    use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+    let mut modes = Vec::new();
+    for mask in [0o000, 0o077] {
+        let _guard = UmaskGuard::set(mask);
+        let drive_dir = TestDir::new("op-state-modes");
+        let vault = Vault::open(&drive_dir.path).unwrap();
+        let vault_mode = mode_of(&vault.dir);
+        assert_eq!(vault_mode & 0o077, 0, "vault dir, umask {mask:03o}");
+        let _serving = ServingEndpoint::open_loopback(&vault, &drive_dir.path).unwrap();
+        let serve_mode = mode_of(&drive_dir.path.join(SERVE_DIR));
+        assert_eq!(serve_mode & 0o077, 0, "serve dir, umask {mask:03o}");
+        modes.push((vault_mode, serve_mode));
+    }
+    assert_eq!(
+        modes[0], modes[1],
+        "the modes are chosen, not umask-derived"
+    );
+}
+
+/// Creation-only, same contract as custody: opening a pre-existing
+/// loose directory changes nothing. Repairing a pre-fix drive's modes
+/// is an operator action, never a side effect of opening it.
+#[cfg(unix)]
+#[test]
+fn opening_a_loose_vault_directory_never_chmods() {
+    use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = UmaskGuard::set(0o077);
+    let drive_dir = TestDir::new("op-state-loose");
+    let loose = drive_dir.path.join("vault");
+    std::fs::create_dir(&loose).unwrap();
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let opened = Vault::open(&drive_dir.path).unwrap();
+    assert_eq!(
+        opened.dir, loose,
+        "the open addressed the pre-existing leaf"
+    );
+    assert_eq!(mode_of(&loose) & 0o777, 0o777, "opening changes nothing");
+}

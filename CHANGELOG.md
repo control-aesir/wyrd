@@ -1092,6 +1092,20 @@ version say exactly what changed.
   imports it, and the pre-grant would let a future addition slide
   past the layer check silently. Re-add both with the NIP-46 session
   wiring (trust.md T16).
+- Operational state directories land owner-only from creation
+  (`nostr:nevent1qqsyfct79g8mzw84wf6uq6snw20sg97xsngx8gxyp8rnyt8qez49zdcpz9mhxue69uhkwunpwdczuap49eehg5u9vq7`):
+  the custody fix left the `escrow/`, `vault/`, and `serve/`
+  subdirectories umask-derived; they now follow the same
+  creation-only contract as the custody files. The escrow write
+  establishes its directory through `ensure_owner_only_dir` and writes
+  the epoch sidecar through `atomic_write_mode` at `0o600` (a crash
+  between temp and rename no longer strands a group-readable sidecar
+  holding a wrapped epoch secret), and `Vault::open` and the serving
+  endpoint's `serve/` creation harden their leaves the same way.
+  Modes are chosen, not umask-derived — pinned under umask `0o000`
+  and `0o077` — and opening never chmods: a pre-fix drive's loose
+  directories keep their modes until repaired by hand. No durable
+  bytes change.
 
 ## [0.2.0-alpha]
 

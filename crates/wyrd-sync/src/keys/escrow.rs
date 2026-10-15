@@ -171,10 +171,25 @@ pub fn record_path(store_dir: &Path, epoch: u64) -> PathBuf {
 /// Persist one epoch's record atomically (temp + fsync + rename, like
 /// every other drive file). Call only after the epoch's transition
 /// commits — see the ordering note at the top of this module.
+///
+/// Creation hardens both leaves the write establishes: the `escrow/`
+/// directory through [`ensure_owner_only_dir`](crate::durable::ensure_owner_only_dir)
+/// (owner-only from creation, never the umask's business) and the
+/// record file through [`atomic_write_mode`](crate::durable::atomic_write_mode)
+/// at [`SECRET_FILE_MODE`](crate::durable::SECRET_FILE_MODE), so a
+/// crash between temp creation and rename never strands a
+/// group-readable sidecar holding a wrapped epoch secret. Like every
+/// custody write, creation hardens and opening never chmods: a
+/// pre-existing directory or record keeps the mode it has.
 pub fn persist_record(store_dir: &Path, record: &EscrowRecord) -> std::io::Result<()> {
     let dir = store_dir.join(ESCROW_DIR);
-    std::fs::create_dir_all(&dir)?;
-    crate::durable::atomic_write(&dir, &record.epoch.to_string(), &record.encode())
+    crate::durable::ensure_owner_only_dir(&dir)?;
+    crate::durable::atomic_write_mode(
+        &dir,
+        &record.epoch.to_string(),
+        &record.encode(),
+        crate::durable::SECRET_FILE_MODE,
+    )
 }
 
 /// Read one epoch's sidecar: `None` when no record was written (the
@@ -256,6 +271,34 @@ mod tests {
             unwrap(&root().escrow_key(&drive(), 3), &forged),
             Err(CryptoError::OpenFailed)
         );
+    }
+
+    /// The custody suite's shape, applied to operational state: the
+    /// escrow sidecar is the custody-adjacent write the custody fix
+    /// left alone, so both leaves it establishes are owner-only from
+    /// creation and the modes are chosen, not umask-derived.
+    #[cfg(unix)]
+    #[test]
+    fn a_persisted_escrow_record_is_not_group_or_world_readable() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        let mut modes = Vec::new();
+        for mask in [0o000, 0o077] {
+            let _guard = UmaskGuard::set(mask);
+            let dir = TestDir::new("escrow-mode");
+            let secret = EpochSecret::from_bytes([0xAA; 32]);
+            let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+            persist_record(&dir.path, &record).unwrap();
+            let record_mode = mode_of(&record_path(&dir.path, 1));
+            let dir_mode = mode_of(&dir.path.join(ESCROW_DIR));
+            assert_eq!(record_mode & 0o077, 0, "record, umask {mask:03o}");
+            assert_eq!(dir_mode & 0o077, 0, "escrow dir, umask {mask:03o}");
+            modes.push((record_mode, dir_mode));
+        }
+        assert_eq!(
+            modes[0], modes[1],
+            "the modes are chosen, not umask-derived"
+        );
+        assert_eq!(modes[0].0 & 0o777, crate::durable::SECRET_FILE_MODE);
     }
 
     #[test]

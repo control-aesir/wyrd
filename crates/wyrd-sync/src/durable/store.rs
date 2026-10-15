@@ -108,8 +108,11 @@ pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Durably create-or-replace one file: temp + `fsync` + rename +
-/// directory `fsync`. Fixed `.tmp` sibling; stale temps are overwritten,
-/// never read.
+/// directory `fsync`, at the umask-derived mode. Test-only since the
+/// escrow sidecar moved to [`atomic_write_mode`]: production writes
+/// now all choose an explicit mode, so nothing outside the test
+/// harness needs the umask's business.
+#[cfg(test)]
 pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
     let mut f = File::create(&tmp)?;
@@ -181,9 +184,11 @@ pub(crate) fn create_mode_temp(
 /// Unix `mode`, see [`create_mode_temp`]) + `fsync` + rename +
 /// directory `fsync`. The rename preserves the temp's mode, so no
 /// post-rename chmod — and no chmod-failure-after-rename outcome —
-/// exists. Custody and identity files flow through here; operational
-/// state (`CURRENT`, commits) keeps flowing through [`atomic_write`]:
-/// creation hardens, opening never chmods.
+/// exists. Custody and identity files flow through here, and the
+/// escrow sidecars are the operational-state files that joined them
+/// (a wrapped epoch secret is custody-adjacent). `CURRENT` has its
+/// own write path with its own ordering; every other published file
+/// gets an explicit mode: creation hardens, opening never chmods.
 ///
 /// Public because device-local operational files beside the drive
 /// directory (like the materialization-role file, owned by

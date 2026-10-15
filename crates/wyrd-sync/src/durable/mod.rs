@@ -140,6 +140,7 @@ pub(crate) use codec::MAX_RECORDS_PER_COMMIT;
 pub(crate) use codec::{decode_reconciliation_evidence, encode_reconciliation_view_canonical};
 #[cfg(test)]
 pub(crate) use codec::{encode_commit, TAG_ANNOUNCEMENT_SEALED, TAG_SNAPSHOT_BODY};
+#[cfg(test)]
 pub(crate) use store::atomic_write;
 #[cfg(test)]
 pub(crate) use store::commit_name;

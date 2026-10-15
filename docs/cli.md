@@ -741,18 +741,19 @@ Both are read and hardened by wyrd code, never by clap:
   `0o600`, the drive directory leaf and `commits/` at no wider than
   `0o700`, `DRIVE` at no wider than `0o644`. Modes are never loosened:
   a replaced custody file takes the hardened mode through the rename.
-   Only the leaf directory this call creates is restricted, except that
-   establishing fresh drive state restricts the directory it is given;
-   missing parents above the leaf keep the operator's modes.
-   Subdirectories created later for operational state follow the same
-   creation-only contract: `escrow/` (and its epoch sidecars, sealed
-   epoch secrets at `0o600`), `vault/`, and `serve/` are established
-   owner-only when wyrd creates them, never the umask's business, on
-   fresh drives — a pre-fix drive's established directories keep their
-   modes until repaired by hand (opening never chmods). Pre-existing files and
-   established drives are otherwise untouched — inspect a pre-fix drive
-   with `stat` (e.g. `stat -c '%a %n'` on Linux, `stat -f '%Lp %N'` on
-    macOS) and repair by hand. Non-Unix platforms get no mode guarantee.
+  Only the leaf directory this call creates is restricted, except that
+  establishing fresh drive state restricts the directory it is given;
+  missing parents above the leaf keep the operator's modes.
+  Subdirectories created later for operational state follow the same
+  creation-only contract: `escrow/` (and its epoch sidecars, sealed
+  epoch secrets at `0o600`), `vault/`, and `serve/` are established
+  owner-only when wyrd creates them, never the umask's business, on
+  fresh drives — a pre-fix drive's established directories keep their
+  modes until repaired by hand (opening never chmods). Pre-existing
+  files and established drives are otherwise untouched — inspect a
+  pre-fix drive with `stat` (e.g. `stat -c '%a %n'` on Linux,
+  `stat -f '%Lp %N'` on macOS) and repair by hand. Non-Unix platforms
+  get no mode guarantee.
 
 ## Drive configuration file
 

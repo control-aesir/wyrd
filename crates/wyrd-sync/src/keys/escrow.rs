@@ -290,8 +290,12 @@ mod tests {
             persist_record(&dir.path, &record).unwrap();
             let record_mode = mode_of(&record_path(&dir.path, 1));
             let dir_mode = mode_of(&dir.path.join(ESCROW_DIR));
-            assert_eq!(record_mode & 0o077, 0, "record, umask {mask:03o}");
-            assert_eq!(dir_mode & 0o077, 0, "escrow dir, umask {mask:03o}");
+            assert_eq!(
+                record_mode & 0o777,
+                crate::durable::SECRET_FILE_MODE,
+                "record, umask {mask:03o}"
+            );
+            assert_eq!(dir_mode & 0o777, 0o700, "escrow dir, umask {mask:03o}");
             modes.push((record_mode, dir_mode));
         }
         assert_eq!(
@@ -321,8 +325,8 @@ mod tests {
         persist_record(&dir.path, &record).unwrap();
         drop(_guard);
         assert_eq!(
-            mode_of(&record_path(&dir.path, 1)) & 0o077,
-            0,
+            mode_of(&record_path(&dir.path, 1)) & 0o777,
+            crate::durable::SECRET_FILE_MODE,
             "the completed record is never readable"
         );
         assert!(
@@ -356,8 +360,8 @@ mod tests {
             "opening and writing change nothing about a pre-existing directory"
         );
         assert_eq!(
-            mode_of(&record_path(&dir.path, 1)) & 0o077,
-            0,
+            mode_of(&record_path(&dir.path, 1)) & 0o777,
+            crate::durable::SECRET_FILE_MODE,
             "the record still lands owner-only inside it"
         );
     }

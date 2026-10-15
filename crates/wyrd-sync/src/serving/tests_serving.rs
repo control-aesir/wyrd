@@ -1297,15 +1297,18 @@ fn vault_and_serve_directories_land_owner_only() {
     );
     // The serve leaf once, outside the loop: the transport the open
     // constructs is the endpoint's business, and the assertion needs
-    // only the leaf its first step establishes. Umask-independence is
-    // already pinned twice above — same helper, same contract.
+    // only the leaf its first step establishes. The umask is pinned
+    // permissive so a future regression to a mode-less create at
+    // `endpoint.rs` would land world-accessible and fail here, not
+    // slip through an owner-masking ambient umask.
+    let _guard = UmaskGuard::set(0o000);
     let drive_dir = TestDir::new("op-state-serve");
     let vault = Vault::open(&drive_dir.path).unwrap();
     let _serving = ServingEndpoint::open_loopback(&vault, &drive_dir.path).unwrap();
     assert_eq!(
-        mode_of(&drive_dir.path.join(SERVE_DIR)) & 0o077,
-        0,
-        "serve dir lands owner-only"
+        mode_of(&drive_dir.path.join(SERVE_DIR)) & 0o777,
+        0o700,
+        "serve dir lands owner-only even under a permissive umask"
     );
 }
 

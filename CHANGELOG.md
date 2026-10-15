@@ -785,7 +785,28 @@ version say exactly what changed.
   stall into cancellation and skip the cache save. The reporter save
   step runs unconditionally like the draft one. A hermetic shell-test
   job (`bash .ngit/scripts/tests/run-all.sh`) pins the bound
-  arithmetic. Warm runs finish in seconds.
+   arithmetic. Warm runs finish in seconds.
+- Local writes pay one durable rebuild instead of four
+  (`nostr:nevent1qqsd2mkn4gxkplcxxvkz9gtvgphajy8tg7663xccsxgkeeq6l65679spz9mhxue69uhkwunpwdczuap49eehgscysnc`):
+  `put_file`/`remove` rebuilt the durable runtime state and
+  reclassified the snapshot DAG once to pick the write base, once more
+  to author, and twice again in the head-projection refresh
+  (`runtime_state` plus `live_heads`).
+  `Engine::begin_write` now captures the eligible heads with the
+  rebuilt state that classified them in a linear `PendingWrite`
+  session, and `Engine::author_pending_write` reuses it instead of
+  replaying; the authored snapshot installs directly as the only head
+  (the path admits zero or one prior heads, and a member-authored
+  snapshot under canonical membership is eligible with a closure the
+  authoring just verified). Parent selection stays engine-side — the
+  node only counts heads and mutates the engine-resolved base — and a
+  session naming several heads fails closed
+  (`EngineError::WriteConflicted`) rather than extending one side.
+  Measured on a 200-snapshot drive, release build: per-write 81ms to
+  63ms (about a fifth off, growing with history since each rebuild
+  replays O(history) facts). No snapshot, membership, restart, or
+  multi-head-resolution semantic change.
+
 
 ### Fixed
 

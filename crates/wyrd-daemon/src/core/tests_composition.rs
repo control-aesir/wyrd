@@ -71,6 +71,45 @@ fn put_file_serves_bytes_and_extends_the_live_head() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The single-rebuild write path preserves the lineage the
+/// refresh-based path produced: the bootstrap authors a root, the
+/// second write parents onto it, and the installed head matches the
+/// engine's own projection — the direct install after authoring is
+/// exactly what a refresh would have picked up.
+#[test]
+fn put_file_chains_single_parent_heads_without_a_refresh() {
+    let (engine, dir, _) = scratch_drive();
+    let mut daemon: WyrdNode<DriveView<_, RuntimeMaterialization>> =
+        WyrdNode::new(engine, MemoryObjectStore::default()).unwrap();
+
+    let first = daemon.put_file("docs/hello.txt", b"hello wyrd").unwrap();
+    assert!(
+        first.snapshot().parents.is_empty(),
+        "the bootstrap write authors a root"
+    );
+    let second = daemon.put_file("docs/hello.txt", b"hello again").unwrap();
+    assert_eq!(
+        second.snapshot().parents,
+        vec![first.snapshot().snapshot_id()],
+        "the second write extends the single live head"
+    );
+    assert_eq!(
+        daemon
+            .engine()
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![second.snapshot().snapshot_id()],
+        "the installed head matches the engine projection"
+    );
+    assert_eq!(read_through(&daemon, "docs/hello.txt"), b"hello again");
+
+    drop(daemon);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Removal is a state change: the path stops resolving while the
 /// drive keeps its history.
 #[test]

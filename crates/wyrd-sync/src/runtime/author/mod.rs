@@ -86,5 +86,6 @@ pub(super) use resolve_conflict::resolve_conflict;
 pub(super) use rotate_epoch::rotate_epoch;
 pub(super) use set_owners::set_owners;
 pub(super) use snapshot::author;
+pub(super) use snapshot::author_over;
 pub(super) use snapshot::author_recovery;
 pub(super) use snapshot::author_with_parents;

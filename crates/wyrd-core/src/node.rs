@@ -13,7 +13,7 @@
 
 use crate::live::{partition_heads, LiveConfig, LiveNode, LiveParts};
 use crate::view::{Head, NamespaceView, RuntimeMaterialization};
-use wyrd_format::{chunk, ContentId, Entry, ObjectStore, Tree};
+use wyrd_format::{chunk, Entry, ObjectStore, Tree};
 use wyrd_sync::durable::AuthorizedSnapshot;
 use wyrd_sync::{
     runtime::{Engine, RoutePublishing},
@@ -264,26 +264,19 @@ where
         self.engine.announce_pending(mailbox, node_addr)
     }
 
-    /// The tree a write builds from when the drive has exactly one live
-    /// head. A conflicted drive is rejected rather than silently losing
-    /// entries from any head; explicit resolution is a separate API
-    /// concern. A headless drive returns `None` so `put_file` can create
-    /// its initial empty tree.
-    fn live_base(&self) -> Result<Option<ContentId>, WriteError<<V::Store as ObjectStore>::Error>> {
-        let heads = self.engine.live_heads()?;
-        match heads.as_slice() {
-            [] => Ok(None),
-            [head] => Ok(Some(head.snapshot().tree)),
-            _ => Err(WriteError::Conflicted { heads: heads.len() }),
-        }
-    }
-
     /// Write `data` to `path`: chunk the bytes into the view's store,
     /// upsert the file entry (creating intermediate directories),
-    /// author a snapshot over the new root, and refresh the live heads
-    /// so backends serve the change. Files are regular and
-    /// non-executable; symlinks and the executable bit are not part of
-    /// this surface. Returns the authored snapshot.
+    /// author a snapshot over the new root, and install it as the
+    /// drive's head so backends serve the change. Files are regular
+    /// and non-executable; symlinks and the executable bit are not
+    /// part of this surface. Returns the authored snapshot.
+    ///
+    /// One durable rebuild serves the whole write: [`Engine::begin_write`]
+    /// captures the eligible heads with the rebuilt state that
+    /// classified them, and [`Engine::author_pending_write`] reuses it
+    /// instead of replaying durable state a second time. The node's
+    /// `&mut` borrow spans begin, mutation, and author, so no intake
+    /// can interleave — the reused state cannot be stale.
     pub fn put_file(
         &mut self,
         path: &str,
@@ -291,38 +284,67 @@ where
     ) -> Result<AuthorizedSnapshot, WriteError<<V::Store as ObjectStore>::Error>> {
         let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
         let mut store = self.view.store_write().map_err(|_| WriteError::Lock)?;
-        let base = match self.live_base()? {
+        let pending = self.engine.begin_write()?;
+        let base = match pending.base_tree() {
             Some(tree) => tree,
-            None => Tree::from_entries(Vec::new())
+            None if pending.head_count() == 0 => Tree::from_entries(Vec::new())
                 .map_err(wyrd_format::MutationError::Tree)?
                 .insert_into(&mut *store)
                 .map_err(WriteError::Store)?,
+            None => {
+                return Err(WriteError::Conflicted {
+                    heads: pending.head_count(),
+                })
+            }
         };
         let chunks = chunk::insert_chunks(&mut *store, data).map_err(WriteError::Store)?;
         let entry = Entry::file(file_name, data.len() as u64, false, chunks)?;
         let root = wyrd_format::mutation::put(&mut *store, base, path, entry)?;
-        let authorized = self.engine.author_snapshot(&*store, root)?;
+        let authorized = self.engine.author_pending_write(&*store, root, pending)?;
         drop(store);
-        self.refresh_live_heads()?;
+        self.install_authored_head(authorized.clone());
         Ok(authorized)
     }
 
     /// Remove the entry at `path`: rebuild the tree without it, author
-    /// a snapshot over the new root, and refresh the live heads. The
-    /// removed bytes stay in the store (append-only until GC); the path
-    /// simply stops resolving. Directories left empty are kept, matching
-    /// the mutation layer. Returns the authored snapshot.
+    /// a snapshot over the new root, and install it as the drive's
+    /// head. The removed bytes stay in the store (append-only until
+    /// GC); the path simply stops resolving. Directories left empty
+    /// are kept, matching the mutation layer. Returns the authored
+    /// snapshot. Single-rebuild like [`WyrdNode::put_file`].
     pub fn remove(
         &mut self,
         path: &str,
     ) -> Result<AuthorizedSnapshot, WriteError<<V::Store as ObjectStore>::Error>> {
-        let base = self.live_base()?.ok_or(WriteError::EmptyDrive)?;
         let mut store = self.view.store_write().map_err(|_| WriteError::Lock)?;
+        let pending = self.engine.begin_write()?;
+        let base = match pending.base_tree() {
+            Some(tree) => tree,
+            None if pending.head_count() == 0 => return Err(WriteError::EmptyDrive),
+            None => {
+                return Err(WriteError::Conflicted {
+                    heads: pending.head_count(),
+                })
+            }
+        };
         let root = wyrd_format::mutation::remove(&mut *store, base, path)?;
-        let authorized = self.engine.author_snapshot(&*store, root)?;
+        let authorized = self.engine.author_pending_write(&*store, root, pending)?;
         drop(store);
-        self.refresh_live_heads()?;
+        self.install_authored_head(authorized.clone());
         Ok(authorized)
+    }
+
+    /// Install a just-authored snapshot as the drive's complete head
+    /// set, without a projection rebuild. The write path admits zero
+    /// or one prior heads (more fail `Conflicted` before mutating, and
+    /// authoring refuses them again), and a member-authored snapshot
+    /// under canonical membership is eligible — so the previous head
+    /// stops being a tip and the new snapshot is the whole head set.
+    /// Its closure verified against this same store during authoring,
+    /// so it is publishable, never pending: exactly what a refresh
+    /// would install, minus the two rebuilds.
+    fn install_authored_head(&mut self, authorized: AuthorizedSnapshot) {
+        NamespaceView::set_heads(&mut self.view, vec![Head::new(authorized)]);
     }
 
     /// Split the composed node for live serving: the engine and the

@@ -142,13 +142,11 @@ pub enum ManifestError {
 impl ManifestEntry {
     /// Sort key: content identity, then kind, then version. One logical
     /// object selects exactly one representation per key; the order keeps
-    /// coexisting mappings distinct and canonical.
-    fn sort_key(&self) -> (Vec<u8>, u8, u8) {
-        (
-            self.content_id.as_bytes().to_vec(),
-            self.kind.byte(),
-            self.version,
-        )
+    /// coexisting mappings distinct and canonical. Borrowed: the key is
+    /// compared in place, so neither the sort nor the sortedness checks
+    /// allocate per element.
+    fn sort_key(&self) -> (&[u8; 32], u8, u8) {
+        (self.content_id.as_bytes(), self.kind.byte(), self.version)
     }
 
     /// The fixed 114-byte canonical encoding.
@@ -209,7 +207,7 @@ impl Manifest {
         if children.len() > u32::MAX as usize {
             return Err(ManifestError::CountOverflow(children.len()));
         }
-        entries.sort_by_key(|entry| entry.sort_key());
+        entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         children.sort_by_key(|child| *child.tree.as_bytes());
         let manifest = Manifest {
             snapshot,

@@ -58,6 +58,105 @@ fn successive_authored_snapshots_get_increasing_timestamps() {
     );
 }
 
+// --- single-rebuild write sessions -------------------------------
+
+/// The write session carries one rebuild from base selection to
+/// authoring: a headless session names no base, and the session after
+/// the first authoring names exactly the authored head.
+#[test]
+fn write_session_chains_single_head_bases_without_a_second_rebuild() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+
+    let pending = pair.a.engine.begin_write().unwrap();
+    assert_eq!(pending.head_count(), 0, "the drive starts headless");
+    assert_eq!(pending.base_tree(), None, "nothing to build on yet");
+    let first = pair
+        .a
+        .engine
+        .author_pending_write(&objects, tree, pending)
+        .unwrap();
+    assert!(
+        first.snapshot().parents.is_empty(),
+        "a headless session authors a root"
+    );
+
+    let pending = pair.a.engine.begin_write().unwrap();
+    assert_eq!(
+        pending.head_count(),
+        1,
+        "one live head after the first write"
+    );
+    assert_eq!(
+        pending.base_tree(),
+        Some(tree),
+        "the session names the head's tree as the base"
+    );
+    let second = pair
+        .a
+        .engine
+        .author_pending_write(&objects, tree, pending)
+        .unwrap();
+    assert_eq!(
+        second.snapshot().parents,
+        vec![first.snapshot().snapshot_id()],
+        "the session authors onto the head it captured"
+    );
+    assert_eq!(
+        pair.a
+            .engine
+            .live_heads()
+            .unwrap()
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![second.snapshot().snapshot_id()],
+        "the authored head supersedes the one it extends"
+    );
+}
+
+/// Two parentless snapshots are the durable shape of two devices
+/// authoring concurrently. A session over them names no base, and
+/// authoring fails closed instead of extending one side.
+#[test]
+fn write_session_onto_a_conflicted_drive_fails_closed_at_authoring() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    // The explicit-parents path stands in for the rival device's
+    // announcement: same tree, no parents, committed beside the first.
+    crate::runtime::author::author_with_parents(&mut pair.a.engine, &objects, tree, Vec::new())
+        .unwrap();
+
+    let pending = pair.a.engine.begin_write().unwrap();
+    assert_eq!(pending.head_count(), 2, "two rival heads");
+    assert_eq!(
+        pending.base_tree(),
+        None,
+        "a conflicted drive names no base"
+    );
+    let error = pair
+        .a
+        .engine
+        .author_pending_write(&objects, tree, pending)
+        .unwrap_err();
+    assert!(
+        matches!(error, EngineError::WriteConflicted { heads: 2 }),
+        "authoring onto a conflict fails closed, got {error:?}"
+    );
+    assert_eq!(
+        pair.a.engine.live_heads().unwrap().len(),
+        2,
+        "the refused authoring commits nothing"
+    );
+}
+
 /// Decision 26's correspondence, end to end: every mapping the local
 /// write path authors names a sealed envelope this device holds, the
 /// AEAD tag verifies over the bound AAD, the plaintext hashes back to

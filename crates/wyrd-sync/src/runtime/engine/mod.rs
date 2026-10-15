@@ -72,7 +72,7 @@ use crate::durable::AuthorizeSnapshot;
 use crate::durable::AuthorizedSnapshot;
 #[cfg(test)]
 use crate::durable::CrashStage;
-use crate::durable::{DurableError, DurableStore, Fact};
+use crate::durable::{DurableError, DurableStore, Fact, Rebuilt};
 use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, DriveRootKey};
 use crate::membership::MembershipLog;
@@ -275,6 +275,14 @@ pub enum EngineError {
     ObjectStore(String),
     #[error("the snapshot timestamp space is exhausted at u64::MAX")]
     TimestampExhausted,
+    /// A write session naming more than one eligible head reached
+    /// authoring. The write path refuses multi-head drives before
+    /// mutating, so this is defense in depth: resolving onto several
+    /// heads is a separate explicit API, never an implicit write, and
+    /// authoring against a conflicted base fails closed here rather
+    /// than extending one side of the conflict.
+    #[error("cannot author a write onto {heads} live heads; resolve the conflict explicitly")]
+    WriteConflicted { heads: usize },
     /// An admission whose membership batch cannot fit the per-commit
     /// ceiling: a capacity refusal, not a durable failure. Rerunning
     /// unchanged cannot help — the device was not admitted, so
@@ -951,6 +959,47 @@ pub struct Engine {
     /// `AlreadyStated` without another full load. Edges and unmarked
     /// digests always evaluate fully.
     pub(super) last_trigger_eval: Option<(u64, [u8; 32])>,
+}
+
+/// A single-rebuild local-write session: the eligible heads plus the
+/// rebuilt state that classified them, captured together for exactly
+/// one authoring. The node carries the session from base selection
+/// through authoring, so a successful local write pays one durable
+/// rebuild and one classification instead of four (base selection,
+/// authoring, and the two inside the projection refresh it also
+/// replaces). The session is linear (non-`Clone`): it authors
+/// at most once, through [`Engine::author_pending_write`], which
+/// consumes it.
+///
+/// Staleness is unrepresentable rather than checked: the node holds
+/// its `&mut` borrow across begin, mutation, and author, so no intake
+/// can commit between the rebuild and the authoring that reuses it. A
+/// session that somehow names several heads fails closed at authoring
+/// ([`EngineError::WriteConflicted`]) — the engine never resolves a
+/// conflict implicitly.
+pub struct PendingWrite {
+    rebuilt: Rebuilt,
+    heads: Vec<AuthorizedSnapshot>,
+}
+
+impl PendingWrite {
+    /// How many eligible heads the session captured. More than one is
+    /// a conflict the write path must refuse before mutating; zero is
+    /// a headless drive (put bootstraps, remove fails).
+    pub fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// The tree a write builds from: the single eligible head's tree,
+    /// resolved by the engine. `None` on a headless or a conflicted
+    /// drive. The node never derives parents itself — this is the only
+    /// base it may mutate under the session.
+    pub fn base_tree(&self) -> Option<ContentId> {
+        match self.heads.as_slice() {
+            [head] => Some(head.snapshot().tree),
+            _ => None,
+        }
+    }
 }
 
 impl Engine {
@@ -1662,18 +1711,68 @@ impl Engine {
     /// internal invariant broke, not that a new corruption flavor was
     /// detected.
     pub fn live_heads(&self) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
+        self.rebuild_eligible_heads().map(|(_, heads)| heads)
+    }
+
+    /// One durable rebuild plus DAG classification, shared by every
+    /// reader that names the eligible heads: the rebuild replays the
+    /// same facts each projection replays, so sharing the helper keeps
+    /// the classification identical everywhere without duplicating the
+    /// observe loop.
+    fn rebuild_eligible_heads(&self) -> Result<(Rebuilt, Vec<AuthorizedSnapshot>), EngineError> {
         let rebuilt = self.store.rebuild(self.device)?;
         let mut dag = crate::authorization::SnapshotDag::new(self.drive);
         for body in rebuilt.runtime.snapshot_bodies.values() {
             dag.observe(body.clone());
         }
-        dag.eligible_head_bodies(&rebuilt.log)
+        let heads = dag
+            .eligible_head_bodies(&rebuilt.log)
             .into_iter()
             .map(|snapshot| {
                 AuthorizedSnapshot::authorize(snapshot, &self.drive)
                     .map_err(EngineError::InvalidHead)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rebuilt, heads))
+    }
+
+    /// Capture a write session: one rebuild, one classification. The
+    /// write path calls this once, mutates the object store over
+    /// [`PendingWrite::base_tree`], then authors with
+    /// [`Engine::author_pending_write`] — no second rebuild between.
+    pub fn begin_write(&self) -> Result<PendingWrite, EngineError> {
+        let (rebuilt, heads) = self.rebuild_eligible_heads()?;
+        Ok(PendingWrite { rebuilt, heads })
+    }
+
+    /// Author a new snapshot over `tree` inside `pending`, reusing its
+    /// rebuild instead of replaying durable state again. Parents are
+    /// the session's eligible heads — selected by the engine, never
+    /// by the caller — and every check [`author_snapshot`] applies
+    /// still applies, over the same rebuilt state. A session naming
+    /// several heads fails closed: use the merge API to resolve first.
+    ///
+    /// [`author_snapshot`]: Engine::author_snapshot
+    pub fn author_pending_write<S: ObjectStore>(
+        &mut self,
+        objects: &S,
+        tree: ContentId,
+        pending: PendingWrite,
+    ) -> Result<AuthorizedSnapshot, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        if pending.heads.len() > 1 {
+            return Err(EngineError::WriteConflicted {
+                heads: pending.heads.len(),
+            });
+        }
+        let parents = pending
+            .heads
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect();
+        super::author::author_over(self, objects, tree, parents, pending.rebuilt, 0)
     }
 
     /// The live heads as of a past epoch, over the currently

@@ -132,7 +132,7 @@ where
     )
 }
 
-fn author_over<S: ObjectStore>(
+pub(crate) fn author_over<S: ObjectStore>(
     engine: &mut Engine,
     objects: &S,
     tree: ContentId,

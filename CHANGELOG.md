@@ -542,6 +542,16 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI small command families extracted from `main.rs`
+  (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
+  phase 2): `mount`, `export` (with the shared offline policy-node
+  opener), `pin`/`unpin`/`evict` with their renderers, `role` with its
+  renderer and role-file error mapper, and `cache` with its residency
+  renderers and `RetentionAccounting` move to `cli/src/commands/`, one
+  module per family. Pure move with `pub(crate)` visibility: no
+  dispatch, lifecycle, exit-code, ordering, or error-path change, and
+  the full `--help` tree plus error paths are byte-identical before
+  and after.
 - CLI argument and runtime helpers extracted from `main.rs`
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   phase 1): the clap types (`Cli`, `Credentials`, `RelayArgs`, `Command`,

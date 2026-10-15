@@ -551,6 +551,12 @@ version say exactly what changed.
   to O(log N) per component; the comparator is the construction sort, so
   it can never disagree with a scan. `Tree::get` is additive; no format
   or canonicalization change.
+- Manifest entry sort keys compare in place
+  (`nostr:nevent1qqsyla3wxrcnnasvw7uh28cqwgcu8thuaue7kcasam9lxltk42jxjrspz9mhxue69uhkwunpwdczuap49eehgzm5sem`):
+  `ManifestEntry::sort_key` borrows the 32-byte content identity instead
+  of allocating a `Vec<u8>` per call, so canonicalizing a manifest and
+  verifying its sortedness no longer allocate. The key order is
+  untouched.
 - Sync contracts split by theme
   (`nostr:nevent1qqsvq5j5lmgvgzy7x4ay22zmcj4hc530u09eyardhzvs2qd8sjagwdcpz9mhxue69uhkwunpwdczuap49eehgmqylse`):
   `wyrd-contracts`' 3,096-line `sync_contracts.rs` is now a

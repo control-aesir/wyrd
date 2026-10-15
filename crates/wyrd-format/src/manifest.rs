@@ -142,13 +142,11 @@ pub enum ManifestError {
 impl ManifestEntry {
     /// Sort key: content identity, then kind, then version. One logical
     /// object selects exactly one representation per key; the order keeps
-    /// coexisting mappings distinct and canonical.
-    fn sort_key(&self) -> (Vec<u8>, u8, u8) {
-        (
-            self.content_id.as_bytes().to_vec(),
-            self.kind.byte(),
-            self.version,
-        )
+    /// coexisting mappings distinct and canonical. Borrowed: the key is
+    /// compared in place, so neither the sort nor the sortedness checks
+    /// allocate per element.
+    fn sort_key(&self) -> (&[u8; 32], u8, u8) {
+        (self.content_id.as_bytes(), self.kind.byte(), self.version)
     }
 
     /// The fixed 114-byte canonical encoding.
@@ -209,7 +207,7 @@ impl Manifest {
         if children.len() > u32::MAX as usize {
             return Err(ManifestError::CountOverflow(children.len()));
         }
-        entries.sort_by_key(|entry| entry.sort_key());
+        entries.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         children.sort_by_key(|child| *child.tree.as_bytes());
         let manifest = Manifest {
             snapshot,
@@ -655,6 +653,73 @@ mod tests {
         e1.kind = ObjectKind::Chunk;
         let m =
             Manifest::new(SnapshotId::from_bytes([0x77; 32]), vec![e1, e2], Vec::new()).unwrap();
+        assert_eq!(
+            Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
+            m
+        );
+    }
+
+    #[test]
+    fn same_content_and_kind_may_map_several_versions_canonically() {
+        // The version is the third sort-key component: identical content
+        // and kind at two versions coexist in ascending version order,
+        // and the descending order is non-canonical. Pins the version
+        // component the kind test above does not vary.
+        let mut v0 = entry(0x01, 1);
+        let mut v1 = entry(0x01, 2);
+        v0.version = 0x00;
+        v1.version = 0x01;
+        // new() sorts, so hand it the descending pair on purpose.
+        let m =
+            Manifest::new(SnapshotId::from_bytes([0x77; 32]), vec![v1, v0], Vec::new()).unwrap();
+        assert_eq!(m.entries()[0].version, 0x00);
+        assert_eq!(m.entries()[1].version, 0x01);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
+            m
+        );
+
+        // Swapping the two encoded entries yields a descending payload,
+        // which decode refuses as non-canonical.
+        let bytes = m.canonical_bytes();
+        let header = 32 + 4;
+        let first = &bytes[header..header + ENTRY_LEN];
+        let second = &bytes[header + ENTRY_LEN..header + 2 * ENTRY_LEN];
+        let mut swapped = bytes[..header].to_vec();
+        swapped.extend_from_slice(second);
+        swapped.extend_from_slice(first);
+        swapped.extend_from_slice(&bytes[header + 2 * ENTRY_LEN..]);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&swapped),
+            Err(ManifestError::UnsortedEntries)
+        );
+    }
+
+    #[test]
+    fn manifest_sort_key_orders_kind_before_version() {
+        // The key is (content_id, kind, version): kind outranks version,
+        // so the same content as Chunk at version 1 sorts before Tree at
+        // version 0. The version test above holds kind constant and the
+        // kind test holds version constant, so this pair is what
+        // distinguishes the key from a (content_id, version, kind)
+        // permutation.
+        let mut chunk_v1 = entry(0x01, 1);
+        let mut tree_v0 = entry(0x01, 2);
+        chunk_v1.kind = ObjectKind::Chunk;
+        chunk_v1.version = 0x01;
+        tree_v0.kind = ObjectKind::Tree;
+        tree_v0.version = 0x00;
+        // new() sorts, so hand it the descending pair on purpose.
+        let m = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![tree_v0, chunk_v1],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(m.entries()[0].kind, ObjectKind::Chunk);
+        assert_eq!(m.entries()[0].version, 0x01);
+        assert_eq!(m.entries()[1].kind, ObjectKind::Tree);
+        assert_eq!(m.entries()[1].version, 0x00);
         assert_eq!(
             Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
             m

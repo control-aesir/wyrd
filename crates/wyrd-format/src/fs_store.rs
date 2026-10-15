@@ -147,6 +147,20 @@ const VERIFIED_CAPACITY: usize = 4096;
 struct VerifiedCache {
     stamps: HashMap<ContentId, VerifiedStamp>,
     order: VecDeque<ContentId>,
+    /// Per-store fast-path accounting (test builds only): how many
+    /// inserts skipped the revalidation read via a matching stamp, and
+    /// how many fell through to the full re-derive. The committed
+    /// counter behind the no-op-insert cost claim.
+    #[cfg(test)]
+    stats: CacheStats,
+}
+
+/// Test-only fast-path accounting for [`VerifiedCache`].
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CacheStats {
+    stamp_hits: u64,
+    full_checks: u64,
 }
 
 impl VerifiedCache {
@@ -169,6 +183,22 @@ impl VerifiedCache {
         // The id may linger in `order`; popping it later is a no-op
         // removal and frees only its slot, so the bound still holds.
         self.stamps.remove(id);
+    }
+
+    /// Record whether an insert took the stamp fast path or the full
+    /// re-derive. Test builds only; production pays no counting branch.
+    #[cfg(test)]
+    fn record_check(&mut self, stamped: bool) {
+        if stamped {
+            self.stats.stamp_hits += 1;
+        } else {
+            self.stats.full_checks += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> CacheStats {
+        self.stats
     }
 }
 
@@ -445,6 +475,16 @@ impl FsObjectStore {
             verified.insert(*id, VerifiedStamp::of(meta));
         }
     }
+
+    /// Fast-path accounting for tests: `(stamp hits, full re-derives)`.
+    /// A poisoned lock reports zeros rather than failing the assertion.
+    #[cfg(test)]
+    fn cache_stats(&self) -> CacheStats {
+        self.verified
+            .lock()
+            .map(|cache| cache.stats())
+            .unwrap_or_default()
+    }
 }
 
 impl ObjectStore for FsObjectStore {
@@ -469,6 +509,12 @@ impl ObjectStore for FsObjectStore {
             Some(meta) => self.stamp_for(&id).is_some_and(|stamp| stamp.matches(meta)),
             None => false,
         };
+        // Test-only accounting for the committed cost claim: hits skip
+        // the revalidation read, full checks pay it.
+        #[cfg(test)]
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.record_check(stamped);
+        }
         let valid = stamped
             || path
                 .is_file()
@@ -995,6 +1041,31 @@ mod tests {
         assert_eq!(
             store.get(&id).unwrap().as_deref(),
             Some(b"pristine".as_slice())
+        );
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn noop_insert_counts_stamp_hits() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        store.insert(ObjectKind::Chunk, b"counted").unwrap();
+        // First insert publishes: one full check, no fast path.
+        assert_eq!(
+            store.cache_stats(),
+            CacheStats {
+                stamp_hits: 0,
+                full_checks: 1,
+            }
+        );
+        store.insert(ObjectKind::Chunk, b"counted").unwrap();
+        // Unchanged bytes: the stamp skips the revalidation read.
+        assert_eq!(
+            store.cache_stats(),
+            CacheStats {
+                stamp_hits: 1,
+                full_checks: 1,
+            }
         );
         remove_scratch(&dir);
     }

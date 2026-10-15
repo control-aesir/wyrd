@@ -14,7 +14,14 @@
 //! under the live name. `open` sweeps stale `.tmp` files left by crashed
 //! writers.
 //! Re-inserting identical content is a no-op when the live bytes still
-//! derive to the requested id, and heals them when they don't.
+//! derive to the requested id, and heals them when they don't. A bounded
+//! in-process map of length-plus-mtime stamps skips the revalidation read
+//! for objects this process already verified; any drift falls back to the
+//! full re-derive, and `get` retires a stamp when it observes corruption.
+//! The stamp assumes the filesystem reports mtime changes (coarse
+//! granularity weakens it): bitrot that leaves length and mtime untouched
+//! is invisible to it and is caught by the full re-derive (or by `get`,
+//! which fails closed and retires it).
 //!
 //! Trust and durability assumptions: the store directory is trusted —
 //! symlinks or foreign entries inside it are not defended against, and
@@ -989,6 +996,93 @@ mod tests {
             store.get(&id).unwrap().as_deref(),
             Some(b"pristine".as_slice())
         );
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn verified_cache_evicts_oldest_beyond_capacity() {
+        let stamp = VerifiedStamp {
+            len: 1,
+            modified: None,
+        };
+        let mut cache = VerifiedCache::default();
+        let first = ContentId::derive(ObjectKind::Chunk, b"first");
+        cache.insert(first, stamp);
+        let mut last = first;
+        for i in 0..VERIFIED_CAPACITY {
+            last = ContentId::derive(ObjectKind::Chunk, &i.to_le_bytes());
+            cache.insert(last, stamp);
+        }
+        // One over capacity: the oldest stamp is evicted so the map
+        // cannot grow with the object count; the newest is kept.
+        assert!(cache.get(&first).is_none());
+        assert_eq!(cache.get(&last), Some(stamp));
+    }
+
+    #[test]
+    fn verified_cache_remove_retires_id() {
+        let mut cache = VerifiedCache::default();
+        let id = ContentId::derive(ObjectKind::Chunk, b"retired");
+        cache.insert(
+            id,
+            VerifiedStamp {
+                len: 7,
+                modified: None,
+            },
+        );
+        cache.remove(&id);
+        assert!(cache.get(&id).is_none());
+    }
+
+    #[test]
+    fn verified_stamp_rejects_mtime_drift() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = scratch_dir();
+        let path = dir.join("stamped");
+        fs::write(&path, b"bytes").unwrap();
+        let earlier = UNIX_EPOCH + Duration::from_secs(1_000);
+        let later = UNIX_EPOCH + Duration::from_secs(2_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let stamp = VerifiedStamp::of(&meta);
+        assert!(stamp.matches(&meta));
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let drifted = fs::metadata(&path).unwrap();
+        assert!(!stamp.matches(&drifted));
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn verified_stamp_rejects_len_drift_and_missing_mtime() {
+        let dir = scratch_dir();
+        let path = dir.join("stamped");
+        fs::write(&path, b"bytes").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let len = meta.len();
+        let modified = meta.modified().unwrap();
+        // Same mtime, different length: not the verified file.
+        assert!(!VerifiedStamp {
+            len: len + 1,
+            modified: Some(modified)
+        }
+        .matches(&meta));
+        // No recorded mtime: the signal is not trusted, even at the
+        // right length.
+        assert!(!VerifiedStamp {
+            len,
+            modified: None
+        }
+        .matches(&meta));
         remove_scratch(&dir);
     }
 

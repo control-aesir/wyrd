@@ -462,8 +462,9 @@ fi # want_phase 10
 # the scratch write has localized the trees it needs): the export
 # below fails closed on remote-only content, so without that delete
 # this phase dies at the member export. Correct product behavior,
-# coupled phases. (Prefix closure guarantees the dependency: phase 11
-# never runs without phase 9.)
+# coupled phases. (Prefix closure guarantees the dependencies: phase
+# 11 never runs without phase 9, and the member's `shared.txt` is
+# the wave-2 overwrite of phase 7.)
 if want_phase 11; then
 echo "=== microvm 11: offline reopen (+$((SECONDS - HOST_T0))s) ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
@@ -493,6 +494,12 @@ as_guest "$WYRD_BIN" export \
 # on this path is the overwrite, not the wave-1 original.
 [[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-2" ]] \
   || die "member export lost the cross-host write"
+# Wave 2's created files survive the restart too, not just the
+# overwrite: same export, same durability proof, one line each.
+[[ "$(cat "$RUN/export-member/wave2-a.txt")" == "wave2-a-bytes" ]] \
+  || die "member export lost wave2-a.txt"
+[[ "$(cat "$RUN/export-member/wave2-dir/wave2-b.txt")" == "wave2-b-bytes" ]] \
+  || die "member export lost wave2-dir/wave2-b.txt"
 # The fetch phase pulled cold-2.txt over the network; the export
 # proves the verified remote object survives process death.
 [[ "$(cat "$RUN/export-member/cold-2.txt")" == "cold-bytes" ]] \

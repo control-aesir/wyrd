@@ -295,6 +295,33 @@ RUMORS="$( { printf '%s' "$REQ9501" | timeout 30 "$NAK_BIN" req "$RELAY_URL" \
 [[ "$nak_status" != 124 ]] || die "9501 query timed out: leak check inconclusive (see logs/nak-9501.err)"
 [[ -z "$RUMORS" ]] || die "relay carries a bare kind-9501 rumor: control leaked in cleartext (see logs/nak-9501.err)"
 pass "relay carries no cleartext control rumors"
+# Wave 2 (sync-convergence issue): the embedded consumer converges
+# without mounting. The owner writes a second wave through FUSE and
+# stays up serving; the member fetches it headless and reads the
+# converged state mount-free (`snapshot list`: heads with tree
+# hashes, no timestamps, so the host diff is exact). Identical
+# live heads mean identical manifests, hence identical bytes by
+# CAS. Placed after the opacity checks so wave-2 control traffic
+# cannot push the relay sample past the queries' limit headroom.
+rm -f "$RUN/owner-w2-written" "$RUN/member-w2-done" "$RUN"/wave2-*.txt
+on_n "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh converge2-member $GMD $GMC $RELAY_URL" \
+  >"$RUN/logs/leg-member-w2.out" 2>&1 &
+LEG_N=$!
+on_o "E2E_ENV_FILE=$GUEST_ENV bash $GUEST_TESTS/alpha-microvm-legs.sh converge2-owner $OD $OC $RELAY_URL" \
+  >"$RUN/logs/leg-owner-w2.out" 2>&1 &
+LEG_O=$!
+# Both statuses captured (review F3): the member-first wait would
+# otherwise report the member's exhausted retry loop while the
+# owner's real failure sits unmentioned in its own log. Name both
+# logs in the one die that fires.
+n_rc=0; o_rc=0
+wait "$LEG_N" || n_rc=$?
+wait "$LEG_O" || o_rc=$?
+[[ "$n_rc" == 0 ]] || die "member wave-2 leg failed (see logs/leg-member-w2.out; owner status $o_rc, see logs/leg-owner-w2.out)"
+[[ "$o_rc" == 0 ]] || die "owner wave-2 leg failed (see logs/leg-owner-w2.out)"
+diff "$RUN/wave2-owner-list.txt" "$RUN/wave2-member-list.txt" \
+  || die "embedded and FUSE views diverge on live heads (see wave2-*-list.txt)"
+pass "embedded consumer converges on identical live heads"
 fi # want_phase 7
 
 # --- phase 4: serving restart -------------------------------------------
@@ -435,8 +462,9 @@ fi # want_phase 10
 # the scratch write has localized the trees it needs): the export
 # below fails closed on remote-only content, so without that delete
 # this phase dies at the member export. Correct product behavior,
-# coupled phases. (Prefix closure guarantees the dependency: phase 11
-# never runs without phase 9.)
+# coupled phases. (Prefix closure guarantees the dependencies: phase
+# 11 never runs without phase 9, and the member's `shared.txt` is
+# the wave-2 overwrite of phase 7.)
 if want_phase 11; then
 echo "=== microvm 11: offline reopen (+$((SECONDS - HOST_T0))s) ==="
 as_guest "$WYRD_BIN" device --identity-file "$MC/identity" --passphrase-file "$MC/passphrase" \
@@ -461,8 +489,17 @@ as_guest "$WYRD_BIN" export \
   || die "member drive does not export after reopen"
 [[ "$(cat "$RUN/export-owner/after-restart.txt")" == "after-restart" ]] \
   || die "owner export lost the post-restart write"
-[[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-1" ]] \
+# Wave 2 (phase 7) overwrote shared.txt with owner-write-2 and the
+# host diffed identical live heads: the surviving cross-host write
+# on this path is the overwrite, not the wave-1 original.
+[[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-2" ]] \
   || die "member export lost the cross-host write"
+# Wave 2's created files survive the restart too, not just the
+# overwrite: same export, same durability proof, one line each.
+[[ "$(cat "$RUN/export-member/wave2-a.txt")" == "wave2-a-bytes" ]] \
+  || die "member export lost wave2-a.txt"
+[[ "$(cat "$RUN/export-member/wave2-dir/wave2-b.txt")" == "wave2-b-bytes" ]] \
+  || die "member export lost wave2-dir/wave2-b.txt"
 # The fetch phase pulled cold-2.txt over the network; the export
 # proves the verified remote object survives process death.
 [[ "$(cat "$RUN/export-member/cold-2.txt")" == "cold-bytes" ]] \

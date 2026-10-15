@@ -1,3 +1,5 @@
+//! Cross-cutting fixtures for the sync contracts: the serving-backend
+//! composer and the epoch-3 rotation helper.
 use crate::support::{signed_transition, Rig};
 use wyrd_daemon::core::RuntimeMaterialization;
 use wyrd_daemon::fuse::FuseBackend;

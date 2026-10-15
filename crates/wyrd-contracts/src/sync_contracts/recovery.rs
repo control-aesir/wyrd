@@ -1,3 +1,4 @@
+//! Conflicted drives, grafting, and owner-proof contracts.
 use super::harness::serving_backend;
 use crate::support::{
     device, drive, scratch_dir, seal_flat_drive, sealed_envelope, sign_snapshot, sign_transition,

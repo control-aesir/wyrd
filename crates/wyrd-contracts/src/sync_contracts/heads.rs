@@ -1,3 +1,4 @@
+//! Verified-head classification and mounting contracts.
 use super::harness::serving_backend;
 use crate::support::{
     drive, mount_heads, seal_flat_drive, signed_snapshot, AnnouncedRoots, Loaded, Relay,

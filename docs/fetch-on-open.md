@@ -346,7 +346,7 @@ what retries:
   as known; intake neither commits unverified bytes nor poisons the
   chain. Pinned end to end by
   `body_never_arriving_leaves_the_snapshot_unadopted_and_paths_enoent`
-  in `crates/wyrd-contracts/src/sync_contracts.rs` (recorded but not
+  in `crates/wyrd-contracts/src/sync_contracts/recovery.rs` (recorded but not
   live, paths `ENOENT`, child classifies
   `Classification::Pending(Pendency::UnknownParent)`,
   and the stall heals cleanly once the bytes arrive).

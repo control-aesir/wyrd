@@ -1,3 +1,4 @@
+//! Deferred delivery and bulk-ceiling contracts.
 use super::harness::epoch3_child;
 use crate::support::{Loaded, Rig};
 use wyrd_format::{FetchStatus, SnapshotId, StorageId};

@@ -1,3 +1,4 @@
+//! Publication, carry, manifest closure, and bootstrap contracts.
 use super::harness::{epoch3_child, serving_backend};
 use crate::support::{drive, scratch_dir, sealed_envelope, Relay, Rig};
 use wyrd_daemon::core::{LiveConfig, RuntimeMaterialization, WyrdNode};

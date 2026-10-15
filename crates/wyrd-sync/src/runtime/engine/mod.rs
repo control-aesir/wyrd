@@ -2619,6 +2619,8 @@ mod tests_authoring;
 #[cfg(test)]
 mod tests_convergence;
 #[cfg(test)]
+mod tests_crash;
+#[cfg(test)]
 mod tests_delivery;
 #[cfg(test)]
 mod tests_drain;
@@ -2633,9 +2635,13 @@ mod tests_lifecycle;
 #[cfg(test)]
 mod tests_materialization;
 #[cfg(test)]
+mod tests_preframing;
+#[cfg(test)]
 mod tests_properties;
 #[cfg(test)]
 mod tests_reconciliation;
+#[cfg(test)]
+mod tests_registration;
 #[cfg(test)]
 mod tests_reopen_agreement;
 #[cfg(test)]
@@ -2644,5 +2650,7 @@ mod tests_response;
 mod tests_restart_equivalence;
 #[cfg(test)]
 mod tests_serving;
+#[cfg(test)]
+mod tests_stale_obligations;
 #[cfg(test)]
 mod tests_terminal;

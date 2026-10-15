@@ -557,6 +557,22 @@ version say exactly what changed.
   of allocating a `Vec<u8>` per call, so canonicalizing a manifest and
   verifying its sortedness no longer allocate. The key order is
   untouched.
+- Sync and mailbox test suites split by topic
+  (`nostr:nevent1qqsgjnygyl3wqz8ujfwvwvervlet4sn6e5kn0f4kwmvps63jeeev7hcpz9mhxue69uhkwunpwdczuap49eehg9ccgw9`):
+  the six oversized suites are split along their existing clusters —
+  `engine/tests_delivery.rs` into delivery, stale obligations,
+  registration, preframing, and crash stages (shared plant fixtures
+  into `tests_harness.rs`); `plan/tests_execution.rs` into convergence
+  and bounded execution; `author/tests_admission.rs` into admission,
+  reissue, epoch rotation, fill, and admission failures
+  (`mint_bare_chain`/`bare_tree`/`relay_catch_up` into
+  `tests_harness.rs`); the fetch strike/cooldown cluster into the
+  existing `tests_attempts.rs`; `durable/tests.rs` into lifecycle,
+  corruption, rebuild, capability, outbox, rotation, reconciliation,
+  and permissions (shared fixtures into a new `tests_harness.rs`); and
+  `mailbox/tests_delivery.rs` into delivery, outage, and shutdown.
+  Pure move: no test renamed, no assertion edited, and the nextest
+  test-name set is identical before and after.
 - Sync contracts split by theme
   (`nostr:nevent1qqsvq5j5lmgvgzy7x4ay22zmcj4hc530u09eyardhzvs2qd8sjagwdcpz9mhxue69uhkwunpwdczuap49eehgmqylse`):
   `wyrd-contracts`' 3,096-line `sync_contracts.rs` is now a

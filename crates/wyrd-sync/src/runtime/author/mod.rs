@@ -34,7 +34,13 @@ mod snapshot;
 #[cfg(test)]
 mod tests_admission;
 #[cfg(test)]
+mod tests_admission_failures;
+#[cfg(test)]
 mod tests_carry;
+#[cfg(test)]
+mod tests_epoch;
+#[cfg(test)]
+mod tests_fill;
 #[cfg(test)]
 mod tests_harness;
 #[cfg(test)]
@@ -45,6 +51,8 @@ mod tests_merge;
 mod tests_reader;
 #[cfg(test)]
 mod tests_recover;
+#[cfg(test)]
+mod tests_reissue;
 #[cfg(test)]
 mod tests_removal;
 #[cfg(test)]

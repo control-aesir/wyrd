@@ -562,6 +562,15 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI sync family extracted from `main.rs`
+  (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
+  phase 3): `sync` / `sync_now` with `SyncRunReport`, the pass cap and
+  settle constants, the stopping-verdict helpers, and the status/now
+  renderers move to `cli/src/commands/sync.rs`. `SyncRunReport` fields
+  (plus `accumulate`) are `pub(crate)` for the untouched `tests_sync`
+  tree. Pure move: no dispatch, lifecycle, exit-code, ordering, or
+  error-path change, and the full `--help` tree plus error paths are
+  byte-identical before and after.
 - CLI small command families extracted from `main.rs`
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   phase 2): `mount`, `export` (with the shared offline policy-node

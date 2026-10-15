@@ -26,11 +26,13 @@
 //! `has` is the trait's cheap existence check only — readability and
 //! validity are proven by `get`, never by `has`.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use thiserror::Error;
 
 use crate::durable::{Durability, PublishError};
@@ -116,6 +118,76 @@ pub struct FsObjectStore {
     /// is configured, which is the default: counting is only worth its
     /// per-write branch when something reads the number.
     retained: Option<Arc<RetainedBytes>>,
+    /// Live file stamps (length + mtime) for objects this process has
+    /// already verified, so a repeated no-op insert of an unchanged
+    /// object pays a `stat` instead of a full read and re-hash. Shared
+    /// across clones; entries are retired when `get` observes corruption
+    /// under the live name. Bitrot that leaves length and mtime
+    /// untouched is invisible to this signal alone and is caught by the
+    /// full re-derive whenever the stamp is absent or stale.
+    verified: Arc<Mutex<VerifiedCache>>,
+}
+
+/// The number of verified stamps held at once. Bounded so a long-lived
+/// process over a large store cannot grow the map with the object
+/// count; eviction costs nothing but a later full re-derive.
+const VERIFIED_CAPACITY: usize = 4096;
+
+/// FIFO-bounded map of verified stamps. Eviction order is insertion
+/// order, which is all the fast path needs: a dropped stamp only means
+/// the next insert re-derives, never that a stale stamp is trusted.
+#[derive(Debug, Default)]
+struct VerifiedCache {
+    stamps: HashMap<ContentId, VerifiedStamp>,
+    order: VecDeque<ContentId>,
+}
+
+impl VerifiedCache {
+    fn get(&self, id: &ContentId) -> Option<VerifiedStamp> {
+        self.stamps.get(id).copied()
+    }
+
+    fn insert(&mut self, id: ContentId, stamp: VerifiedStamp) {
+        if self.stamps.insert(id, stamp).is_none() {
+            self.order.push_back(id);
+            if self.order.len() > VERIFIED_CAPACITY {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.stamps.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &ContentId) {
+        // The id may linger in `order`; popping it later is a no-op
+        // removal and frees only its slot, so the bound still holds.
+        self.stamps.remove(id);
+    }
+}
+
+/// The cheap integrity signal for a verified live object: its byte
+/// length and modification time at the moment it was last proven to
+/// derive to its address. A change in either (a rewrite, a truncation, a
+/// replaced file) invalidates it and forces a full re-derive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl VerifiedStamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+
+    /// Whether `meta` matches this stamp. A missing mtime on either side
+    /// never matches: without one the signal is not trusted.
+    fn matches(&self, meta: &fs::Metadata) -> bool {
+        self.modified.is_some() && self.len == meta.len() && self.modified == meta.modified().ok()
+    }
 }
 
 /// All envelope kind bytes: `get`/`has` take an id without a kind, so
@@ -155,6 +227,7 @@ impl FsObjectStore {
             dir,
             durability: Arc::new(Durability::new()),
             retained,
+            verified: Arc::new(Mutex::new(VerifiedCache::default())),
         };
         fs::create_dir_all(store.objects_dir()).map_err(FsStoreError::io)?;
         // One traversal either way; the total is asked for only when an
@@ -343,6 +416,28 @@ impl FsObjectStore {
         let nonce = NEXT_TEMP.fetch_add(1, Ordering::SeqCst);
         path.with_extension(format!("{}-{}.tmp", std::process::id(), nonce))
     }
+
+    /// The remembered stamp for `id`, if any. A poisoned lock disables
+    /// the fast path (returns `None`) rather than failing the insert.
+    fn stamp_for(&self, id: &ContentId) -> Option<VerifiedStamp> {
+        self.verified.lock().ok()?.get(id)
+    }
+
+    /// Retire the stamp for `id` when its live bytes were observed not to
+    /// derive to the address, so the next insert re-derives and heals.
+    fn forget(&self, id: &ContentId) {
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.remove(id);
+        }
+    }
+
+    /// Record that `id`'s live file matched `meta`. A poisoned lock drops
+    /// the update: the next insert simply re-derives as before.
+    fn remember(&self, id: &ContentId, meta: &fs::Metadata) {
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.insert(*id, VerifiedStamp::of(meta));
+        }
+    }
 }
 
 impl ObjectStore for FsObjectStore {
@@ -356,12 +451,23 @@ impl ObjectStore for FsObjectStore {
         let path = self.path_for(kind, &id);
         // A present file is a no-op only when it still derives to the
         // requested id: bitrot under the live name heals here instead of
-        // succeeding while `get` keeps failing closed.
-        let valid = path
-            .is_file()
-            .then(|| fs::read(&path))
-            .and_then(Result::ok)
-            .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
+        // succeeding while `get` keeps failing closed. The stamp check is
+        // a fast path over that rule: an object this process already
+        // verified at the same length and mtime cannot have been replaced
+        // or rewritten since, so the read and re-hash are skipped. Any
+        // drift (or a retired stamp) falls through to the full re-derive,
+        // which still heals.
+        let meta = fs::metadata(&path).ok().filter(fs::Metadata::is_file);
+        let stamped = match meta.as_ref() {
+            Some(meta) => self.stamp_for(&id).is_some_and(|stamp| stamp.matches(meta)),
+            None => false,
+        };
+        let valid = stamped
+            || path
+                .is_file()
+                .then(|| fs::read(&path))
+                .and_then(Result::ok)
+                .is_some_and(|bytes| ContentId::derive(kind, &bytes) == id);
         if !valid {
             self.atomic_write(&path, data)?;
             // Only a real publication retains bytes. A rewrite of a
@@ -378,6 +484,12 @@ impl ObjectStore for FsObjectStore {
             if let Some(retained) = &self.retained {
                 retained.add(data.len() as u64);
             }
+            // The bytes we just published are the live ones: stamp the
+            // post-write file so the next insert of the same content
+            // skips the read.
+            if let Ok(meta) = fs::metadata(&path) {
+                self.remember(&id, &meta);
+            }
         } else {
             // The object exists, but a prior publication (possibly before
             // a restart) may have installed it without a successful
@@ -386,6 +498,13 @@ impl ObjectStore for FsObjectStore {
             self.durability
                 .verify_dir(path.parent().expect("object paths have parents"))
                 .map_err(FsStoreError::io)?;
+            // The stamp is the stat taken before the read: if the file
+            // had already changed between that stat and the read, the
+            // stamp is stale and simply fails to match on the next
+            // insert, which then re-derives.
+            if let Some(meta) = meta.as_ref() {
+                self.remember(&id, meta);
+            }
         }
         Ok(id)
     }
@@ -408,12 +527,26 @@ impl ObjectStore for FsObjectStore {
         let Some((kind, path)) = self.find(id) else {
             return Ok(None);
         };
+        // Stat before the read: the stamp we remember on success must
+        // describe the file as read. A change between stat and read
+        // leaves the stamp stale, so it fails to match next time.
+        let meta = fs::metadata(&path).ok();
         let bytes = fs::read(&path).map_err(FsStoreError::io)?;
         // The scrub invariant: stored bytes always hash back to their
         // address. Bitrot under the live name fails closed here, never
         // served to a caller.
         if ContentId::derive(kind, &bytes) != *id {
+            // Observing corruption retires the fast-path stamp: a rewrite
+            // that keeps length and mtime must not be trusted on the next
+            // insert just because the cheap signal still matches.
+            self.forget(id);
             return Err(FsStoreError::Corrupt);
+        }
+        // A verified read is a verification: remember the stamp so a
+        // following insert of the same content skips the read and
+        // re-derive.
+        if let Some(meta) = meta.as_ref() {
+            self.remember(id, meta);
         }
         Ok(Some(bytes))
     }
@@ -453,6 +586,10 @@ impl DiscardRejectedRepresentation for FsObjectStore {
         if ContentId::derive(kind, &bytes) == *id {
             return Ok(DiscardOutcome::NowValid);
         }
+        // The live name was observed not to derive to `id`: retire any
+        // fast-path stamp so a later insert re-derives and heals rather
+        // than trusting a matching length/mtime.
+        self.forget(id);
         let len = bytes.len() as u64;
         match fs::remove_file(&path) {
             Ok(()) => Ok(DiscardOutcome::Discarded(len)),
@@ -817,6 +954,36 @@ mod tests {
         assert!(store.get(&id).is_err());
         // Re-inserting the original bytes restores the scrub invariant
         // instead of succeeding over corrupt bytes.
+        assert_eq!(store.insert(ObjectKind::Chunk, b"pristine").unwrap(), id);
+        assert_eq!(
+            store.get(&id).unwrap().as_deref(),
+            Some(b"pristine".as_slice())
+        );
+        remove_scratch(&dir);
+    }
+
+    #[test]
+    fn silent_corruption_heals_on_insert_after_get() {
+        let dir = scratch_dir();
+        let mut store = FsObjectStore::open(dir.clone()).unwrap();
+        let id = store.insert(ObjectKind::Chunk, b"pristine").unwrap();
+        let path = store.path_for(ObjectKind::Chunk, &id);
+        let pristine = fs::metadata(&path).unwrap();
+        fs::write(&path, b"tampered").unwrap();
+        // Restore the mtime so the cheap signal still matches: length
+        // and mtime alone cannot see this corruption.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(pristine.modified().unwrap())
+            .unwrap();
+        let disguised = fs::metadata(&path).unwrap();
+        assert_eq!(disguised.len(), pristine.len());
+        assert_eq!(disguised.modified().unwrap(), pristine.modified().unwrap());
+        // `get` still fails closed, and retires the stamp so the next
+        // insert re-derives and heals instead of trusting it.
+        assert!(store.get(&id).is_err());
         assert_eq!(store.insert(ObjectKind::Chunk, b"pristine").unwrap(), id);
         assert_eq!(
             store.get(&id).unwrap().as_deref(),

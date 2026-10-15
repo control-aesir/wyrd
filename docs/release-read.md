@@ -33,10 +33,9 @@ Consequences, accepted up front:
 Two things, both public: the release metadata (`PublicRelease`:
 `version ‖ drive ‖ maintainer ‖ genesis ‖ epoch-1 secret`, 129 bytes)
 and signed-but-unsealed snapshot announcements (the ordinary
-`SnapshotAnnouncement` encoding, published in the clear — members keep
-receiving announcements through the sealed control-plane envelopes; the
-public posting is an additional cleartext publication of the same
-signed statement, never a claim that announcements are never sealed). The reader
+`SnapshotAnnouncement` encoding, published in the clear as an additional
+distribution of the same signed statement; members continue to receive
+announcements through the sealed control-plane envelopes). The reader
 holds no identity, no mailbox, no membership log, and no capability —
 by construction the module imports none of those surfaces.
 
@@ -46,6 +45,10 @@ by construction the module imports none of those surfaces.
 maintainer's announcement signature, the snapshot id, the body's scope,
 and the body's own signature — in that order, so scope violations
 report as scope violations even when the signature would also fail.
+Through the fetch path the id match subsumes the scope fields (the
+snapshot id hashes author, membership, and epoch), so a fetched
+out-of-scope body reports `SnapshotMismatch` first and `BodyOutsideScope`
+is the backstop for bodies arriving by any other route.
 Every violation fails closed (`NotMaintainer`, `NotGenesis`,
 `WrongEpoch`, ...); there is no fallback to membership replay,
 capability installation, or a more permissive mode. Public readability

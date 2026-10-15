@@ -6,3 +6,4 @@ pub(crate) mod export;
 pub(crate) mod mount;
 pub(crate) mod pin;
 pub(crate) mod role;
+pub(crate) mod sync;

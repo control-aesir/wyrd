@@ -3,8 +3,9 @@
 //! drained, epoch key installed, self capability committed) so every
 //! authoring test starts from the production shape one transition in.
 
+use super::admission::ADMISSION_OBLIGATION_BATCH;
 use crate::control::seal;
-use crate::durable::{AuthorizedCapability, Fact};
+use crate::durable::{AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, Fact};
 use crate::keys::capability::Capability;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
@@ -196,4 +197,94 @@ pub(super) fn frozen_engine(
         );
     }
     (dir, engine, owner_id, genesis, winner_id, rival_id)
+}
+
+/// Mint a bare signed snapshot chain straight onto the store: one
+/// Schnorr signature per link, no content, no manifests, no
+/// announcements. The admission walk needs recorded bodies under a
+/// live tip, and classification needs only signature plus membership
+/// binding plus epoch match — so contentless links exercise the true
+/// closure path at ceiling scale without tens of thousands of full
+/// authorings. Bodies commit in bounded chunks (the setup dogfoods
+/// the bound the fill relies on). Returns every link id in chain
+/// order, tip last.
+pub(super) fn mint_bare_chain(
+    engine: &mut Engine,
+    genesis_id: wyrd_format::TransitionId,
+    tree: wyrd_format::ContentId,
+    len: usize,
+) -> Vec<wyrd_format::SnapshotId> {
+    use crate::authorization::test_util::sign_snapshot;
+    use crate::membership::test_util::{drive as member_drive, key};
+
+    let (owner_sk, owner_id) = key(10);
+    let drive = member_drive();
+    let mut parents = Vec::new();
+    let mut ids = Vec::with_capacity(len);
+    let mut batch = Vec::new();
+    for n in 0..len {
+        let mut body =
+            wyrd_format::Snapshot::new(parents, tree, owner_id, genesis_id, 1, 0, n as u64)
+                .unwrap();
+        sign_snapshot(&mut body, &owner_sk, &drive);
+        let authorized = AuthorizedSnapshot::authorize(body, &drive).unwrap();
+        let id = authorized.snapshot().snapshot_id();
+        parents = vec![id];
+        ids.push(id);
+        batch.push(Fact::SnapshotBody(authorized));
+        if batch.len() == ADMISSION_OBLIGATION_BATCH {
+            engine.commit_facts(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        engine.commit_facts(&batch).unwrap();
+    }
+    ids
+}
+
+/// One shared content root for bare chains: the closure walk and
+/// classification never resolve the tree, so every link reuses it.
+pub(super) fn bare_tree(objects: &mut wyrd_format::MemoryObjectStore) -> wyrd_format::ContentId {
+    use wyrd_format::{Entry, ObjectKind, ObjectStore, Tree};
+
+    let chunk = objects.insert(ObjectKind::Chunk, b"bare").unwrap();
+    Tree::from_entries(vec![Entry::file("bare.txt", 4, false, vec![chunk]).unwrap()])
+        .unwrap()
+        .insert_into(objects)
+        .unwrap()
+}
+
+/// Drive one newcomer's membership catch-up over the relay: the
+/// owner sends transitions and capabilities (`deliver_pending`) plus
+/// announcements (`announce_pending`), the newcomer drains until
+/// quiet (at most four rounds cover the key-install two-pass shape
+/// plus redelivery). Returns nothing; tests assert on durable
+/// state afterwards.
+pub(super) fn relay_catch_up(
+    engine: &mut Engine,
+    joined: &mut Engine,
+    relay: &mut MemoryRelay,
+    newcomer_id: wyrd_format::DeviceId,
+) {
+    for _ in 0..4 {
+        {
+            let mut sender = MemoryMailbox {
+                relay: &mut *relay,
+                owner: engine.device(),
+            };
+            engine.deliver_pending(&mut sender).unwrap();
+            engine.announce_pending(&mut sender, None).unwrap();
+        }
+        let report = {
+            let mut receiver = MemoryMailbox {
+                relay: &mut *relay,
+                owner: newcomer_id,
+            };
+            joined.drain(&mut receiver).unwrap()
+        };
+        if report.accepted == 0 {
+            break;
+        }
+    }
 }

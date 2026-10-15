@@ -216,7 +216,11 @@ mod tests_mailbox;
 #[cfg(test)]
 mod tests_multirelay;
 #[cfg(test)]
+mod tests_outage;
+#[cfg(test)]
 mod tests_poison;
+#[cfg(test)]
+mod tests_shutdown;
 #[cfg(test)]
 mod tests_signer_boundary;
 

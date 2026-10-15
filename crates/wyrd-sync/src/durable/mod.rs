@@ -109,7 +109,23 @@ mod reconciliation;
 mod replay;
 mod store;
 #[cfg(test)]
-mod tests;
+mod tests_capability;
+#[cfg(test)]
+mod tests_corruption;
+#[cfg(test)]
+mod tests_harness;
+#[cfg(test)]
+mod tests_lifecycle;
+#[cfg(test)]
+mod tests_outbox;
+#[cfg(test)]
+mod tests_permissions;
+#[cfg(test)]
+mod tests_rebuild;
+#[cfg(test)]
+mod tests_reconciliation;
+#[cfg(test)]
+mod tests_rotation;
 
 pub use reconciliation::{
     reconciliation_statement_digest, ReconciliationError, ReconciliationEvidence,

@@ -658,4 +658,40 @@ mod tests {
             m
         );
     }
+
+    #[test]
+    fn same_content_and_kind_may_map_several_versions_canonically() {
+        // The version is the third sort-key component: identical content
+        // and kind at two versions coexist in ascending version order,
+        // and the descending order is non-canonical. Pins the version
+        // component the kind test above does not vary.
+        let mut v0 = entry(0x01, 1);
+        let mut v1 = entry(0x01, 2);
+        v0.version = 0x00;
+        v1.version = 0x01;
+        // new() sorts, so hand it the descending pair on purpose.
+        let m =
+            Manifest::new(SnapshotId::from_bytes([0x77; 32]), vec![v1, v0], Vec::new()).unwrap();
+        assert_eq!(m.entries()[0].version, 0x00);
+        assert_eq!(m.entries()[1].version, 0x01);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
+            m
+        );
+
+        // Swapping the two encoded entries yields a descending payload,
+        // which decode refuses as non-canonical.
+        let bytes = m.canonical_bytes();
+        let header = 32 + 4;
+        let first = &bytes[header..header + ENTRY_LEN];
+        let second = &bytes[header + ENTRY_LEN..header + 2 * ENTRY_LEN];
+        let mut swapped = bytes[..header].to_vec();
+        swapped.extend_from_slice(second);
+        swapped.extend_from_slice(first);
+        swapped.extend_from_slice(&bytes[header + 2 * ENTRY_LEN..]);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&swapped),
+            Err(ManifestError::UnsortedEntries)
+        );
+    }
 }

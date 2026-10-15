@@ -694,4 +694,35 @@ mod tests {
             Err(ManifestError::UnsortedEntries)
         );
     }
+
+    #[test]
+    fn manifest_sort_key_orders_kind_before_version() {
+        // The key is (content_id, kind, version): kind outranks version,
+        // so the same content as Chunk at version 1 sorts before Tree at
+        // version 0. The version test above holds kind constant and the
+        // kind test holds version constant, so this pair is what
+        // distinguishes the key from a (content_id, version, kind)
+        // permutation.
+        let mut chunk_v1 = entry(0x01, 1);
+        let mut tree_v0 = entry(0x01, 2);
+        chunk_v1.kind = ObjectKind::Chunk;
+        chunk_v1.version = 0x01;
+        tree_v0.kind = ObjectKind::Tree;
+        tree_v0.version = 0x00;
+        // new() sorts, so hand it the descending pair on purpose.
+        let m = Manifest::new(
+            SnapshotId::from_bytes([0x77; 32]),
+            vec![tree_v0, chunk_v1],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(m.entries()[0].kind, ObjectKind::Chunk);
+        assert_eq!(m.entries()[0].version, 0x01);
+        assert_eq!(m.entries()[1].kind, ObjectKind::Tree);
+        assert_eq!(m.entries()[1].version, 0x00);
+        assert_eq!(
+            Manifest::from_canonical_bytes(&m.canonical_bytes()).unwrap(),
+            m
+        );
+    }
 }

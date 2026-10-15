@@ -549,7 +549,8 @@ version say exactly what changed.
   the mount-free view's per-component path walk uses it in place of a
   linear `iter().find`. A lookup on an N-entry directory drops from O(N)
   to O(log N) per component; the comparator is the construction sort, so
-  it can never disagree with a scan. No format or public-API change.
+  it can never disagree with a scan. `Tree::get` is additive; no format
+  or canonicalization change.
 - Sync contracts split by theme
   (`nostr:nevent1qqsvq5j5lmgvgzy7x4ay22zmcj4hc530u09eyardhzvs2qd8sjagwdcpz9mhxue69uhkwunpwdczuap49eehgmqylse`):
   `wyrd-contracts`' 3,096-line `sync_contracts.rs` is now a

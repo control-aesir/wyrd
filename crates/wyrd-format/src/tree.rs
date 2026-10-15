@@ -452,28 +452,56 @@ mod tests {
             .collect();
         // Input order must not matter: from_entries canonicalizes first,
         // and get must track that canonical order for every rotation.
+        // Check both the constructed tree and a decode round-trip, since
+        // the view resolves the decode-produced path.
         for rotation in [0usize, 1, 7] {
             let mut ordered = entries.clone();
             let len = ordered.len();
             ordered.rotate_left(rotation % len);
             let tree = Tree::from_entries(ordered).unwrap();
-            for name in names {
-                let component = Component::new(name).unwrap();
-                let linear = tree
-                    .entries()
-                    .iter()
-                    .find(|entry| entry.name.as_str() == name);
-                assert_eq!(tree.get(&component), linear, "present name {name:?}");
-            }
-            for missing in ["A", "aa", "b0", "zzz", "ünïcodf"] {
-                let component = Component::new(missing).unwrap();
-                assert!(tree.get(&component).is_none(), "absent name {missing:?}");
+            let decoded = Tree::decode(&tree.encode()).unwrap();
+            for candidate in [&tree, &decoded] {
+                for name in names {
+                    let component = Component::new(name).unwrap();
+                    let linear = tree
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.name.as_str() == name);
+                    assert_eq!(candidate.get(&component), linear, "present name {name:?}");
+                }
+                for missing in ["A", "aa", "b0", "zzz", "ünïcodf"] {
+                    let component = Component::new(missing).unwrap();
+                    assert!(
+                        candidate.get(&component).is_none(),
+                        "absent name {missing:?}"
+                    );
+                }
             }
         }
         // An empty tree resolves no name.
         assert!(Tree::empty()
             .get(&Component::new("anything").unwrap())
             .is_none());
+    }
+
+    #[test]
+    fn get_resolves_large_canonical_directories() {
+        // Not a timing assertion: 10k entries is past the point where a
+        // linear scan is obviously wrong, and pins that present names
+        // still resolve and absent ones do not at scale.
+        let entries: Vec<Entry> = (0..10_000)
+            .map(|i| file_entry(&format!("file-{i:05}"), i as u64, false))
+            .collect();
+        let tree = Tree::from_entries(entries).unwrap();
+        for i in [0usize, 1, 9, 4_999, 9_998, 9_999] {
+            let name = format!("file-{i:05}");
+            let entry = tree
+                .get(&Component::new(&name).unwrap())
+                .expect("present at scale");
+            assert_eq!(entry.name.as_str(), name.as_str());
+        }
+        assert!(tree.get(&Component::new("file-10000").unwrap()).is_none());
+        assert!(tree.get(&Component::new("file-0000x").unwrap()).is_none());
     }
 
     #[test]

@@ -542,6 +542,16 @@ version say exactly what changed.
 
 ### Changed
 
+- Sync contracts split by theme
+  (`nostr:nevent1qqsvq5j5lmgvgzy7x4ay22zmcj4hc530u09eyardhzvs2qd8sjagwdcpz9mhxue69uhkwunpwdczuap49eehgmqylse`):
+  `wyrd-contracts`' 3,096-line `sync_contracts.rs` is now a
+  `sync_contracts/` directory: `heads.rs` (verified-head classification
+  and mounting), `write_path.rs` (publication, carry, and closure),
+  `queue_pressure.rs` (deferred delivery and bulk ceilings), and
+  `recovery.rs` (conflicted drives, grafting, and owner proofs), with the
+  cross-cutting `serving_backend`/`epoch3_child` fixtures in
+  `harness.rs`. Pure move: contract names and count unchanged, shared
+  `support` rig use unchanged.
 - View and backend test suites split by topic
   (`nostr:nevent1qqs9ntumnt0l5fcycq7vxct2m2947j28a4mdmxslg359llprkchdccspz9mhxue69uhkwunpwdczuap49eehg0yykgn`):
   `wyrd-fuse`'s `view/tests.rs` is now `tests_harness.rs` (fixtures only)

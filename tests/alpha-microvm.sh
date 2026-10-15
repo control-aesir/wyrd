@@ -488,7 +488,10 @@ as_guest "$WYRD_BIN" export \
   || die "member drive does not export after reopen"
 [[ "$(cat "$RUN/export-owner/after-restart.txt")" == "after-restart" ]] \
   || die "owner export lost the post-restart write"
-[[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-1" ]] \
+# Wave 2 (phase 7) overwrote shared.txt with owner-write-2 and the
+# host diffed identical live heads: the surviving cross-host write
+# on this path is the overwrite, not the wave-1 original.
+[[ "$(cat "$RUN/export-member/shared.txt")" == "owner-write-2" ]] \
   || die "member export lost the cross-host write"
 # The fetch phase pulled cold-2.txt over the network; the export
 # proves the verified remote object survives process death.

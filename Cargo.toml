@@ -9,6 +9,7 @@ members = [
     "crates/wyrd-daemon",
     "crates/wyrd-cli",
     "crates/wyrd-contracts",
+    "crates/wyrd-embed",
 ]
 
 [workspace.package]

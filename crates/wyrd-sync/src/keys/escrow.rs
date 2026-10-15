@@ -301,6 +301,67 @@ mod tests {
         assert_eq!(modes[0].0 & 0o777, crate::durable::SECRET_FILE_MODE);
     }
 
+    /// The custody suite's crash-window shape: a stale temp stranded
+    /// by a pre-fix crash is reclaimed, and the record it precedes
+    /// lands owner-only — the escrow write inherits the primitive's
+    /// create-time mode rather than a post-hoc chmod.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_during_escrow_write_leaves_no_readable_temp() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = UmaskGuard::set(0o000);
+        let dir = TestDir::new("escrow-crash-temp");
+        std::fs::create_dir(dir.path.join(ESCROW_DIR)).unwrap();
+        let stale = dir.path.join(ESCROW_DIR).join("1.tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let secret = EpochSecret::from_bytes([0xAA; 32]);
+        let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+        persist_record(&dir.path, &record).unwrap();
+        drop(_guard);
+        assert_eq!(
+            mode_of(&record_path(&dir.path, 1)) & 0o077,
+            0,
+            "the completed record is never readable"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale temp is reclaimed, not published"
+        );
+    }
+
+    /// Creation-only, same contract as the vault leaf: a pre-existing
+    /// loose `escrow/` keeps its mode across a persist, while the
+    /// sidecar it then holds still lands hardened. Repairing the
+    /// directory is an operator action, never a side effect of
+    /// writing one record.
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_escrow_directory_keeps_its_mode_but_the_record_still_lands_hardened() {
+        use crate::runtime::test_util::{file_mode as mode_of, TestDir, UmaskGuard};
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = UmaskGuard::set(0o000);
+        let dir = TestDir::new("escrow-loose-dir");
+        let escrow_dir = dir.path.join(ESCROW_DIR);
+        std::fs::create_dir(&escrow_dir).unwrap();
+        std::fs::set_permissions(&escrow_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let secret = EpochSecret::from_bytes([0xAA; 32]);
+        let record = wrap(&root().escrow_key(&drive(), 1), &drive(), 1, &secret).unwrap();
+        persist_record(&dir.path, &record).unwrap();
+        drop(_guard);
+        assert_eq!(
+            mode_of(&escrow_dir) & 0o777,
+            0o755,
+            "opening and writing change nothing about a pre-existing directory"
+        );
+        assert_eq!(
+            mode_of(&record_path(&dir.path, 1)) & 0o077,
+            0,
+            "the record still lands owner-only inside it"
+        );
+    }
+
     #[test]
     fn rewrap_is_fresh_and_records_are_fixed_length() {
         let secret = EpochSecret::from_bytes([0xAA; 32]);

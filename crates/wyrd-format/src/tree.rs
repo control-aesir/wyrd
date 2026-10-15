@@ -208,6 +208,19 @@ impl Tree {
         &self.entries
     }
 
+    /// Look up one entry by component name over the canonical bytewise
+    /// order. Entries are sorted at construction and `decode` rejects
+    /// unsorted payloads, so this is a binary search; the comparator is
+    /// the same [`Component`] order [`Tree::from_entries`] sorts by, so
+    /// it can never disagree with a linear scan. Returns the entry when
+    /// present.
+    pub fn get(&self, name: &Component) -> Option<&Entry> {
+        self.entries
+            .binary_search_by(|entry| entry.name.cmp(name))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
     /// The canonical payload encoding (see the module docs).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -411,6 +424,84 @@ mod tests {
         // Bytewise (case-sensitive) sort: "Alpha" < "beta" < "zeta".
         let names: Vec<&str> = tree.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn get_matches_linear_scan_on_canonical_order() {
+        // Names exercising bytewise ordering: case, separators, digit
+        // and symbol placement, shared prefixes, and multibyte UTF-8.
+        let names = [
+            "Alpha",
+            "alpha",
+            "a",
+            "a.b",
+            "a-b",
+            "a_b",
+            "a0",
+            "b",
+            "z",
+            "É",
+            "é",
+            "日本語",
+            "ünïcode",
+        ];
+        let entries: Vec<Entry> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| file_entry(name, i as u64, false))
+            .collect();
+        // Input order must not matter: from_entries canonicalizes first,
+        // and get must track that canonical order for every rotation.
+        // Check both the constructed tree and a decode round-trip, since
+        // the view resolves the decode-produced path.
+        for rotation in [0usize, 1, 7] {
+            let mut ordered = entries.clone();
+            let len = ordered.len();
+            ordered.rotate_left(rotation % len);
+            let tree = Tree::from_entries(ordered).unwrap();
+            let decoded = Tree::decode(&tree.encode()).unwrap();
+            for candidate in [&tree, &decoded] {
+                for name in names {
+                    let component = Component::new(name).unwrap();
+                    let linear = tree
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.name.as_str() == name);
+                    assert_eq!(candidate.get(&component), linear, "present name {name:?}");
+                }
+                for missing in ["A", "aa", "b0", "zzz", "ünïcodf"] {
+                    let component = Component::new(missing).unwrap();
+                    assert!(
+                        candidate.get(&component).is_none(),
+                        "absent name {missing:?}"
+                    );
+                }
+            }
+        }
+        // An empty tree resolves no name.
+        assert!(Tree::empty()
+            .get(&Component::new("anything").unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn get_resolves_large_canonical_directories() {
+        // Not a timing assertion: 10k entries is past the point where a
+        // linear scan is obviously wrong, and pins that present names
+        // still resolve and absent ones do not at scale.
+        let entries: Vec<Entry> = (0..10_000)
+            .map(|i| file_entry(&format!("file-{i:05}"), i as u64, false))
+            .collect();
+        let tree = Tree::from_entries(entries).unwrap();
+        for i in [0usize, 1, 9, 4_999, 9_998, 9_999] {
+            let name = format!("file-{i:05}");
+            let entry = tree
+                .get(&Component::new(&name).unwrap())
+                .expect("present at scale");
+            assert_eq!(entry.name.as_str(), name.as_str());
+        }
+        assert!(tree.get(&Component::new("file-10000").unwrap()).is_none());
+        assert!(tree.get(&Component::new("file-0000x").unwrap()).is_none());
     }
 
     #[test]

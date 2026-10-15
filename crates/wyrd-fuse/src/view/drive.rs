@@ -327,11 +327,7 @@ where
             let Some((first, remaining)) = rest.split_first() else {
                 return Ok(Some(Node::Dir { subtree: tree_id }));
             };
-            let Some(entry) = tree
-                .entries()
-                .iter()
-                .find(|entry| entry.name.as_str() == first.as_str())
-            else {
+            let Some(entry) = tree.get(first) else {
                 return Ok(None);
             };
             match &entry.content {

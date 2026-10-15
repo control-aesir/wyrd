@@ -1,0 +1,23 @@
+[package]
+name = "wyrd-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The embedder-shaped consumer: one named contract proving a drive's whole lifecycle runs through wyrd-core with no presentation, daemon, or CLI in the path"
+
+[dependencies]
+wyrd-format.workspace = true
+wyrd-sync.workspace = true
+wyrd-core.workspace = true
+# The view crate is the mount-free read surface (`never mounts`): the
+# embedder drives the same `NamespaceView` implementation the daemon
+# builds its backends from, with no `fuser` anywhere in the closure.
+wyrd-fuse.workspace = true
+
+[dev-dependencies]
+# The contract builds a real drive; enable the fast KDF profile so the
+# lifecycle composition does not pay the production Argon2id cost.
+wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+
+[lints]
+workspace = true

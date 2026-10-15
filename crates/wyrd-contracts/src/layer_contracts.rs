@@ -202,6 +202,16 @@ fn policy_for(member: &str) -> Option<MemberPolicy> {
             ],
             external_allow: &[],
         }),
+        // The embedder-shaped consumer: everything the embedded
+        // lifecycle needs (format, transport, node, the mount-free
+        // view) and nothing presentation-shaped — no daemon (which
+        // carries `fuser`), no CLI (which carries `clap`/`libc`), no
+        // contract suite. The transitive half of the boundary is
+        // `consumer_link_graph_excludes_presentation`.
+        "wyrd-embed" => Some(MemberPolicy {
+            workspace_allow: &["wyrd-format", "wyrd-sync", "wyrd-fuse", "wyrd-core"],
+            external_allow: &[],
+        }),
         _ => None,
     }
 }
@@ -748,6 +758,7 @@ fn workspace_members_are_exact() {
         "crates/wyrd-daemon",
         "crates/wyrd-cli",
         "crates/wyrd-contracts",
+        "crates/wyrd-embed",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -956,6 +967,96 @@ fn fuse_dev_deps_stay_pinned() {
     assert!(
         violations.is_empty(),
         "dev-dep violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// Check one consumer member's transitive production closure against
+/// the embedder boundary: no process-host or suite crate reachable
+/// (`wyrd-daemon` carries `fuser`, `wyrd-cli` carries `clap`/`libc`,
+/// `wyrd-contracts` is the suite itself), and no presentation external
+/// (`fuser`, `libc`, `clap`) declared by any reached member. Pure over
+/// the edge sets so the negative tests below can prove the checker
+/// bites without touching the filesystem.
+fn check_consumer_link_graph(member: &str, graph: &BTreeMap<String, MemberEdges>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![member.to_owned()];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if let Some(edges) = graph.get(&current) {
+            stack.extend(edges.workspace.iter().cloned());
+        }
+    }
+    let mut violations = Vec::new();
+    for host in ["wyrd-daemon", "wyrd-cli", "wyrd-contracts"] {
+        if seen.contains(host) {
+            violations.push(format!(
+                "`{member}` reaches `{host}` through production edges ({}): the \
+                 embedded consumer boundary excludes presentation and the process \
+                 host — keep the embedded surface in wyrd-core",
+                witness_path(member, host, graph).join(" → ")
+            ));
+        }
+    }
+    let mut presentation: BTreeSet<(String, String)> = BTreeSet::new();
+    for reached in &seen {
+        if let Some(edges) = graph.get(reached) {
+            presentation.extend(
+                edges
+                    .external
+                    .iter()
+                    .filter(|name| matches!(name.as_str(), "fuser" | "libc" | "clap"))
+                    .map(|name| (reached.clone(), name.clone())),
+            );
+        }
+    }
+    if !presentation.is_empty() {
+        let via = presentation
+            .iter()
+            .map(|(reached, name)| format!("`{name}` via `{reached}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "`{member}`'s link graph includes a presentation package ({via}): the \
+             embedded consumer boundary excludes presentation, even transitively"
+        ));
+    }
+    violations
+}
+
+/// Contract 34, consumer half: `wyrd-embed` is a real consumer of the
+/// whole embedded lifecycle, so its production closure must reach no
+/// presentation or process surface — resolving its edges from the
+/// manifests exactly as the direct check does (dev-dependencies
+/// excluded, as there).
+#[test]
+fn consumer_link_graph_excludes_presentation() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let members: Vec<String> = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("workspace members list")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    // Never pass vacuously: an empty member list would check nothing.
+    assert!(!members.is_empty(), "workspace declares no members");
+    let workspace_deps = workspace_dep_table(&root_manifest);
+
+    let mut graph = BTreeMap::new();
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member);
+        let deps = production_deps(&read_manifest(&root.join(member)));
+        graph.insert(name.to_owned(), member_edges(&deps, &workspace_deps));
+    }
+    let violations = check_consumer_link_graph("wyrd-embed", &graph);
+    assert!(
+        violations.is_empty(),
+        "link-graph violations:\n- {}",
         violations.join("\n- ")
     );
 }
@@ -1403,6 +1504,77 @@ mod policy_tests {
         assert!(
             check_link_graph("wyrd-fuse", &graph).is_empty(),
             "unknown members are leaves to the closure: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn consumer_closure_rejects_presentation_reachability_with_witness() {
+        let graph = link_graph(&[
+            ("wyrd-embed", &["wyrd-core"], &[]),
+            ("wyrd-core", &["wyrd-format", "wyrd-daemon"], &["thiserror"]),
+            ("wyrd-daemon", &["wyrd-fuse"], &["fuser"]),
+            ("wyrd-fuse", &[], &["thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_consumer_link_graph("wyrd-embed", &graph);
+        assert_eq!(
+            violations.len(),
+            2,
+            "the daemon reachability and the fuser external: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("wyrd-daemon"),
+            "reachability names the target: {violations:?}"
+        );
+        assert!(
+            violations[0].contains("wyrd-embed → wyrd-core → wyrd-daemon"),
+            "the witness path names every hop: {violations:?}"
+        );
+        assert!(
+            violations[1].contains("`fuser` via `wyrd-daemon`"),
+            "the presentation external names its declaring member: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn consumer_closure_rejects_the_process_host_even_without_presentation_externals() {
+        // The two clauses are independent: a reached host fails even
+        // when no reached member declares a presentation external.
+        let graph = link_graph(&[
+            ("wyrd-embed", &["wyrd-cli"], &[]),
+            ("wyrd-cli", &["wyrd-core"], &["hex", "thiserror"]),
+            ("wyrd-core", &["wyrd-format"], &["thiserror"]),
+            ("wyrd-format", &[], &["blake3", "thiserror"]),
+        ]);
+        let violations = check_consumer_link_graph("wyrd-embed", &graph);
+        assert_eq!(violations.len(), 1, "the host only: {violations:?}");
+        assert!(
+            violations[0].contains("wyrd-cli"),
+            "names the process host: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn consumer_clean_closure_passes() {
+        let graph = link_graph(&[
+            ("wyrd-embed", &["wyrd-fuse", "wyrd-core"], &[]),
+            ("wyrd-fuse", &["wyrd-namespace"], &["thiserror"]),
+            (
+                "wyrd-core",
+                &["wyrd-format", "wyrd-sync"],
+                &["thiserror", "tokio"],
+            ),
+            (
+                "wyrd-sync",
+                &["wyrd-format"],
+                &["iroh", "nostr", "thiserror"],
+            ),
+            ("wyrd-namespace", &["wyrd-format"], &["thiserror"]),
+            ("wyrd-format", &[], &["blake3", "hex", "thiserror"]),
+        ]);
+        assert!(
+            check_consumer_link_graph("wyrd-embed", &graph).is_empty(),
+            "a presentation-free closure must pass, transport and all: {graph:?}"
         );
     }
 

@@ -5276,6 +5276,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-embed"
+version = "0.2.0-alpha"
+dependencies = [
+ "wyrd-core",
+ "wyrd-format",
+ "wyrd-fuse",
+ "wyrd-sync",
+]
+
+[[package]]
 name = "wyrd-format"
 version = "0.2.0-alpha"
 dependencies = [

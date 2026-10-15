@@ -57,6 +57,7 @@ arbitrary subsets of that drive locally.
 | `wyrd-core` | Embeddable local node: namespace, snapshots, mutations, materialization, sync control, and the mount-free demand-driven read surface (`read::LiveReader`: same fetch-on-open sequence as the mount, no kernel mount); no presentation, no process supervision | `wyrd-format`, `wyrd-namespace`, `wyrd-sync` |
 | `wyrd-daemon` | Composition library: engine + view, presentation backends (FUSE today; mobile file surfaces later) | `wyrd-core`, `wyrd-sync`, `wyrd-fuse`, `fuser` |
 | `wyrd-cli` | The `wyrd` process host: argument parsing, credential files, mount orchestration, diagnostics, exit codes | `wyrd-daemon` (+ `wyrd-core`/`wyrd-sync`/`wyrd-format` surfaces), `clap`, `fuser`, `libc` |
+| `wyrd-embed` | The embedder-shaped consumer: one named contract driving a drive's whole embedded lifecycle, with no presentation, daemon, or CLI in the path | `wyrd-core`, `wyrd-sync`, `wyrd-format`, `wyrd-fuse` — never the daemon, the CLI, or the suite |
 | `wyrd-contracts` | Test suite: one named test per architectural contract, composed end to end | all of the above |
 
 Dependency arrows point downward only. `wyrd-format` must never grow a network,
@@ -90,6 +91,50 @@ view crate, the transitive closure — so each extraction phase landed
 against an invariant rather than review vigilance. `nostr-sdk` inside `wyrd-core` is scoped
 to the mailbox subsystem by the same contract: control-plane framing
 lives with sync control, never ambient across the node.
+
+## The embedded consumer boundary
+
+A Wyrd drive must be operable by an in-process embedder that is not a
+mount, not the daemon process, and not the CLI: an application opens a
+drive through `wyrd-core`'s public API and runs its whole lifecycle —
+create, write, mutate, read, observe, write policy, reopen, shut down —
+with no presentation surface and no child process anywhere in the path.
+This is a contract, not a preference, and every clause is a named test
+rather than a sentence a reader must trust:
+
+- **The lifecycle composes headless.**
+  `embedded_drive_lifecycle_needs_no_fuse_and_no_daemon`
+  (`crates/wyrd-embed`) drives one drive through the whole sequence —
+  `Engine::create` → `WyrdNode::new` → direct writes → the loop-driven
+  mutation channel → stop → an `Engine::open_keystore` reopen →
+  namespace reads → a `SyncStatus`-shaped read → materialization
+  policy write → a second reopen → ordered shutdown — asserting the
+  same heads, the same durable facts, and the same durable policy
+  across each restart, with no want-registry or in-memory state
+  carried across.
+- **The embedded shutdown is one named sequence.** Stop the flag the
+  loop polls, join the loop, close admission. The same contract pins
+  that a mutation arriving after shutdown begins resolves with
+  `Shutdown` instead of blocking, and that the published generation
+  keeps serving afterwards — serving never needed the loop. The CLI
+  keeps its own, richer order; this is the path an embedder without a
+  session join owns.
+- **The boundary is a dependency fact.**
+  `consumer_link_graph_excludes_presentation` (contract 34,
+  `layer_contracts.rs`) pins the embedder's production closure — no
+  `wyrd-daemon` (which links `fuser`), no `wyrd-cli` (`clap`/`libc`),
+  no `wyrd-contracts`, and no presentation external under any reached
+  member — while `crate_dependencies_follow_the_layered_dag` pins the
+  direct edges for every member and `workspace_members_are_exact` pins
+  the set those member-wide checks run over. A presentation edge
+  reaching the embedded surface fails the suite, not a review.
+- **The node serves with no backend, over any view.**
+  `node_composes_and_serves_without_a_presentation_backend` (contract
+  35), `node_serves_over_a_view_defined_outside_the_fuse_crate`
+  (contract 36), `committed_bytes_survive_restart_without_a_running_daemon`
+  (contract 47), and `shutdown_closes_the_mutation_channel_for_both_paths`
+  (contract 48) prove the composition never names a presentation type
+  and that restart and shutdown need no running daemon.
 
 ## Invariants (hold everywhere, always)
 

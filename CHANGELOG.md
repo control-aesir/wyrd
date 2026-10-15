@@ -65,6 +65,26 @@ version say exactly what changed.
   remote-only content without a kernel mount and both paths share
   one read semantics, proven by equivalence tests over a real
   `DriveView`.
+- Embedded consumer boundary
+  (`nostr:nevent1qqs9v3gervmm9putjafptv94a0qna9xlllve4s7l4aahej5a0p95wucpz9mhxue69uhkwunpwdczuap49eehg3r8q9l`):
+  `crates/wyrd-embed` is the embedder-shaped consumer — a real
+  consumer of `wyrd-core` that is not the daemon, the CLI, or a
+  mount. Its one named contract,
+  `embedded_drive_lifecycle_needs_no_fuse_and_no_daemon`, drives one
+  drive through the whole embedded lifecycle (create, direct write,
+  loop-driven mutation, stop, reopen from custody, namespace and
+  status reads, materialization policy write, second reopen, ordered
+  shutdown) with the same heads, durable facts, and durable policy
+  across each restart, no want-registry or in-memory state carried
+  across, and a late mutation submitter resolved with `Shutdown`
+  instead of hanging. The boundary is machine-enforced, not merely
+  documented: contract 34's new
+  `consumer_link_graph_excludes_presentation` pins the embedder's
+  production closure (no daemon, no CLI, no suite, and no
+  `fuser`/`libc`/`clap` under any reached member) beside the existing
+  direct-edge check, and `workspace_members_are_exact` pins the member
+  set the member-wide checks run over. Contract text:
+  `docs/architecture.md`, "The embedded consumer boundary".
 - Relay-flap forensics
   (`nostr:nevent1qqsxtrye00qccpa6dtsx8xczyjrvn3xm8fwecf06tvt7tvd4wmev56cpz9mhxue69uhkwunpwdczuap49eehgm4t73u`):
   after two ~30s relay outages left neither guest logs nor a host load

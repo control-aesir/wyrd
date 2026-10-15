@@ -15,6 +15,7 @@ to. The README carries the vision; `docs/` carries the current design contract.
 - `crates/wyrd-daemon` — Composition library: engine + view + presentation backends (FUSE adapter today; mobile file surfaces later). The composer per T16.
 - `crates/wyrd-cli` — The `wyrd` process host (binary-only): argument parsing, credential files, mount orchestration, diagnostics, exit codes over the daemon's public surface.
 - `crates/wyrd-contracts` — Cross-crate architectural contract suite: one named test per review contract, composed end to end over the public APIs. Workspace leaf over the library crates (it cannot depend on the binary-only `wyrd-cli`; the CLI's edges are pinned by contract 34's member-wide check instead), nothing depends on it.
+- `crates/wyrd-embed` — The embedder-shaped consumer: the `embedded_drive_lifecycle_needs_no_fuse_and_no_daemon` contract proves one drive's whole lifecycle runs through `wyrd-core` with no presentation, daemon, or CLI in the path (see `docs/architecture.md`, "The embedded consumer boundary"). Its production closure is pinned by contract 34: never the daemon, the CLI, or the contract suite.
 - `docs/` — agent-digestible architecture docs. `object-model.md` is the normative
   v0 format spec; `trust.md` and `epochs.md` are the normative trust and
   authorization contracts. Keep them current when behavior changes; stale

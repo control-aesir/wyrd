@@ -55,6 +55,7 @@
 //! [`DurableStore`]: crate::durable::DurableStore
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 
 use thiserror::Error;
 #[cfg(test)]
@@ -750,6 +751,20 @@ pub struct Engine {
     /// In-memory fast path only — the relay retains unacked
     /// envelopes, so a crash loses nothing but latency.
     pub(super) pending: PendingQueue,
+    /// Memoized eligible-head projection keyed on the durable tip: the
+    /// live loop and the status surface ask for heads far more often
+    /// than commits land, and classification is a pure function of
+    /// committed facts, so an unadvanced tip re-serves the cached
+    /// heads instead of replaying history and re-verifying. No
+    /// explicit invalidation runs anywhere: every durable commit
+    /// advances the tip, and nothing else can change what the
+    /// projection derives from. The key is the in-memory tip, which
+    /// tracks the disk tip only because the store's exclusive,
+    /// held-for-life lock forbids a second writer to the directory:
+    /// if that lock model ever changes, this keying must change with
+    /// it. Volatile like every other live projection — a reopen
+    /// starts empty.
+    pub(super) live_heads_cache: Mutex<Option<(u64, Vec<AuthorizedSnapshot>)>>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were
     /// last struck (one strike per run — a call's convergence passes

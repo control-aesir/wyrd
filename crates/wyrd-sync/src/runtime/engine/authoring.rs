@@ -109,8 +109,24 @@ impl Engine {
     /// while constructing the typed value. A failure here means an
     /// internal invariant broke, not that a new corruption flavor was
     /// detected.
+    ///
+    /// Calls at an unchanged durable tip re-serve the memoized
+    /// projection instead of replaying history (see the
+    /// `live_heads_cache` field).
     pub fn live_heads(&self) -> Result<Vec<AuthorizedSnapshot>, EngineError> {
-        self.rebuild_eligible_heads().map(|(_, heads)| heads)
+        let tip = self.store.current();
+        if let Ok(guard) = self.live_heads_cache.lock() {
+            if let Some((cached_tip, heads)) = guard.as_ref() {
+                if *cached_tip == tip {
+                    return Ok(heads.clone());
+                }
+            }
+        }
+        let (_, heads) = self.rebuild_eligible_heads()?;
+        if let Ok(mut guard) = self.live_heads_cache.lock() {
+            *guard = Some((tip, heads.clone()));
+        }
+        Ok(heads)
     }
 
     /// One durable rebuild plus DAG classification, shared by every

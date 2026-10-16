@@ -562,6 +562,13 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI hex parsers consolidated
+  (`nostr:nevent1qqsgzquxttceqlxke6hnmqwn264myw5jn8zg9gryc0mmnsa7gm8jalcpz9mhxue69uhkwunpwdczuap49eehga8888v`,
+  follow-up to
+  `nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`):
+  the five `parse_*` helpers in `commands/device.rs` share one private
+  `parse_32_byte_hex` decode-or-usage-error shape; names, signatures,
+  and usage messages are unchanged. No behavior change.
 - CLI command tree hardened after the `main.rs` split
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   follow-up): sixteen single-module helpers return to private

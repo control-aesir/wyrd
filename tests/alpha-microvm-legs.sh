@@ -106,8 +106,8 @@ leg_converge2_owner() {
   poll_until 420 test -f "$E2E_ROOT/member-w2-done" \
     || die "member never converged on wave 2"
   stop_mount xowner-w2 INT
-  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-owner-list.txt" \
-    || die "owner snapshot list failed"
+  with_creds "$c" snapshot "$d" heads >"$E2E_ROOT/wave2-owner-list.txt" \
+    || die "owner snapshot heads failed"
   pass "owner converged state captured mount-free"
   check_no_leaks "$LOGDIR/mount-xowner-w2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
   check_no_leaks "$E2E_ROOT/wave2-owner-list.txt" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -116,10 +116,10 @@ leg_converge2_owner() {
 # leg_converge2_member <drive> <creds> <relay>: the embedded
 # consumer half — converge on wave 2 with headless `sync now` and
 # no mount up, then read the converged state mount-free
-# (`snapshot list`: heads with their tree hashes). v0 promises no
+# (`snapshot heads`: heads with their tree hashes). v0 promises no
 # headless materialization, so the proof is structural: identical
 # live heads mean identical manifests, hence identical bytes by
-# CAS. (`snapshot plan` cannot serve here: it refuses a single
+# CAS. (`merge --dry-run` cannot serve here: it refuses a single
 # head, and this wave converges to exactly one.) A mount follows
 # only to fault one wave-2 file in, tying this wave's heads to
 # bytes through the serving route (the step-12 pattern), before
@@ -136,14 +136,14 @@ leg_converge2_member() {
   # owner's commit is still in flight. Sync until the live-head
   # set moves past the pre-wave capture (bounded): only the owner
   # authors, so any movement is wave 2 observed, never raced.
-  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/member-w2-pre.txt" \
-    || die "member pre-wave snapshot list failed"
+  with_creds "$c" snapshot "$d" heads >"$E2E_ROOT/member-w2-pre.txt" \
+    || die "member pre-wave snapshot heads failed"
   for round in 1 2 3 4 5 6; do
     with_creds "$c" sync "$d" --relay "$relay" now \
       >"$LOGDIR/member-w2-sync-$round.out" 2>"$LOGDIR/member-w2-sync-$round.err" \
       || die "member wave-2 headless sync exited non-zero (round $round)"
-    with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
-      || die "member snapshot list failed (round $round)"
+    with_creds "$c" snapshot "$d" heads >"$E2E_ROOT/wave2-member-list.txt" \
+      || die "member snapshot heads failed (round $round)"
     cmp -s "$E2E_ROOT/member-w2-pre.txt" "$E2E_ROOT/wave2-member-list.txt" || break
     [[ "$round" == 6 ]] && die "member live heads never moved past wave 1 after 6 headless syncs"
   done
@@ -174,8 +174,8 @@ leg_converge2_member() {
   # Re-capture after the mount cycle: the sync loop may have broken
   # on a wave prefix, and the mount's own sync drained the rest —
   # the host diff must compare the full wave, not the prefix.
-  with_creds "$c" snapshot "$d" list >"$E2E_ROOT/wave2-member-list.txt" \
-    || die "member final snapshot list failed"
+  with_creds "$c" snapshot "$d" heads >"$E2E_ROOT/wave2-member-list.txt" \
+    || die "member final snapshot heads failed"
   touch "$E2E_ROOT/member-w2-done"
   for sync_out in "$LOGDIR"/member-w2-sync-*.out; do
     check_no_content_ids "$sync_out"

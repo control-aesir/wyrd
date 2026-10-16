@@ -524,6 +524,34 @@ version say exactly what changed.
   storage, identity, or sync semantics change; old top-level names
   are removed without aliases (pre-alpha, no compatibility
   burden).
+- `snapshot heads` absorbs `snapshot list`
+  (`nostr:nevent1qqs8kv456kdtuanmcv9gfg3kaly8lnkrvyldv30kdwkat6lsxymyhmqpz9mhxue69uhkwunpwdczuap49eehgxpm29a`,
+  Phase B): one head listing — every DAG head with its
+  classification and epoch, eligible rows carrying their `@N`
+  merge numbers with author, tree, and parent count, non-eligible
+  rows their reason with no number. The `@N` contract is pinned:
+  `heads` and the default merge selection number the same sorted
+  eligible set, an explicit `--head` subset re-bases `@N` onto
+  itself, and `recover --from` takes hex ids only. `snapshot
+  list` is removed without an alias (pre-alpha, no compatibility
+  burden); the wave-2 e2e legs capture `heads` (still tree hashes,
+  no timestamps, so the host diff stays exact).
+- `snapshot merge --dry-run` and `snapshot recover --dry-run`
+  replace `snapshot plan` and `snapshot recover plan/run`
+  (same issue, Phase B): preview and commit share one decision
+  path — the merge commit runs the preview then authors, the
+  recover commit resolves through the same helper the preview
+  uses (owner gate stays execution-only, owner-before-locality
+  precedence unchanged), pinned by preview/commit
+  verdict-identity tests at the engine level. The dry run takes the commit's full
+  argument set, prints the rows first and the verdict second (an
+  unclosed spec or refusing selection still shows every row),
+  and authors nothing. `recover --dry-run` with no selection
+  refuses empty like the commit would (`--all --dry-run` is the
+  discovery spelling); ownership gates authoring only, so
+  non-owners preview clean and commit refused. `plan` and the
+  `recover` subcommands are removed without aliases (pre-alpha,
+  no compatibility burden).
 
 ### Fixed
 

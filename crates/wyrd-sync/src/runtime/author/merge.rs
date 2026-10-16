@@ -204,6 +204,34 @@ where
     })
 }
 
+/// Preview a merge over explicit source heads with a full spec:
+/// run every check [`merge`] applies before authoring — head
+/// validation, spec closure, and the locality gate — and return
+/// the plan plus the adopted entries the commit would author.
+/// Read-only; the dry run front ends show instead of committing.
+/// No ownership check: merging carries ordinary member authority,
+/// and every other gate here is literally the commit's.
+///
+/// [`merge`]: self::merge
+pub(crate) fn preview<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    heads: Vec<SnapshotId>,
+    default: Option<SnapshotId>,
+    spec: &BTreeMap<String, MergeSelection>,
+) -> Result<(MergePlan, Vec<Entry>), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let plan = plan(engine, objects, heads)?;
+    let taken = validate_spec(&plan, default, spec)?;
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    for entry in &taken {
+        check_local(engine, objects, &rebuilt, entry)?;
+    }
+    Ok((plan, taken))
+}
+
 /// Merge explicit source heads into one snapshot: validate the whole
 /// merge-spec contract over the [`plan`], build the deterministic
 /// merged tree, and author it parenting onto exactly the selected
@@ -230,13 +258,7 @@ pub(crate) fn merge<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let plan = plan(engine, objects, heads)?;
-    let taken = validate_spec(&plan, default, &spec)?;
-    let rebuilt = engine.store.rebuild(engine.device)?;
-    for entry in &taken {
-        check_local(engine, objects, &rebuilt, entry)?;
-    }
-
+    let (plan, taken) = preview(engine, objects, heads, default, &spec)?;
     let merged = Tree::from_entries(taken)
         .map_err(|error| EngineError::MergeTreeInvalid(format!("{error:?}")))?;
     let bytes = merged.encode();

@@ -272,6 +272,191 @@ fn recover_refuses_bad_selections() {
     );
 }
 
+/// Preview and commit share one decision path: the dry run
+/// returns the commit's pre-authoring verdict on the same
+/// selection, including the graft names. Verdicts compare by
+/// debug rendering, like the merge parity pin — the errors carry
+/// ids, and equality must pin the whole verdict.
+#[test]
+fn recovery_preview_matches_the_commit_verdict() {
+    let (_dir, mut engine, _) = owner_engine("recover-preview-parity");
+    let mut objects = MemoryObjectStore::default();
+    let (base_id, child_id) = base_and_child(&mut engine, &mut objects);
+    let takes = ["a.txt".to_owned()];
+
+    // A take previews the graft names without authoring, then
+    // commits them under the recovery flag.
+    let preview = engine
+        .recovery_preview(&objects, base_id, &takes, false, &[])
+        .unwrap();
+    assert_eq!(preview.plan.from, base_id, "the preview names its source");
+    assert_eq!(preview.grafted, takes, "the preview names the graft");
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        1,
+        "the preview authors nothing"
+    );
+    let grafted = engine
+        .recover(&mut objects, base_id, &takes, false, &[])
+        .unwrap();
+    assert_eq!(
+        grafted.snapshot().flags() & RECOVERY_FLAG,
+        RECOVERY_FLAG,
+        "the graft carries the recovery flag"
+    );
+    assert_eq!(
+        grafted.snapshot().parents,
+        vec![child_id],
+        "parents are the current eligible heads, never the source fork"
+    );
+}
+
+/// Unknown paths, unknown content ids, and empty selections fail
+/// identically on both paths, committing nothing.
+#[test]
+fn recovery_preview_refuses_like_the_commit() {
+    let (_dir, mut engine, _) = owner_engine("recover-preview-refusals");
+    let mut objects = MemoryObjectStore::default();
+    let (base_id, _) = base_and_child(&mut engine, &mut objects);
+    let verdict = |error: EngineError| format!("{error:?}");
+    let unknown_content = ContentId::from_bytes([0x77; 32]);
+
+    for (takes, all, contents) in [
+        (vec!["nope.txt".to_owned()], false, vec![]),
+        (vec![], false, vec![]),
+        (vec![], false, vec![unknown_content]),
+    ] {
+        let preview_err = engine
+            .recovery_preview(&objects, base_id, &takes, all, &contents)
+            .unwrap_err();
+        let commit_err = engine
+            .recover(&mut objects, base_id, &takes, all, &contents)
+            .unwrap_err();
+        assert_eq!(
+            verdict(preview_err),
+            verdict(commit_err),
+            "preview predicts the commit verdict"
+        );
+    }
+    assert_eq!(
+        engine.live_heads().unwrap().len(),
+        1,
+        "refusals commit nothing"
+    );
+}
+
+/// A `--content` id previews under its hex name and grafts there:
+///
+/// the escape hatch takes the same decision path as row takes.
+#[test]
+fn recovery_preview_covers_content_ids() {
+    let (_dir, mut engine, _) = owner_engine("recover-preview-content");
+    let mut objects = MemoryObjectStore::default();
+    let (base_id, _) = base_and_child(&mut engine, &mut objects);
+    let loose = objects.insert(ObjectKind::Chunk, b"loose").unwrap();
+
+    let preview = engine
+        .recovery_preview(&objects, base_id, &[], false, &[loose])
+        .unwrap();
+    assert_eq!(
+        preview.grafted,
+        vec![loose.to_string()],
+        "the content grafts under its hex name"
+    );
+    engine
+        .recover(&mut objects, base_id, &[], false, &[loose])
+        .unwrap();
+}
+
+/// Owner-before-locality precedence: a stranger whose selection
+/// also fails the locality gate is refused as a non-owner, not
+/// as missing bytes — the commit checks ownership first, exactly
+/// like before the preview extraction. The preview, which takes
+/// no owner gate by design, still reports the locality verdict.
+#[test]
+fn recover_refuses_non_owner_before_locality() {
+    use crate::authorization::test_util::sign_snapshot;
+    use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact};
+    use crate::membership::test_util::{drive as member_drive, key};
+    use wyrd_format::Snapshot;
+
+    let (_dir, mut engine, genesis) = owner_engine("recover-precedence");
+    let mut objects = MemoryObjectStore::default();
+    // A source row whose bytes never land: the tree is stored, the
+    // chunk is not, so the row probes missing and the locality
+    // gate refuses it.
+    let missing_chunk = ContentId::from_bytes([0x99; 32]);
+    let bad_tree = Tree::from_entries(vec![
+        Entry::file("gone.txt", 4, false, vec![missing_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let (owner_sk, owner_id) = key(10);
+    let mut body = Snapshot::new(vec![], bad_tree, owner_id, genesis, 1, 0, 1).unwrap();
+    sign_snapshot(&mut body, &owner_sk, &member_drive());
+    let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
+    let source = authorized.snapshot().snapshot_id();
+    engine
+        .commit_facts(&[Fact::SnapshotBody(authorized)])
+        .unwrap();
+
+    let takes = ["gone.txt".to_owned()];
+    assert!(
+        matches!(
+            engine.recovery_preview(&objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "the preview reports the locality verdict"
+    );
+    assert!(
+        matches!(
+            engine.recover(&mut objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "the owner commit runs the locality gate too"
+    );
+    engine.device = key(20).1;
+    assert!(
+        matches!(
+            engine.recovery_preview(&objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "preview reads need no ownership, even failing ones"
+    );
+    assert!(
+        matches!(
+            engine.recover(&mut objects, source, &takes, false, &[]),
+            Err(EngineError::RecoveryNotOwner)
+        ),
+        "the commit checks ownership before locality"
+    );
+}
+
+/// Ownership is the one deliberate exception to preview/commit
+/// parity: previewing reads history any keystore holder can read,
+/// so no owner gate; authoring still needs the current canonical
+/// owner. A stranger previews clean and commits refused.
+#[test]
+fn recovery_preview_needs_no_ownership() {
+    use crate::membership::test_util::key;
+
+    let (_dir, mut engine, _) = owner_engine("recover-preview-stranger");
+    let mut objects = MemoryObjectStore::default();
+    let (base_id, _) = base_and_child(&mut engine, &mut objects);
+    engine.device = key(20).1;
+    engine
+        .recovery_preview(&objects, base_id, &["a.txt".to_owned()], false, &[])
+        .expect("preview reads need no ownership");
+    assert!(
+        matches!(
+            engine.recover(&mut objects, base_id, &["a.txt".to_owned()], false, &[]),
+            Err(EngineError::RecoveryNotOwner)
+        ),
+        "the commit still needs the owner"
+    );
+}
+
 /// A non-owner selection writes nothing at all: the ownership gate
 /// runs before the graft-tree insert, so the refused call leaves no
 /// orphaned tree object. The expected graft id is recomputed from

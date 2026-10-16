@@ -3,7 +3,7 @@
 //! snapshot/recovery/classification renderers; the dispatcher in
 //! `main.rs` calls in.
 
-use crate::args::{RecoverAction, SnapshotAction};
+use crate::args::SnapshotAction;
 use crate::commands::device::{parse_content_id, parse_snapshot_id};
 use crate::CliError;
 use std::collections::BTreeMap;
@@ -25,22 +25,8 @@ pub(crate) fn snapshot(
 ) -> Result<(), CliError> {
     let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
     match action {
-        SnapshotAction::List => {
-            print!("{}", snapshot_list_report(&engine)?);
-            Ok(())
-        }
         SnapshotAction::Heads => {
             print!("{}", snapshot_heads_report(&engine)?);
-            Ok(())
-        }
-        SnapshotAction::Plan { heads } => {
-            let selected = select_merge_heads(&engine, &heads)?;
-            let store = FsObjectStore::open(drive_dir.to_path_buf())
-                .map_err(|error| CliError::Store(error.to_string()))?;
-            let plan = engine
-                .merge_plan(&store, selected)
-                .map_err(map_merge_error)?;
-            print!("{}", snapshot_plan_report(&plan));
             Ok(())
         }
         SnapshotAction::Merge {
@@ -48,6 +34,7 @@ pub(crate) fn snapshot(
             default,
             takes,
             drops,
+            dry_run,
         } => {
             // Sources default to every live head; explicit ids narrow
             // to a subset. Sorted ascending, so `@N` numbers the
@@ -96,6 +83,26 @@ pub(crate) fn snapshot(
             }
             let mut store = FsObjectStore::open(drive_dir.to_path_buf())
                 .map_err(|error| CliError::Store(error.to_string()))?;
+            if dry_run {
+                // Rows first, verdict second: an unclosed spec still
+                // teaches the operator what is missing. Both derive
+                // from the same plan basis the commit validates.
+                let shown = snapshot_plan_report(
+                    &engine
+                        .merge_plan(&store, selected.clone())
+                        .map_err(map_merge_error)?,
+                );
+                match engine.merge_preview(&store, selected, default, &spec) {
+                    Ok(plan) => {
+                        print!("{shown}{}", merge_dry_run_verdict(&plan));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        print!("{shown}");
+                        return Err(map_merge_error(error));
+                    }
+                }
+            }
             let merged = engine
                 .merge_heads(&mut store, selected, default, spec)
                 .map_err(map_merge_error)?;
@@ -113,61 +120,77 @@ pub(crate) fn snapshot(
             );
             Ok(())
         }
-        SnapshotAction::Recover { action } => match action {
-            RecoverAction::Plan { from } => {
-                let from = parse_snapshot_id(&from)?;
+        SnapshotAction::Recover {
+            from,
+            takes,
+            all,
+            contents,
+            dry_run,
+        } => {
+            // The commit refuses non-owners before any selection
+            // work; the dry run skips that gate — previewing reads
+            // history any keystore holder can read, and only
+            // authoring needs the owner.
+            if !dry_run {
+                check_recovery_owner(&engine)?;
+            }
+            if all && !takes.is_empty() {
+                return Err(CliError::Usage(
+                    "--all grafts the whole source tree: drop the --take lines".into(),
+                ));
+            }
+            let from = parse_snapshot_id(&from)?;
+            let mut checked = Vec::with_capacity(takes.len());
+            for take in &takes {
+                checked.push(check_recover_path(take)?);
+            }
+            let mut ids = Vec::with_capacity(contents.len());
+            for content in &contents {
+                ids.push(parse_content_id(content)?);
+            }
+            if dry_run {
+                // Rows first, verdict second: a refusing selection
+                // still shows every row, so the operator sees what
+                // is graftable before narrowing. Both derive from
+                // the same plan basis the commit validates.
                 let store = FsObjectStore::open(drive_dir.to_path_buf())
                     .map_err(|error| CliError::Store(error.to_string()))?;
-                let plan = engine.recovery_plan(&store, from)?;
-                print!("{}", recovery_plan_report(&plan));
-                Ok(())
+                let shown = recovery_plan_report(&engine.recovery_plan(&store, from)?);
+                match engine.recovery_preview(&store, from, &checked, all, &ids) {
+                    Ok(preview) => {
+                        print!("{shown}{}", recovery_dry_run_verdict(&preview));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        print!("{shown}");
+                        return Err(CliError::Engine(error));
+                    }
+                }
             }
-            RecoverAction::Run {
-                from,
-                takes,
-                all,
-                contents,
-            } => {
-                check_recovery_owner(&engine)?;
-                if all && !takes.is_empty() {
-                    return Err(CliError::Usage(
-                        "--all grafts the whole source tree: drop the --take lines".into(),
-                    ));
-                }
-                let from = parse_snapshot_id(&from)?;
-                let mut checked = Vec::with_capacity(takes.len());
-                for take in &takes {
-                    checked.push(check_recover_path(take)?);
-                }
-                let mut ids = Vec::with_capacity(contents.len());
-                for content in &contents {
-                    ids.push(parse_content_id(content)?);
-                }
-                let mut store = FsObjectStore::open(drive_dir.to_path_buf())
-                    .map_err(|error| CliError::Store(error.to_string()))?;
-                let grafted = engine.recover(&mut store, from, &checked, all, &ids)?;
-                let parents = grafted
-                    .snapshot()
-                    .parents
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!(
-                    "recovered {} at epoch {} (parents {parents})",
-                    grafted.snapshot().snapshot_id(),
-                    grafted.snapshot().epoch,
-                );
-                Ok(())
-            }
-        },
+            let mut store = FsObjectStore::open(drive_dir.to_path_buf())
+                .map_err(|error| CliError::Store(error.to_string()))?;
+            let grafted = engine.recover(&mut store, from, &checked, all, &ids)?;
+            let parents = grafted
+                .snapshot()
+                .parents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "recovered {} at epoch {} (parents {parents})",
+                grafted.snapshot().snapshot_id(),
+                grafted.snapshot().epoch,
+            );
+            Ok(())
+        }
     }
 }
 
 /// Resolve merge sources: every live head by default, or an
 /// explicit id subset. Sorted ascending, so `@N` numbers the
-/// selection in SnapshotId byte order — the basis `merge` and
-/// `plan` share.
+/// selection in SnapshotId byte order — the basis `merge` and its
+/// dry run share.
 fn select_merge_heads(engine: &Engine, heads: &[String]) -> Result<Vec<SnapshotId>, CliError> {
     let mut selected: Vec<SnapshotId> = if heads.is_empty() {
         engine
@@ -242,50 +265,43 @@ fn check_recover_path(path: &str) -> Result<String, CliError> {
     Ok(path.to_owned())
 }
 
-/// Live heads with their `@N` merge numbers, ascending by id —
-/// the same order the `name@N` conflict siblings use. Built as a
-/// string so tests assert the rendering without capturing stdout.
-pub(crate) fn snapshot_list_report(engine: &Engine) -> Result<String, CliError> {
-    let heads = engine.live_heads()?;
-    if heads.is_empty() {
-        return Ok("live heads: none\n".into());
-    }
-    let mut out = String::from("live heads:\n");
-    for (number, head) in heads.iter().enumerate() {
-        let snapshot = head.snapshot();
-        out.push_str(&format!(
-            "@{} {} epoch {} author {} tree {} parents {}{}\n",
-            number + 1,
-            snapshot.snapshot_id(),
-            snapshot.epoch,
-            snapshot.author,
-            snapshot.tree,
-            snapshot.parents.len(),
-            recovery_marker(snapshot.flags()),
-        ));
-    }
-    Ok(out)
-}
-
 /// Every DAG head with its authorization classification; eligible
-/// heads carry their `@N` merge numbers. Built as a string so tests
-/// assert the rendering without capturing stdout.
+/// heads carry their `@N` merge numbers plus the live-head detail
+/// (author, tree, parent count) the old `list` command showed, so
+/// one listing serves both. The detail joins the live-head
+/// projection by id — an eligible head with no live body (an
+/// internal disagreement both projections fail safe on) falls back
+/// to the short row rather than disappearing. Built as a string so
+/// tests assert the rendering without capturing stdout.
 pub(crate) fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
+    use wyrd_sync::authorization::Classification;
+
     let heads = engine.snapshot_heads()?;
     if heads.is_empty() {
         return Ok("heads: none\n".into());
     }
     let mut eligible: Vec<SnapshotId> = heads
         .iter()
-        .filter(|head| {
-            matches!(
-                head.classification,
-                wyrd_sync::authorization::Classification::Eligible
-            )
-        })
+        .filter(|head| matches!(head.classification, Classification::Eligible))
         .map(|head| head.id)
         .collect();
     eligible.sort();
+    // The live-head detail for the eligible rows, by id.
+    let live: BTreeMap<SnapshotId, (String, String, usize)> = engine
+        .live_heads()?
+        .iter()
+        .map(|head| {
+            let snapshot = head.snapshot();
+            (
+                snapshot.snapshot_id(),
+                (
+                    snapshot.author.to_string(),
+                    snapshot.tree.to_string(),
+                    snapshot.parents.len(),
+                ),
+            )
+        })
+        .collect();
     let mut out = String::from("heads:\n");
     for head in &heads {
         let number = eligible
@@ -293,8 +309,14 @@ pub(crate) fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError>
             .position(|id| *id == head.id)
             .map(|number| format!(" @{}", number + 1))
             .unwrap_or_default();
+        let detail = live
+            .get(&head.id)
+            .map(|(author, tree, parents)| {
+                format!(" author {author} tree {tree} parents {parents}")
+            })
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}{} {} epoch {}{}\n",
+            "{}{} {} epoch {}{detail}{}\n",
             head.id,
             number,
             render_classification(&head.classification),
@@ -341,6 +363,17 @@ pub(crate) fn snapshot_plan_report(plan: &wyrd_sync::runtime::MergePlan) -> Stri
     out
 }
 
+/// The dry-run verdict line for a recovery: the graft names the
+/// commit would author, in graft order. The plan rows above say
+/// what each source path means; this line says what the
+/// selection does.
+pub(crate) fn recovery_dry_run_verdict(preview: &wyrd_sync::runtime::RecoveryPreview) -> String {
+    format!(
+        "dry-run: would graft {}; nothing authored\n",
+        preview.grafted.join(" ")
+    )
+}
+
 /// The recovery audit marker: a recovery-flagged snapshot names
 /// itself in both head views, so grafts stay visible as long as the
 /// snapshot is listed at all.
@@ -350,6 +383,21 @@ fn recovery_marker(flags: u8) -> &'static str {
     } else {
         ""
     }
+}
+
+/// The dry-run verdict line for a merge: the spec closed over
+/// the plan, so the commit would proceed past validation. Counts
+/// agreed paths — the ones that take themselves — against the
+/// total, so scripts see how much the spec decided. The preview
+/// already ran every pre-commit check including the locality
+/// gate; only authoring remains, hence "would", not "will".
+pub(crate) fn merge_dry_run_verdict(plan: &wyrd_sync::runtime::MergePlan) -> String {
+    let agreed = plan.paths.iter().filter(|path| path.agreed()).count();
+    format!(
+        "dry-run: spec closed over {} paths ({} agreed); nothing authored\n",
+        plan.paths.len(),
+        agreed,
+    )
 }
 
 /// Preview a recovery without authoring: one row per source root

@@ -27,6 +27,8 @@ wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passp
 wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
 wyrd [--config <path>] policy <drive_dir> \
     (status [path] creds | budgets creds | role (set <mirror|vault> [--yes] | status creds) | pin <path> creds | unpin <path> creds | evict <path> creds)
+wyrd [--config <path>] snapshot [--identity-file <path>] [--passphrase-file <path>] <drive_dir> \
+    (heads | merge [--head <id>...] [--default @N] [--take path=@N]... [--drop path]... [--dry-run] | recover --from <id> [--take path]... [--all] [--content <id>]... [--dry-run])
   where creds = [--identity-file <path>] [--passphrase-file <path>]: credential flags ride each
   policy action, never the parent — `policy role set` alone takes neither
 ```
@@ -216,25 +218,30 @@ number the versions of one path (`name@N`), skipping heads that lack
 the path, so a present-vs-absent conflict's `@N` there is not the
 merge's `@N`. And with `--head` narrowing, `@N` counts the selection,
 not the full live-head set: re-check the numbers before copying them
-from `snapshot list` into a narrowed merge.
+from `snapshot heads` into a narrowed merge. The numbering has one
+meaning everywhere it is accepted: `heads` and the `merge`
+selection (including its dry run) number the same sorted eligible
+set (the engine test
+`at_n_numbers_the_sorted_eligible_set_everywhere` pins this; only
+`Eligible` tips are ever numbered, so a stranded or superseded tip
+keeps its classification row but takes no number). `recover
+--from` takes a 64-hex snapshot id and never accepts `@N`.
 
-- `list`: the live heads with their `@N` numbers, epochs, authors,
-  trees, and parent counts. Recovery-flagged heads carry a
-  `recovery` marker.
 - `heads`: every DAG head with its authorization classification
   (`eligible`, `canonical-history`, `superseded`, `stranded`,
   `voided`, `pending:<reason>`, `rejected:<reason>`) and epoch.
-  Eligible heads carry their `@N` merge numbers; every other class
-  is retained history with its reason attached. Recovery-flagged
-  tips carry the same `recovery` marker as `list`: the marker
-  audits a snapshot while it is listed, not after history moves
-  past it.
+  Eligible heads carry their `@N` merge numbers with author, tree,
+  and parent count — this is also the live-head listing. Every
+  other class is retained history with its reason attached and no
+  number. Recovery-flagged tips carry a `recovery` marker: the
+  marker audits a snapshot while it is listed, not after history
+  moves past it.
 - `merge [--head <id>...] [--default @N] [--take path=@N]...
-  [--drop path]...`: merge source heads — all live heads by
-  default, or an explicit subset of at least two — into one
-  snapshot parented onto exactly the selected heads at the current
-  epoch. The merged tree is a deterministic function of the
-  sources plus the spec: paths every source agrees on take
+  [--drop path]... [--dry-run]`: merge source heads — all live
+  heads by default, or an explicit subset of at least two — into
+  one snapshot parented onto exactly the selected heads at the
+  current epoch. The merged tree is a deterministic function of
+  the sources plus the spec: paths every source agrees on take
   themselves, conflicted root paths take `--take path=@N`, drop
   with `--drop path`, or fall back to `--default @N`. A spec line
   on an agreed path, a path no source holds, an uncovered conflict,
@@ -248,20 +255,16 @@ from `snapshot list` into a narrowed merge.
   The choice is one-way from the CLI: the unselected versions
   survive only inside the merge's parent heads, which no v0 surface
   reads back.
-- `plan [--head <id>...]`: preview a merge without authoring —
-  one row per root path over the same `@N` basis, naming each
-  head's version, so the operator sees which paths are agreed and
-  which need a `--take` line before merging. Refused with a pointer
-  to `member resolve` where a short selection meets no eligible
-  heads on a membership-frozen drive.
-- `recover plan --from <id>`: preview a recovery without
-  authoring — one row per source root path with its status, so the
-  operator sees what is graftable (`ready`), what is already live
-  under the current heads (`already-live`, with the reason),
-  what no held epoch decrypts (`undecryptable`), and what is gone
-  (`missing`).
-- `recover run --from <id> [--take path]... [--all]
-  [--content <id>]...`: graft the selection into a
+  With `--dry-run` nothing authors: the plan rows print over the
+  same `@N` basis, then the spec verdict — `dry-run: spec closed
+  ...` on success, the commit's refusal after the rows otherwise.
+  Preview and commit share one decision path (the engine tests
+  `merge_preview_matches_the_commit_verdict` pins this), so a dry
+  run that passes predicts the commit on stable state; bytes that
+  leave between preview and commit still fail the commit, which
+  re-runs every gate itself.
+- `recover --from <id> [--take path]... [--all]
+  [--content <id>]... [--dry-run]`: graft the selection into a
   recovery-flagged snapshot parented onto the current eligible
   heads at the current epoch. Paths are root entries, like the
   merge spec; `--all` takes the whole source tree instead of
@@ -272,7 +275,25 @@ from `snapshot list` into a narrowed merge.
   is refused up front with the engine's `RecoveryNotOwner`, and
   the engine re-enforces it at authoring. No membership change,
   no epoch change; the grafted bytes ride the usual announcement
-  outbox.
+  outbox. One row per source root path carries its status, so the
+  operator sees what is graftable (`ready`), what is already live
+  under the current heads (`already-live`, with the reason),
+  what no held epoch decrypts (`undecryptable`), and what is gone
+  (`missing`).
+  With `--dry-run` nothing authors: the rows print, then the
+  would-graft set (`dry-run: would graft ...`) or the commit's
+  refusal after the rows. The dry run takes the full selection,
+  so `--all --dry-run` is the discovery spelling — a bare
+  `--dry-run` with no selection refuses empty exactly like the
+  commit would. Preview and commit share one decision path (the
+  engine tests `recovery_preview_matches_the_commit_verdict`,
+  `recovery_preview_refuses_like_the_commit`, and
+  `recovery_preview_covers_content_ids` pin this) with one
+  deliberate exception: ownership gates authoring, not
+  read-only history inspection, so non-owners preview clean and
+  commit refused (pinned by
+  `recovery_preview_needs_no_ownership` and the CLI's
+  `recover_dry_run_previews_for_non_owners`).
 
 ### `device` — pair this device with a drive
 
@@ -861,7 +882,7 @@ passphrase_file = "/etc/wyrd/passphrase"
   DeviceIds never reach the durable `sync status` surface or the
   structured dispatch lines; `sync now` alone names the senders its
   intake actually heard, because that process connected and the
-  operator holds the keys. (`member list`, `member log`, and `snapshot list` are
+  operator holds the keys. (`member list`, `member log`, and `snapshot heads` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
   them.) Debug-level tracing is the exception: `mount.log` is the

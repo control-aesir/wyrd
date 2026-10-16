@@ -2,7 +2,7 @@
 //! with a `default.toml` needs no `--relay` on the command line —
 //! `sync now` converges over the configured relays, the refusal and
 //! `--offline` semantics judge the effective set, and `sync status`
-//! plus `cache policy` name where the configuration came from.
+//! plus `policy budgets` name where the configuration came from.
 //!
 //! Process-level on purpose: argument resolution, file reading, and
 //! exit codes live in the binary composer, not the library. The
@@ -272,7 +272,7 @@ fn sync_status_names_the_config_file() {
     );
 }
 
-/// `cache policy` reports the effective configuration: the file it
+/// `policy budgets` reports the effective configuration: the file it
 /// read, the relay source, and which surface each credential path
 /// came from — here the file for all three, with no credential
 /// flags passed at all.
@@ -289,9 +289,9 @@ fn cache_policy_reports_the_effective_configuration() {
         fixture.passphrase.display(),
     ));
     let output = fixture
-        .wyrd(&["cache", fixture.drive.to_str().unwrap(), "policy"])
+        .wyrd(&["policy", fixture.drive.to_str().unwrap(), "budgets"])
         .output()
-        .expect("wyrd cache policy runs");
+        .expect("wyrd policy budgets runs");
     assert!(
         output.status.success(),
         "policy resolves credentials from the file"

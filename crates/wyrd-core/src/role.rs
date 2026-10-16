@@ -180,7 +180,7 @@ pub fn effective_policy(stored: MaterializationState, effective: Role) -> Retent
 /// How many of this device's own in-scope snapshots still name a
 /// serving route at some peer. The withdrawal-completion half of the
 /// predicate, evaluated off durable state only so the driver and
-/// `role status` observe the same value: [`Engine::withdrawal_outstanding`]
+/// `policy role status` observe the same value: [`Engine::withdrawal_outstanding`]
 /// counts own-authored redelivery-scope snapshots with a queued
 /// recipient whose last discharge carried a real route. Snapshots
 /// this device did not author, undelivered pairs (nothing to

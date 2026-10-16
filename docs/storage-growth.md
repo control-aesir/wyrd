@@ -354,7 +354,7 @@ X declined your content" message is an enumeration channel and a
 pressure surface, and building it in the milestone that grants the
 right is backwards. Refusal is local and silent on the wire; the
 operator reads it locally — the implementation reports the ceiling
-that caused a refusal from `wyrd cache policy`, alongside the
+that caused a refusal from `wyrd policy budgets`, alongside the
 reachable-content census and effective budgets it already shows.
 
 **Who bears the cost.** The author bears its own disk (the local quota)
@@ -387,7 +387,7 @@ the follow-up's mechanism, not today's bytes.
 
 **Interaction with the local quota.** The per-device
 `retained_bytes_quota` and a serving-boundary ceiling are different
-ceilings and must not be conflated in `wyrd cache policy`'s output: the
+ceilings and must not be conflated in `wyrd policy budgets`'s output: the
 quota bounds the author's own commits before their first write
 (`LiveNode::enforce_retained_quota`, ahead of every arm of
 `apply_mutation` in `crates/wyrd-core/src/live.rs`); the refusal
@@ -436,7 +436,7 @@ contract unblocks rather than contains):
 - The local-quota interaction: a device with both ceilings reports two
   distinct numbers, and the local ceiling's handle semantics (buffer
   lost, `EIO` thereafter) are unchanged.
-- `wyrd cache policy` shows the ceiling that caused a refusal.
+- `wyrd policy budgets` shows the ceiling that caused a refusal.
 
 **Dependents unblocked.** The control-message reconciliation decision
 takes its requirements against this model without waiting for the
@@ -523,7 +523,7 @@ against. **Resident bytes** is what the device physically holds:
 retained bytes plus everything else on its disk. **Auxiliary growth**
 is the resident-but-unenforced durable state — the fact log and the
 sync vault — reported next to the enforced number, never folded into
-it. `wyrd cache policy` renders all three with their labels; a quota
+it. `wyrd policy budgets` renders all three with their labels; a quota
 is an operator-selected refusal boundary over retained bytes, not an
 implicit product policy over the device.
 
@@ -617,7 +617,7 @@ handles, not just the write in hand.
    The accounting machinery for it is in place — `RetainedBytes::subtract`
    exists for the removal paths (quarantine, scrub) with the
    durable-removal-only discipline, `check_retained_ceiling` diagnoses a
-   quota below current retention at startup, and `wyrd cache policy`
+   quota below current retention at startup, and `wyrd policy budgets`
    reports retained / fact-log / vault bytes separately — but no
    removal, admission-gate, or residency-refusal caller exists yet.
    The question entry stays as the pointer; the contract is the answer.
@@ -628,7 +628,7 @@ handles, not just the write in hand.
     - **Counting the other two writers.** Settled as report, not as
       enforcement (OD-26-B option B). `RetainedBytes` still covers the
       object store only — widening it would silently widen what a
-      refusal rejects — and `wyrd cache policy` reports the fact log
+      refusal rejects — and `wyrd policy budgets` reports the fact log
       and the sync vault as separate observational rows with an
       observational total, each labelled, so the gap is explicit
       instead of a single total known to be low.

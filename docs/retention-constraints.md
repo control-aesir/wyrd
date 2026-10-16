@@ -107,7 +107,7 @@ bound one commit. They do not bound the count of commits.
 6. **v0.3 refusal is local and has no wire representation.** No
   v0.3 control-plane refusal signal: a "peer X declined your content"
   message is an enumeration channel. Refusal is operator-visible locally
-  (`wyrd cache policy` names the ceiling), never a protocol event. This
+  (`wyrd policy budgets` names the ceiling), never a protocol event. This
   scopes the v0.3 protocol contract only; it does not forbid a future
   GC or availability protocol from representing inability to retain.
 7. **Refusal never looks like loss.** The operator surface and all
@@ -144,7 +144,7 @@ on them:
   rebuild to preserve the same refusal decision — this document does
   not fix the unit (content, representation, snapshot, or otherwise);
   the implementation follow-up does.
-* `wyrd cache policy` reports the ceiling that caused a refusal,
+* `wyrd policy budgets` reports the ceiling that caused a refusal,
   alongside the reachable-content census and effective budgets, with
   local quota and receive-side ceilings shown as distinct numbers.
 

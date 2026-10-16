@@ -1,5 +1,6 @@
-//! End-to-end policy commands: init, author, pin/unpin/evict,
-//! cache status/policy through the real `command` entrypoint,
+//! End-to-end policy commands: init, author,
+//! policy pin/unpin/evict/status/budgets and policy role
+//! set/status through the real `command` entrypoint,
 //! proving the wiring the core and daemon tests prove the semantics
 //! of. Policy assertions reopen the engine from custody, the way a
 //! second CLI invocation would.
@@ -56,24 +57,27 @@ fn drive_of(temp: &TempDir) -> String {
 fn pin_status_and_policy_roundtrip() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
-    let mut pin = vec!["pin".into(), drive.clone(), "a.txt".into()];
+    let mut pin = vec!["policy".into(), drive.clone(), "pin".into(), "a.txt".into()];
     pin.extend(creds.clone());
     command(pin).unwrap();
     // A second invocation observes the durable promise. The
-    // flattened credentials precede the nested subcommand; clap
-    // parses positionally past it.
-    let mut status = vec!["cache".into(), drive.clone()];
+    // credential flags ride each policy action, so they follow the
+    // action's own positional path.
+    let mut status = vec![
+        "policy".into(),
+        drive.clone(),
+        "status".into(),
+        "a.txt".into(),
+    ];
     status.extend(creds.clone());
-    status.extend(["status".into(), "a.txt".into()]);
     command(status).unwrap();
-    let mut policy = vec!["cache".into(), drive.clone()];
-    policy.extend(creds.clone());
-    policy.push("policy".into());
-    command(policy).unwrap();
+    let mut budgets = vec!["policy".into(), drive.clone(), "budgets".into()];
+    budgets.extend(creds);
+    command(budgets).unwrap();
     drop(temp);
 }
 
-/// `cache policy` measures a real drive end to end: the object-store
+/// `policy budgets` measures a real drive end to end: the object-store
 /// walk, the fact-log walk, and the vault walk all run against the
 /// authored drive without error. The rendered numbers are asserted in
 /// `policy_renderers_name_counts_and_quadrants`; this pins the wiring
@@ -82,10 +86,9 @@ fn pin_status_and_policy_roundtrip() {
 fn policy_measures_a_real_drive() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
-    let mut policy = vec!["cache".into(), drive.clone()];
-    policy.extend(creds);
-    policy.push("policy".into());
-    command(policy).unwrap();
+    let mut budgets = vec!["policy".into(), drive.clone(), "budgets".into()];
+    budgets.extend(creds);
+    command(budgets).unwrap();
     drop(temp);
 }
 
@@ -93,21 +96,36 @@ fn policy_measures_a_real_drive() {
 fn evict_refuses_pins_until_unpinned() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
-    let mut pin = vec!["pin".into(), drive.clone(), "a.txt".into()];
+    let mut pin = vec!["policy".into(), drive.clone(), "pin".into(), "a.txt".into()];
     pin.extend(creds.clone());
     command(pin).unwrap();
     // Same-path evict refuses while pinned.
-    let mut evict = vec!["evict".into(), drive.clone(), "a.txt".into()];
+    let mut evict = vec![
+        "policy".into(),
+        drive.clone(),
+        "evict".into(),
+        "a.txt".into(),
+    ];
     evict.extend(creds.clone());
     let error = command(evict).unwrap_err();
     assert!(
         matches!(error, CliError::Policy(_)),
         "evict must refuse pinned content, got {error:?}"
     );
-    let mut unpin = vec!["unpin".into(), drive.clone(), "a.txt".into()];
+    let mut unpin = vec![
+        "policy".into(),
+        drive.clone(),
+        "unpin".into(),
+        "a.txt".into(),
+    ];
     unpin.extend(creds.clone());
     command(unpin).unwrap();
-    let mut evict = vec!["evict".into(), drive.clone(), "a.txt".into()];
+    let mut evict = vec![
+        "policy".into(),
+        drive.clone(),
+        "evict".into(),
+        "a.txt".into(),
+    ];
     evict.extend(creds);
     command(evict).unwrap();
     drop(temp);
@@ -117,7 +135,12 @@ fn evict_refuses_pins_until_unpinned() {
 fn pin_missing_path_names_the_failure() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
-    let mut pin = vec!["pin".into(), drive.clone(), "nope.txt".into()];
+    let mut pin = vec![
+        "policy".into(),
+        drive.clone(),
+        "pin".into(),
+        "nope.txt".into(),
+    ];
     pin.extend(creds);
     let error = command(pin).unwrap_err();
     assert!(
@@ -152,12 +175,32 @@ fn policy_renderers_name_counts_and_quadrants() {
         dirs: 0,
         symlinks_skipped: 0,
     };
-    let rendered = cache_status_render("docs", &census);
+    let rendered = policy_status_render("", "docs", &census);
     assert!(rendered.contains("PINNED"));
     assert!(rendered.contains("PRESENT"));
     assert!(rendered.contains("a.txt"));
     assert!(rendered.contains("CONFLICT"));
     assert!(rendered.contains("split"));
+    // One posture block, one census: the block the status report
+    // prepends is the same renderer `policy role status` composes
+    // with the quadrant totals, so the two projections cannot drift.
+    let state = wyrd_core::role::RoleState {
+        role: wyrd_core::role::Role::Vault,
+        transition: wyrd_core::role::Transition::Settled,
+    };
+    let block = role_section_render(std::path::Path::new("/nowhere"), state, 0);
+    assert!(block.contains("role: vault"));
+    assert!(block.contains("effective: vault"));
+    let composed = policy_status_render(&block, "docs", &census);
+    assert!(
+        composed.starts_with(&block) && composed.contains("policy status under docs"),
+        "the posture block prefixes the table: {composed}"
+    );
+    let role_only = role_status_render(std::path::Path::new("/nowhere"), state, &census, 0);
+    assert!(
+        role_only.contains("role: vault") && role_only.contains("files: 1 ("),
+        "the role report is the block plus the same census: {role_only}"
+    );
     let accounting = RetentionAccounting {
         retained_content: 812,
         fact_log: 37,
@@ -165,7 +208,7 @@ fn policy_renderers_name_counts_and_quadrants() {
         quota: None,
     };
     let budgets = LiveConfig::for_local_sync().budgets;
-    let rendered = cache_policy_render(&census, &accounting, &budgets);
+    let rendered = policy_budgets_render(&census, &accounting, &budgets);
     assert!(rendered.contains("pinned files: 1"));
     assert!(rendered.contains("retained_bytes_quota: unlimited"));
     // OD-26-B option B: the report names each dimension and labels
@@ -191,7 +234,12 @@ fn role_set_status_roundtrip_survives_reinvocation() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
     // A fresh device names the mirror default explicitly, never silent.
-    let mut status = vec!["role".into(), drive.clone(), "status".into()];
+    let mut status = vec![
+        "policy".into(),
+        drive.clone(),
+        "role".into(),
+        "status".into(),
+    ];
     status.extend(creds.clone());
     command(status).unwrap();
     let state = role::load(std::path::Path::new(&drive)).unwrap();
@@ -202,13 +250,19 @@ fn role_set_status_roundtrip_survives_reinvocation() {
     // invocation — the restart equivalent, with no in-memory state
     // carried over — observes the same role from the file.
     command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "vault".into(),
     ])
     .unwrap();
-    let mut status = vec!["role".into(), drive.clone(), "status".into()];
+    let mut status = vec![
+        "policy".into(),
+        drive.clone(),
+        "role".into(),
+        "status".into(),
+    ];
     status.extend(creds.clone());
     command(status).unwrap();
     let state = role::load(std::path::Path::new(&drive)).unwrap();
@@ -222,8 +276,9 @@ fn role_set_rejects_garbage() {
     let (temp, _creds) = authored_drive();
     let drive = drive_of(&temp);
     let error = command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "archivist".into(),
     ])
@@ -231,6 +286,10 @@ fn role_set_rejects_garbage() {
     assert!(
         matches!(error, CliError::Usage(_)),
         "unknown roles fail as usage errors, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("want \"mirror\" or \"vault\""),
+        "the real role parse refuses — not clap's unknown-subcommand error: {error}"
     );
     drop(temp);
 }
@@ -242,8 +301,9 @@ fn narrowing_requires_explicit_acknowledgement() {
     let (temp, _creds) = authored_drive();
     let drive = drive_of(&temp);
     command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "vault".into(),
     ])
@@ -251,8 +311,9 @@ fn narrowing_requires_explicit_acknowledgement() {
     // Leaving vault without --yes refuses: stopping being a
     // provider must be explicit.
     let error = command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "mirror".into(),
     ])
@@ -264,8 +325,9 @@ fn narrowing_requires_explicit_acknowledgement() {
     // Acknowledged narrowing records intent but keeps vault
     // effective: acknowledgement is not observability.
     command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "mirror".into(),
         "--yes".into(),
@@ -278,8 +340,9 @@ fn narrowing_requires_explicit_acknowledgement() {
     // Re-narrowing an acknowledged transition names the way out
     // instead of silently succeeding: widen first, then narrow.
     let error = command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "mirror".into(),
         "--yes".into(),
@@ -297,13 +360,19 @@ fn evict_refuses_under_vault() {
     let (temp, creds) = authored_drive();
     let drive = drive_of(&temp);
     command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "vault".into(),
     ])
     .unwrap();
-    let mut evict = vec!["evict".into(), drive.clone(), "a.txt".into()];
+    let mut evict = vec![
+        "policy".into(),
+        drive.clone(),
+        "evict".into(),
+        "a.txt".into(),
+    ];
     evict.extend(creds);
     let error = command(evict).unwrap_err();
     assert!(

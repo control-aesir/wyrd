@@ -484,9 +484,10 @@ Peer role and materialization are independent parameters:
 A desktop is `mirror + full`; a laptop `mirror + partial`; a phone
 `on-demand` with a pinned subset; a NAS `vault + full`. Pin/evict decisions
 are local device policy — they change what the device holds, never what the
-drive contains. The CLI surface for this is `wyrd pin` / `unpin` / `evict`
-plus `wyrd cache status|policy` (`docs/cli.md`): policy facts stay in the
-device's durable log and are never published. The CLI reports two policy
+drive contains. The CLI surface for this is `wyrd policy` (`pin` /
+`unpin` / `evict`, plus `status` / `budgets` and the `role` they report
+against — `docs/cli.md`): policy facts stay in the device's durable
+log and are never published. The CLI reports two policy
 values, not three — fetched-by-access `CACHED` carries no retention promise
 and collapses into `REMOTE_ONLY`; only an explicit pin promises retention.
 
@@ -507,8 +508,8 @@ and role selection is never an authorization mechanism.
   keystore, read at startup by offline commands and once per pass by
   the live loop. It is not a fact-log entry and never leaves
   the   device. Policy the role implies is admitted as `Cached` facts
-  through the same admission path `pin` uses, so `wyrd role set`
-  and `wyrd pin` cannot disagree about what the device intends.
+  through the same admission path `pin` uses, so `wyrd policy role set`
+  and `wyrd policy pin` cannot disagree about what the device intends.
 - **Default.** A device with no role file reports its effective role
   explicitly and behaves exactly as today: no pins and no quota means
   prunable, which is the `mirror` posture. The default names current
@@ -532,7 +533,7 @@ never happen silently:
   nothing about peers.
 - **Withdrawal pending.** The device has stopped publishing itself as a
   serving peer for new snapshots and serves only in-flight fetches already
-  underway. `role status` names what is outstanding. Obligations retire
+  underway. `policy role status` names what is outstanding. Obligations retire
   only through the reconciliation contract (delivered ∪ reconciled) —
   never because the operator acknowledged.
 - **Withdrawal complete.** The serving queue is drained with nothing
@@ -553,11 +554,12 @@ never happen silently:
 
 ### Role effects on pin, evict, quota, and serving
 
-- A role is a **default**, not an override. `pin` under any role sets the
-  policy for that subtree exactly as today.
-- `evict` under `vault` refuses (and says the role forbids it): the role
-  promises no pruning, and a silent bypass of the pin refusal would be
-  worse than no role. `evict` under `mirror` behaves exactly as today.
+- A role is a **default**, not an override. `policy pin` under any
+  role sets the policy for that subtree exactly as today.
+- `policy evict` under `vault` refuses (and says the role forbids it):
+  the role promises no pruning, and a silent bypass of the pin
+  refusal would be worse than no role. `policy evict` under `mirror`
+  behaves exactly as today.
 - Quota enforcement needs no role branch. The ceiling compares
   retained bytes and nothing prunes under any role — there is no
   prune path to gate — so a `vault` device with a

@@ -90,7 +90,7 @@ pub(crate) struct LoadedConfig {
 }
 
 /// Where the effective relay list came from: what the provenance
-/// lines in `sync status`, `sync now`, and `cache policy` name, so
+/// lines in `sync status`, `sync now`, and `policy budgets` name, so
 /// precedence is debuggable instead of a support ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelaySource {

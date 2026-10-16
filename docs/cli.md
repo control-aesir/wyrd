@@ -7,8 +7,8 @@ itself — every subcommand opens the drive through `WyrdNode` and the
 behavior lives in `wyrd-core` / `wyrd-daemon`. This document mirrors
 the `crates/wyrd-cli/src` module tree (`main.rs` dispatches; argument
 parsing in `args.rs`, one module per command family in `commands/`
-(`cache`, `device`, `export`, `member`, `mount`, `pin`, `role`,
-`snapshot`, `sync`, `vault`, declared in `commands.rs`), credentials in `credentials.rs`, drive
+(`device`, `export`, `member`, `mount`, `policy`, `snapshot`,
+`sync`, `vault`, declared in `commands.rs`), credentials in `credentials.rs`, drive
 config in `drive_config.rs`, the live-node host in `live.rs`,
 diagnostics in `logging.rs`, posture in `posture.rs`, probes in
 `probes.rs`, and updates in `update.rs`); when they disagree, the code wins and
@@ -25,10 +25,10 @@ wyrd [--config <path>] member [--identity-file <path>] [--passphrase-file <path>
 wyrd [--config <path>] device [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status | now)
 wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
-wyrd [--config <path>] pin [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
-wyrd [--config <path>] unpin [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
-wyrd [--config <path>] evict [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <path>
-wyrd [--config <path>] cache [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status [path] | policy)
+wyrd [--config <path>] policy <drive_dir> \
+    (status [path] creds | budgets creds | role (set <mirror|vault> [--yes] | status creds) | pin <path> creds | unpin <path> creds | evict <path> creds)
+  where creds = [--identity-file <path>] [--passphrase-file <path>]: credential flags ride each
+  policy action, never the parent — `policy role set` alone takes neither
 ```
 
 `--identity-file` and `--passphrase-file` are optional when the
@@ -626,12 +626,15 @@ The blake3 digest names the artifact in reports; it is an
 identity, never trust — a locally supplied archive is verified
 structurally, and integrity stays separate from compatibility.
 
-### `pin` / `unpin` / `evict` / `cache` — local materialization policy
+### `policy` — local materialization policy
 
-What this device intends to retain, declared per subtree and stored
-durably in this device's log. Policy facts are never published,
-never authorize anything, and never alter a snapshot — pinning a
-subtree changes nothing any other device can observe.
+One namespace for device-local materialization policy: what this
+device intends to retain (`pin`/`unpin`/`evict`), what it reports
+(`status`/`budgets`), and the posture baseline both report against
+(`role`). What this device intends to retain is declared per subtree
+and stored durably in this device's log. Policy facts are never
+published, never authorize anything, and never alter a snapshot —
+pinning a subtree changes nothing any other device can observe.
 
 Two independent columns, never merged:
 
@@ -646,24 +649,34 @@ reads with a retention promise only at `PINNED` + `PRESENT` over
 every chunk. The fetch loop's arrival marking (`Cached`) carries no
 retention promise and reports as `REMOTE_ONLY` policy.
 
-- `pin <path>`: promise every byte under `path`. Offline,
+The actions stay semantically distinct: pin promises, unpin
+releases, and evict changes intent without deleting bytes. None of
+them silently reinterprets another — a pinned subtree refuses
+eviction, and the effective `vault` role refuses eviction outright.
+
+- `policy pin <path>`: promise every byte under `path`. Offline,
   idempotent, never fetches — the next sync or mount fetches what
   the policy now requires. Policy is per content identity, so a
   chunk shared with files outside the subtree carries the promise
   there too.
-- `unpin <path>`: release the promise (pinned returns to cacheable
-  policy). Never deletes bytes, never refuses. Promises are per
-  content identity, not per path: unpinning a subtree releases
-  shared chunks other pinned paths also relied on.
-- `evict <path>`: return unpinned content to `REMOTE_ONLY` policy.
-  Refuses the whole subtree while any of it is pinned (unpin
-  first) — a partial evict would let overlapping paths silently
-  narrow a promise. Intent only: no bytes deleted, files that stay
-  fully local keep reading.
-- `cache status [path]`: one row per reachable file with its
-  policy/presence pair, plus quadrant totals. Reachable content
-  only — the object store as a whole is never scanned.
-- `cache policy`: device totals over reachable content plus the
+- `policy unpin <path>`: release the promise (pinned returns to
+  cacheable policy). Never deletes bytes, never refuses. Promises
+  are per content identity, not per path: unpinning a subtree
+  releases shared chunks other pinned paths also relied on.
+- `policy evict <path>`: return unpinned content to `REMOTE_ONLY`
+  policy. Refuses the whole subtree while any of it is pinned
+  (`policy unpin` first) — a partial evict would let overlapping
+  paths silently narrow a promise. Intent only: no bytes deleted,
+  files that stay fully local keep reading. Refuses under an
+  effective `vault` role, which promises no pruning.
+- `policy status [path]`: one row per reachable file with its
+  policy/presence pair, plus quadrant totals, under the role
+  posture the census was measured against — one report answers
+  what is retained, what exists, and against which baseline.
+  Reachable content only — the object store as a whole is never
+  scanned. One census, one projection: the posture block and the
+  table render from a single read.
+- `policy budgets`: device totals over reachable content plus the
   effective retention and fetch budgets. Facts are per identity,
   not per path, so pinned paths are not listed. Below the budgets,
   a `retention accounting (bytes):` block reports three resident
@@ -677,10 +690,36 @@ retention promise and reports as `REMOTE_ONLY` policy.
   report names the local quota only: the refusal ceiling and the
   receive-side ceiling required by `docs/retention-constraints.md:147-149`
   have no value to report until the receive-path admission gate lands.
+- `policy role set <mirror|vault>`: widen or narrow the device-local
+  materialization role. What this device intends to be: `mirror`
+  (prunable participant) or `vault` (replicates every object, never
+  prunes). A role is a retention posture, never replicated state —
+  setting one writes one `role` file beside the keystore: no fact,
+  no snapshot, nothing any peer can observe. It is not the `vault`
+  process: a device can hold the role without running one, and one
+  can run without the role. Widening toward `vault` takes effect
+  immediately; narrowing away from it requires `--yes` and records
+  an acknowledged transition — effective posture stays `vault`
+  until withdrawal completes, and completion is reported, never
+  assumed. Setting reads no key, so it takes neither credential
+  flag.
+- `policy role status`: configured role, transition, effective
+  posture, and the quadrant totals to back it — the same census
+  `policy status` reads, because there is one effective policy,
+  not two. While withdrawing it names the outstanding count: own
+  snapshots still routing this device at a peer (zero means
+  serving is still draining).
+
+A role is a default, not an override: explicit pins mean exactly
+what they always meant. What the role changes is the baseline —
+under `vault`, content `mirror` would leave `REMOTE_ONLY` is
+effectively retained, and the policy reports show those effective
+numbers. A device with no role file reports `mirror` explicitly:
+the default names current behavior, never a silent choice.
 
 Conflicted paths refuse every mutating policy command: resolve
 first, or address one version through the existing `path@N`
-grammar. `cache status` instead renders them as `CONFLICT` rows —
+grammar. `policy status` instead renders them as `CONFLICT` rows —
 a read-only report survives the ordinary multi-head state. One
 invocation walks one generation — heads install once up front, so
 a concurrent local write cannot mix generations into it. Policy
@@ -691,44 +730,16 @@ retention without fetching: a pinned-but-never-fetched subtree
 still fails closed offline (export names the unheld bytes) until
 a sync or mount lands the bytes.
 
-### `role` — device-local materialization role
-
-What this device intends to be: `mirror` (prunable participant) or
-`vault` (replicates every object, never prunes). A role is a
-retention posture, never replicated state — setting one writes one
-`role` file beside the keystore: no fact, no snapshot, nothing any
-peer can observe. It is not the `vault` process: a device can hold
-the role without running one, and one can run without the role.
-
-A role is a default, not an override: explicit pins mean exactly
-what they always meant. What the role changes is the baseline —
-under `vault`, content `mirror` would leave `REMOTE_ONLY` is
-effectively retained, and `cache status` reports those effective
-numbers. A device with no role file reports `mirror` explicitly:
-the default names current behavior, never a silent choice.
-
-- `role set <mirror|vault>`: widening toward `vault` takes effect
-  immediately. Narrowing away from it requires `--yes` and records
-  an acknowledged transition: effective posture stays `vault`
-  until withdrawal completes, and completion is reported, never
-  assumed.
-- `role status`: configured role, transition, effective posture,
-  and the quadrant totals to back it. While withdrawing it names
-  the outstanding count: own snapshots still routing this device
-  at a peer (zero means serving is still draining).
-- `evict` under an effective `vault` role refuses and says the
-  role forbids it: the role promises no pruning.
-
 ## Credential files
 
 All subcommands take `--identity-file` and `--passphrase-file`,
 optionally: each defaults to the drive configuration file's
 `identity_file` / `passphrase_file` when the flag is absent (see
 "Drive configuration file" below), and the flag always wins —
-with one exception: `role set` writes one local file and touches
-no key, so it takes neither flag and reads no file. A role stays
-settable on a machine whose keystore is unavailable. (`role
-status` opens the node and takes both.)
+with one exception: `policy role set` writes one local file and
+touches no key, so it takes neither flag and reads no file. A role stays
+settable on a machine whose keystore is unavailable (a
+`policy role status` opens the node and takes both).
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters
@@ -794,7 +805,7 @@ passphrase_file = "/etc/wyrd/passphrase"
   only paths, read through the same hardening as the flags — so the
   file stays committable and printable.
 - `sync status` and `sync now` print a `relays from:` line (flags,
-  file with its path, or none configured), and `cache policy`
+  file with its path, or none configured), and `policy budgets`
   prints a `configuration:` section with the file, the relay source,
   and each credential path's source.
 - The file reads without the store lock: it is deployment state,

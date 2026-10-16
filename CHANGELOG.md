@@ -122,7 +122,7 @@ version say exactly what changed.
   quenches under a recorded withdrawn sentinel, so re-widening
   re-addresses like any route change. Pending completes to settled
   `mirror` exactly when no own in-scope snapshot still names a route at
-  a peer and serving idles; `role status` names the outstanding count,
+  a peer and serving idles; `policy role status` names the outstanding count,
   effective stays vault until that commit, and a stuck withdrawal
   reports pending with its reason.
 - Post-upgrade convergence leg
@@ -145,7 +145,7 @@ version say exactly what changed.
   relay contradicts `--offline` like a flag), unknown keys are refused with
   their name, the file holds paths never secret material, and it reads
   without the store lock. `sync status` / `sync now` print a `relays from:`
-  line and `cache policy` a `configuration:` section, so precedence is
+  line and `policy budgets` a `configuration:` section, so precedence is
   debuggable. `toml` joins `wyrd-cli`'s production edges (parse-only),
   allow-listed in the layer contract's policy.
 - Validation pins for the serving-endpoint follow-ups
@@ -197,13 +197,14 @@ version say exactly what changed.
   M obligations` or `catch-up already complete; 0 obligations`;
   `AdmitOutcome` carries `obligations_queued` and `batches` for the
   fresh path.
-- Device-local materialization roles (`wyrd role set|status`,
+- Device-local materialization roles (`wyrd policy role set|status`,
   `crates/wyrd-core/src/role.rs`): a `mirror`/`vault` posture stored
   in one `role` file beside the keystore — no fact, no snapshot,
   nothing any peer can observe. The role is a retention default, not
   an override: under `vault`, unpinned content is effectively
-  retained and `cache status` reports effective numbers; `evict`
-  under `vault` refuses; narrowing away from `vault` requires
+  retained and `policy status` reports effective numbers;
+  `policy evict` under `vault` refuses; narrowing away from `vault`
+  requires
   `--yes` and keeps vault-effective posture until withdrawal
   completes. Normative contract in `docs/sync-and-peers.md`
   (Materialization policy vs peer role).
@@ -509,6 +510,20 @@ version say exactly what changed.
   bytes), so restart waste is measurable for the deferred resume
   decision. Cross-pass resume stays deferred behind the design
    note; no `BulkSource` trait change.
+- `policy` namespace for device-local materialization
+  (`nostr:nevent1qqs8kv456kdtuanmcv9gfg3kaly8lnkrvyldv30kdwkat6lsxymyhmqpz9mhxue69uhkwunpwdczuap49eehgxpm29a`,
+  Phase A): `pin`, `unpin`, `evict`, `cache`, and the top-level
+  `role` command collapse into `wyrd policy <drive>
+  (status [path] | budgets | role (set <mirror|vault> [--yes] |
+  status) | pin <path> | unpin <path> | evict <path>)`. Behavior
+  and exit codes are preserved: `policy status` reads the same
+  residency census the old cache surface did, now under the role
+  posture it was measured against (one census, one projection), and
+  `policy role set` keeps taking neither credential flag — the
+  flags ride each policy action, not the parent. No protocol,
+  storage, identity, or sync semantics change; old top-level names
+  are removed without aliases (pre-alpha, no compatibility
+  burden).
 
 ### Fixed
 
@@ -1066,7 +1081,7 @@ version say exactly what changed.
   retention`): `RetainedBytes::subtract` (saturating, removal paths only —
   quarantine is a decrement only where it actually removes bytes);
   `check_retained_ceiling` startup diagnosis for a quota below current
-  retention; `wyrd cache policy` reports retained content (quota-enforced),
+  retention; `wyrd policy budgets` reports retained content (quota-enforced),
   fact log and sync vault (observational) plus an explicitly
   non-authoritative advisory ceiling when no quota is configured; and a
   committed measurement showing 100 opens of unavailable content commit

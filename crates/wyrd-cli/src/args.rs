@@ -190,68 +190,17 @@ pub(crate) enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
-    /// Promise retention for a subtree: every byte under `path` is
-    /// pinned durably on this device. Policy only — never fetches,
-    /// never authors, never touches heads. Offline by construction.
-    Pin {
-        /// Directory holding the drive's keystore and object store.
-        drive_dir: PathBuf,
-        /// Drive path to pin (drive-relative; empty means the root).
-        path: String,
-        #[command(flatten)]
-        credentials: Credentials,
-    },
-    /// Release retention promises under `path`: pinned content
-    /// returns to cacheable policy. Never deletes bytes, never
-    /// touches heads. Promises are per content identity, so
-    /// unpinning a subtree also releases shared chunks other paths
-    /// relied on. Offline by construction.
-    Unpin {
-        /// Directory holding the drive's keystore and object store.
-        drive_dir: PathBuf,
-        /// Drive path to unpin (drive-relative; empty means the root).
-        path: String,
-        #[command(flatten)]
-        credentials: Credentials,
-    },
-    /// Return unpinned content under `path` to REMOTE_ONLY policy.
-    /// Refuses the whole subtree while any of it is pinned (unpin
-    /// first). Changes intent only: no bytes are deleted, files that
-    /// stay fully local keep reading, heads are untouched. Offline
-    /// by construction.
-    Evict {
-        /// Directory holding the drive's keystore and object store.
-        drive_dir: PathBuf,
-        /// Drive path to evict (drive-relative; empty means the root).
-        path: String,
-        #[command(flatten)]
-        credentials: Credentials,
-    },
-    /// Report residency: per-file retention policy against physical
-    /// presence, or device totals plus the effective budgets. Reads
-    /// durable state only; never connects, never mutates.
-    Cache {
+    /// Device-local materialization policy, one namespace: what this
+    /// device intends to retain (`pin` / `unpin` / `evict`), what it
+    /// reports (`status` / `budgets`), and the posture baseline both
+    /// report against (`role`). Policy only — never fetches, never
+    /// authors, never touches heads, never replicates. Offline by
+    /// construction.
+    Policy {
         /// Directory holding the drive's keystore and object store.
         drive_dir: PathBuf,
         #[command(subcommand)]
-        action: CacheAction,
-        #[command(flatten)]
-        credentials: Credentials,
-    },
-    /// Device-local materialization role: what this device intends to
-    /// be (`mirror`: prunable participant; `vault`: replicates every
-    /// object, never prunes). A role is retention posture, never
-    /// replicated state — setting one writes one local file, no fact,
-    /// no snapshot. It is not the `vault` process: a device can hold
-    /// the role without running one, and one can run without the
-    /// role. Setting needs no credentials, so a role is settable on
-    /// a machine whose keystore is unavailable; only status opens
-    /// the node.
-    Role {
-        /// Directory holding the drive's keystore and object store.
-        drive_dir: PathBuf,
-        #[command(subcommand)]
-        action: RoleAction,
+        action: PolicyAction,
     },
     /// Upgrade this installation from a local release archive:
     /// quiesce, flush, stop, swap the binary atomically, verify the
@@ -568,36 +517,92 @@ pub(crate) enum SyncAction {
     },
 }
 
-/// One cache reporting action. Both read durable state only: never
-/// connect, never mutate, and need the drive un-mounted like every
-/// other offline command.
+/// One policy-namespace action. Credentials flatten per action, not
+/// on the parent, so `policy role set` alone keeps taking neither flag: a
+/// role is settable on a machine whose keystore is unavailable
+/// (OD-24-R), and a flag the command never reads is a flag that can
+/// silently rot.
 #[derive(Debug, Subcommand)]
-pub(crate) enum CacheAction {
+pub(crate) enum PolicyAction {
     /// Show every reachable file under `path` with its retention
     /// policy (PINNED / REMOTE_ONLY — what this device intends to
     /// retain) against physical presence (PRESENT / ABSENT — what
-    /// bytes happen to exist locally). The two columns are
-    /// independent: REMOTE_ONLY + PRESENT is ordinary (eviction
-    /// releases intent, never deletes bytes), and only all-chunks
-    /// PINNED + PRESENT reads with a retention promise.
+    /// bytes happen to exist locally), under the role posture it is
+    /// measured against: one report answers policy, presence, and
+    /// baseline. The two columns are independent: REMOTE_ONLY +
+    /// PRESENT is ordinary (eviction releases intent, never deletes
+    /// bytes), and only all-chunks PINNED + PRESENT reads with a
+    /// retention promise. Reads durable state only: never connects,
+    /// never mutates.
     Status {
         /// Drive path to report (drive-relative; empty means the
         /// whole drive).
         #[arg(default_value = "")]
         path: String,
+        #[command(flatten)]
+        credentials: Credentials,
     },
     /// Show device totals over reachable content (pinned files and
     /// chunks, quadrant counts) plus the effective retention and
     /// fetch budgets. Policy facts are per content identity, not per
     /// path, so pinned paths are not listed — only what they amount
-    /// to.
-    Policy,
+    /// to. Reads durable state only: never connects, never mutates.
+    Budgets {
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Device-local materialization role: what this device intends to
+    /// be (`mirror`: prunable participant; `vault`: replicates every
+    /// object, never prunes). A role is retention posture, never
+    /// replicated state — setting one writes one local file, no fact,
+    /// no snapshot. It is not the `vault` process: a device can hold
+    /// the role without running one, and one can run without the
+    /// role. Setting needs no credentials, so a role is settable on
+    /// a machine whose keystore is unavailable; only status opens
+    /// the node.
+    Role {
+        #[command(subcommand)]
+        action: RoleAction,
+    },
+    /// Promise retention for a subtree: every byte under `path` is
+    /// pinned durably on this device. Never fetches, never authors,
+    /// never touches heads. Offline by construction.
+    Pin {
+        /// Drive path to pin (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Release retention promises under `path`: pinned content
+    /// returns to cacheable policy. Never deletes bytes, never
+    /// touches heads. Promises are per content identity, so
+    /// unpinning a subtree also releases shared chunks other paths
+    /// relied on. Offline by construction.
+    Unpin {
+        /// Drive path to unpin (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
+    /// Return unpinned content under `path` to REMOTE_ONLY policy.
+    /// Refuses the whole subtree while any of it is pinned (unpin
+    /// first), and refuses under an effective `vault` role. Changes
+    /// intent only: no bytes are deleted, files that stay fully
+    /// local keep reading, heads are untouched. Offline by
+    /// construction.
+    Evict {
+        /// Drive path to evict (drive-relative; empty means the root).
+        path: String,
+        #[command(flatten)]
+        credentials: Credentials,
+    },
 }
 
-/// One role action. `set` names the posture; `status` reports the
-/// configured role, any in-flight narrowing, and the effective
-/// retention posture — the same numbers `cache status` reports,
-/// because there is one effective policy, not two.
+/// One role action. `set` names the posture and reads no key;
+/// `status` reports the configured role, any in-flight narrowing,
+/// and the effective retention posture — the same numbers `policy
+/// status` reports against, because there is one effective policy,
+/// not two.
 #[derive(Debug, Subcommand)]
 pub(crate) enum RoleAction {
     /// Set this device's materialization role, durably and offline.

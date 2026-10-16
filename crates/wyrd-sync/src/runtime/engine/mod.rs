@@ -1102,7 +1102,7 @@ impl Engine {
 
     /// Bytes of fact-log commit files on disk. Observational only —
     /// the fact log is resident but unenforced — for the retention
-    /// breakdown `cache policy` renders.
+    /// breakdown `policy budgets` renders.
     pub fn fact_log_bytes(&self) -> Result<u64, EngineError> {
         Ok(self.store.committed_bytes()?)
     }

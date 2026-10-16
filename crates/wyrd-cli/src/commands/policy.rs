@@ -20,10 +20,10 @@ use wyrd_daemon::{LiveConfig, ResourceBudgets};
 use wyrd_sync::keys::DeviceIdentitySecret;
 
 /// One policy invocation. `status` and `budgets` read durable state;
-/// the three writes commit one durable policy change each; the
-/// `role set` action writes one local file and no key (see the
-/// `policy role set` dispatch in `main.rs`)
-/// returns it before credential loading).
+/// the three writes commit one durable policy change each, and the
+/// `role set` action writes one local file and no key (the `policy
+/// role set` dispatch in `main.rs` returns it before credential
+/// loading).
 pub(crate) fn policy(
     drive_dir: PathBuf,
     action: PolicyAction,

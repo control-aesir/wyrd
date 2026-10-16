@@ -360,7 +360,7 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             // a machine whose keystore is unavailable (OD-24-R).
             // Every other action loads below like every other
             // command — the credential flags ride each action, so
-            // `role set` alone takes neither.
+            // `policy role set` alone takes neither.
             PolicyAction::Role {
                 action: RoleAction::Set { role, yes },
             } => {

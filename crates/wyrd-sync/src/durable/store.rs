@@ -393,7 +393,7 @@ impl DurableStore {
 
     /// Bytes of commit files on disk, counted without touching
     /// anything. The observational half of retention reporting: the
-    /// fact log is resident but unenforced, so `cache policy` shows
+    /// fact log is resident but unenforced, so `policy budgets` shows
     /// this next to the quota-enforced object-store count rather than
     /// folding it in. Read-only like
     /// [`wyrd_format::FsObjectStore::retained_bytes`]: temp files

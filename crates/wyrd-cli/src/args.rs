@@ -518,7 +518,7 @@ pub(crate) enum SyncAction {
 }
 
 /// One policy-namespace action. Credentials flatten per action, not
-/// on the parent, so `role set` alone keeps taking neither flag: a
+/// on the parent, so `policy role set` alone keeps taking neither flag: a
 /// role is settable on a machine whose keystore is unavailable
 /// (OD-24-R), and a flag the command never reads is a flag that can
 /// silently rot.

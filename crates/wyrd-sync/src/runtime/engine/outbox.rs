@@ -59,7 +59,7 @@ impl Engine {
     /// (`docs/sync-and-peers.md`, role transitions). Rebuilds from
     /// the store, so the count is committed facts only —
     /// restart-equivalent by construction, and the narrowing driver
-    /// and `role status` observe the same value. The counting rule
+    /// and `policy role status` observe the same value. The counting rule
     /// lives on [`RuntimeState`](super::super::RuntimeState) so holders of an
     /// already-rebuilt state do not rebuild again; the scope here
     /// is the same redelivery-scope derivation the send path gates

@@ -90,7 +90,7 @@ impl Vault {
     /// Bytes of sealed representations on disk, counted without
     /// touching anything. The observational half of retention
     /// reporting alongside the fact log: the vault is resident but
-    /// unenforced, so `cache policy` shows this next to the
+    /// unenforced, so `policy budgets` shows this next to the
     /// quota-enforced object-store count rather than folding it in.
     /// Import scratch files (`.tmp-*`, a crashed import's debris) are
     /// excluded — they are not servable representations — and a missing

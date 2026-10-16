@@ -276,8 +276,9 @@ fn role_set_rejects_garbage() {
     let (temp, _creds) = authored_drive();
     let drive = drive_of(&temp);
     let error = command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "archivist".into(),
     ])
@@ -285,6 +286,10 @@ fn role_set_rejects_garbage() {
     assert!(
         matches!(error, CliError::Usage(_)),
         "unknown roles fail as usage errors, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("want \"mirror\" or \"vault\""),
+        "the real role parse refuses — not clap's unknown-subcommand error: {error}"
     );
     drop(temp);
 }
@@ -335,8 +340,9 @@ fn narrowing_requires_explicit_acknowledgement() {
     // Re-narrowing an acknowledged transition names the way out
     // instead of silently succeeding: widen first, then narrow.
     let error = command(vec![
-        "role".into(),
+        "policy".into(),
         drive.clone(),
+        "role".into(),
         "set".into(),
         "mirror".into(),
         "--yes".into(),

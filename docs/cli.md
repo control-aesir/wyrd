@@ -7,8 +7,8 @@ itself — every subcommand opens the drive through `WyrdNode` and the
 behavior lives in `wyrd-core` / `wyrd-daemon`. This document mirrors
 the `crates/wyrd-cli/src` module tree (`main.rs` dispatches; argument
 parsing in `args.rs`, one module per command family in `commands/`
-(`cache`, `device`, `export`, `member`, `mount`, `pin`, `role`,
-`snapshot`, `sync`, `vault`, declared in `commands.rs`), credentials in `credentials.rs`, drive
+(`device`, `export`, `member`, `mount`, `policy`, `snapshot`,
+`sync`, `vault`, declared in `commands.rs`), credentials in `credentials.rs`, drive
 config in `drive_config.rs`, the live-node host in `live.rs`,
 diagnostics in `logging.rs`, posture in `posture.rs`, probes in
 `probes.rs`, and updates in `update.rs`); when they disagree, the code wins and
@@ -25,8 +25,10 @@ wyrd [--config <path>] member [--identity-file <path>] [--passphrase-file <path>
 wyrd [--config <path>] device [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status | now)
 wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
-wyrd [--config <path>] policy [--identity-file <path>] [--passphrase-file <path>] <drive_dir> \
-    (status [path] | budgets | role (set <mirror|vault> [--yes] | status) | pin <path> | unpin <path> | evict <path>)
+wyrd [--config <path>] policy <drive_dir> \
+    (status [path] creds | budgets creds | role (set <mirror|vault> [--yes] | status creds) | pin <path> creds | unpin <path> creds | evict <path> creds)
+  where creds = [--identity-file <path>] [--passphrase-file <path>]: credential flags ride each
+  policy action, never the parent — `policy role set` alone takes neither
 ```
 
 `--identity-file` and `--passphrase-file` are optional when the
@@ -736,8 +738,8 @@ optionally: each defaults to the drive configuration file's
 "Drive configuration file" below), and the flag always wins —
 with one exception: `policy role set` writes one local file and
 touches no key, so it takes neither flag and reads no file. A role stays
-settable on a machine whose keystore is unavailable. (`role
-status` opens the node and takes both.)
+settable on a machine whose keystore is unavailable (a
+`policy role status` opens the node and takes both).
 Both are read and hardened by wyrd code, never by clap:
 
 - The identity file holds exactly 32 raw bytes or 64 hex characters

@@ -20,8 +20,9 @@ use wyrd_daemon::{LiveConfig, ResourceBudgets};
 use wyrd_sync::keys::DeviceIdentitySecret;
 
 /// One policy invocation. `status` and `budgets` read durable state;
-/// the three writes commit one durable policy change each; `role set`
-/// writes one local file and no key (the dispatcher in `main.rs`
+/// the three writes commit one durable policy change each; the
+/// `role set` action writes one local file and no key (see the
+/// `policy role set` dispatch in `main.rs`)
 /// returns it before credential loading).
 pub(crate) fn policy(
     drive_dir: PathBuf,
@@ -45,7 +46,9 @@ pub(crate) fn policy(
         PolicyAction::Role { action } => match action {
             // Set returns before credential loading, in `main.rs`;
             // the arm exists only because the match is exhaustive.
-            RoleAction::Set { .. } => unreachable!("role set returns before credential loading"),
+            RoleAction::Set { .. } => {
+                unreachable!("policy role set returns before credential loading")
+            }
             RoleAction::Status { .. } => role_status(drive_dir, passphrase, identity),
         },
         PolicyAction::Pin { path, .. } => pin(drive_dir, &path, passphrase, identity),

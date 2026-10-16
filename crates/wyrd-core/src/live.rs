@@ -658,7 +658,7 @@ pub struct LiveNode<V: NamespaceView> {
     /// keystore it already opens (`role` file); `None` (tests,
     /// compositions without a drive directory) behaves as mirror,
     /// which is today's behavior exactly. A per-pass file read —
-    /// not cached node state — so `role set` bites a running loop
+    /// not cached node state — so `policy role set` bites a running loop
     /// on its next pass and a restart reconciles nothing.
     pub(super) role_dir: Option<std::path::PathBuf>,
     /// Durable revision a full vault sweep last covered with no new
@@ -1089,7 +1089,7 @@ where
     /// driver below (one read discipline, one warning).
     ///
     /// This pass's role: the file beside the keystore, read fresh so
-    /// `role set` lands on a running loop with no restart
+    /// `policy role set` lands on a running loop with no restart
     /// reconciliation. `None` when no role dir is composed or the
     /// file is unreadable (warned): callers leave everything as-is —
     /// the sweep skips, announcements keep the composed route, the
@@ -1305,7 +1305,7 @@ where
     /// materialization role from, once per pass. The composer passes
     /// the directory whose keystore it already opened; `None` (the
     /// default) behaves as mirror. Reading per pass rather than
-    /// caching keeps `role set` effective on a running loop with no
+    /// caching keeps `policy role set` effective on a running loop with no
     /// restart reconciliation.
     pub fn set_role_dir(&mut self, dir: std::path::PathBuf) {
         self.role_dir = Some(dir);

@@ -509,7 +509,7 @@ and role selection is never an authorization mechanism.
   the live loop. It is not a fact-log entry and never leaves
   the   device. Policy the role implies is admitted as `Cached` facts
   through the same admission path `pin` uses, so `wyrd policy role set`
-  and `wyrd pin` cannot disagree about what the device intends.
+  and `wyrd policy pin` cannot disagree about what the device intends.
 - **Default.** A device with no role file reports its effective role
   explicitly and behaves exactly as today: no pins and no quota means
   prunable, which is the `mirror` posture. The default names current

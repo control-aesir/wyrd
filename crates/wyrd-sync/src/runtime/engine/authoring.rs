@@ -271,7 +271,18 @@ impl Engine {
     ///
     /// [`Eligible`]: crate::authorization::Classification::Eligible
     pub fn snapshot_heads(&self) -> Result<Vec<SnapshotHead>, EngineError> {
-        let rebuilt = self.store.rebuild(self.device)?;
+        // One rebuild for the listing and the live projection alike:
+        // the eligible set below is byte-for-byte what `live_heads`
+        // would compute at this tip, so warming its memo here lets a
+        // following `live_heads` serve from memory instead of
+        // replaying history again. Non-eligible rows still carry
+        // their reason with no author/tree detail — verified heads
+        // only, as before.
+        let (rebuilt, eligible) = self.rebuild_eligible_heads()?;
+        let tip = self.store.current();
+        if let Ok(mut guard) = self.live_heads_cache.lock() {
+            *guard = Some((tip, eligible));
+        }
         let mut dag = crate::authorization::SnapshotDag::new(self.drive);
         for body in rebuilt.runtime.snapshot_bodies.values() {
             dag.observe(body.clone());

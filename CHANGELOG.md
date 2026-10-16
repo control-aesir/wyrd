@@ -642,8 +642,22 @@ version say exactly what changed.
   on the store tip so every durable commit retires it with no explicit
   invalidation, and a reopen starts empty like every other live
   projection. Pinned by a replay-count test and a post-commit
-  invalidation test; `snapshot_heads` and `live_heads_at_epoch` keep
-  the uncached path.
+   invalidation test; `live_heads_at_epoch` keeps the uncached path
+   (`snapshot_heads` now shares the eligible-heads rebuild and warms
+   the memo — see the read-path entry below).
+- Snapshot read paths replay durable state once per projection
+  (`nostr:nevent1qqsyqz48qa80tn2vkr04ffakt62d9ra8mag4e8ae5jkzdcsyhkxqzugpz9mhxue69uhkwunpwdczuap49eehgv48wd9`):
+  `snapshot_heads` builds the classified listing over the shared
+  eligible-heads rebuild and warms the live-heads memo, so the
+  `heads` report's listing plus live join cost one rebuild instead
+  of two; merge and recovery `plan` split into a rebuild plus a pure
+  `plan_over`, and each `preview` runs classification and its
+  locality gate over one rebuild, so `merge --dry-run` costs three
+  rebuilds instead of four and `recover --dry-run` two instead of
+  three. Preview and commit still share the same decision functions
+  (`plan_over`, `select`, `check_local`), and the trust boundary is
+  unchanged: non-eligible rows keep their reason with no
+  author/tree detail. Pinned by per-path rebuild-count tests.
 - Device ids validated as secp256k1 curve points at the parse boundary
   (`nostr:nevent1qqs857qucehn206t5lc2ksyg3var5cr047lg2sp977gpudclta3dn4gpz9mhxue69uhkwunpwdczuap49eehge5xkfs`):
   `Capability::new` rejects a non-curve-point `device` with the new

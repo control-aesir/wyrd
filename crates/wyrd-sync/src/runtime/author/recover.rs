@@ -84,20 +84,42 @@ where
     S::Error: std::fmt::Debug,
 {
     let rebuilt = engine.store.rebuild(engine.device)?;
+    plan_over(engine, objects, &rebuilt, from)
+}
+
+/// Read the source rows over one durable rebuild: the shared row
+/// reader [`plan`], [`resolve`], and [`preview`] validate against,
+/// so the dry run and the commit classify the same facts without
+/// replaying per helper. Pure over the rebuild — no store reads —
+/// besides the object-store root and content loads the statuses
+/// name.
+///
+/// [`plan`]: self::plan
+/// [`resolve`]: self::resolve
+/// [`preview`]: self::preview
+fn plan_over<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    from: SnapshotId,
+) -> Result<RecoveryPlan, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
     let body = rebuilt
         .runtime
         .snapshot_bodies
         .get(&from)
         .ok_or(EngineError::UnknownRecoverySource(from))?;
     let source = load_root(objects, body.tree)?;
-    let live = live_root_names(engine, objects, &rebuilt)?;
+    let live = live_root_names(engine, objects, rebuilt)?;
     let mut paths = Vec::with_capacity(source.entries().len());
     for entry in source.entries() {
         let name = entry.name.as_str().to_owned();
         let status = if live.contains(&name) {
             RecoveryStatus::AlreadyLive
         } else {
-            probe_entry(engine, objects, &rebuilt, entry)?
+            probe_entry(engine, objects, rebuilt, entry)?
         };
         paths.push(RecoveryPath {
             path: name,
@@ -192,11 +214,12 @@ where
 /// selection: run every check [`recover`] applies before
 /// authoring — source readability, selection validity, and the
 /// locality gate — and return the plan, the graft names, and the
-/// adopted entries the commit would author. Read-only; the dry
-/// run front ends show the names instead of committing, and
-/// [`recover`] resolves through the same helper. No ownership check:
-/// previewing reads history the keystore holder can already read,
-/// while authoring stays owner-gated in [`recover`].
+/// adopted entries the commit would author. Rows and locality
+/// share one durable rebuild. Read-only; the dry run front ends
+/// show the names instead of committing, and [`recover`] resolves
+/// through the shared helper. No ownership check: previewing reads
+/// history the keystore holder can already read, while authoring
+/// stays owner-gated in [`recover`].
 ///
 /// [`recover`]: self::recover
 pub(crate) fn preview<S: ObjectStore>(
@@ -210,8 +233,9 @@ pub(crate) fn preview<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let (plan, taken) = resolve(engine, objects, from, takes, all, contents)?;
     let rebuilt = engine.store.rebuild(engine.device)?;
+    let plan = plan_over(engine, objects, &rebuilt, from)?;
+    let taken = select(objects, &plan, takes, all, contents)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;
     }

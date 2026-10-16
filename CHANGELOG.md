@@ -615,6 +615,20 @@ version say exactly what changed.
 
 ### Changed
 
+- Live sync loop split, phase 3: pass extraction
+  (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
+  the sync half moves from `live/mod.rs` to `live/pass.rs`
+  (`sync_pass`, `publish`, `flush_serving_barrier`, `sync_once`,
+  `run_loop`, `drain_until_closed`, plus the `partition_heads`
+  closure gate and its `HeadPartition` helper). Pure move in one
+  `impl LiveNode` block; `partition_heads` is re-exported through
+  `live` for `node.rs` and the prereq tests. One method takes
+  `pub(super)` (`flush_serving_barrier`, called from the staying
+  `drive_withdrawal` and the mirror-diagnostics tests); the
+  `config.rs` `pub(super)` helpers stay as the issue specifies —
+  the backoff test imports them from `config`, so collapsing them
+  to private would require moving the test, which the rescope
+  defers. `wyrd_core::live::X` paths preserved. No behavior change.
 - Live sync loop split, phase 2: config extraction
   (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
   the no-engine types move from `live/mod.rs` to `live/config.rs`

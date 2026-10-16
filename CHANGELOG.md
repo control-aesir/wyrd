@@ -615,6 +615,12 @@ version say exactly what changed.
 
 ### Changed
 
+- Live sync loop split, phase 1: module file rename
+  (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
+  `crates/wyrd-core/src/live.rs` becomes `live/mod.rs` with the ten
+  `#[path]` test attributes shortened accordingly (the `tests_*.rs`
+  files were already extracted). Pure rename: no signature, behavior,
+  or visibility change; all `wyrd_core::live::X` paths are untouched.
 - Live-head projection memoized per durable tip
   (`nostr:nevent1qqsv5z8jrudzpuv8n4f367lrjp4xjvh6zlkszd4gen7d4ccyggs9cmspz9mhxue69uhkwunpwdczuap49eehgu4lj9x`):
   `Engine::live_heads` re-serves the cached verified heads while the

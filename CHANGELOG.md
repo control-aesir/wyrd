@@ -577,6 +577,18 @@ version say exactly what changed.
 
 ### Changed
 
+- Live-head projection memoized per durable tip
+  (`nostr:nevent1qqsv5z8jrudzpuv8n4f367lrjp4xjvh6zlkszd4gen7d4ccyggs9cmspz9mhxue69uhkwunpwdczuap49eehgu4lj9x`):
+  `Engine::live_heads` re-serves the cached verified heads while the
+  durable tip has not advanced instead of replaying history,
+  rebuilding the DAG, and re-verifying on every call (about 50us per
+  snapshot of history before: 5.5ms at depth 100, 80ms at depth 1600;
+  repeated reads at a tip are now sub-microsecond). The memo is keyed
+  on the store tip so every durable commit retires it with no explicit
+  invalidation, and a reopen starts empty like every other live
+  projection. Pinned by a replay-count test and a post-commit
+  invalidation test; `snapshot_heads` and `live_heads_at_epoch` keep
+  the uncached path.
 - CLI hex parsers consolidated
   (`nostr:nevent1qqsgzquxttceqlxke6hnmqwn264myw5jn8zg9gryc0mmnsa7gm8jalcpz9mhxue69uhkwunpwdczuap49eehga8888v`,
   follow-up to

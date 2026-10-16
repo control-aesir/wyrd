@@ -599,3 +599,66 @@ fn cold_authoring_collects_every_missing_chunk() {
         .author_snapshot(&objects, root)
         .expect("the named set was complete");
 }
+
+// --- live-head memoization -----------------------------------------
+
+/// Calls at one durable tip share a single replay: the first call
+/// classifies, every later call re-serves the memoized heads. Five
+/// calls, one replay — the live loop asks per pass while commits
+/// land rarely.
+#[test]
+fn live_heads_memoizes_across_calls_at_one_tip() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let first = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+
+    let replays_before = pair.a.engine.store.rebuild_count();
+    let heads: Vec<Vec<AuthorizedSnapshot>> = (0..5)
+        .map(|_| pair.a.engine.live_heads().unwrap())
+        .collect();
+    assert_eq!(
+        pair.a.engine.store.rebuild_count() - replays_before,
+        1,
+        "one replay serves every call at a tip"
+    );
+    for heads in &heads {
+        assert_eq!(
+            heads
+                .iter()
+                .map(|head| head.snapshot().snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![first.snapshot().snapshot_id()],
+            "the memo serves the same verified heads"
+        );
+    }
+}
+
+/// A commit advances the durable tip past the memo: the next call
+/// reclassifies instead of serving the stale projection. Without
+/// tip-keying this test pins the old head forever.
+#[test]
+fn live_heads_sees_heads_authored_after_the_memo() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    let first = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    assert_eq!(pair.a.engine.live_heads().unwrap().len(), 1);
+
+    let second = pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    assert_ne!(
+        second.snapshot().snapshot_id(),
+        first.snapshot().snapshot_id()
+    );
+    let heads = pair.a.engine.live_heads().unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|head| head.snapshot().snapshot_id())
+            .collect::<Vec<_>>(),
+        vec![second.snapshot().snapshot_id()],
+        "the tip advance retired the memoized heads"
+    );
+}

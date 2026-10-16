@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use wyrd_format::{DeviceEncryptionKey, DeviceId, DriveId, MembershipTransition, TransitionId};
 use zeroize::Zeroizing;
@@ -66,6 +67,7 @@ impl Engine {
             stalled_statements: BTreeSet::new(),
             answered_upto: 0,
             pending: PendingQueue::default(),
+            live_heads_cache: Mutex::new(None),
             fetch_run: 0,
             fetch_strikes: BTreeMap::new(),
             fetch_budget_burns: BTreeMap::new(),

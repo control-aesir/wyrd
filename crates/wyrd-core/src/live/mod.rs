@@ -3718,44 +3718,45 @@ pub fn admit_wants<E>(
     Ok(admitted)
 }
 
-// Sibling test files under the workspace tests_* naming: #[path] is required
-// because default resolution from this parent would look for <mod-name>.rs, not these names.
+// Sibling test files under the workspace tests_* naming: #[path] is
+// required because default resolution from live/ would look for
+// <mod-name>.rs, not these names.
 #[cfg(test)]
-#[path = "live/tests_backoff.rs"]
+#[path = "tests_backoff.rs"]
 mod backoff_tests;
 
 #[cfg(test)]
-#[path = "live/tests_post_corruption.rs"]
+#[path = "tests_post_corruption.rs"]
 mod post_corruption_tests;
 
 #[cfg(test)]
-#[path = "live/tests_prereq.rs"]
+#[path = "tests_prereq.rs"]
 mod prereq_tests;
 
 #[cfg(test)]
-#[path = "live/tests_mirror_diagnostics.rs"]
+#[path = "tests_mirror_diagnostics.rs"]
 mod mirror_diagnostics_tests;
 
 #[cfg(test)]
-#[path = "live/tests_parent_mutation.rs"]
+#[path = "tests_parent_mutation.rs"]
 mod parent_mutation_tests;
 
 #[cfg(test)]
-#[path = "live/tests_quota.rs"]
+#[path = "tests_quota.rs"]
 mod quota_tests;
 
 #[cfg(test)]
-#[path = "live/tests_terminal.rs"]
+#[path = "tests_terminal.rs"]
 mod terminal_tests;
 
 #[cfg(test)]
-#[path = "live/tests_trigger.rs"]
+#[path = "tests_trigger.rs"]
 mod trigger_tests;
 
 #[cfg(test)]
-#[path = "live/tests_serve_barrier.rs"]
+#[path = "tests_serve_barrier.rs"]
 mod serve_barrier_tests;
 
 #[cfg(test)]
-#[path = "live/tests_restart_redelivery.rs"]
+#[path = "tests_restart_redelivery.rs"]
 mod restart_redelivery_tests;

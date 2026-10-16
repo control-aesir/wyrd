@@ -583,6 +583,17 @@ version say exactly what changed.
   move with `pub(crate)` visibility: no dispatch, lifecycle,
   exit-code, ordering, or error-path change, and the full `--help`
   tree plus error paths are byte-identical before and after.
+- Sync engine split by responsibility family
+  (`nostr:nevent1qqszz92kdwfwxcle7fdphp5gzcugflfyhmjtdqxza5kh5cv4fzs6yzcpz9mhxue69uhkwunpwdczuap49eehg2zxjr3`):
+  the 2755-line `engine/mod.rs` keeps the module doc, `EngineError`, all
+  shared types, the `Engine` struct, and the observation accessors, while
+  the `impl Engine` verb groups move verbatim to one submodule each
+  (`membership`, `authoring`, `delivery`, `carry`, `outbox`, `intake`,
+  `materialization`, `plan`, `terminal`) and `impl PendingQueue` moves to
+  `pending`. Pure move: every method keeps its signature and reach —
+  `pub(super)` becomes the identical `pub(in crate::runtime)` across the
+  module boundary — all `engine::` paths resolve unchanged, and the full
+  nextest gate passes with no behavior diff.
 - CLI sync family extracted from `main.rs`
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   phase 3): `sync` / `sync_now` with `SyncRunReport`, the pass cap and

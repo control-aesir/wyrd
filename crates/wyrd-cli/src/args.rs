@@ -122,9 +122,9 @@ pub(crate) enum Command {
         #[command(flatten)]
         credentials: Credentials,
     },
-    /// Inspect snapshots and merge conflicted heads: list the live
-    /// heads, classify every DAG head, or author one merge snapshot
-    /// over explicit sources plus a path spec. Reads are offline
+    /// Inspect snapshots and merge conflicted heads: classify every
+    /// DAG head, preview a merge, or author one merge snapshot over
+    /// explicit sources plus a path spec. Reads are offline
     /// projections of the keystore; a merge authors one snapshot
     /// with ordinary member authority and queues the usual
     /// announcements for the next mounted sync.
@@ -343,11 +343,11 @@ pub(crate) enum MemberAction {
 /// when `--head` narrows it.
 #[derive(Debug, Subcommand)]
 pub(crate) enum SnapshotAction {
-    /// List the live heads with their `@N` numbers.
-    List,
     /// Classify every DAG head: eligible, superseded, stranded,
     /// voided, pending, or rejected. Eligible heads carry their
-    /// `@N` merge numbers.
+    /// `@N` merge numbers with author, tree, and parent count, so
+    /// this is also the live-head listing; every other class is
+    /// retained history with its reason attached and no number.
     Heads,
     /// Preview a merge without authoring: one row per root path
     /// with each selected head's version, so the operator sees

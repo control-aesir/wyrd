@@ -1,4 +1,4 @@
-//! Snapshot-list/heads/merge CLI edges: argument validation fails
+//! Snapshot-heads/merge CLI edges: argument validation fails
 //! at the boundary, engine verdicts pass through, and the reports
 //! render the `@N` merge numbers.
 
@@ -90,40 +90,36 @@ fn write_file(fixture: &Fixture, name: &str, bytes: &[u8]) -> SnapshotId {
         .snapshot_id()
 }
 
-/// Reads project an empty drive: no heads to list or classify.
+/// Reads project an empty drive: no heads to classify.
 #[test]
 fn snapshot_reports_describe_a_fresh_drive() {
     let fixture = Fixture::new();
-    command(fixture.args(vec!["list".into()])).unwrap();
     command(fixture.args(vec!["heads".into()])).unwrap();
 
     let engine = fixture.open();
-    assert!(
-        snapshot_list_report(&engine).unwrap().contains("none"),
-        "no live heads yet"
-    );
     assert!(
         snapshot_heads_report(&engine).unwrap().contains("none"),
         "no DAG heads yet"
     );
 }
 
-/// The list numbers the live head `@1`; the heads view classifies
-/// it eligible under the same number.
+/// The heads view numbers the live head `@1` with its live detail:
+/// the one listing serves the old list's readers and the merge's
+/// `@N` basis alike.
 #[test]
-fn snapshot_list_numbers_the_live_head() {
+fn snapshot_heads_numbers_the_live_head() {
     let fixture = Fixture::new();
     let id = write_file(&fixture, "kept.txt", b"kept");
-    command(fixture.args(vec!["list".into()])).unwrap();
     command(fixture.args(vec!["heads".into()])).unwrap();
 
     let engine = fixture.open();
-    let list = snapshot_list_report(&engine).unwrap();
-    assert!(list.contains("@1"), "the head is numbered");
-    assert!(list.contains(&id.to_string()), "the list names the head");
     let heads = snapshot_heads_report(&engine).unwrap();
+    assert!(heads.contains("@1"), "the head is numbered");
+    assert!(heads.contains(&id.to_string()), "the row names the head");
     assert!(heads.contains("eligible"), "the head is eligible");
-    assert!(heads.contains("@1"), "the number matches the list");
+    assert!(heads.contains("author"), "live detail travels along");
+    assert!(heads.contains("tree"), "the tree hash is listed");
+    assert!(heads.contains("parents 0"), "the parent count is listed");
 }
 
 /// Author a recovery snapshot grafting `bytes` under `name`,
@@ -147,25 +143,10 @@ fn write_recovery(fixture: &Fixture, name: &str, bytes: &[u8]) -> SnapshotId {
         .snapshot_id()
 }
 
-/// A recovery-flagged head carries its marker in the list while
-/// live: the OD-15-4 audit surface.
-#[test]
-fn snapshot_list_marks_recovery_heads() {
-    let fixture = Fixture::new();
-    write_file(&fixture, "kept.txt", b"kept");
-    let id = write_recovery(&fixture, "grafted.txt", b"grafted");
-    command(fixture.args(vec!["list".into()])).unwrap();
-
-    let engine = fixture.open();
-    let list = snapshot_list_report(&engine).unwrap();
-    assert!(list.contains(&id.to_string()), "the list names the head");
-    assert!(list.contains("recovery"), "the recovery flag is marked");
-}
-
-/// The marker is also on the heads tip row: the two renderers
-/// mark independently. Heads lists tips only, so the marker audits
+/// A recovery-flagged head carries its marker on the tip row
+/// beside its number: the OD-15-4 audit surface. The marker audits
 /// a recovery while it is listed — once history moves past it the
-/// snapshot leaves both views (see `docs/cli.md`).
+/// snapshot leaves the view (see `docs/cli.md`).
 #[test]
 fn snapshot_heads_marks_recovery_tips() {
     let fixture = Fixture::new();
@@ -179,6 +160,7 @@ fn snapshot_heads_marks_recovery_tips() {
         .find(|line| line.contains(&id.to_string()))
         .expect("the recovery tip is listed");
     assert!(row.contains("eligible"), "still the tip: {row}");
+    assert!(row.contains("@1"), "numbered like any live head: {row}");
     assert!(row.contains("recovery"), "the flag is marked: {row}");
 }
 
@@ -491,8 +473,8 @@ fn recover_run_grafts_the_take() {
     .unwrap();
 
     let engine = fixture.open();
-    let list = snapshot_list_report(&engine).unwrap();
-    assert!(list.contains("recovery"), "the graft is marked: {list}");
+    let heads = snapshot_heads_report(&engine).unwrap();
+    assert!(heads.contains("recovery"), "the graft is marked: {heads}");
     let grafted = engine
         .live_heads()
         .unwrap()

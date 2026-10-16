@@ -25,10 +25,6 @@ pub(crate) fn snapshot(
 ) -> Result<(), CliError> {
     let mut engine = Engine::open_keystore(drive_dir.clone(), passphrase, identity)?;
     match action {
-        SnapshotAction::List => {
-            print!("{}", snapshot_list_report(&engine)?);
-            Ok(())
-        }
         SnapshotAction::Heads => {
             print!("{}", snapshot_heads_report(&engine)?);
             Ok(())
@@ -242,50 +238,43 @@ fn check_recover_path(path: &str) -> Result<String, CliError> {
     Ok(path.to_owned())
 }
 
-/// Live heads with their `@N` merge numbers, ascending by id —
-/// the same order the `name@N` conflict siblings use. Built as a
-/// string so tests assert the rendering without capturing stdout.
-pub(crate) fn snapshot_list_report(engine: &Engine) -> Result<String, CliError> {
-    let heads = engine.live_heads()?;
-    if heads.is_empty() {
-        return Ok("live heads: none\n".into());
-    }
-    let mut out = String::from("live heads:\n");
-    for (number, head) in heads.iter().enumerate() {
-        let snapshot = head.snapshot();
-        out.push_str(&format!(
-            "@{} {} epoch {} author {} tree {} parents {}{}\n",
-            number + 1,
-            snapshot.snapshot_id(),
-            snapshot.epoch,
-            snapshot.author,
-            snapshot.tree,
-            snapshot.parents.len(),
-            recovery_marker(snapshot.flags()),
-        ));
-    }
-    Ok(out)
-}
-
 /// Every DAG head with its authorization classification; eligible
-/// heads carry their `@N` merge numbers. Built as a string so tests
-/// assert the rendering without capturing stdout.
+/// heads carry their `@N` merge numbers plus the live-head detail
+/// (author, tree, parent count) the old `list` command showed, so
+/// one listing serves both. The detail joins the live-head
+/// projection by id — an eligible head with no live body (an
+/// internal disagreement both projections fail safe on) falls back
+/// to the short row rather than disappearing. Built as a string so
+/// tests assert the rendering without capturing stdout.
 pub(crate) fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError> {
+    use wyrd_sync::authorization::Classification;
+
     let heads = engine.snapshot_heads()?;
     if heads.is_empty() {
         return Ok("heads: none\n".into());
     }
     let mut eligible: Vec<SnapshotId> = heads
         .iter()
-        .filter(|head| {
-            matches!(
-                head.classification,
-                wyrd_sync::authorization::Classification::Eligible
-            )
-        })
+        .filter(|head| matches!(head.classification, Classification::Eligible))
         .map(|head| head.id)
         .collect();
     eligible.sort();
+    // The live-head detail for the eligible rows, by id.
+    let live: BTreeMap<SnapshotId, (String, String, usize)> = engine
+        .live_heads()?
+        .iter()
+        .map(|head| {
+            let snapshot = head.snapshot();
+            (
+                snapshot.snapshot_id(),
+                (
+                    snapshot.author.to_string(),
+                    snapshot.tree.to_string(),
+                    snapshot.parents.len(),
+                ),
+            )
+        })
+        .collect();
     let mut out = String::from("heads:\n");
     for head in &heads {
         let number = eligible
@@ -293,8 +282,14 @@ pub(crate) fn snapshot_heads_report(engine: &Engine) -> Result<String, CliError>
             .position(|id| *id == head.id)
             .map(|number| format!(" @{}", number + 1))
             .unwrap_or_default();
+        let detail = live
+            .get(&head.id)
+            .map(|(author, tree, parents)| {
+                format!(" author {author} tree {tree} parents {parents}")
+            })
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}{} {} epoch {}{}\n",
+            "{}{} {} epoch {}{detail}{}\n",
             head.id,
             number,
             render_classification(&head.classification),

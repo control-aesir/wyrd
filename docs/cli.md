@@ -216,7 +216,7 @@ number the versions of one path (`name@N`), skipping heads that lack
 the path, so a present-vs-absent conflict's `@N` there is not the
 merge's `@N`. And with `--head` narrowing, `@N` counts the selection,
 not the full live-head set: re-check the numbers before copying them
-from `snapshot list` into a narrowed merge. The numbering has one
+from `snapshot heads` into a narrowed merge. The numbering has one
 meaning everywhere it is accepted: `list`, `heads`, `plan`, and the
 default `merge` selection all number the same sorted eligible set
 (the engine test `at_n_numbers_the_sorted_eligible_set_everywhere`
@@ -224,17 +224,15 @@ pins this; only `Eligible` tips are ever numbered, so a stranded or
 superseded tip keeps its classification row but takes no number).
 `recover --from` takes a 64-hex snapshot id and never accepts `@N`.
 
-- `list`: the live heads with their `@N` numbers, epochs, authors,
-  trees, and parent counts. Recovery-flagged heads carry a
-  `recovery` marker.
 - `heads`: every DAG head with its authorization classification
   (`eligible`, `canonical-history`, `superseded`, `stranded`,
   `voided`, `pending:<reason>`, `rejected:<reason>`) and epoch.
-  Eligible heads carry their `@N` merge numbers; every other class
-  is retained history with its reason attached. Recovery-flagged
-  tips carry the same `recovery` marker as `list`: the marker
-  audits a snapshot while it is listed, not after history moves
-  past it.
+  Eligible heads carry their `@N` merge numbers with author, tree,
+  and parent count — this is also the live-head listing. Every
+  other class is retained history with its reason attached and no
+  number. Recovery-flagged tips carry a `recovery` marker: the
+  marker audits a snapshot while it is listed, not after history
+  moves past it.
 - `merge [--head <id>...] [--default @N] [--take path=@N]...
   [--drop path]...`: merge source heads — all live heads by
   default, or an explicit subset of at least two — into one
@@ -867,7 +865,7 @@ passphrase_file = "/etc/wyrd/passphrase"
   DeviceIds never reach the durable `sync status` surface or the
   structured dispatch lines; `sync now` alone names the senders its
   intake actually heard, because that process connected and the
-  operator holds the keys. (`member list`, `member log`, and `snapshot list` are
+  operator holds the keys. (`member list`, `member log`, and `snapshot heads` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
   them.) Debug-level tracing is the exception: `mount.log` is the

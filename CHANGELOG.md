@@ -524,6 +524,18 @@ version say exactly what changed.
   storage, identity, or sync semantics change; old top-level names
   are removed without aliases (pre-alpha, no compatibility
   burden).
+- `snapshot heads` absorbs `snapshot list`
+  (`nostr:nevent1qqs8kv456kdtuanmcv9gfg3kaly8lnkrvyldv30kdwkat6lsxymyhmqpz9mhxue69uhkwunpwdczuap49eehgxpm29a`,
+  Phase B): one head listing — every DAG head with its
+  classification and epoch, eligible rows carrying their `@N`
+  merge numbers with author, tree, and parent count, non-eligible
+  rows their reason with no number. The `@N` contract is pinned:
+  `heads` and the default merge selection number the same sorted
+  eligible set, an explicit `--head` subset re-bases `@N` onto
+  itself, and `recover --from` takes hex ids only. `snapshot
+  list` is removed without an alias (pre-alpha, no compatibility
+  burden); the wave-2 e2e legs capture `heads` (still tree hashes,
+  no timestamps, so the host diff stays exact).
 
 ### Fixed
 

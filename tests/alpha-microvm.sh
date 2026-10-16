@@ -298,7 +298,7 @@ pass "relay carries no cleartext control rumors"
 # Wave 2 (sync-convergence issue): the embedded consumer converges
 # without mounting. The owner writes a second wave through FUSE and
 # stays up serving; the member fetches it headless and reads the
-# converged state mount-free (`snapshot list`: heads with tree
+# converged state mount-free (`snapshot heads`: heads with tree
 # hashes, no timestamps, so the host diff is exact). Identical
 # live heads mean identical manifests, hence identical bytes by
 # CAS. Placed after the opacity checks so wave-2 control traffic

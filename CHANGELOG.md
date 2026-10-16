@@ -549,9 +549,9 @@ version say exactly what changed.
   and authors nothing. `recover --dry-run` with no selection
   refuses empty like the commit would (`--all --dry-run` is the
   discovery spelling); ownership gates authoring only, so
-   non-owners preview clean and commit refused. `plan` and the
-   `recover` subcommands are removed without aliases (pre-alpha,
-   no compatibility burden).
+  non-owners preview clean and commit refused. `plan` and the
+  `recover` subcommands are removed without aliases (pre-alpha,
+  no compatibility burden).
 - `update <drive> <archive>` positional and `member reissue`
    (same issue, Phase C): the release archive moves from
    `--archive <path>` to a second positional beside the drive

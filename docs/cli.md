@@ -180,7 +180,7 @@ characters (x-only pubkeys).
   holds every epoch secret but authors nothing. The destination is
   claimed before the commit: an existing file is refused, and an
   uncreatable path fails with no transition authored. A write failure
-   past the commit leaves the admission standing — recover with
+  past the commit leaves the admission standing — recover with
    `reissue` below, or rerun invite: rerunning for an
   already-admitted device resumes its catch-up fill instead of
   failing, after verifying the supplied key and role against the
@@ -194,7 +194,7 @@ characters (x-only pubkeys).
   ceiling, unqueued closure size) that states rerunning cannot help;
   resume does not apply — the device was not admitted.
 - `reissue <device> <out>`: reseal a device's invitation
-   from durable state, for an admission whose invitation never
+  from durable state, for an admission whose invitation never
   reached a file. Authors nothing; the reseal opens identically,
   with fresh randomness. Owner-only, like admission, and only for
   an active canonical member or reader: revocation bounds
@@ -620,7 +620,7 @@ update
       passed verification ever commits, everything else rolls
       back to the pre-swap binary
     = resolve the `<archive>` positional before anything is stopped: the path
-       must be a regular file under its canonical name
+      must be a regular file under its canonical name
       (`wyrd-<version>-<os>-<arch>.tar.gz`, matching this host
       except the Rosetta pair); anything else is a usage error
       naming the expected shape

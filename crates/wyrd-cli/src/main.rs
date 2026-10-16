@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::args::{Cli, Command, RoleAction, VaultAction};
+use crate::args::{Cli, Command, PolicyAction, RoleAction, VaultAction};
 use crate::drive_config::{
     load_drive_config, resolve_credential_path, resolve_relays, update_request_relays,
 };
@@ -14,11 +14,6 @@ use crate::live::{install_shutdown_handler, SHUTDOWN};
 // names these through `main`.
 #[cfg(test)]
 pub(crate) use crate::args::Credentials;
-use crate::commands::cache::cache;
-#[cfg(test)]
-pub(crate) use crate::commands::cache::{
-    cache_policy_render, cache_status_render, RetentionAccounting,
-};
 use crate::commands::device::device;
 #[cfg(test)]
 pub(crate) use crate::commands::device::{device_id_report, parse_device_id, parse_encryption_key};
@@ -30,9 +25,11 @@ pub(crate) use crate::commands::member::{
 };
 use crate::commands::mount::mount;
 #[cfg(test)]
-pub(crate) use crate::commands::pin::pin_render;
-use crate::commands::pin::{evict, pin, unpin};
-use crate::commands::role::{role_set, role_status};
+pub(crate) use crate::commands::policy::{
+    pin_render, policy_budgets_render, policy_status_render, role_section_render,
+    role_status_render, RetentionAccounting,
+};
+use crate::commands::policy::{policy, role_set};
 use crate::commands::snapshot::snapshot;
 #[cfg(test)]
 pub(crate) use crate::commands::snapshot::{
@@ -350,42 +347,33 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             credentials,
             ..
         } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
-        Command::Pin {
-            drive_dir,
-            credentials,
-            ..
-        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
-        Command::Unpin {
-            drive_dir,
-            credentials,
-            ..
-        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
-        Command::Evict {
-            drive_dir,
-            credentials,
-            ..
-        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
-        Command::Cache {
-            drive_dir,
-            credentials,
-            ..
-        } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
         Command::UpdateVerify {
             drive_dir,
             credentials,
             ..
         } => load_credentials(drive_dir, credentials, cli.config.as_deref())?,
-        Command::Role {
+        Command::Policy {
             drive_dir, action, ..
         } => match action {
             // Setting touches one local file and no key: return
             // before credential loading, so a role is settable on
             // a machine whose keystore is unavailable (OD-24-R).
-            // Status loads below like every other command.
-            RoleAction::Set { role, yes } => {
+            // Every other action loads below like every other
+            // command — the credential flags ride each action, so
+            // `role set` alone takes neither.
+            PolicyAction::Role {
+                action: RoleAction::Set { role, yes },
+            } => {
                 return role_set(drive_dir.clone(), role.clone(), *yes);
             }
-            RoleAction::Status { credentials } => {
+            PolicyAction::Role {
+                action: RoleAction::Status { credentials },
+            }
+            | PolicyAction::Status { credentials, .. }
+            | PolicyAction::Budgets { credentials }
+            | PolicyAction::Pin { credentials, .. }
+            | PolicyAction::Unpin { credentials, .. }
+            | PolicyAction::Evict { credentials, .. } => {
                 load_credentials(drive_dir, credentials, cli.config.as_deref())?
             }
         },
@@ -485,23 +473,14 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
             )),
             Some(VaultAction::Status) => vault_status(drive_dir, &passphrase, identity),
         },
-        Command::Pin {
-            drive_dir, path, ..
-        } => pin(drive_dir, &path, &passphrase, identity),
-        Command::Unpin {
-            drive_dir, path, ..
-        } => unpin(drive_dir, &path, &passphrase, identity),
-        Command::Evict {
-            drive_dir, path, ..
-        } => evict(drive_dir, &path, &passphrase, identity),
-        Command::Cache {
+        Command::Policy {
             drive_dir, action, ..
         } => {
-            // Cache names no relays of its own: the effective set is
-            // whatever the file declares, and the policy report says
+            // Policy names no relays of its own: the effective set is
+            // whatever the file declares, and the budgets report says
             // where it came from.
             let resolution = resolve_relays(Vec::new(), config.as_ref());
-            cache(
+            policy(
                 drive_dir,
                 action,
                 &resolution,
@@ -511,16 +490,6 @@ fn command(args: Vec<String>) -> Result<(), CliError> {
                 identity,
             )
         }
-        Command::Role {
-            drive_dir, action, ..
-        } => match action {
-            // Set returns before credential loading above; the arm
-            // exists only because the match is exhaustive.
-            RoleAction::Set { .. } => {
-                unreachable!("role set returns before credential loading")
-            }
-            RoleAction::Status { .. } => role_status(drive_dir, &passphrase, identity),
-        },
     }
 }
 

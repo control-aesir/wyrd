@@ -509,6 +509,20 @@ version say exactly what changed.
   bytes), so restart waste is measurable for the deferred resume
   decision. Cross-pass resume stays deferred behind the design
    note; no `BulkSource` trait change.
+- `policy` namespace for device-local materialization
+  (`nostr:nevent1qqs8kv456kdtuanmcv9gfg3kaly8lnkrvyldv30kdwkat6lsxymyhmqpz9mhxue69uhkwunpwdczuap49eehgxpm29a`,
+  Phase A): `pin`, `unpin`, `evict`, `cache`, and the top-level
+  `role` command collapse into `wyrd policy <drive>
+  (status [path] | budgets | role (set <mirror|vault> [--yes] |
+  status) | pin <path> | unpin <path> | evict <path>)`. Behavior
+  and exit codes are preserved: `policy status` reads the same
+  residency census the old cache surface did, now under the role
+  posture it was measured against (one census, one projection), and
+  `policy role set` keeps taking neither credential flag — the
+  flags ride each policy action, not the parent. No protocol,
+  storage, identity, or sync semantics change; old top-level names
+  are removed without aliases (pre-alpha, no compatibility
+  burden).
 
 ### Fixed
 

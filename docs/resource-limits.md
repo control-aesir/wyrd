@@ -73,7 +73,7 @@ the `wyrd` binary takes no flags for these today and runs defaults.
 The mailbox and engine-intake bounds stay constants: they are
 protocol-adjacent, already bounded and backpressure-tested, and not
 operational tuning. The daemon-side bounds above are the configurable
-ones. Offline one-shot walks (`wyrd cache status` over a subtree)
+ones. Offline one-shot walks (`wyrd policy status` over a subtree)
 are outside this table by construction: they hold the exclusive
 store lock, run under the operator's own hand, and stream one row
 per reachable file — on a very large drive, redirect the report to

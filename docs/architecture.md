@@ -254,10 +254,12 @@ health polling and capped-backoff drainer recovery) and the `wyrd` binary
 provides local init/mount plus headless sync (`wyrd sync status`
 observes durable sync state without connecting; `wyrd sync now`
 runs the mount's sync machinery without mounting — see
-`docs/cli.md`), and local materialization policy (`wyrd pin` /
-`unpin` / `evict` promise and release retention per subtree;
-`wyrd cache` reports retention intent against physical presence —
-policy facts stay on the device and never alter a snapshot). The demand machinery for fetch-on-open has
+`docs/cli.md`), and local materialization policy (`wyrd policy
+pin` / `unpin` / `evict` promise and release retention per
+subtree; `wyrd policy status` / `budgets` report retention intent
+against physical presence, under the role posture the census is
+measured against — policy facts stay on the device and never alter
+a snapshot). The demand machinery for fetch-on-open has
 landed (`docs/fetch-on-open.md`): a want registry on its own lock,
 blocking `open`/`read` with a bounded deadline (`EIO` on expiry), and
 read-side chunk demand — proven against the bulk-source contract. The

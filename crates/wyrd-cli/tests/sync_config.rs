@@ -289,7 +289,7 @@ fn cache_policy_reports_the_effective_configuration() {
         fixture.passphrase.display(),
     ));
     let output = fixture
-        .wyrd(&["cache", fixture.drive.to_str().unwrap(), "policy"])
+        .wyrd(&["policy", fixture.drive.to_str().unwrap(), "budgets"])
         .output()
         .expect("wyrd cache policy runs");
     assert!(

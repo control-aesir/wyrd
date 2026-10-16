@@ -1,8 +1,7 @@
 //! Pass configuration, outcome classification, and the serving-mirror
 //! readiness barrier: every type the loop programs against without
 //! touching the engine. Nothing here drives sync; the pass lives in
-//! the parent module (later `pass.rs`) and mutation application in
-//! `apply.rs`.
+//! `super::pass` and mutation application in `apply.rs` (phase 4).
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,3 +1,4 @@
+use super::config::{backoff, jitter_below};
 use super::*;
 
 /// The documented equal-jitter range holds at every rung of the

@@ -615,6 +615,17 @@ version say exactly what changed.
 
 ### Changed
 
+- Live sync loop split, phase 2: config extraction
+  (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
+  the no-engine types move from `live/mod.rs` to `live/config.rs`
+  (`LiveConfig`, `FailureClass`, `LiveError`, `SyncReport`/`LiveSummary`,
+  quota and barrier types, `PendingObligations`, `CompositionError`,
+  the jitter/backoff helpers, `check_retained_ceiling`). Pure move;
+  `wyrd_core::live::X` paths are preserved via re-exports. The three
+  cross-module helpers take the narrowest compiling visibility
+  (`backoff`, `jitter_below`, `FailureClass::index` are `pub(super)`);
+  the backoff test gains one import line, every other test is
+  untouched. No behavior change.
 - Live sync loop split, phase 1: module file rename
   (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
   `crates/wyrd-core/src/live.rs` becomes `live/mod.rs` with the ten

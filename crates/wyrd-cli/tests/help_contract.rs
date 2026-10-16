@@ -52,7 +52,10 @@ fn subcommands(help: &str) -> Vec<String> {
             } else if line.starts_with("Options:") {
                 break;
             } else if line.trim().is_empty() || line.starts_with("Arguments:") {
-                continue;
+                // End of the Commands block: anything indented past
+                // here is a positional argument (e.g. `<DRIVE_DIR>`),
+                // not a subcommand.
+                break;
             } else {
                 break;
             }
@@ -73,6 +76,8 @@ fn capture() -> BTreeMap<String, String> {
     let mut pages = BTreeMap::new();
 
     fn visit(pages: &mut BTreeMap<String, String>, args: Vec<String>, depth: usize) {
+        // Deepest real page today is `snapshot recover run` at depth
+        // 3; raise this cap if the command tree ever nests deeper.
         if pages.contains_key(&slug(&args)) || depth > 3 {
             return;
         }

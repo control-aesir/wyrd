@@ -96,7 +96,6 @@ impl Fixture {
         Command::new(&self.exe)
             .arg("update")
             .arg(&self.drive)
-            .arg("--archive")
             .arg(archive)
             .arg("--identity-file")
             .arg(&self.identity)

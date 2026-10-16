@@ -207,7 +207,7 @@ step4_member() {
   # the reseal opens identically, with fresh randomness.
   rm "$E2E_ROOT/invitation"
   expect_exit 0 step4-reissue \
-    with_creds "$oc" member "$od" reissue-invitation "$dev" "$E2E_ROOT/invitation2" >/dev/null
+    with_creds "$oc" member "$od" reissue "$dev" "$E2E_ROOT/invitation2" >/dev/null
   [[ -f "$E2E_ROOT/invitation2" ]] || die "reissue wrote no file"
   pass "reissue reseals the admission from durable state"
 

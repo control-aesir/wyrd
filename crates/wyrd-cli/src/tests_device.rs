@@ -389,7 +389,7 @@ fn non_owner_reissue_refuses() {
     let third = device_id_of(&[0x44; 32]);
     let out = pair._temp.0.join("newcomer-reissue");
     let error = command(pair.newcomer_member(vec![
-        "reissue-invitation".into(),
+        "reissue".into(),
         third.to_string(),
         out.display().to_string(),
     ]))
@@ -494,7 +494,7 @@ fn reissue_recovers_lost_invitation_through_the_surface() {
     // re-admission.
     let reissued = pair._temp.0.join("reissued-invitation");
     command(pair.owner_member(vec![
-        "reissue-invitation".into(),
+        "reissue".into(),
         device,
         reissued.display().to_string(),
     ]))
@@ -506,7 +506,7 @@ fn reissue_recovers_lost_invitation_through_the_surface() {
     // an existing destination.
     let stranger = device_id_of(&[0x44; 32]);
     let error = command(pair.owner_member(vec![
-        "reissue-invitation".into(),
+        "reissue".into(),
         stranger.to_string(),
         reissued.display().to_string(),
     ]))
@@ -517,7 +517,7 @@ fn reissue_recovers_lost_invitation_through_the_surface() {
     );
     let elsewhere = pair._temp.0.join("elsewhere-invitation");
     let error = command(pair.owner_member(vec![
-        "reissue-invitation".into(),
+        "reissue".into(),
         stranger.to_string(),
         elsewhere.display().to_string(),
     ]))

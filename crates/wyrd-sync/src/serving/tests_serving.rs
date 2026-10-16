@@ -1301,10 +1301,14 @@ fn vault_and_serve_directories_land_owner_only() {
     // permissive so a future regression to a mode-less create at
     // `endpoint.rs` would land world-accessible and fail here, not
     // slip through an owner-masking ambient umask.
-    let _guard = UmaskGuard::set(0o000);
+    let guard = UmaskGuard::set(0o000);
     let drive_dir = TestDir::new("op-state-serve");
     let vault = Vault::open(&drive_dir.path).unwrap();
     let _serving = ServingEndpoint::open_loopback(&vault, &drive_dir.path).unwrap();
+    // The guard's purpose ends with the open: the mode is fixed at
+    // creation, so the assertion reads state, not umask-dependent
+    // behavior.
+    drop(guard);
     assert_eq!(
         mode_of(&drive_dir.path.join(SERVE_DIR)) & 0o777,
         0o700,

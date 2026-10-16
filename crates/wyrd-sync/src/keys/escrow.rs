@@ -302,12 +302,13 @@ mod tests {
             modes[0], modes[1],
             "the modes are chosen, not umask-derived"
         );
-        assert_eq!(modes[0].0 & 0o777, crate::durable::SECRET_FILE_MODE);
     }
 
-    /// The custody suite's crash-window shape: a stale temp stranded
-    /// by a pre-fix crash is reclaimed, and the record it precedes
-    /// lands owner-only — the escrow write inherits the primitive's
+    /// Mirrors the custody suite's
+    /// `a_stale_temp_is_reclaimed_at_the_hardened_mode`
+    /// (`durable/tests_permissions.rs`): a stale temp stranded by a
+    /// pre-fix crash is reclaimed, and the record it precedes lands
+    /// owner-only — the escrow write inherits the primitive's
     /// create-time mode rather than a post-hoc chmod.
     #[cfg(unix)]
     #[test]

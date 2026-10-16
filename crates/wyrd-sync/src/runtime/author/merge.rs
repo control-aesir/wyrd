@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use wyrd_format::{
-    Component, ContentId, Entry, EntryContent, ObjectKind, ObjectStore, SnapshotId, Tree,
+    Component, ContentId, DriveId, Entry, EntryContent, ObjectKind, ObjectStore, SnapshotId, Tree,
 };
 
 use super::snapshot::author_with_parents;
@@ -99,6 +99,27 @@ pub(crate) fn plan<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
+    let rebuilt = engine.store.rebuild(engine.device)?;
+    plan_over(engine.drive, objects, &rebuilt, heads)
+}
+
+/// Classify explicit source heads over one durable rebuild: the
+/// shared classification [`plan`] and [`preview`] validate against,
+/// so both read the same facts without replaying twice. Pure over
+/// the rebuild — no store reads — besides the object-store root
+/// loads the classification names.
+///
+/// [`plan`]: self::plan
+/// [`preview`]: self::preview
+fn plan_over<S: ObjectStore>(
+    drive: DriveId,
+    objects: &S,
+    rebuilt: &Rebuilt,
+    heads: Vec<SnapshotId>,
+) -> Result<MergePlan, EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
     let mut sorted = heads;
     sorted.sort();
     for pair in sorted.windows(2) {
@@ -119,8 +140,7 @@ where
         ));
     }
 
-    let rebuilt = engine.store.rebuild(engine.device)?;
-    let mut dag = SnapshotDag::new(engine.drive);
+    let mut dag = SnapshotDag::new(drive);
     for body in rebuilt.runtime.snapshot_bodies.values() {
         dag.observe(body.clone());
     }
@@ -208,6 +228,7 @@ where
 /// run every check [`merge`] applies before authoring — head
 /// validation, spec closure, and the locality gate — and return
 /// the plan plus the adopted entries the commit would author.
+/// Classification and locality share one durable rebuild.
 /// Read-only; the dry run front ends show instead of committing.
 /// No ownership check: merging carries ordinary member authority,
 /// and every other gate here is literally the commit's.
@@ -223,9 +244,12 @@ pub(crate) fn preview<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let plan = plan(engine, objects, heads)?;
-    let taken = validate_spec(&plan, default, spec)?;
     let rebuilt = engine.store.rebuild(engine.device)?;
+    let plan = plan_over(engine.drive, objects, &rebuilt, heads)?;
+    let taken = validate_spec(&plan, default, spec)?;
+    // Locality reads the same rebuild the plan classified: both
+    // gates see one tip, so a concurrent commit between two replays
+    // can no longer split the verdict across states.
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;
     }

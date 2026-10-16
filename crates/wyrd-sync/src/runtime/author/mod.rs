@@ -48,6 +48,8 @@ mod tests_lifecycle;
 #[cfg(test)]
 mod tests_merge;
 #[cfg(test)]
+mod tests_read_paths;
+#[cfg(test)]
 mod tests_reader;
 #[cfg(test)]
 mod tests_recover;

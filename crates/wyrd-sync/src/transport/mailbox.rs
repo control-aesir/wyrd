@@ -134,6 +134,14 @@ pub fn seal_for_recipient(
     control_bytes: &[u8],
 ) -> Result<MailboxEnvelope, MailboxError> {
     check_outbound_size(control_bytes)?;
+    // lift_x: the recipient is a Nostr identity key, so a
+    // non-curve-point recipient is refused with a precise InvalidKey
+    // before any seal is built — without this, the bogus point would
+    // fail later inside NIP-44 ECDH parsing with a generic Crypto
+    // error. Same shared gate as the live mailbox's send path.
+    if !crate::keys::device_id_is_curve_point(&recipient) {
+        return Err(MailboxError::InvalidKey);
+    }
     let sender_key = sender_secret.secret_key();
     let sk = nostr_secret(&sender_key)?;
     let sender = device_id_from_secret(&sender_key);
@@ -531,6 +539,23 @@ mod tests {
         let opened: Zeroizing<Vec<u8>> =
             open_from_sender(&recipient_sk, recipient, &envelope).unwrap();
         assert_eq!(opened.as_slice(), sealed.encode().as_slice());
+    }
+
+    #[test]
+    fn seal_refuses_an_off_curve_recipient_before_sealing() {
+        // Sealing to a device that cannot exist is refused with a
+        // precise InvalidKey before any NIP-44 work (which would fail
+        // the bogus point later with a generic Crypto error). 0xFF is
+        // never a valid x-only point.
+        let (sender_sk, _) = identity(0x01);
+        assert!(matches!(
+            seal_for_recipient(
+                &sender_sk,
+                DeviceId::from_bytes([0xFF; 32]),
+                b"control bytes",
+            ),
+            Err(MailboxError::InvalidKey)
+        ));
     }
 
     #[test]

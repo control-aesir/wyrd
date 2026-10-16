@@ -1685,6 +1685,15 @@ where
         if envelope.sender != self.owner {
             return Err(MailboxError::Identity);
         }
+        // lift_x: the recipient is a Nostr identity key, so a
+        // non-curve-point recipient is refused before any wrap is
+        // built — otherwise an unroutable gift wrap would leave for
+        // a device that cannot exist. Checked through wyrd-sync's
+        // shared gate (nostr's `PublicKey::from_slice` only checks
+        // length, so it cannot serve here).
+        if !wyrd_sync::keys::device_id_is_curve_point(&envelope.recipient) {
+            return Err(MailboxError::InvalidKey);
+        }
         let recipient = PublicKey::from_byte_array(*envelope.recipient.as_bytes());
         // The rumor is authored by the real device key but never signed
         // directly: its JSON travels inside the NIP-59 seal, which the
@@ -1692,9 +1701,7 @@ where
         // then signed locally by an ephemeral key the NIP-59 builder
         // generates and discards.
         let rumor: UnsignedEvent = EventBuilder::new(Kind::Custom(RUMOR_KIND), envelope.ciphertext)
-            .tag(Tag::public_key(PublicKey::from_byte_array(
-                *envelope.recipient.as_bytes(),
-            )))
+            .tag(Tag::public_key(recipient))
             .finalize_unsigned(self.sender_pk);
         let wrap = self
             .rt()

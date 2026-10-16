@@ -27,6 +27,25 @@ fn enc_pair(pattern: u8) -> (DeviceEncryptionSecret, DeviceEncryptionKey) {
     }
 }
 
+/// A device id drawn on the curve: `BLAKE3("wyrd test device id v1"
+/// || seed || counter)` until lift_x succeeds, so proptest seeds
+/// always form constructible capabilities (construction rejects
+/// off-curve devices).
+fn curve_device(seed: [u8; 32]) -> DeviceId {
+    let mut counter = 0u8;
+    loop {
+        let mut input = Vec::with_capacity(64);
+        input.extend_from_slice(b"wyrd test device id v1");
+        input.extend_from_slice(&seed);
+        input.push(counter);
+        let hash = blake3::hash(&input);
+        if XOnlyPublicKey::from_slice(hash.as_bytes()).is_ok() {
+            return DeviceId::from_bytes(*hash.as_bytes());
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
 fn capability(device: DeviceId, enc_key: DeviceEncryptionKey, n: u64) -> Capability {
     Capability::new(
         DriveId::from_bytes([0xEE; 32]),
@@ -539,6 +558,58 @@ fn new_rejects_an_encryption_key_that_is_not_a_curve_point() {
 }
 
 #[test]
+fn new_rejects_a_device_that_is_not_a_curve_point() {
+    // The device is a Nostr identity key, so it gets the same lift_x
+    // check as the encryption key: a non-point must not flow into the
+    // keyring or the capability AAD. The bound transition is a
+    // BLAKE3 hash, not a key, so it is deliberately not curve-checked.
+    let (_, enc_key) = enc_pair(0x42);
+    let bad = DeviceId::from_bytes([0xFF; 32]);
+    let secrets = vec![EpochSecret::from_bytes([0xAA; 32])];
+    assert!(matches!(
+        Capability::new(
+            DriveId::from_bytes([0x01; 32]),
+            bad,
+            enc_key,
+            TransitionId::from_bytes([0x11; 32]),
+            1,
+            secrets,
+        ),
+        Err(CapabilityError::InvalidDevice)
+    ));
+}
+
+#[test]
+fn decode_rejects_a_stored_capability_with_an_off_curve_device() {
+    // Fail-closed durable direction: a capability committed by an
+    // older build (before the constructor gate) with a non-point
+    // device no longer decodes — replay reads the commit as corrupt
+    // rather than installing it. Built by splicing: the plaintext
+    // layout is drive || device || key || transition || epoch || body.
+    use super::encoding::{parse_plaintext, plaintext_bytes};
+    let (_, enc_key) = enc_pair(0x42);
+    let good = Capability::new(
+        DriveId::from_bytes([0x01; 32]),
+        key(5).1,
+        enc_key,
+        TransitionId::from_bytes([0x11; 32]),
+        1,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    let mut pt = plaintext_bytes(&good).to_vec();
+    pt[32..64].copy_from_slice(&[0xFF; 32]);
+    assert!(
+        parse_plaintext(&pt).is_none(),
+        "an off-curve device must fail decode, not install"
+    );
+    assert!(
+        parse_plaintext(&plaintext_bytes(&good)).is_some(),
+        "an on-curve capability still decodes"
+    );
+}
+
+#[test]
 fn mint_uses_the_state_registered_encryption_key() {
     // The owner (caller of mint) does not choose the key: `state`
     // is the source of truth. A caller passing any other key gets
@@ -546,10 +617,7 @@ fn mint_uses_the_state_registered_encryption_key() {
     use crate::membership::test_util::Builder;
     use crate::membership::MembershipState;
     use std::collections::BTreeSet;
-    let (drive, device) = (
-        DriveId::from_bytes([0x33; 32]),
-        DeviceId::from_bytes([0x55; 32]),
-    );
+    let (drive, device) = (DriveId::from_bytes([0x33; 32]), key(0x55).1);
     let (_, registered_key) = enc_pair(0x42);
     let state = MembershipState {
         members: BTreeSet::from([device]),
@@ -688,8 +756,8 @@ fn mint_covers_a_reader() {
     use crate::membership::MembershipState;
     use std::collections::BTreeSet;
     let drive = DriveId::from_bytes([0x33; 32]);
-    let member = DeviceId::from_bytes([0x55; 32]);
-    let reader = DeviceId::from_bytes([0x66; 32]);
+    let member = key(0x55).1;
+    let reader = key(0x66).1;
     let (_, reader_key) = enc_pair(0x44);
     let (_, member_key) = enc_pair(0x45);
     let state = MembershipState {
@@ -707,11 +775,12 @@ fn mint_covers_a_reader() {
 
 proptest! {
     /// Wrap/unwrap preserves arbitrary capabilities exactly: random
-    /// devices, delivery keys, epoch ranges, and secrets all survive
-    /// the envelope, and only the matching encryption secret opens it.
-    /// The tamper variant flips one byte in the ephemeral-key header
-    /// or the tag tail: the forgery must fail the open, never
-    /// half-open.
+    /// on-curve devices, delivery keys, epoch ranges, and secrets all
+    /// survive the envelope, and only the matching encryption secret
+    /// opens it. Devices are drawn on the curve because construction
+    /// rejects off-curve ids. The tamper variant flips one byte in
+    /// the ephemeral-key header or the tag tail: the forgery must
+    /// fail the open, never half-open.
     #[test]
     fn wrap_unwrap_preserves_arbitrary_capabilities(
         device in any::<[u8; 32]>(),
@@ -720,7 +789,7 @@ proptest! {
         tamper_header in any::<bool>(),
         mask in 1u8..=255,
     ) {
-        let device = DeviceId::from_bytes(device);
+        let device = curve_device(device);
         let (enc_secret, enc_key) = enc_pair(enc_pattern);
         let epoch = secrets.len() as u64;
         let secrets: Vec<EpochSecret> =

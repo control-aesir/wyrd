@@ -287,6 +287,24 @@ fn fuzz_enc_pair(pattern: u8) -> (DeviceEncryptionSecret, DeviceEncryptionKey) {
     }
 }
 
+/// A device id drawn on the curve for capability-wrap fuzzing:
+/// construction rejects off-curve devices, so the fuzz seed must
+/// form a constructible capability before any mutation runs.
+fn fuzz_curve_device(seed: [u8; 32]) -> DeviceId {
+    let mut counter = 0u8;
+    loop {
+        let mut input = Vec::with_capacity(64);
+        input.extend_from_slice(b"wyrd fuzz device id v1");
+        input.extend_from_slice(&seed);
+        input.push(counter);
+        let hash = blake3::hash(&input);
+        if XOnlyPublicKey::from_slice(hash.as_bytes()).is_ok() {
+            return DeviceId::from_bytes(*hash.as_bytes());
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
 // --- wyrd-format decoders ---------------------------------------------------
 
 proptest! {
@@ -530,7 +548,7 @@ proptest! {
             secrets.into_iter().map(EpochSecret::from_bytes).collect();
         let cap = Capability::new(
             drive(),
-            DeviceId::from_bytes(device),
+            fuzz_curve_device(device),
             enc_key,
             TransitionId::from_bytes([0x11; 32]),
             secrets.len() as u64,

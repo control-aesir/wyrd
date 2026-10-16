@@ -70,6 +70,8 @@ pub enum CapabilityError {
     Empty,
     #[error("the claimed encryption key is not a valid secp256k1 x-only key")]
     InvalidEncryptionKey,
+    #[error("the claimed device is not a valid secp256k1 x-only key")]
+    InvalidDevice,
     #[error("device is not a member of this membership state")]
     NotAMember,
     #[error("capability targets an encryption key that is not the device's registered key")]
@@ -92,7 +94,10 @@ impl Capability {
     /// `epoch`, addressed to `device` via its registered
     /// `encryption_key`. The minter holds the membership log, so the
     /// binding is validated here: the secret count must equal the
-    /// transition's epoch (the capability covers exactly `1..=epoch`).
+    /// transition's epoch (the capability covers exactly `1..=epoch`),
+    /// and both the device and the encryption key must be real
+    /// secp256k1 x-only curve points (the bound transition id is a
+    /// BLAKE3 hash, not a key, and is not curve-checked).
     pub fn new(
         drive: DriveId,
         device: DeviceId,
@@ -114,6 +119,14 @@ impl Capability {
         // lift_x: the claimed key must be a real curve point (T14).
         if XOnlyPublicKey::from_slice(encryption_key.as_bytes()).is_err() {
             return Err(CapabilityError::InvalidEncryptionKey);
+        }
+        // lift_x: the device is a Nostr identity key, so it gets the
+        // same check — a non-point must not flow into the keyring or
+        // the capability AAD. The bound `transition` is deliberately
+        // unchecked: a TransitionId is a BLAKE3 hash, not a key, so a
+        // curve check would reject legitimate transitions.
+        if !crate::keys::device_id_is_curve_point(&device) {
+            return Err(CapabilityError::InvalidDevice);
         }
         Ok(Capability {
             drive,
@@ -371,6 +384,12 @@ impl WrappedCapability {
             .chunks_exact(32)
             .map(|chunk| EpochSecret::from_bytes(chunk.try_into().expect("chunks_exact(32)")))
             .collect();
+        // No curve gate here by design: the envelope authenticates
+        // the recipient through ECDH against the proven encryption
+        // key, and install-time `preflight` rejects any capability
+        // whose device differs from the keyring's — the keyring device
+        // derives from a secret, so it is on-curve by construction.
+        // A capability-supplied device never becomes an identity.
         Ok(Capability {
             drive,
             device: claimed_device,

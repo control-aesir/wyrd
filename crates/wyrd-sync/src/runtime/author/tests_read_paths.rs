@@ -85,6 +85,28 @@ fn heads_report_rebuilds_once() {
     let live = engine.live_heads().unwrap();
     assert_eq!(listed.len(), 2, "every tip is listed with its class");
     assert_eq!(live.len(), 2, "both forks stay eligible");
+    // The join is by id: the listing's eligible set is exactly the
+    // live set, so no row borrows detail from another head.
+    let mut listed_eligible: Vec<SnapshotId> = listed
+        .iter()
+        .filter(|head| {
+            matches!(
+                head.classification,
+                crate::authorization::Classification::Eligible
+            )
+        })
+        .map(|head| head.id)
+        .collect();
+    listed_eligible.sort();
+    let mut live_ids: Vec<SnapshotId> = live
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+    live_ids.sort();
+    assert_eq!(
+        listed_eligible, live_ids,
+        "eligible rows join exactly the live heads"
+    );
     assert_eq!(
         engine.store.rebuild_count() - before,
         1,

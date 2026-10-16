@@ -278,10 +278,18 @@ impl Engine {
         // replaying history again. Non-eligible rows still carry
         // their reason with no author/tree detail — verified heads
         // only, as before.
-        let (rebuilt, eligible) = self.rebuild_eligible_heads()?;
+        //
+        // The memo write is tip-guarded: a commit landing between
+        // the tip read and the rebuild would otherwise key stale
+        // heads to the new tip. On a race the listing still returns
+        // the consistent rebuild it holds; only the memo write is
+        // skipped.
         let tip = self.store.current();
-        if let Ok(mut guard) = self.live_heads_cache.lock() {
-            *guard = Some((tip, eligible));
+        let (rebuilt, eligible) = self.rebuild_eligible_heads()?;
+        if self.store.current() == tip {
+            if let Ok(mut guard) = self.live_heads_cache.lock() {
+                *guard = Some((tip, eligible));
+            }
         }
         let mut dag = crate::authorization::SnapshotDag::new(self.drive);
         for body in rebuilt.runtime.snapshot_bodies.values() {

@@ -615,6 +615,21 @@ version say exactly what changed.
 
 ### Changed
 
+- Live sync loop split, phase 4: apply extraction
+  (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
+  the mutation half moves from `live/mod.rs` to `live/apply.rs`
+  (`apply_entry`, `apply_mutation`, the fold machinery, `build_root`,
+  demand resolution, the quota gates, the commit error-mapping
+  helpers, `ApplyEntry`, `authoring_error`). Pure move in one `impl
+  LiveNode` block plus the free items. Items called across the new
+  boundary take `pub(super)` (nine: the pass-called entry point, the
+  test-pinned evaluators, the shared sweep type and its two
+  error-mapping helpers); a private `use` in `live` keeps the free
+  items reachable through `super::*` without widening past the
+  module. `docs/write-path.md` numeric refs re-pointed at the new
+  homes (including the `ConflictedHeads` → `Conflicted` rename the
+  refs predated). `wyrd_core::live::X` paths preserved. No behavior
+  change.
 - Live sync loop split, phase 3: pass extraction
   (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
   the sync half moves from `live/mod.rs` to `live/pass.rs`

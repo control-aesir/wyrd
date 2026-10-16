@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a5c25b0ae6ecb7456a95e9716027e2069af1b6163b047ce408fb2cf86c5e7730 # shrinks to enc_pattern = 0, device = [13, 14, 189, 35, 111, 35, 40, 19, 84, 59, 32, 116, 26, 24, 44, 76, 48, 114, 23, 104, 32, 15, 23, 7, 68, 31, 2, 34, 122, 90, 52, 38], secrets = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], cut = 0, tail = [0], flipped_at = 0, mask = 1, random = []

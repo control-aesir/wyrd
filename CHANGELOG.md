@@ -617,6 +617,18 @@ version say exactly what changed.
   projection. Pinned by a replay-count test and a post-commit
   invalidation test; `snapshot_heads` and `live_heads_at_epoch` keep
   the uncached path.
+- Device ids validated as secp256k1 curve points at the parse boundary
+  (`nostr:nevent1qqs857qucehn206t5lc2ksyg3var5cr047lg2sp977gpudclta3dn4gpz9mhxue69uhkwunpwdczuap49eehge5xkfs`):
+  `Capability::new` rejects a non-curve-point `device` with the new
+  `CapabilityError::InvalidDevice` (beside the existing
+  `InvalidEncryptionKey` check), and `LiveMailbox::send` refuses an
+  off-curve recipient with `MailboxError::InvalidKey` before building
+  any gift wrap. One shared `device_id_is_curve_point` gate in
+  `wyrd-sync` keys, so `wyrd-core`'s runtime dependencies gain no new
+  crypto crate; the bound transition id is a BLAKE3 hash, not a key,
+  and stays unchecked. Fail-closed note: a capability committed by an
+  older build with an off-curve device no longer decodes (durable
+  replay reads the commit as corrupt rather than installing it).
 - CLI hex parsers consolidated
   (`nostr:nevent1qqsgzquxttceqlxke6hnmqwn264myw5jn8zg9gryc0mmnsa7gm8jalcpz9mhxue69uhkwunpwdczuap49eehga8888v`,
   follow-up to

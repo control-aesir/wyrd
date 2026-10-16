@@ -92,6 +92,16 @@ macro_rules! device_secret {
 device_secret!(DeviceIdentitySecret);
 device_secret!(DeviceEncryptionSecret);
 
+/// Whether a device id names a real secp256k1 x-only curve point
+/// (BIP-340 lift_x). The single validated gate for inbound public
+/// identifiers: `wyrd-format`'s `DeviceId` is opaque 32 bytes by
+/// design, so every layer that treats one as a Nostr identity key —
+/// capability construction, mailbox delivery — checks through here
+/// instead of reimplementing the curve call.
+pub fn device_id_is_curve_point(device: &DeviceId) -> bool {
+    XOnlyPublicKey::from_slice(device.as_bytes()).is_ok()
+}
+
 impl DeviceIdentitySecret {
     /// The device id this identity names: the x-only public key.
     /// Public output only — the secret never leaves the wrapper, and

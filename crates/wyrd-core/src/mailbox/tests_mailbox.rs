@@ -486,6 +486,24 @@ fn foreign_envelope_sender_rejected() {
     ));
 }
 
+#[test]
+fn off_curve_recipient_rejected_before_any_wrap() {
+    // A recipient that is not a curve point cannot exist as a Nostr
+    // identity: refuse before building any gift wrap, instead of
+    // emitting an unroutable wrap for a device that cannot decrypt.
+    // 0xFF is never a valid x-only point.
+    let device = keys();
+    let mut mailbox = offline_mailbox(&device);
+    assert!(matches!(
+        mailbox.send(envelope(
+            device_id(&device),
+            DeviceId::from_bytes([0xFF; 32]),
+            "nowhere bytes",
+        )),
+        Err(MailboxError::InvalidKey)
+    ));
+}
+
 /// The send-path debug line's accounting: accepted relays land in
 /// `accepted`, every other relay lands in `not_accepted` carrying the
 /// relay's answer — so a relay that answers `OK false` reads

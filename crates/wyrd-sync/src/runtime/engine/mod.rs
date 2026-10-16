@@ -758,8 +758,12 @@ pub struct Engine {
     /// heads instead of replaying history and re-verifying. No
     /// explicit invalidation runs anywhere: every durable commit
     /// advances the tip, and nothing else can change what the
-    /// projection derives from. Volatile like every other live
-    /// projection — a reopen starts empty.
+    /// projection derives from. The key is the in-memory tip, which
+    /// tracks the disk tip only because the store's exclusive,
+    /// held-for-life lock forbids a second writer to the directory:
+    /// if that lock model ever changes, this keying must change with
+    /// it. Volatile like every other live projection — a reopen
+    /// starts empty.
     pub(super) live_heads_cache: Mutex<Option<(u64, Vec<AuthorizedSnapshot>)>>,
     /// In-memory fetch-backoff state: how many `execute_plan` runs have
     /// happened, per-representation strike counts with the run they were

@@ -662,3 +662,40 @@ fn live_heads_sees_heads_authored_after_the_memo() {
         "the tip advance retired the memoized heads"
     );
 }
+
+/// An open write session does not move the projection: `begin_write`
+/// captures the eligible heads but commits nothing, so `live_heads`
+/// before and after opening a session must agree. This pins the
+/// pending-mutation guardrail the memo relies on — memory that has
+/// not committed can never populate or be served from the cache —
+/// for the future transaction-window work.
+#[test]
+fn live_heads_ignores_an_open_write_session() {
+    let (mut pair, _, _) = scenario();
+    assert_eq!(drain_side(&mut pair.relay, &mut pair.a).accepted, 7);
+    let mut objects = MemoryObjectStore::default();
+    let tree = local_tree(&mut objects);
+    pair.a.engine.author_snapshot(&objects, tree).unwrap();
+    let before: Vec<SnapshotId> = pair
+        .a
+        .engine
+        .live_heads()
+        .unwrap()
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+
+    let _session = pair.a.engine.begin_write().unwrap();
+    let during: Vec<SnapshotId> = pair
+        .a
+        .engine
+        .live_heads()
+        .unwrap()
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+    assert_eq!(
+        during, before,
+        "an uncommitted session leaves the projection alone"
+    );
+}

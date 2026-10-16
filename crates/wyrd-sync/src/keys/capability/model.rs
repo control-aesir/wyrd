@@ -384,6 +384,12 @@ impl WrappedCapability {
             .chunks_exact(32)
             .map(|chunk| EpochSecret::from_bytes(chunk.try_into().expect("chunks_exact(32)")))
             .collect();
+        // No curve gate here by design: the envelope authenticates
+        // the recipient through ECDH against the proven encryption
+        // key, and install-time `preflight` rejects any capability
+        // whose device differs from the keyring's — the keyring device
+        // derives from a secret, so it is on-curve by construction.
+        // A capability-supplied device never becomes an identity.
         Ok(Capability {
             drive,
             device: claimed_device,

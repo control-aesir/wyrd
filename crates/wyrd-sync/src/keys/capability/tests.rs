@@ -580,6 +580,36 @@ fn new_rejects_a_device_that_is_not_a_curve_point() {
 }
 
 #[test]
+fn decode_rejects_a_stored_capability_with_an_off_curve_device() {
+    // Fail-closed durable direction: a capability committed by an
+    // older build (before the constructor gate) with a non-point
+    // device no longer decodes — replay reads the commit as corrupt
+    // rather than installing it. Built by splicing: the plaintext
+    // layout is drive || device || key || transition || epoch || body.
+    use super::encoding::{parse_plaintext, plaintext_bytes};
+    let (_, enc_key) = enc_pair(0x42);
+    let good = Capability::new(
+        DriveId::from_bytes([0x01; 32]),
+        key(5).1,
+        enc_key,
+        TransitionId::from_bytes([0x11; 32]),
+        1,
+        vec![EpochSecret::from_bytes([0xAA; 32])],
+    )
+    .unwrap();
+    let mut pt = plaintext_bytes(&good).to_vec();
+    pt[32..64].copy_from_slice(&[0xFF; 32]);
+    assert!(
+        parse_plaintext(&pt).is_none(),
+        "an off-curve device must fail decode, not install"
+    );
+    assert!(
+        parse_plaintext(&plaintext_bytes(&good)).is_some(),
+        "an on-curve capability still decodes"
+    );
+}
+
+#[test]
 fn mint_uses_the_state_registered_encryption_key() {
     // The owner (caller of mint) does not choose the key: `state`
     // is the source of truth. A caller passing any other key gets

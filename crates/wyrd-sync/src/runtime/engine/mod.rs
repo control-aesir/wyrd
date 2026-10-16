@@ -939,6 +939,21 @@ impl Engine {
         Ok(seq)
     }
 
+    /// Commit one fact batch and report whether the batch landed: a
+    /// torn write leaves the durable tip (and therefore the returned
+    /// sequence) where it was, so a caller that keeps an in-memory
+    /// projection of the facts it committed must rebuild from disk
+    /// instead of trusting it. Production commits always land; only a
+    /// crash-hooked (test) commit tears.
+    pub(in crate::runtime) fn commit_facts_landing(
+        &mut self,
+        facts: &[Fact],
+    ) -> Result<bool, DurableError> {
+        let before = self.store.current();
+        let seq = self.commit_facts(facts)?;
+        Ok(seq > before)
+    }
+
     /// Test-only: release the store's advisory lock without dropping the
     /// engine, modeling abrupt process death. Used by the restart helper:
     /// the fresh engine opens the directory while the parked old engine

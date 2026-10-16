@@ -13,9 +13,11 @@ impl Engine {
     /// Run the fetch plan to convergence against a bulk source,
     /// importing every object strictly through `insert_verified`.
     ///
-    /// Each pass rebuilds the keyring and runtime view from durable
-    /// facts, reconciles the plan, and commits one batch of manifest
-    /// and local-object facts. Passes repeat while they commit: child
+    /// The run replays the keyring and runtime view from durable
+    /// facts once, then reconciles and commits one batch of manifest
+    /// and local-object facts per pass against the retained
+    /// projection (a torn commit replays from disk before the next
+    /// pass). Passes repeat while they commit: child
     /// manifests discovered in one pass unlock their own children and
     /// objects in the next. A pass that commits nothing ends the run;
     /// its remaining items are reported as unfulfilled, never raised.

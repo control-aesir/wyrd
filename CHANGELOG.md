@@ -584,6 +584,17 @@ version say exactly what changed.
   the five `parse_*` helpers in `commands/device.rs` share one private
   `parse_32_byte_hex` decode-or-usage-error shape; names, signatures,
   and usage messages are unchanged. No behavior change.
+- Plan execution replays the durable store once per run instead of once
+  per convergence pass
+  (`nostr:nevent1qqspuma5u2cne26swr9qxv2aly54ul4n2mk9p4pg25zy6yrl44mdhacpz9mhxue69uhkwunpwdczuap49eehgw6jpj8`):
+  the executor commits only snapshot-body, manifest, and local-object
+  facts and applies each through the same mutator a replay uses, so a
+  landed commit leaves the held projection equal to a rebuild and the
+  next pass reconciles from memory. A torn (crash-hooked) commit still
+  replays from disk before the next pass, so the in-memory projection
+  can never drive work on facts the store never took. Pinned by a
+  replay-count test and a crash-stage-by-batch-position equivalence
+  test; report counters and recovery behavior are unchanged.
 - CLI command tree hardened after the `main.rs` split
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   follow-up): sixteen single-module helpers return to private

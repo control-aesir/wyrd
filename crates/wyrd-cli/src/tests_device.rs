@@ -1,3 +1,4 @@
+use super::commands::device::{parse_content_id, parse_snapshot_id, parse_transition_id};
 use super::tests_harness::{write_secret, TempDir};
 use super::*;
 use wyrd_sync::runtime::EngineError;
@@ -525,4 +526,42 @@ fn reissue_recovers_lost_invitation_through_the_surface() {
         matches!(error, CliError::Engine(EngineError::NotMember)),
         "unknown device has no invitation: {error:?}"
     );
+}
+
+/// The five hex parsers share one decode helper; their usage
+/// messages are the user-facing contract, so pin each message
+/// against both failure modes (undecodable input, wrong length).
+/// The help contract covers `--help` pages only and would not
+/// catch silent drift here.
+#[test]
+fn hex_parsers_reject_malformed_input_with_stable_messages() {
+    fn assert_usage<T: std::fmt::Debug>(result: Result<T, CliError>, message: &str) {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, CliError::Usage(actual) if actual == message),
+            "malformed hex is refused with the stable usage message: {error:?}"
+        );
+    }
+    for bad in ["not-hex", "ab"] {
+        assert_usage(
+            parse_device_id(bad),
+            "device must be 64 hex characters naming an x-only pubkey",
+        );
+        assert_usage(
+            parse_snapshot_id(bad),
+            "snapshot must be 64 hex characters naming a snapshot id",
+        );
+        assert_usage(
+            parse_content_id(bad),
+            "content must be 64 hex characters naming a content id",
+        );
+        assert_usage(
+            parse_transition_id(bad),
+            "transition must be 64 hex characters naming a transition id",
+        );
+        assert_usage(
+            parse_encryption_key(bad),
+            "encryption key must be 64 hex characters naming an x-only pubkey",
+        );
+    }
 }

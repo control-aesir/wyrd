@@ -330,7 +330,7 @@ a negative test in the implementation follow-up:
    carry a `node_addr` whose serving residency does not hold the
    announced representation — the barrier's existing job
    (`write-path.md` step 5; the `ServingBarrier` trait in
-   `crates/wyrd-core/src/live.rs`), true of a refusal as of a slow
+   `crates/wyrd-core/src/live/mod.rs`), true of a refusal as of a slow
    mirror. The author's commit stands regardless: later-stage failure
    never rolls back earlier durable state, so refusing to
    retain or advertise does not un-commit the author's snapshot.
@@ -390,7 +390,7 @@ the follow-up's mechanism, not today's bytes.
 ceilings and must not be conflated in `wyrd policy budgets`'s output: the
 quota bounds the author's own commits before their first write
 (`LiveNode::enforce_retained_quota`, ahead of every arm of
-`apply_mutation` in `crates/wyrd-core/src/live.rs`); the refusal
+`apply_mutation` in `crates/wyrd-core/src/live/mod.rs`); the refusal
 ceilings bound what a device accepts from others and what it promises
 to serve. Until the receive path enforces A, the interference channel
 stands as documented: a remote author can spend a peer's local-write

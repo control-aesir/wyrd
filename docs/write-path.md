@@ -208,7 +208,7 @@ Rules:
    submit nothing and force nothing, and a member whose namespace
    precondition fails during fold application (the `create` arm's
    `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
-   inside application at `live.rs:1621`/`:1623`/`:1625-1626`/
+   inside application at `live/mod.rs:1621`/`:1623`/`:1625-1626`/
    `:1628-1629`, never at admission; the clause is generic over
    every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
    fail the same way)
@@ -216,8 +216,8 @@ Rules:
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
    bytes durable. A fold-fatal refusal raised before the commit
-   begins — the pre-commit quota (`live.rs:1455`, `live.rs:2020-2025`
-   under folding) and `ConflictedHeads` (`live.rs:2004-2019`) — leaves members
+   begins — the pre-commit quota (`live/mod.rs:1455`, `live/mod.rs:2020-2025`
+   under folding) and `ConflictedHeads` (`live/mod.rs:2004-2019`) — leaves members
    retryable and non-terminal, as does a failed forcing member; a
    `StaleHandle` is terminal, and so is a store, authoring, or
    fact-commit failure wherever it occurs (the stale/`EIO` rule

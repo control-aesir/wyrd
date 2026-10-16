@@ -116,6 +116,7 @@ impl Engine {
         S::Error: std::fmt::Debug,
     {
         author::preview_recovery(self, objects, from, takes, all, contents)
+            .map(|(preview, _)| preview)
     }
 
     /// Recover selected source rows into a recovery-flagged

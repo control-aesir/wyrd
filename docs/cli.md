@@ -27,6 +27,8 @@ wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passp
 wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
 wyrd [--config <path>] policy <drive_dir> \
     (status [path] creds | budgets creds | role (set <mirror|vault> [--yes] | status creds) | pin <path> creds | unpin <path> creds | evict <path> creds)
+wyrd [--config <path>] snapshot [--identity-file <path>] [--passphrase-file <path>] <drive_dir> \
+    (heads | merge [--head <id>...] [--default @N] [--take path=@N]... [--drop path]... [--dry-run] | recover --from <id> [--take path]... [--all] [--content <id>]... [--dry-run])
   where creds = [--identity-file <path>] [--passphrase-file <path>]: credential flags ride each
   policy action, never the parent — `policy role set` alone takes neither
 ```

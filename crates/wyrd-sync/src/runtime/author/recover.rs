@@ -165,11 +165,12 @@ where
 /// Preview a recovery over one source snapshot with a full
 /// selection: run every check [`recover`] applies before
 /// authoring — source readability, selection validity, and the
-/// locality gate — and return the plan plus the graft names the
-/// commit would author. Read-only; the dry run front ends show
-/// instead of committing. No ownership check: previewing reads
-/// history the keystore holder can already read, while authoring
-/// stays owner-gated in [`recover`].
+/// locality gate — and return the plan, the graft names, and the
+/// adopted entries the commit would author. Read-only; the dry
+/// run front ends show the names instead of committing, and
+/// [`recover`] authors from the entries. No ownership check:
+/// previewing reads history the keystore holder can already read,
+/// while authoring stays owner-gated in [`recover`].
 ///
 /// [`recover`]: self::recover
 pub(crate) fn preview<S: ObjectStore>(
@@ -179,7 +180,7 @@ pub(crate) fn preview<S: ObjectStore>(
     takes: &[String],
     all: bool,
     contents: &[ContentId],
-) -> Result<RecoveryPreview, EngineError>
+) -> Result<(RecoveryPreview, Vec<Entry>), EngineError>
 where
     S::Error: std::fmt::Debug,
 {
@@ -193,16 +194,18 @@ where
         .iter()
         .map(|entry| entry.name.as_str().to_owned())
         .collect();
-    Ok(RecoveryPreview { plan, grafted })
+    Ok((RecoveryPreview { plan, grafted }, taken))
 }
 
-/// Recover selected source rows into a new snapshot: validate the
-/// whole selection over the [`plan`], build the deterministic graft
-/// tree, and author it with the recovery flag parenting onto the
-/// current eligible heads. Owner-only, current epoch, existing
-/// announcement outbox — no membership change. A selection that is
-/// empty, names unknown paths, or leans on bytes the device cannot
-/// produce fails closed with nothing committed.
+/// Recover selected source rows into a new snapshot: derive the
+/// graft through the [`preview`] path, then build the
+/// deterministic graft tree and author it with the recovery flag
+/// parenting onto the current eligible heads. Owner-only, current
+/// epoch, existing announcement outbox — no membership change. A
+/// selection that is empty, names unknown paths, or leans on bytes
+/// the device cannot produce fails closed with nothing committed.
+///
+/// [`preview`]: self::preview
 pub(crate) fn recover<S: ObjectStore>(
     engine: &mut Engine,
     objects: &mut S,
@@ -214,17 +217,15 @@ pub(crate) fn recover<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let plan = plan(engine, objects, from)?;
-    let taken = select(objects, &plan, takes, all, contents)?;
+    let (_, taken) = preview(engine, objects, from, takes, all, contents)?;
     let rebuilt = engine.store.rebuild(engine.device)?;
     // Same ownership projection `author_recovery` enforces, checked
     // before the graft-tree insert: a non-owner call must write
     // nothing at all, not even an orphaned tree object. The dry run
     // skips this gate — previewing reads history, authoring needs
-    // the owner — and every other check runs through the same
-    // [`preview`] path.
-    //
-    // [`preview`]: self::preview
+    // the owner — and the locality gate below re-runs so the
+    // owner-before-locality order never changes: read-only checks
+    // are cheap, error precedence is not.
     check_recovery_owner(&rebuilt, &engine.device)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;

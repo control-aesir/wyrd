@@ -388,8 +388,9 @@ fn recovery_marker(flags: u8) -> &'static str {
 /// The dry-run verdict line for a merge: the spec closed over
 /// the plan, so the commit would proceed past validation. Counts
 /// agreed paths — the ones that take themselves — against the
-/// total, so scripts see how much the spec decided. Locality and
-/// authoring run only in the commit, hence "would", not "will".
+/// total, so scripts see how much the spec decided. The preview
+/// already ran every pre-commit check including the locality
+/// gate; only authoring remains, hence "would", not "will".
 pub(crate) fn merge_dry_run_verdict(plan: &wyrd_sync::runtime::MergePlan) -> String {
     let agreed = plan.paths.iter().filter(|path| path.agreed()).count();
     format!(

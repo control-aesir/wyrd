@@ -112,63 +112,56 @@ pub(crate) fn device_id_report(engine: &Engine) -> Result<String, CliError> {
     })
 }
 
-/// Parse a device identity from 64 hex characters (x-only pubkey).
-pub(crate) fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
-    let bytes = hex::decode(hex.trim())
+/// Decode 64 hex characters into 32 bytes, or fail with the
+/// caller's usage message. The five `parse_*` wrappers below share
+/// this shape; only the target type and the message differ.
+fn parse_32_byte_hex(hex: &str, usage: &str) -> Result<[u8; 32], CliError> {
+    hex::decode(hex.trim())
         .ok()
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CliError::Usage("device must be 64 hex characters naming an x-only pubkey".into())
-        })?;
-    Ok(DeviceId::from_bytes(bytes))
+        .ok_or_else(|| CliError::Usage(usage.into()))
+}
+
+/// Parse a device identity from 64 hex characters (x-only pubkey).
+pub(crate) fn parse_device_id(hex: &str) -> Result<DeviceId, CliError> {
+    Ok(DeviceId::from_bytes(parse_32_byte_hex(
+        hex,
+        "device must be 64 hex characters naming an x-only pubkey",
+    )?))
 }
 
 /// Parse a snapshot id from 64 hex characters (the merge sources
 /// named by `snapshot merge --head`).
 pub(crate) fn parse_snapshot_id(hex: &str) -> Result<SnapshotId, CliError> {
-    let bytes = hex::decode(hex.trim())
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CliError::Usage("snapshot must be 64 hex characters naming a snapshot id".into())
-        })?;
-    Ok(SnapshotId::from_bytes(bytes))
+    Ok(SnapshotId::from_bytes(parse_32_byte_hex(
+        hex,
+        "snapshot must be 64 hex characters naming a snapshot id",
+    )?))
 }
 
 /// Parse a content id from 64 hex characters (the `--content`
 /// escape hatch for grafting bytes whose path is unknown).
 pub(crate) fn parse_content_id(hex: &str) -> Result<wyrd_format::ContentId, CliError> {
-    let bytes = hex::decode(hex.trim())
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CliError::Usage("content must be 64 hex characters naming a content id".into())
-        })?;
-    Ok(wyrd_format::ContentId::from_bytes(bytes))
+    Ok(wyrd_format::ContentId::from_bytes(parse_32_byte_hex(
+        hex,
+        "content must be 64 hex characters naming a content id",
+    )?))
 }
 
 /// Parse a membership transition id from 64 hex characters (the
 /// winner and voided siblings named by `member resolve`).
 pub(crate) fn parse_transition_id(hex: &str) -> Result<TransitionId, CliError> {
-    let bytes = hex::decode(hex.trim())
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CliError::Usage("transition must be 64 hex characters naming a transition id".into())
-        })?;
-    Ok(TransitionId::from_bytes(bytes))
+    Ok(TransitionId::from_bytes(parse_32_byte_hex(
+        hex,
+        "transition must be 64 hex characters naming a transition id",
+    )?))
 }
 
 /// Parse a device encryption key from 64 hex characters (x-only
 /// pubkey, from the newcomer's pairing-request output).
 pub(crate) fn parse_encryption_key(hex: &str) -> Result<DeviceEncryptionKey, CliError> {
-    let bytes = hex::decode(hex.trim())
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            CliError::Usage(
-                "encryption key must be 64 hex characters naming an x-only pubkey".into(),
-            )
-        })?;
-    Ok(DeviceEncryptionKey::from_bytes(bytes))
+    Ok(DeviceEncryptionKey::from_bytes(parse_32_byte_hex(
+        hex,
+        "encryption key must be 64 hex characters naming an x-only pubkey",
+    )?))
 }

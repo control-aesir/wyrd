@@ -349,18 +349,6 @@ pub(crate) enum SnapshotAction {
     /// this is also the live-head listing; every other class is
     /// retained history with its reason attached and no number.
     Heads,
-    /// Preview a merge without authoring: one row per root path
-    /// with each selected head's version, so the operator sees
-    /// which paths are agreed and which need a `--take` line.
-    /// Sources default to all live heads, like `merge`. A short
-    /// selection with no eligible heads on a membership-frozen
-    /// drive is refused with a pointer to `member resolve`.
-    Plan {
-        /// Source head, 64 hex characters. Repeatable; omitted means
-        /// all live heads.
-        #[arg(long = "head")]
-        heads: Vec<String>,
-    },
     /// Merge source heads into one snapshot. Sources default to all
     /// live heads; `--head` narrows to an explicit subset (at least
     /// two). Conflicted root paths take `--take path=@N`, drop with
@@ -387,37 +375,20 @@ pub(crate) enum SnapshotAction {
         /// Repeatable.
         #[arg(long = "drop")]
         drops: Vec<String>,
+        /// Preview the merge without authoring: the plan rows over
+        /// the same `@N` basis plus the spec verdict. Runs every
+        /// pre-commit check the merge runs, minus the authoring.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Recover stranded bytes into a recovery-flagged snapshot:
     /// republish selected content from a dead fork under the
-    /// current epoch without adopting its lineage. Plan first,
-    /// then run — like `merge`, the dry run shows every row
-    /// before anything commits.
+    /// current epoch without adopting its lineage. `--dry-run`
+    /// shows the plan rows plus the would-graft set before
+    /// anything commits; without it the selection grafts.
     Recover {
-        #[command(subcommand)]
-        action: RecoverAction,
-    },
-}
-
-/// One owner-recovery step: preview the graft, or author it.
-#[derive(Debug, Subcommand)]
-pub(crate) enum RecoverAction {
-    /// Preview a recovery without authoring: one row per source
-    /// root path with its status, so the operator sees what is
-    /// graftable, what is already live, and what is gone before
-    /// selecting.
-    Plan {
         /// Source snapshot, 64 hex characters: the stranded fork
         /// whose bytes are grafted.
-        #[arg(long = "from")]
-        from: String,
-    },
-    /// Graft selected source rows into a recovery snapshot
-    /// parented onto the current eligible heads. Owner-only: a
-    /// non-owner fails closed with the engine's refusal before
-    /// anything commits.
-    Run {
-        /// Source snapshot, 64 hex characters.
         #[arg(long = "from")]
         from: String,
         /// Source root path to graft. Repeatable, one path per
@@ -432,6 +403,10 @@ pub(crate) enum RecoverAction {
         /// Repeatable.
         #[arg(long = "content")]
         contents: Vec<String>,
+        /// Preview the graft without authoring. Reads need no
+        /// ownership; the commit still refuses non-owners.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 

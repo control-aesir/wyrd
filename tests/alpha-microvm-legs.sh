@@ -119,7 +119,7 @@ leg_converge2_owner() {
 # (`snapshot heads`: heads with their tree hashes). v0 promises no
 # headless materialization, so the proof is structural: identical
 # live heads mean identical manifests, hence identical bytes by
-# CAS. (`snapshot plan` cannot serve here: it refuses a single
+# CAS. (`merge --dry-run` cannot serve here: it refuses a single
 # head, and this wave converges to exactly one.) A mount follows
 # only to fault one wave-2 file in, tying this wave's heads to
 # bytes through the serving route (the step-12 pattern), before

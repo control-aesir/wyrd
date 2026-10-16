@@ -84,7 +84,8 @@ use crate::membership::MembershipLog;
 pub use super::author::AdmitOutcome;
 pub use super::author::ResumeOutcome;
 pub use super::author::{
-    MergePath, MergePlan, MergeSelection, RecoveryPath, RecoveryPlan, RecoveryStatus,
+    MergePath, MergePlan, MergeSelection, RecoveryPath, RecoveryPlan, RecoveryPreview,
+    RecoveryStatus,
 };
 pub use super::bootstrap::PairingRequest;
 

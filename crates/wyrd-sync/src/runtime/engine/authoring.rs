@@ -52,6 +52,29 @@ impl Engine {
         author::plan_merge(self, objects, heads)
     }
 
+    /// Preview a merge over explicit source heads with a full spec:
+    /// every check [`merge_heads`] applies before authoring, minus
+    /// the authoring. Read-only; the `--dry-run` front end shows
+    /// the returned plan instead of committing. A preview that
+    /// passes predicts the commit's pre-authoring verdict on stable
+    /// state — the commit still re-runs every gate itself, so bytes
+    /// that leave between preview and commit fail the commit, never
+    /// slip through.
+    ///
+    /// [`merge_heads`]: Engine::merge_heads
+    pub fn merge_preview<S: ObjectStore>(
+        &self,
+        objects: &S,
+        heads: Vec<SnapshotId>,
+        default: Option<SnapshotId>,
+        spec: &std::collections::BTreeMap<String, author::MergeSelection>,
+    ) -> Result<author::MergePlan, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        author::preview_merge(self, objects, heads, default, spec).map(|(plan, _)| plan)
+    }
+
     /// Plan a recovery over one source snapshot without authoring
     /// anything: the per-path status a dry run shows before the
     /// operator selects. Read-only; shares the classification
@@ -68,6 +91,31 @@ impl Engine {
         S::Error: std::fmt::Debug,
     {
         author::plan_recovery(self, objects, from)
+    }
+
+    /// Preview a recovery over one source snapshot with a full
+    /// selection: every check [`recover`] applies before
+    /// authoring, minus the authoring and minus the owner gate
+    /// (previewing reads history any keystore holder can read;
+    /// only authoring needs the owner). Read-only; the `--dry-run`
+    /// front end shows the plan plus the graft names instead of
+    /// committing. Same staleness note as [`merge_preview`]: the
+    /// commit re-runs every gate itself.
+    ///
+    /// [`recover`]: Engine::recover
+    /// [`merge_preview`]: Engine::merge_preview
+    pub fn recovery_preview<S: ObjectStore>(
+        &self,
+        objects: &S,
+        from: SnapshotId,
+        takes: &[String],
+        all: bool,
+        contents: &[ContentId],
+    ) -> Result<author::RecoveryPreview, EngineError>
+    where
+        S::Error: std::fmt::Debug,
+    {
+        author::preview_recovery(self, objects, from, takes, all, contents)
     }
 
     /// Recover selected source rows into a recovery-flagged

@@ -293,23 +293,28 @@ fn snapshot_merge_rejects_bad_sources() {
     );
 }
 
-/// Planning without two heads fails with the engine's verdict,
+/// A dry run without two heads fails with the engine's verdict,
 /// authoring nothing — including on a headed drive, where no
 /// membership freeze diverts the error.
 #[test]
-fn snapshot_plan_needs_two_heads() {
+fn snapshot_merge_dry_run_needs_two_heads() {
     let fixture = Fixture::new();
-    let error = command(fixture.args(vec!["plan".into()])).unwrap_err();
+    let error = command(fixture.args(vec!["merge".into(), "--dry-run".into()])).unwrap_err();
     assert!(
         matches!(error, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
         "unexpected: {error:?}"
     );
-    let error =
-        command(fixture.args(vec!["plan".into(), "--head".into(), "not-hex".into()])).unwrap_err();
+    let error = command(fixture.args(vec![
+        "merge".into(),
+        "--dry-run".into(),
+        "--head".into(),
+        "not-hex".into(),
+    ]))
+    .unwrap_err();
     assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
 
     write_file(&fixture, "kept.txt", b"kept");
-    let error = command(fixture.args(vec!["plan".into()])).unwrap_err();
+    let error = command(fixture.args(vec!["merge".into(), "--dry-run".into()])).unwrap_err();
     assert!(
         matches!(error, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
         "one eligible head is still one head short: {error:?}"
@@ -384,6 +389,71 @@ fn snapshot_plan_report_renders_versions_per_head() {
     assert!(report.contains("same: agreed"), "agreed row takes itself");
 }
 
+/// The merge dry-run verdict names the closed spec: agreed
+/// paths against the total, so scripts see how much the spec
+/// decided without parsing rows.
+#[test]
+fn merge_dry_run_verdict_names_agreement() {
+    use std::collections::BTreeMap;
+    use wyrd_format::{ContentId, EntryContent};
+    use wyrd_sync::runtime::{MergePath, MergePlan};
+    let first = SnapshotId::from_bytes([0x11; 32]);
+    let second = SnapshotId::from_bytes([0x22; 32]);
+    let chunk = ContentId::from_bytes([0x33; 32]);
+    let entry = Entry::file("a", 3, false, vec![chunk]).unwrap();
+    assert!(matches!(entry.content, EntryContent::File { .. }));
+    let plan = MergePlan {
+        heads: vec![first, second],
+        paths: vec![
+            MergePath {
+                path: "a".to_owned(),
+                versions: BTreeMap::from([(first, Some(entry)), (second, None)]),
+            },
+            MergePath {
+                path: "same".to_owned(),
+                versions: BTreeMap::from([
+                    (
+                        first,
+                        Some(Entry::file("same", 1, false, vec![chunk]).unwrap()),
+                    ),
+                    (
+                        second,
+                        Some(Entry::file("same", 1, false, vec![chunk]).unwrap()),
+                    ),
+                ]),
+            },
+        ],
+    };
+    assert_eq!(
+        merge_dry_run_verdict(&plan),
+        "dry-run: spec closed over 2 paths (1 agreed); nothing authored\n",
+    );
+}
+
+/// The recovery dry-run verdict names the would-graft set in
+/// graft order: the selection made visible.
+#[test]
+fn recovery_dry_run_verdict_names_the_graft() {
+    use wyrd_sync::runtime::{RecoveryPath, RecoveryPlan, RecoveryPreview, RecoveryStatus};
+
+    let chunk = wyrd_format::ContentId::from_bytes([0x33; 32]);
+    let preview = RecoveryPreview {
+        plan: RecoveryPlan {
+            from: SnapshotId::from_bytes([0x77; 32]),
+            paths: vec![RecoveryPath {
+                path: "ready.txt".to_owned(),
+                entry: Entry::file("ready.txt", 1, false, vec![chunk]).unwrap(),
+                status: RecoveryStatus::Ready,
+            }],
+        },
+        grafted: vec!["ready.txt".to_owned()],
+    };
+    assert_eq!(
+        recovery_dry_run_verdict(&preview),
+        "dry-run: would graft ready.txt; nothing authored\n",
+    );
+}
+
 /// The plan report names the source and every row with its reason:
 /// the dry run is honest about the full picture or it is not one.
 #[test]
@@ -426,18 +496,21 @@ fn recover_plan_report_names_every_status_with_its_reason() {
     );
 }
 
-/// `recover plan` over history prints graftable rows; over the live
-/// head it reports already-live instead of a graft case.
+/// `recover --all --dry-run` over history prints graftable
+/// rows; over the live head it reports already-live instead of a
+/// graft case. The bare dry run refuses an empty selection like
+/// the commit would — `--all` is the discovery spelling.
 #[test]
-fn recover_plan_renders_source_rows() {
+fn recover_dry_run_renders_source_rows() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let second = write_file(&fixture, "new.txt", b"new");
     command(fixture.args(vec![
         "recover".into(),
-        "plan".into(),
         "--from".into(),
         first.to_string(),
+        "--all".into(),
+        "--dry-run".into(),
     ]))
     .unwrap();
 
@@ -455,16 +528,15 @@ fn recover_plan_renders_source_rows() {
     );
 }
 
-/// `recover run --take` grafts the selection under the recovery
+/// `recover --take` grafts the selection under the recovery
 /// flag, parenting onto the current eligible heads.
 #[test]
-fn recover_run_grafts_the_take() {
+fn recover_grafts_the_take() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let second = write_file(&fixture, "new.txt", b"new");
     command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--take".into(),
@@ -490,13 +562,12 @@ fn recover_run_grafts_the_take() {
 
 /// `--all` grafts the whole source tree in one run.
 #[test]
-fn recover_run_all_grafts_the_whole_tree() {
+fn recover_all_grafts_the_whole_tree() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     write_file(&fixture, "new.txt", b"new");
     command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--all".into(),
@@ -524,7 +595,7 @@ fn recover_run_all_grafts_the_whole_tree() {
 /// `--content` grafts explicitly named bytes under their hex name,
 /// for content whose path the operator no longer knows.
 #[test]
-fn recover_run_content_grafts_under_its_hex_name() {
+fn recover_content_grafts_under_its_hex_name() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     write_file(&fixture, "new.txt", b"new");
@@ -534,7 +605,6 @@ fn recover_run_content_grafts_under_its_hex_name() {
     };
     command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--content".into(),
@@ -566,17 +636,12 @@ fn recover_run_content_grafts_under_its_hex_name() {
 
 /// Running with no selection names itself and commits nothing.
 #[test]
-fn recover_run_refuses_when_nothing_is_selected() {
+fn recover_refuses_when_nothing_is_selected() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let before = fixture.open().live_heads().unwrap().len();
-    let error = command(fixture.args(vec![
-        "recover".into(),
-        "run".into(),
-        "--from".into(),
-        first.to_string(),
-    ]))
-    .unwrap_err();
+    let error = command(fixture.args(vec!["recover".into(), "--from".into(), first.to_string()]))
+        .unwrap_err();
     assert!(
         matches!(error, CliError::Engine(EngineError::RecoveryEmptySelection)),
         "unexpected: {error:?}"
@@ -591,13 +656,12 @@ fn recover_run_refuses_when_nothing_is_selected() {
 /// Unknown paths and unknown content ids fail closed with nothing
 /// committed.
 #[test]
-fn recover_run_refuses_an_unrecoverable_selection() {
+fn recover_refuses_an_unrecoverable_selection() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let before = fixture.open().live_heads().unwrap().len();
     let error = command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--take".into(),
@@ -610,7 +674,6 @@ fn recover_run_refuses_an_unrecoverable_selection() {
     );
     let error = command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--content".into(),
@@ -634,12 +697,11 @@ fn recover_run_refuses_an_unrecoverable_selection() {
 /// `--all` with `--take` lines contradicts itself at the argument
 /// boundary, before the engine runs.
 #[test]
-fn recover_run_rejects_all_with_take() {
+fn recover_rejects_all_with_take() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let error = command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--all".into(),
@@ -653,7 +715,7 @@ fn recover_run_rejects_all_with_take() {
 /// A non-owner fails closed with the engine's refusal and the heads
 /// are unchanged: the pre-check surfaces before any selection work.
 #[test]
-fn recover_run_by_a_non_owner_fails_closed() {
+fn recover_by_a_non_owner_fails_closed() {
     let fixture = Fixture::new();
     let first = write_file(&fixture, "old.txt", b"old");
     let member = admit_member(&fixture, &[0x44; 32]);
@@ -662,7 +724,6 @@ fn recover_run_by_a_non_owner_fails_closed() {
     let before = snapshot_heads_report(&fixture.open()).unwrap();
     let error = command(fixture.args(vec![
         "recover".into(),
-        "run".into(),
         "--from".into(),
         first.to_string(),
         "--take".into(),
@@ -680,8 +741,90 @@ fn recover_run_by_a_non_owner_fails_closed() {
     );
 }
 
+/// A dry run with no selection refuses exactly like the commit
+/// would: the preview predicts, never browses. Rows still print
+/// first — the refusal teaches what is selectable.
+#[test]
+fn recover_dry_run_without_selection_refuses() {
+    let fixture = Fixture::new();
+    let first = write_file(&fixture, "old.txt", b"old");
+    let before = fixture.open().live_heads().unwrap().len();
+    let error = command(fixture.args(vec![
+        "recover".into(),
+        "--from".into(),
+        first.to_string(),
+        "--dry-run".into(),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::RecoveryEmptySelection)),
+        "unexpected: {error:?}"
+    );
+    assert_eq!(
+        fixture.open().live_heads().unwrap().len(),
+        before,
+        "refusals commit nothing"
+    );
+}
+
+/// A dry run previews for non-owners: the owner gate guards
+/// authoring, not read-only history inspection, so the preview
+/// succeeds where the commit refuses — and authors nothing.
+#[test]
+fn recover_dry_run_previews_for_non_owners() {
+    let fixture = Fixture::new();
+    let first = write_file(&fixture, "old.txt", b"old");
+    let member = admit_member(&fixture, &[0x44; 32]);
+    command(fixture.member_args(vec!["set-owner".into(), member.to_string()])).unwrap();
+
+    let before = snapshot_heads_report(&fixture.open()).unwrap();
+    command(fixture.args(vec![
+        "recover".into(),
+        "--from".into(),
+        first.to_string(),
+        "--take".into(),
+        "old.txt".into(),
+        "--dry-run".into(),
+    ]))
+    .unwrap();
+    assert_eq!(
+        snapshot_heads_report(&fixture.open()).unwrap(),
+        before,
+        "the preview authors nothing"
+    );
+}
+
+/// A merge dry run threads the whole argument surface: malformed
+/// spec lines fail at the boundary, and engine refusals pass
+/// through with nothing authored.
+#[test]
+fn merge_dry_run_refuses_like_the_commit() {
+    let fixture = Fixture::new();
+    let before = fixture.open().live_heads().unwrap().len();
+    let error = command(fixture.args(vec![
+        "merge".into(),
+        "--dry-run".into(),
+        "--take".into(),
+        "a".into(),
+    ]))
+    .unwrap_err();
+    assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+
+    write_file(&fixture, "kept.txt", b"kept");
+    let error = command(fixture.args(vec!["merge".into(), "--dry-run".into()])).unwrap_err();
+    assert!(
+        matches!(error, CliError::Engine(EngineError::MergeNeedsTwoHeads)),
+        "unexpected: {error:?}"
+    );
+    assert_eq!(
+        fixture.open().live_heads().unwrap().len(),
+        before + 1,
+        "refusals author nothing beyond the fixture write"
+    );
+}
+
 /// `@N` never reaches recovery: `--from` takes a snapshot id, so
-/// a head number fails at the argument boundary on both verbs.
+/// a head number fails at the argument boundary on both paths.
 #[test]
 fn recover_rejects_head_numbers() {
     let fixture = Fixture::new();
@@ -689,13 +832,12 @@ fn recover_rejects_head_numbers() {
     for args in [
         vec![
             "recover".into(),
-            "plan".into(),
             "--from".into(),
             "@1".into(),
+            "--dry-run".into(),
         ],
         vec![
             "recover".into(),
-            "run".into(),
             "--from".into(),
             "@1".into(),
             "--take".into(),

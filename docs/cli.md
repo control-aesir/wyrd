@@ -8,7 +8,7 @@ behavior lives in `wyrd-core` / `wyrd-daemon`. This document mirrors
 the `crates/wyrd-cli/src` module tree (`main.rs` dispatches; argument
 parsing in `args.rs`, one module per command family in `commands/`
 (`cache`, `device`, `export`, `member`, `mount`, `pin`, `role`,
-`snapshot`, `sync`, `vault`), credentials in `credentials.rs`, drive
+`snapshot`, `sync`, `vault`, declared in `commands.rs`), credentials in `credentials.rs`, drive
 config in `drive_config.rs`, the live-node host in `live.rs`,
 diagnostics in `logging.rs`, posture in `posture.rs`, probes in
 `probes.rs`, and updates in `update.rs`); when they disagree, the code wins and

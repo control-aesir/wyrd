@@ -410,7 +410,10 @@ fn credential_contents_never_appear_in_errors() {
 /// orphaned test module compiles nothing and fails nothing, so the
 /// wiring itself needs a pin. Reads the source tree at the
 /// build-time manifest directory; every file but `main.rs` must be
-/// named by a `mod <stem>;` line in `main.rs`.
+/// named by a `mod <stem>;` line in `main.rs`. The `commands/`
+/// family tree gets the same pin one level down: every file in
+/// `src/commands/` must be named by a `mod <stem>;` line in
+/// `commands.rs`, or the family compiles nothing and fails nothing.
 #[test]
 fn every_src_file_is_a_declared_module() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -429,6 +432,19 @@ fn every_src_file_is_a_declared_module() {
         }
         if !main.contains(&format!("mod {stem};")) {
             orphaned.push(name);
+        }
+    }
+    let commands = fs::read_to_string(src.join("commands.rs")).unwrap();
+    let mut family: Vec<_> = fs::read_dir(src.join("commands")).unwrap().collect();
+    family.sort_by_key(|entry| entry.as_ref().unwrap().file_name());
+    for entry in family {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
+        if !commands.contains(&format!("mod {stem};")) {
+            orphaned.push(format!("commands/{name}"));
         }
     }
     assert!(orphaned.is_empty(), "uncompiled modules: {orphaned:?}");

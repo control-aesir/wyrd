@@ -562,6 +562,14 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI command tree hardened after the `main.rs` split
+  (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
+  follow-up): sixteen single-module helpers return to private
+  visibility, the `every_src_file_is_a_declared_module` pin descends
+  into `src/commands/`, `docs/cli.md` names `commands.rs`, and the new
+  `tests/help_contract.rs` verifies the full `--help` tree plus error
+  paths against the committed `help-contract.blake3` (46 pages) inside
+  the normal cargo gate. No behavior change.
 - CLI vault/member/snapshot/device families extracted from `main.rs`
   (`nostr:nevent1qqsyfxq3flw7nx0slwkvmvpuau47a9xmfsgstk5leulu297af7fvkqgpz9mhxue69uhkwunpwdczuap49eehgfncncm`,
   phase 4): `vault` with the status renderer, durable-probe helpers,

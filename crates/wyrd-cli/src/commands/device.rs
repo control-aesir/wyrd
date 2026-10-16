@@ -70,7 +70,7 @@ pub(crate) fn device(
 /// sealed, not secret, so no ownership hardening applies — but an
 /// unbounded read lets a corrupt file exhaust memory before decode
 /// refuses it.
-pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, CliError> {
+fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, CliError> {
     let mut file = fs::File::open(path).map_err(|source| CliError::Io {
         path: path.to_path_buf(),
         source,
@@ -92,7 +92,7 @@ pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, CliError>
 /// The sealed invitation bound: genesis plus one wrapped capability.
 /// Kilobytes in practice; a megabyte leaves headroom no honest
 /// inviter approaches.
-pub(crate) const MAX_INVITATION_BYTES: usize = 1024 * 1024;
+const MAX_INVITATION_BYTES: usize = 1024 * 1024;
 
 /// This device's id plus the encryption key the membership state
 /// registers for it. `unregistered` is honest, not an error: a fresh

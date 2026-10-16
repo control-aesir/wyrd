@@ -805,3 +805,191 @@ fn plan_fetches_duplicate_entries_once() {
         "duplicate entries across manifests fetch once"
     );
 }
+
+/// One durable replay per run, not one per convergence pass. The
+/// executor applies the facts it commits through the same mutators a
+/// replay uses, so a landed commit leaves the held projection equal
+/// to a rebuild and the pass that unlocks the next phase reconciles
+/// from memory. A run that fetches a body, then a root plus its
+/// child, then an object, therefore pays exactly one replay — and
+/// the torn-commit path pays one more to recover from a write that
+/// left memory claiming facts the store never took.
+#[test]
+fn converged_run_replays_the_store_once() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"one replay",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+
+    let replays_before = fixture.engine.store.rebuild_count();
+    let report = fixture
+        .engine
+        .execute_plan(&mut bulk.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(report.manifests, 2, "root plus its child");
+    assert_eq!(report.objects, 1);
+    assert_eq!(report.unfulfilled, 0);
+    // Body, root/child manifests, and the object each commit in their
+    // own pass; only the run pays a replay.
+    assert_eq!(
+        fixture.engine.store.rebuild_count() - replays_before,
+        1,
+        "one durable replay per run, not per pass"
+    );
+    assert_eq!(
+        objects.get(&published.content).unwrap().as_deref(),
+        Some(b"one replay".as_slice())
+    );
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(facts.manifests.len(), 2);
+    assert_eq!(facts.local_objects, vec![published.content]);
+}
+
+/// Tearing any pass — the first, a middle one, or the last — lands
+/// the same durable state as a clean run, inside the same run: the
+/// torn batch is retried from a disk replay, so everything is
+/// durable by the time the run returns and a reopened drive finds
+/// nothing left to do. This is the crash-equivalence half of
+/// retaining state across passes: a torn commit must not let the
+/// in-memory projection (which already claims the torn facts) drive
+/// the next pass, and recovery must not double-commit anything.
+#[test]
+fn torn_commit_in_any_pass_converges_like_a_clean_run() {
+    // nth = 0 tears the snapshot-body pass, 1 the manifest pass,
+    // 2 the object pass: batch position times crash stage.
+    for nth in 0..3 {
+        for stage in [
+            CrashStage::AfterWriteTemp,
+            CrashStage::AfterFsyncTemp,
+            CrashStage::AfterRenameCommit,
+            CrashStage::AfterFsyncCommitDir,
+            CrashStage::AfterRenameCurrent,
+        ] {
+            torn_pass_converges(nth, stage);
+        }
+    }
+}
+
+fn torn_pass_converges(nth: usize, stage: CrashStage) {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let mut bulk = MemoryBulkSource::default();
+    let body = intake_body(&builder, &admission);
+    let published = publish_into(
+        &mut bulk,
+        &epoch_secret,
+        2,
+        &epoch_secret,
+        2,
+        body.snapshot_id(),
+        b"torn equivalence",
+    );
+    let _body = intake_published(
+        &mut fixture,
+        &mut bulk,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: published.root_manifest,
+            transport: published.root_transport,
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materialization(published.content, MaterializationState::Pinned)
+        .unwrap();
+    fixture.engine.crash_after_nth_commit(nth, stage);
+
+    let torn = fixture
+        .engine
+        .execute_plan(&mut bulk.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(
+        torn.unfulfilled, 0,
+        "{stage:?} nth={nth}: the run converges despite the tear"
+    );
+    // The torn batch was retried inside the same run from a disk
+    // replay, so the store is already complete — including the batch
+    // the crash hook ate.
+    let facts = fixture.engine.store.load().expect("loads");
+    assert_eq!(
+        facts.snapshot_bodies.len(),
+        1,
+        "{stage:?} nth={nth}: torn body fact landed on retry"
+    );
+    assert_eq!(
+        facts.manifests.len(),
+        2,
+        "{stage:?} nth={nth}: root plus child, exactly once"
+    );
+    assert_eq!(
+        facts.local_objects,
+        vec![published.content],
+        "{stage:?} nth={nth}: object local exactly once"
+    );
+    assert_eq!(
+        objects.get(&published.content).unwrap().as_deref(),
+        Some(b"torn equivalence".as_slice()),
+        "{stage:?} nth={nth}: bytes intact"
+    );
+
+    // A reopened drive therefore finds nothing left to do: the
+    // recovery rerun is the same no-op a clean run promises, which
+    // fails if the first run ever trusted memory over the store.
+    fixture.engine = reopen(&mut fixture);
+    let recovery = fixture
+        .engine
+        .execute_plan(&mut bulk.clone(), &mut objects)
+        .unwrap();
+    assert_eq!(
+        recovery,
+        ExecuteReport {
+            manifests: 0,
+            snapshot_bodies: 0,
+            objects: 0,
+            unfulfilled: 0,
+            transport_errors: 0,
+            deadlines: 0,
+            missing: 0,
+            invalid: 0,
+            unavailable_keys: 0,
+            local_failures: 0,
+        },
+        "{stage:?} nth={nth}: recovery rerun is a no-op"
+    );
+}

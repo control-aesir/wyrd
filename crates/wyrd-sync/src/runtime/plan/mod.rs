@@ -71,10 +71,20 @@ fn execute_inner(
 ) -> Result<ExecuteReport, EngineError> {
     let mut report = ExecuteReport::default();
     engine.fetch_run += 1;
+    // One durable replay per run, not per pass: this executor commits
+    // only snapshot-body, manifest, and local-object facts, and it
+    // applies each of those to the in-memory projection through the
+    // same mutator a replay uses (`record_snapshot_body`,
+    // `record_manifest`, `mark_local_object`), so after a landed
+    // commit the held state equals what a rebuild would produce and
+    // the next pass reconciles from it directly. Nothing else can
+    // commit while this loop holds `engine`, and the membership log
+    // and keyring the executor reads are untouched by those fact
+    // types, so only a torn commit forces the replay back.
+    let mut rebuilt = engine.store.rebuild(engine.device)?;
     loop {
-        let rebuilt = engine.store.rebuild(engine.device)?;
-        let mut runtime = rebuilt.runtime;
-        let keyring = rebuilt.keyring;
+        let runtime = &mut rebuilt.runtime;
+        let keyring = &rebuilt.keyring;
         let plan = runtime.reconcile();
         // Items this pass has not yet fulfilled, counted down as work
         // lands: the unfulfilled total covers everything planned and
@@ -103,7 +113,7 @@ fn execute_inner(
                 tracing::debug!(key = ?body_key, "fetch skipped: backoff cooling");
                 continue;
             }
-            match super::fetch::snapshot_body(bulk, &runtime, snapshot) {
+            match super::fetch::snapshot_body(bulk, runtime, snapshot) {
                 FetchOutcome::Fulfilled(body) => {
                     // The cross-record binding: the body must be the one
                     // the accepted announcement describes. The snapshot
@@ -113,7 +123,7 @@ fn execute_inner(
                     // the body's own binding drives authorization. Only
                     // an agreeing pair commits; a disagreement is the
                     // sender's invalid data, not a transport failure.
-                    let announced = planned_announcement(&runtime, snapshot)?;
+                    let announced = planned_announcement(runtime, snapshot)?;
                     let agrees = announced.author == body.author
                         && announced.epoch == body.epoch
                         && announced.membership == body.membership;
@@ -195,8 +205,8 @@ fn execute_inner(
             match super::fetch::root(
                 &engine.drive,
                 bulk,
-                &keyring,
-                &runtime,
+                keyring,
+                runtime,
                 &engine.vault,
                 snapshot,
             ) {
@@ -246,8 +256,8 @@ fn execute_inner(
             match super::fetch::child(
                 &engine.drive,
                 bulk,
-                &keyring,
-                &runtime,
+                keyring,
+                runtime,
                 &engine.vault,
                 id,
                 link,
@@ -311,7 +321,7 @@ fn execute_inner(
             let attempt = super::fetch::object(
                 &engine.drive,
                 bulk,
-                &keyring,
+                keyring,
                 objects,
                 &engine.vault,
                 content,
@@ -380,9 +390,19 @@ fn execute_inner(
             report.unfulfilled = remaining;
             return Ok(report);
         }
-        if let Err(error) = engine.commit_facts(&facts) {
-            let _ = engine.resync();
-            return Err(error.into());
+        match engine.commit_facts_landing(&facts) {
+            Ok(true) => {}
+            // Torn (crash-hooked) commit: the in-memory projection
+            // now claims facts that are not durable, so the next pass
+            // replays from disk instead of building on them — the same
+            // recovery the per-pass rebuild used to provide.
+            Ok(false) => {
+                rebuilt = engine.store.rebuild(engine.device)?;
+            }
+            Err(error) => {
+                let _ = engine.resync();
+                return Err(error.into());
+            }
         }
         // The convergence pass the commits unlocked starts only if the
         // budget allows: stopping here leaves the rest planned and

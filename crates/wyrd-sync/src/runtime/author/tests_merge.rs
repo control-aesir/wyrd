@@ -199,6 +199,64 @@ fn merge_default_covers_unspecified_conflicts() {
     );
 }
 
+/// The `@N` contract: the live-head projection, the heads
+/// view's eligible set, and the merge-plan basis number one set —
+/// the eligible heads ascending by id. Authoring order never leaks
+/// into the numbering, and narrowing the selection re-bases `@N`
+/// onto the narrowed set (the CLI resolves `--take`/`--default`
+/// against the plan's heads, never a global index).
+#[test]
+fn at_n_numbers_the_sorted_eligible_set_everywhere() {
+    use crate::authorization::Classification;
+
+    let (_dir, mut engine, _genesis) = owner_engine("merge-at-n-contract");
+    let mut objects = MemoryObjectStore::default();
+    let base = multi_tree(&mut objects, &[("base", b"base")]);
+    let trees = [
+        multi_tree(&mut objects, &[("a", b"a1")]),
+        multi_tree(&mut objects, &[("a", b"a2")]),
+        multi_tree(&mut objects, &[("a", b"a3")]),
+    ];
+    let authored = forks(&mut engine, &mut objects, base, &trees);
+    let mut sorted = authored.clone();
+    sorted.sort();
+
+    let live: Vec<SnapshotId> = engine
+        .live_heads()
+        .unwrap()
+        .iter()
+        .map(|head| head.snapshot().snapshot_id())
+        .collect();
+    assert_eq!(live, sorted, "live heads number ascending by id");
+
+    let heads = engine.snapshot_heads().unwrap();
+    assert_eq!(heads.len(), 3, "every tip is listed with its class");
+    let eligible: Vec<SnapshotId> = heads
+        .iter()
+        .filter(|head| head.classification == Classification::Eligible)
+        .map(|head| head.id)
+        .collect();
+    assert_eq!(
+        eligible, sorted,
+        "the heads view numbers the same eligible set"
+    );
+
+    let plan = engine.merge_plan(&objects, authored.clone()).unwrap();
+    assert_eq!(
+        plan.heads, sorted,
+        "plan and merge share the live numbering"
+    );
+
+    let narrowed = vec![authored[2], authored[0]];
+    let mut rebased = narrowed.clone();
+    rebased.sort();
+    let plan = engine.merge_plan(&objects, narrowed).unwrap();
+    assert_eq!(
+        plan.heads, rebased,
+        "an explicit selection re-bases @N onto itself"
+    );
+}
+
 /// One head is an extension, not a merge: nothing commits.
 #[test]
 fn merge_refuses_fewer_than_two_heads() {

@@ -697,3 +697,45 @@ fn recover_run_by_a_non_owner_fails_closed() {
         "the failed run commits nothing"
     );
 }
+
+/// `@N` never reaches recovery: `--from` takes a snapshot id, so
+/// a head number fails at the argument boundary on both verbs.
+#[test]
+fn recover_rejects_head_numbers() {
+    let fixture = Fixture::new();
+    write_file(&fixture, "old.txt", b"old");
+    for args in [
+        vec![
+            "recover".into(),
+            "plan".into(),
+            "--from".into(),
+            "@1".into(),
+        ],
+        vec![
+            "recover".into(),
+            "run".into(),
+            "--from".into(),
+            "@1".into(),
+            "--take".into(),
+            "old.txt".into(),
+        ],
+    ] {
+        let error = command(fixture.args(args)).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)), "unexpected: {error:?}");
+    }
+}
+
+/// An out-of-range `@N` names the selection it ran against, so a
+/// number copied from another view diagnoses itself instead of
+/// resolving elsewhere.
+#[test]
+fn merge_default_out_of_range_names_the_selection() {
+    let fixture = Fixture::new();
+    write_file(&fixture, "kept.txt", b"kept");
+    let error =
+        command(fixture.args(vec!["merge".into(), "--default".into(), "@2".into()])).unwrap_err();
+    assert!(
+        matches!(&error, CliError::Usage(message) if message.contains("@2 names no selected head: 1 selected")),
+        "unexpected: {error:?}"
+    );
+}

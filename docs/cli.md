@@ -216,7 +216,13 @@ number the versions of one path (`name@N`), skipping heads that lack
 the path, so a present-vs-absent conflict's `@N` there is not the
 merge's `@N`. And with `--head` narrowing, `@N` counts the selection,
 not the full live-head set: re-check the numbers before copying them
-from `snapshot list` into a narrowed merge.
+from `snapshot list` into a narrowed merge. The numbering has one
+meaning everywhere it is accepted: `list`, `heads`, `plan`, and the
+default `merge` selection all number the same sorted eligible set
+(the engine test `at_n_numbers_the_sorted_eligible_set_everywhere`
+pins this; only `Eligible` tips are ever numbered, so a stranded or
+superseded tip keeps its classification row but takes no number).
+`recover --from` takes a 64-hex snapshot id and never accepts `@N`.
 
 - `list`: the live heads with their `@N` numbers, epochs, authors,
   trees, and parent counts. Recovery-flagged heads carry a

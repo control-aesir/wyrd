@@ -21,7 +21,7 @@ wyrd [--config <path>] init [--identity-file <path>] [--passphrase-file <path>] 
 wyrd [--config <path>] mount [--relay <url>...] [--verbose] [--interval <secs>] \
     [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <mountpoint>
 wyrd [--config <path>] export [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <out_dir>
-wyrd [--config <path>] member [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue-invitation <device> <out>)
+wyrd [--config <path>] member [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (list | log | status | remove <device> [--yes] | rotate | set-owner <device> | invite <device> <encryption-key> <out> [--reader] | reissue <device> <out>)
 wyrd [--config <path>] device [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (id | pairing-request <out> | join <invitation>)
 wyrd [--config <path>] sync [--relay <url>...] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> (status | now)
 wyrd [--config <path>] vault [--relay <url>...] [--log-file <path>] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> [start | status]
@@ -29,6 +29,7 @@ wyrd [--config <path>] policy <drive_dir> \
     (status [path] creds | budgets creds | role (set <mirror|vault> [--yes] | status creds) | pin <path> creds | unpin <path> creds | evict <path> creds)
 wyrd [--config <path>] snapshot [--identity-file <path>] [--passphrase-file <path>] <drive_dir> \
     (heads | merge [--head <id>...] [--default @N] [--take path=@N]... [--drop path]... [--dry-run] | recover --from <id> [--take path]... [--all] [--content <id>]... [--dry-run])
+wyrd [--config <path>] update [--relay <url>...] [--restart] [--identity-file <path>] [--passphrase-file <path>] <drive_dir> <archive>
   where creds = [--identity-file <path>] [--passphrase-file <path>]: credential flags ride each
   policy action, never the parent — `policy role set` alone takes neither
 ```
@@ -180,7 +181,7 @@ characters (x-only pubkeys).
   claimed before the commit: an existing file is refused, and an
   uncreatable path fails with no transition authored. A write failure
   past the commit leaves the admission standing — recover with
-  `reissue-invitation` below, or rerun invite: rerunning for an
+   `reissue` below, or rerun invite: rerunning for an
   already-admitted device resumes its catch-up fill instead of
   failing, after verifying the supplied key and role against the
   recorded admission (a mismatch refuses with the actual role named
@@ -192,7 +193,7 @@ characters (x-only pubkeys).
   per-commit ceiling refuses with a named capacity error (counts,
   ceiling, unqueued closure size) that states rerunning cannot help;
   resume does not apply — the device was not admitted.
-- `reissue-invitation <device> <out>`: reseal a device's invitation
+- `reissue <device> <out>`: reseal a device's invitation
   from durable state, for an admission whose invitation never
   reached a file. Authors nothing; the reseal opens identically,
   with fresh randomness. Owner-only, like admission, and only for
@@ -320,14 +321,21 @@ next mounted sync, not here.
   refuses outright, and a member record for another device refuses
   rather than stranding it.
 
-The pairing flow, end to end:
+The pairing flow, end to end — three steps, two actors, two
+artifacts handed over out of band. The newcomer acts twice (steps
+1 and 3), the owner once (step 2); the member/device boundary
+holds throughout, and no step touches the network:
 
 ```
-# newcomer, in its own directory
+# 1. newcomer, in its own directory: stage the pairing secret and
+#    write the public pairing material (device id plus encryption
+#    key, no secrets) for the owner -> pairing.txt
 wyrd device --identity-file ... --passphrase-file ... <newcomer-dir> pairing-request pairing.txt
-# owner, with the pairing material
+# 2. owner, with the pairing material: admit the device and seal
+#    the invitation for out-of-band delivery -> invitation
 wyrd member --identity-file ... --passphrase-file ... <owner-dir> invite <device> <encryption-key> invitation
-# newcomer, with the invitation file
+# 3. newcomer, with the invitation file: join the drive from the
+#    owner's sealed invitation
 wyrd device --identity-file ... --passphrase-file ... <newcomer-dir> join invitation
 ```
 
@@ -611,7 +619,7 @@ update
     = converge a leftover `<exe>.update-state` first: only a
       passed verification ever commits, everything else rolls
       back to the pre-swap binary
-    = resolve `--archive` before anything is stopped: the path
+    = resolve the `<archive>` positional before anything is stopped: the path
       must be a regular file under its canonical name
       (`wyrd-<version>-<os>-<arch>.tar.gz`, matching this host
       except the Rosetta pair); anything else is a usage error

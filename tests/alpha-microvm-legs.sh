@@ -263,7 +263,7 @@ leg_upgrade_owner() {
   mkdir -p "$E2E_ROOT/wyrd-upgraded"
   cp "$WYRD_BIN" "$uexe"
   export WYRD_BIN="$uexe"
-  with_creds "$c" update "$d" --archive "$archive" \
+  with_creds "$c" update "$d" "$archive" \
     >"$LOGDIR/update-owner.out" 2>"$LOGDIR/update-owner.err" \
     || die "owner update transaction failed (see update-owner.err)"
   grep -q "^update done: " "$LOGDIR/update-owner.out" \

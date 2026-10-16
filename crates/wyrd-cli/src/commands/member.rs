@@ -199,7 +199,7 @@ pub(crate) fn member(
             );
             Ok(())
         }
-        MemberAction::ReissueInvitation { device, out } => {
+        MemberAction::Reissue { device, out } => {
             let device = parse_device_id(&device)?;
             // Same destination policy as invite: the reseal is new
             // bytes for an old admission, and an existing file is

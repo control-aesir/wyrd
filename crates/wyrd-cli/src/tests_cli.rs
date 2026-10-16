@@ -485,10 +485,10 @@ fn vault_start_is_default_and_status_queries() {
     }
 }
 
-/// `wyrd update` takes a drive, a local archive path, and the
-/// credential paths to forward (U1=B): no download source, and the
-/// parent never reads secrets — only the verification child opens
-/// custody.
+/// `wyrd update` takes a drive and a local archive path as
+/// positionals, plus the credential paths to forward (U1=B): no
+/// download source, and the parent never reads secrets — only the
+/// verification child opens custody.
 #[test]
 fn update_parses_drive_archive_and_forwarded_credentials() {
     let temp = TempDir::new();
@@ -506,7 +506,6 @@ fn update_parses_drive_archive_and_forwarded_credentials() {
         "wyrd",
         "update",
         drive.to_str().unwrap(),
-        "--archive",
         archive.to_str().unwrap(),
         "--identity-file",
         identity.to_str().unwrap(),
@@ -546,7 +545,6 @@ fn update_rejects_a_noncanonical_archive() {
     let error = command(vec![
         "update".into(),
         drive.display().to_string(),
-        "--archive".into(),
         archive.display().to_string(),
         "--identity-file".into(),
         identity.display().to_string(),
@@ -578,7 +576,6 @@ fn update_refuses_mismatched_restart_flags() {
         vec![
             "update".into(),
             drive.display().to_string(),
-            "--archive".into(),
             "wyrd-0.4.0-alpha-linux-aarch64.tar.gz".into(),
             "--identity-file".into(),
             identity.display().to_string(),

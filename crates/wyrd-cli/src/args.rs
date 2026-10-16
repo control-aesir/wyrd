@@ -217,7 +217,7 @@ pub(crate) enum Command {
         /// Local release archive under its canonical name
         /// (`wyrd-<version>-<os>-<arch>.tar.gz`): resolved and
         /// validated before anything is stopped.
-        #[arg(long, value_name = "PATH")]
+        #[arg(value_name = "ARCHIVE")]
         archive: PathBuf,
         /// Control-plane relays, forwarded to the vault child under
         /// `--restart` only; refused otherwise.
@@ -328,7 +328,7 @@ pub(crate) enum MemberAction {
     /// Reissue a device's sealed invitation from durable state, for
     /// an admission whose invitation never reached a file. Authors
     /// nothing; the reseal opens identically, with fresh randomness.
-    ReissueInvitation {
+    Reissue {
         /// Device whose invitation to reissue, 64 hex characters.
         device: String,
         /// Where to write the sealed invitation.

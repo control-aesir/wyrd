@@ -121,6 +121,32 @@ pub struct RecoveryPreview {
     pub grafted: Vec<String>,
 }
 
+/// Resolve the graft over the plan: read the source, validate
+/// the selection, return both. The one decision both paths share
+/// — [`preview`] adds the locality gate and returns names,
+/// [`recover`] adds the owner gate then the locality gate and
+/// authors. Splitting resolution from gating keeps the commit's
+/// owner-before-locality precedence exactly where it was before
+/// the preview extraction.
+///
+/// [`preview`]: self::preview
+/// [`recover`]: self::recover
+fn resolve<S: ObjectStore>(
+    engine: &Engine,
+    objects: &S,
+    from: SnapshotId,
+    takes: &[String],
+    all: bool,
+    contents: &[ContentId],
+) -> Result<(RecoveryPlan, Vec<Entry>), EngineError>
+where
+    S::Error: std::fmt::Debug,
+{
+    let plan = plan(engine, objects, from)?;
+    let taken = select(objects, &plan, takes, all, contents)?;
+    Ok((plan, taken))
+}
+
 /// Resolve the operator selection over the plan: `--all` takes
 /// every source row, `--take` lines take named rows, `--content`
 /// ids synthesize graft entries under their hex names. Pure
@@ -168,7 +194,7 @@ where
 /// locality gate — and return the plan, the graft names, and the
 /// adopted entries the commit would author. Read-only; the dry
 /// run front ends show the names instead of committing, and
-/// [`recover`] authors from the entries. No ownership check:
+/// [`recover`] resolves through the same helper. No ownership check:
 /// previewing reads history the keystore holder can already read,
 /// while authoring stays owner-gated in [`recover`].
 ///
@@ -184,8 +210,7 @@ pub(crate) fn preview<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let plan = plan(engine, objects, from)?;
-    let taken = select(objects, &plan, takes, all, contents)?;
+    let (plan, taken) = resolve(engine, objects, from, takes, all, contents)?;
     let rebuilt = engine.store.rebuild(engine.device)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;
@@ -197,15 +222,15 @@ where
     Ok((RecoveryPreview { plan, grafted }, taken))
 }
 
-/// Recover selected source rows into a new snapshot: derive the
-/// graft through the [`preview`] path, then build the
-/// deterministic graft tree and author it with the recovery flag
-/// parenting onto the current eligible heads. Owner-only, current
-/// epoch, existing announcement outbox — no membership change. A
-/// selection that is empty, names unknown paths, or leans on bytes
-/// the device cannot produce fails closed with nothing committed.
+/// Recover selected source rows into a new snapshot: resolve the
+/// graft through the shared helper, then build the deterministic
+/// graft tree and author it with the recovery flag parenting onto
+/// the current eligible heads. Owner-only, current epoch, existing
+/// announcement outbox — no membership change. A selection that is
+/// empty, names unknown paths, or leans on bytes the device cannot
+/// produce fails closed with nothing committed.
 ///
-/// [`preview`]: self::preview
+/// [`resolve`]: self::resolve
 pub(crate) fn recover<S: ObjectStore>(
     engine: &mut Engine,
     objects: &mut S,
@@ -217,15 +242,15 @@ pub(crate) fn recover<S: ObjectStore>(
 where
     S::Error: std::fmt::Debug,
 {
-    let (_, taken) = preview(engine, objects, from, takes, all, contents)?;
+    let (_, taken) = resolve(engine, objects, from, takes, all, contents)?;
     let rebuilt = engine.store.rebuild(engine.device)?;
     // Same ownership projection `author_recovery` enforces, checked
     // before the graft-tree insert: a non-owner call must write
     // nothing at all, not even an orphaned tree object. The dry run
     // skips this gate — previewing reads history, authoring needs
-    // the owner — and the locality gate below re-runs so the
-    // owner-before-locality order never changes: read-only checks
-    // are cheap, error precedence is not.
+    // the owner — and both paths resolve through `resolve`, so the
+    // owner-before-locality order matches the pre-extraction
+    // commit exactly.
     check_recovery_owner(&rebuilt, &engine.device)?;
     for entry in &taken {
         check_local(engine, objects, &rebuilt, entry)?;

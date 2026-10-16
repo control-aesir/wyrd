@@ -368,6 +368,71 @@ fn recovery_preview_covers_content_ids() {
         .unwrap();
 }
 
+/// Owner-before-locality precedence: a stranger whose selection
+/// also fails the locality gate is refused as a non-owner, not
+/// as missing bytes — the commit checks ownership first, exactly
+/// like before the preview extraction. The preview, which takes
+/// no owner gate by design, still reports the locality verdict.
+#[test]
+fn recover_refuses_non_owner_before_locality() {
+    use crate::authorization::test_util::sign_snapshot;
+    use crate::durable::{AuthorizeSnapshot, AuthorizedSnapshot, Fact};
+    use crate::membership::test_util::{drive as member_drive, key};
+    use wyrd_format::Snapshot;
+
+    let (_dir, mut engine, genesis) = owner_engine("recover-precedence");
+    let mut objects = MemoryObjectStore::default();
+    // A source row whose bytes never land: the tree is stored, the
+    // chunk is not, so the row probes missing and the locality
+    // gate refuses it.
+    let missing_chunk = ContentId::from_bytes([0x99; 32]);
+    let bad_tree = Tree::from_entries(vec![
+        Entry::file("gone.txt", 4, false, vec![missing_chunk]).unwrap()
+    ])
+    .unwrap()
+    .insert_into(&mut objects)
+    .unwrap();
+    let (owner_sk, owner_id) = key(10);
+    let mut body = Snapshot::new(vec![], bad_tree, owner_id, genesis, 1, 0, 1).unwrap();
+    sign_snapshot(&mut body, &owner_sk, &member_drive());
+    let authorized = AuthorizedSnapshot::authorize(body, &member_drive()).unwrap();
+    let source = authorized.snapshot().snapshot_id();
+    engine
+        .commit_facts(&[Fact::SnapshotBody(authorized)])
+        .unwrap();
+
+    let takes = ["gone.txt".to_owned()];
+    assert!(
+        matches!(
+            engine.recovery_preview(&objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "the preview reports the locality verdict"
+    );
+    assert!(
+        matches!(
+            engine.recover(&mut objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "the owner commit runs the locality gate too"
+    );
+    engine.device = key(20).1;
+    assert!(
+        matches!(
+            engine.recovery_preview(&objects, source, &takes, false, &[]),
+            Err(EngineError::ChunkUnavailable(_))
+        ),
+        "preview reads need no ownership, even failing ones"
+    );
+    assert!(
+        matches!(
+            engine.recover(&mut objects, source, &takes, false, &[]),
+            Err(EngineError::RecoveryNotOwner)
+        ),
+        "the commit checks ownership before locality"
+    );
+}
+
 /// Ownership is the one deliberate exception to preview/commit
 /// parity: previewing reads history any keystore holder can read,
 /// so no owner gate; authoring still needs the current canonical

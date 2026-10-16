@@ -539,9 +539,11 @@ version say exactly what changed.
 - `snapshot merge --dry-run` and `snapshot recover --dry-run`
   replace `snapshot plan` and `snapshot recover plan/run`
   (same issue, Phase B): preview and commit share one decision
-  path — the commit derives its verdict by running the preview
-  then authoring, pinned by preview/commit verdict-identity
-  tests at the engine level. The dry run takes the commit's full
+  path — the merge commit runs the preview then authors, the
+  recover commit resolves through the same helper the preview
+  uses (owner gate stays execution-only, owner-before-locality
+  precedence unchanged), pinned by preview/commit
+  verdict-identity tests at the engine level. The dry run takes the commit's full
   argument set, prints the rows first and the verdict second (an
   unclosed spec or refusing selection still shows every row),
   and authors nothing. `recover --dry-run` with no selection

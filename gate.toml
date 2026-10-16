@@ -1,0 +1,25 @@
+# gate: agent-facing development CLI. Verbs encode the correct procedure.
+# Profile for this repo: gate reads this from the checkout root.
+
+[project]
+# ngit repository coordinate, passed to every ngit call as --repo.
+repo_naddr = "naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl97nj2qvzqqqrhnyzuuxrw"
+# Branch prefix that marks a proposal branch.
+branch_prefix = "pr/"
+# Signer whose comments count as review (resolved to an npub at runtime).
+review_signer = "Wyrd AI Review"
+
+[ci]
+# Trust floor passed to `ngit ci status --require-ci-trust`.
+trust_level = "maintainer-directed"
+
+[log]
+# Per-user invocation log, outside the repo by design.
+path = "~/.local/state/gate/invocations.jsonl"
+
+# Odin suite resource: the forced-command ssh path. The machine id comes
+# from the key entry server-side; nothing here can forge it.
+[suite]
+host = "odin"
+user = "gate-suite"
+key = "~/.ssh/id_ed25519_gate_odin"

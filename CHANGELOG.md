@@ -627,6 +627,25 @@ version say exactly what changed.
 
 ### Changed
 
+- Mutation channel split
+  (`nostr:nevent1qqsgzj5zd26vrruzcs065kl8azes500efzzmv98ffhxxv2u7kyyx7mcpz9mhxue69uhkwunpwdczuap49eehg3fayms`):
+  `core/mutation.rs` becomes the `core/mutation/` directory: the parent
+  registry (`FileIdentity`, `ParentToken`, `ParentRegistry`,
+  `is_blocked`) moves to `parents.rs`, the request vocabulary
+  (`MutationOutcome`, fold outcomes, `CommitSource`, `WriteStats`,
+  `MutationError`, `MutationKind`, `FoldMember`, `MutationRequest`,
+  `MutationId`, `QueuedMutation`) to `kind.rs`, the channel
+  (`MutationQueue`, admission, saturation, shutdown) to `queue.rs`, and
+  the completion guard (`MutationBatch`, `BatchEntry`, `Drop`) to
+  `batch.rs`. Pure move. Items called across the new boundary take
+  `pub(super)`; `QueuedMutation` keeps its `pub` shape. The channel
+  tests follow the concern: `mkdir` and `take_batch_blocking` move to
+  `tests_harness.rs`, the four parent-token tests to `tests_parents.rs`,
+  the seven defer/drop/want/timeout mechanics tests to
+  `tests_batch.rs`, and the gauge/admission/shutdown/redaction tests to
+  `tests_queue.rs`. All 27 tests keep their names and pass untouched.
+  No behavior change.
+
 - Outbox delivery split: rotation extraction
   (`nostr:nevent1qqsrdtwq9seytyxmtgumfl2ckv0s0d4ymz0atlt07tw244t3egu7degpz9mhxue69uhkwunpwdczuap49eehgc7m8vd`):
   the rotation arm moves from `author/deliver.rs` to `author/rotation.rs`

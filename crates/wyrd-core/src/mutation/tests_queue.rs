@@ -28,19 +28,6 @@ fn format_store_full_reports_no_space() {
     );
 }
 
-/// Block until a request is queued, then take it as a batch. The
-/// guard completes on drop, so tests must finish it explicitly.
-fn take_batch_blocking(queue: &MutationQueue) -> MutationBatch<'_> {
-    let stop = AtomicBool::new(false);
-    queue.wait_for_work(&stop, Duration::from_secs(5));
-    let batch = queue.take_batch();
-    assert!(
-        !batch.is_empty(),
-        "wait_for_work returned without a request"
-    );
-    batch
-}
-
 /// Diagnostic rendering never carries file content: every variant
 /// formats without its plaintext bytes while keeping paths and
 /// content lengths. The queued entry (the shape logs and panic

@@ -43,13 +43,10 @@ pub use parents::*;
 pub use queue::*;
 
 #[cfg(test)]
-#[path = "tests_batch.rs"]
 mod tests_batch;
 #[cfg(test)]
 mod tests_harness;
 #[cfg(test)]
-#[path = "tests_parents.rs"]
 mod tests_parents;
 #[cfg(test)]
-#[path = "tests_queue.rs"]
 mod tests_queue;

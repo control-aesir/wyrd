@@ -615,6 +615,9 @@ version say exactly what changed.
 
 ### Changed
 
+- Bump `negentropy` 0.5.1 → 0.5.2 (RUSTSEC-2026-0365: remote DoS
+  through unchecked `IdList` allocation in reconciliation parsing).
+
 - Live sync loop split, phase 4: apply extraction
   (`nostr:nevent1qqsgarlva47x5muhk2sme5n86fguuayqwdjx24d0wqa2fvyvas4pvxqpz9mhxue69uhkwunpwdczuap49eehg2t3g3c`):
   the mutation half moves from `live/mod.rs` to `live/apply.rs`

@@ -4,7 +4,7 @@ Review the current branch against `master` and post the review to its existing N
 
 Repository root:!`pwd`
 Current branch:!`git branch --show-current`
-PR info:!`ngit pr list --json --offline`
+PR state:!`gate pr status`
 Recent commits:!`git log master..HEAD --oneline`
 Diff stats:!`git diff master..HEAD --stat`
 
@@ -19,7 +19,7 @@ Diff stats:!`git diff master..HEAD --stat`
 * Do not modify files, add tests, create probes, commit, push, or change the branch.
 * No subagents. No web search unless a current external fact is required and not derivable from the repo.
 * Run everything in the foreground. Never background commands or redirect gate output to logs.
-* Batch read-only git commands into one invocation (devenv shell setup is slow, and hung calls burn their full timeout).
+* Batch read-only commands into one invocation (devenv shell setup is slow, and hung calls burn their full timeout); gate reads (`gate pr status`, `gate review show`) batch the same way.
 * Never infer paths from shortened project names; locate and verify first. Don't reopen unchanged files or repeat successful checks.
 
 ## Scope
@@ -42,17 +42,22 @@ Then classify the changed paths from `git diff --name-status master..HEAD` befor
 
 ## Resolve the PR and load history
 
-`review` exists only inside the dev shell. Obey literally:
-* Resolve and consume the PR id in **one** invocation; shell state doesn't persist across calls, and an empty id shows up as the helper's `Usage` text.
-* Don't use `$(review ...)` in the outer shell (expanded before devenv starts, so the variable lands empty).
+`gate` exists inside the dev shell and resolves the PR itself from the
+checked-out branch — never hand-pick, retype, or reconstruct a bech32
+identifier. Obey literally:
+* Run gate directly and read its output as-is. Never pipe or redirect it
+  (`| head`, `| grep`, `> file`, command substitution): its exit code and
+  refusal block are the signal. No `$(...)` id plumbing is needed.
 * Don't nest shells (`devenv shell -- bash -lc ...`); the git guard shim refuses bare `git` there.
-* Never retype or reconstruct a bech32 identifier.
 
 ```
-pr_id=$(devenv shell -- review resolve-pr 2>/dev/null | grep -o 'nevent1[a-z0-9]*'); devenv shell -- review pr-context "$pr_id"
+devenv shell -- gate pr status
+devenv shell -- gate review show
 ```
 
-This loads the PR view and full comment thread as JSON, and fails loud on zero or multiple matches. Never guess. Add `--online` for a network refresh.
+This loads the PR state plus the full comment thread as plain text, oldest
+first. `gate review show` refuses loud when no proposal matches; `gate pr
+status` refreshes tip, PR, CI, and review state with observation times.
 
 Extract every linked issue reference from the PR description, preserving exact `nostr:nevent1...` text. If the description points at issue history without a link, resolve the issue via the CHANGELOG entry's nevent or the branch name, and file a Non-blocking finding about the missing link. If the issue or PR has zero comments, record that once and don't repeat the lookup.
 
@@ -133,13 +138,17 @@ Resolve PR and history → check base freshness and `--name-status` → classify
 
 ## Post
 
-Set the variable and post in the same invocation. The helper reads the body from the heredoc (no staged files anywhere, and no `sed -i` fixup passes), posts once as Scout, and verifies the comment landed:
+Write the review body to a file in the worktree (never `/tmp`, never home —
+writing this one file is the allowed worktree write), post it with gate
+(which posts as Scout and verifies the comment landed), then delete the file:
 
 ```
-devenv shell -- review post-comment "$pr_id" <<'EOF'
-<review>
-EOF
+devenv shell -- gate review post --body-file ./review-body.md
 ```
+
+`gate review post` refuses an empty body and refuses when review already
+covers the tip (each tip gets at most one review); a missing comment
+afterward is unknown, never a cue to post again.
 
 If publication fails, times out, or aborts: stop, report exact local and remote state, and do not retry or use another method. A successful post ends the review.
 

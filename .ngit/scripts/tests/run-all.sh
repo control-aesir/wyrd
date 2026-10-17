@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs every shell suite in this directory (stubbed ngit/timeout: no
-# relay, credential, or network). Used by the review-tests git hook
+# relay, credential, or network). Used by the shell-tests git hook
 # and the CI shell-tests job.
 set -uo pipefail
 

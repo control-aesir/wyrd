@@ -69,6 +69,7 @@ devenv shell -- cargo nextest run --profile slow
                                             # the PR gate, run by master CI
 devenv shell -- cargo test -p wyrd-cli      # CLI suite (argument parsing, exit codes)
 devenv shell                # enter the dev environment (rust, git-hooks)
+devenv shell -- gate help   # agent dev CLI: pr/issue/review/CI verbs
 ```
 
 ## Running the Lima e2e suite
@@ -125,7 +126,7 @@ Lima for macOS dev iteration and as the refactor guard.)
 ## Conventions
 
 - Conventional Commits. Nothing commits to `master` directly; use `pr/<name>`
-  branches (see the ngit skill).
+  branches (see the gate skill).
 - Follow `docs/collaboration-workflow.md` for issue triage, PR review, merge,
   and issue resolution. Project labels are applied after issue creation —
   never during it (creation-time labels are permanent: no later `ngit label`

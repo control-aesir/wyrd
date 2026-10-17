@@ -16,7 +16,6 @@ on:
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
-      - ".ngit/scripts/review.sh"
       - ".ngit/scripts/tests/**"
   pull_request:
     types: [opened, ready_for_review]
@@ -33,7 +32,6 @@ on:
       - ".ngit/act/workflows/workflow.yml"
       - ".ngit/scripts/ngit.sh"
       - ".ngit/scripts/build.sh"
-      - ".ngit/scripts/review.sh"
       - ".ngit/scripts/tests/**"
 
 jobs:

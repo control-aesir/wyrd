@@ -20,7 +20,7 @@ Never pass them to `ngit issue create --label`: creation-time labels are
 lowercased, embedded permanently in the issue event, and cannot be removed
 through a later `ngit label` event — `--remove-label` only retracts labels
 applied during triage. A wrong label at creation is effectively forever.
-Use `ngit issue label` so priority case is preserved and the label is a
+Use `gate issue label` so priority case is preserved and the label is a
 separate, manageable event.
 
 The current milestone labels are:
@@ -35,7 +35,7 @@ The current milestone labels are:
 - `release:backlog`: explicitly deferred beyond the immediate roadmap. This
   is the parked state: no triaged issue is ever without a `release:*` label.
 
-Do not stack milestone labels. Swap with `ngit issue label --remove-label`
+Do not stack milestone labels. Swap with `gate issue label --remove-label`
 before applying the new one through the available project tooling.
 
 ## Code Changes
@@ -44,5 +44,5 @@ before applying the new one through the available project tooling.
 - Work on `pr/<name>` branches; do not commit directly to `master`.
 - Keep `wyrd-format` free of networking, async, and FUSE dependencies.
 - Run the relevant checks locally while the PR is in draft. Marking the PR
-  ready (`ngit pr ready`) moves it to open and triggers CI for PRs
+  ready (`gate pr ready`) moves it to open and triggers CI for PRs
   touching the workflow's filtered paths (docs-only PRs trigger none).

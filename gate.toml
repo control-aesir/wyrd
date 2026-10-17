@@ -10,7 +10,9 @@ branch_prefix = "pr/"
 review_signer = "scout"
 # Draft a newly created proposal as part of the first push, matching the
 # "draft immediately after the first push" policy (CI runs on
-# ready_for_review only). Omit for the default (proposal stays open).
+# ready_for_review only). This replaces the old CI auto-draft job (removed
+# from .ngit/act/workflows/): new PRs land open, and the project works
+# draft-first. Omit for the default (proposal stays open).
 auto_draft = true
 
 [ci]
@@ -49,8 +51,8 @@ milestones = [
 # `opencode run` invocation; substituted values are shell-quoted by gate.
 # `{variant}` expands to `--variant X` (or nothing when unset), `{pr}`,
 # `{tip}` and `{log}` name the proposal, its tip and this run's log.
-# Prompts live at the workspace meta-root, shared by the master and
-# pr/* checkouts, so the path climbs one level from the checkout root.
+# Prompts are vendored in the checkout (master and pr/* worktrees carry
+# their own copy), so the path is checkout-relative.
 [review]
 prompt = ".agents/prompts/branch-review.md"
 model = "opencode-go/deepseek-v4.1-flash"

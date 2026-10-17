@@ -14,3 +14,5 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
+  gate:
+    url: git+https://grasp.t5.st/npub1k0y4eceal2zryes3azm6nsgt0r0jsa2v8zcsdf9uqxttn0jlfe9q04c9h8/gate.git?ref=refs/heads/master

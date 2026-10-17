@@ -15,7 +15,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Hook runners export GIT_DIR into hook processes; drop repo discovery
-# so the scratch repo below is a real fresh repo (see test-review.sh).
+# so the scratch repo below is a real fresh repo.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 
 # shellcheck disable=SC1091

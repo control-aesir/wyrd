@@ -1,6 +1,9 @@
 # Collaboration Workflow
 
-This is the project workflow for issues and pull requests over ngit.
+This is the project workflow for issues and pull requests over ngit,
+driven through `gate` (verbs encode the correct procedure; `gate help`
+lists them, the gate skill documents them). Run `gate` inside the repo's
+`devenv` shell; never pipe or redirect its output.
 
 ## 1. Create An Issue
 
@@ -12,8 +15,8 @@ formats or protocol bytes change and what that means for
 `docs/upgrade-contract.md`, or explicitly `none`.
 
 ```bash
-ngit issue create --subject "feat(format): path-level tree mutation" \
-  --body "$(cat issue.md)" --json
+gate issue create --subject "feat(format): path-level tree mutation" \
+  --body-file issue.md
 ```
 
 Never add project labels during creation. Creation-time labels are lowercased,
@@ -34,44 +37,47 @@ Apply exactly one label from each category:
   without a `release:*` label.
 
 ```bash
-ngit issue label <issue> --label enhancement --json
-ngit issue label <issue> --label P2 --json
-ngit issue label <issue> --label release:v0.3.0-alpha --json
+gate issue label <id> --type enhancement
+gate issue label <id> --priority P2
+gate issue label <id> --milestone release:v0.3.0-alpha
 ```
 
 Do not stack milestones. Swap deliberately with
-`ngit issue label <issue> --remove-label <old> --label <new>` when scope or
-priority changes. Keep the issue open while work is in progress.
+`gate issue label <id> --remove-label <old> --milestone <new>` when scope
+or priority changes. Keep the issue open while work is in progress.
 
 These three categories are a closed set: do not invent labels outside them
 (`test`, `docs`, component names, and the like are Conventional Commit
 scopes for the subject line, not labels). Creation labels cannot be removed
 through a later ngit label event, so prefer creating bare — when in doubt,
 list existing issues first to see the labels in use rather than guessing a
-new one. Capture the created
-issue's id from the `create --json` output and reuse it; never run `create`
+new one (no gate verb lists issues; `ngit issue list --json --offline`
+does). Capture the created
+issue's id from the `create` output and reuse it; never run `create`
 again to "check" something, and verify any unfamiliar subcommand flag with
 `--help` before running a command that writes.
 
 ## 3. Create A PR
 
-Create a `pr/<name>` branch from the current `master`. Make focused commits
-using Conventional Commit subjects. The first push creates the PR when the
-branch uses the required `pr/` prefix.
+Create a `pr/<name>` branch from the current `master` (worktrees are linked
+under `../pr/<name>`; agents never touch the `master` worktree, so the
+human creates the worktree or an explicit exception covers it). Make
+focused commits using Conventional Commit subjects. The first push creates
+the PR when the branch uses the required `pr/` prefix, and gate drafts it
+immediately (`auto_draft` in `gate.toml`, replacing the old CI draft job):
 
 ```bash
-git checkout -b pr/<name>
-git push -u origin pr/<name>
+git worktree add -b pr/<name> ../pr/<name> master
+# ... work, commit ...
+gate pr push
 ```
 
-Verify the branch before every commit: `checkout -b` on an already
-existing name fails and leaves you wherever you were, so a quiet
-checkout followed by a commit can land work on the wrong branch —
-including `master`, where nothing commits directly. Chain the check
-into the commit so a wrong branch aborts the sequence:
+`gate pr push` refuses a dirty tree or a non-`pr/` branch instead of
+publishing half-finished work, and knows first push vs fast-forward vs
+rewrite. Verify the branch and its draft state afterward:
 
 ```bash
-git branch --show-current && git commit -m "..."
+gate pr status
 ```
 
 Hooks verify the staged tree, not the worktree: each commit in a
@@ -79,44 +85,65 @@ multi-commit stack must compile standalone, or keep the PR to a single
 commit. A stack that only builds as a whole fails the hooks on every
 commit but the last.
 
-Set the PR to draft immediately after the first push. CI runs on
-`ready_for_review` only, for PRs touching the paths listed in the workflows
-under `.ngit/act/workflows/` (`workflow.yml` covers `crates/**`,
-`Cargo.toml`, `Cargo.lock`, `deny.toml`, `rust-toolchain.toml`, `flake.*`,
-the workflow itself, and `.ngit/scripts/*.sh`) — docs-only PRs run no CI,
-and drafts run none. The merge check below verifies the final revision is
-green.
-Work stays in draft until it is ready:
+CI runs on `ready_for_review` only, for PRs touching the paths listed in
+the workflows under `.ngit/act/workflows/` (`workflow.yml` covers
+`crates/**`, `Cargo.toml`, `Cargo.lock`, `deny.toml`,
+`rust-toolchain.toml`, `flake.*`, the workflow itself, and
+`.ngit/scripts/*.sh`) — docs-only PRs run no CI, and drafts run none.
+The merge check below verifies the final revision is green. Work stays in
+draft (from the first push's auto-draft) until it is ready.
 
-```bash
-ngit pr draft <pr> --reason "work in progress" --json
-```
-
-Reference the issue in the PR description with a `nostr:nevent1...` URI. Do
-not rely on an unqualified issue number or raw event ID.
+Set the PR description at creation
+(`git push -o 'title=...' -o 'description=...'`, which `gate pr push` does
+not forward — use a plain `git push` for a titled first push, then
+`gate pr push` after) or right after pushing
+(`ngit pr set-cover-note <id> --body "..."`; no gate verb sets the cover
+note): link the issue with a `nostr:nevent1...` URI and summarize the
+change. An empty description is a review finding. Do not rely on an
+unqualified issue number or raw event ID.
 
 ## 4. Review And Update
 
-Inspect the PR and comments with ngit. Address concrete findings with new
-commits, run the relevant checks locally, and push the branch again. Keep
-the PR in draft while iterating. Do not change branches during a review:
-all related work stays on the PR's branch until it merges — switching
-branches mid-review orphans the review context and the CI attached to
-the branch.
+Read the PR thread as plain text, oldest first. Address concrete findings
+with new commits, run the relevant checks locally, and push the branch
+again. Keep the PR in draft while iterating. Do not change branches during
+a review: all related work stays on the PR's branch until it merges —
+switching branches mid-review orphans the review context and the CI
+attached to the branch.
 
 ```bash
-ngit pr view <pr> --comments --json
-ngit pr comment <pr> --body "Addressed in <commit>." --json
-git push origin pr/<name>
+gate pr status
+gate review show
+# ... address findings, commit, push ...
+gate pr push
 ```
 
-When the work is ready, mark the PR ready. This moves it from draft to
-open and triggers CI for PRs touching the filtered paths
-(`ready_for_review` is the only `pull_request` trigger; drafts and
-docs-only PRs trigger none):
+Fire the reviewer (its prompt and model come from `gate.toml`), then block
+until it covers the tip — never a shell polling loop:
 
 ```bash
-ngit pr ready <pr> --reason "ready for review" --json
+gate review run
+gate review wait
+```
+
+Replies to review comments post as yourself, not as the review signer
+(`gate review post` always posts as the review signer, so it is
+reviewer-only). Reply from the PR worktree:
+
+```bash
+ngit pr comment <id> --body "Addressed in <commit>."
+```
+
+When the work is ready, mark the PR ready and let CI run. `gate pr ready`
+refuses unless the review covers the tip and CI is green on it, naming
+whichever leg is missing; `gate ci run` performs the correct CI procedure
+for the current tip, and `gate ci wait` blocks until CI settles (skip the
+wait when `ci status` is `none` — docs-only PRs run no CI):
+
+```bash
+gate ci run
+gate ci wait
+gate pr ready
 ```
 
 If CI fails on a PR, it posts the truncated failure tail as a PR comment
@@ -125,7 +152,10 @@ CI) and mark ready again to re-trigger. Master-push failures have no PR
 to report to and change no PR state.
 
 Do not rewrite published history unless the workflow explicitly requires it.
-Keep unrelated worktree changes out of the PR.
+A sync merge from the target (pulling `master` in for review tooling) is
+fine — gate tolerates it at merge time. A stacked merge that pulls in
+another branch's commits is not: rebase those out. Keep unrelated
+worktree changes out of the PR.
 
 ## 5. Merge
 
@@ -135,19 +165,23 @@ so check green for the final revision itself — a green run on an older
 revision does not qualify:
 
 ```bash
-ngit ci status <pr> --require-ci-trust maintainer-directed --json
+gate pr status
+gate ci status
 ```
 
-Docs-only PRs run no CI: merge those on green local hooks plus review. Use
-ngit's merge command, then publish `master`.
+Docs-only PRs run no CI: merge those on green local hooks plus review.
+Merge from the `master` worktree — agents never touch `master`, so merging
+needs the user or an explicit exception — then publish `master` with a
+human-signed push (gate never pushes the target):
 
 ```bash
-ngit merge <pr> --json
+gate pr merge pr/<name>
 git push origin master
 ```
 
 The merge command creates the merge commit locally; the push publishes it and
-the applied status. Confirm the PR is `applied` afterward.
+the applied status. Confirm the PR is `applied` afterward with
+`gate pr status`.
 
 ## 6. Resolve The Issue
 
@@ -156,32 +190,28 @@ Commits only auto-resolve issues when the commit message contains `fixes` or
 issue was not linked that way, resolve it explicitly after the merge:
 
 ```bash
-ngit issue resolved <issue> \
-  --reason "Implemented and merged in nostr:nevent1..." --json
+gate issue resolve <id> --reason "Implemented and merged in nostr:nevent1..."
 ```
 
-Use `ngit issue close` for rejected, duplicate, or otherwise non-completed
-work. Use `ngit issue resolved` for work that was completed.
+Use `gate issue close` for rejected, duplicate, or otherwise non-completed
+work. Use `gate issue resolve` for work that was completed.
 
 ## 7. CI trigger and identifier discipline
 
-Manual `ngit ci trigger` is retry-only: tag and branch pushes already fire
-the matching workflows, and duplicate triggers cannot be cancelled (`ci
-stop` ends all CI for the repo). Check `ngit ci status <commit>` before
-triggering anything. Signed per-job logs for failures arrive as PR comments
-and as Blossom `.asc` links; `ci status --log-tail` only embeds tails for
-non-successful jobs.
+`gate ci run` is the trigger procedure — never hand-roll `ngit ci trigger`
+commands. Manual triggering is retry-only anyway: tag and branch pushes
+already fire the matching workflows, and duplicate triggers cannot be
+cancelled. Check `gate ci status` before triggering anything. Signed
+per-job logs for failures arrive as PR comments and as Blossom `.asc`
+links.
 
 Never retype a bech32 identifier (npub, nevent, naddr) from memory:
-transcription silently corrupts them. Resolve once into a variable or file
-and reuse it:
-
-```bash
-COORD=$(ngit ci status <commit> --json | python3 -c "...")
-ngit ci trigger "$COORD" <ref> --workflow <file> --json
-ngit pr list --json --offline | python3 -c "..." # stash the PR id, then
-ngit merge $(cat /tmp/prid.txt) --json
-```
+transcription silently corrupts them. Let gate resolve them — `gate pr id`
+resolves the current branch once, and every verb takes it from there.
+Never pipe gate output through `python3 -c`, `head`, `grep`, or into files
+to plumb IDs between commands; gate's exit code and refusal block are the
+signal. Verify any unfamiliar subcommand flag with `--help` before running
+a command that writes.
 
 ## 8. Releases
 

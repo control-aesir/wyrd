@@ -15,6 +15,9 @@ in
     cargo-nextest
     pkg-config
     shellcheck
+    # Agent-facing development CLI (verbs encode the correct procedure);
+    # see gate.toml and docs/collaboration-workflow.md.
+    inputs.gate.packages.${pkgs.stdenv.system}.default
   ] ++ optionals isLinux [
     # Fast parallel linker for large debug artifacts. Only wired up when we
     # add .cargo/config.toml with -fuse-ld=mold; falls back to the system
@@ -70,14 +73,14 @@ in
       pass_filenames = false;
     };
 
-    # Review helper tests: the stub suites run when the helpers, their
-    # library, or the suites themselves change, so broken resolve/post
+    # Shell helper tests: the stub suites run when the helpers, their
+    # library, or the suites themselves change, so broken ngit ceremony
     # semantics never ship green.
-    review-tests = {
+    shell-tests = {
       enable = true;
-      name = "review helper tests";
+      name = "shell tests";
       entry = "bash .ngit/scripts/tests/run-all.sh";
-      files = "^\\.ngit/scripts/(review\\.sh|ngit\\.sh|tests/.*\\.sh)$";
+      files = "^\\.ngit/scripts/(ngit\\.sh|tests/.*\\.sh)$";
       pass_filenames = false;
     };
 
@@ -103,13 +106,4 @@ in
   # detection). Input is pinned to the release tag in a detached
   # worktree, never the working copy.
   scripts.build.exec = "${./.ngit/scripts/build.sh} \"$@\"";
-
-  # Review tooling: `review` wraps `.ngit/scripts/review.sh`, the
-  # tested resolve/context/post helpers local PR reviews call instead
-  # of re-deriving ngit ceremony. The store-installed script loses its
-  # sibling ngit.sh, so REVIEW_LIB_DIR points it back at the stored
-  # scripts directory. The stub-based suite runs from the checkout, not
-  # exposed as a `scripts.*` command: its fixtures resolve
-  # source-relative paths.
-  scripts.review.exec = "REVIEW_LIB_DIR=${./.ngit/scripts} ${./.ngit/scripts/review.sh} \"$@\"";
 }

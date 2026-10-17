@@ -8,6 +8,10 @@ repo_naddr = "naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl9
 branch_prefix = "pr/"
 # Signer whose comments count as review (resolved to an npub at runtime).
 review_signer = "scout"
+# Draft a newly created proposal as part of the first push, matching the
+# "draft immediately after the first push" policy (CI runs on
+# ready_for_review only). Omit for the default (proposal stays open).
+auto_draft = true
 
 [ci]
 # Trust floor passed to `ngit ci status --require-ci-trust`.
@@ -16,6 +20,41 @@ trust_level = "maintainer-directed"
 [log]
 # Per-user invocation log, outside the repo by design.
 path = "~/.local/state/gate/invocations.jsonl"
+
+# Triage taxonomy, mirroring CONTRIBUTING.md: every triaged issue carries
+# exactly one label from each category. `gate issue label` validates
+# against these and swaps any existing label in the same category, so
+# milestones never stack. Unlisted `release:*` values are still accepted
+# (and swapped) by prefix; extend the milestone list as the roadmap firms
+# up. Omit the table to allow only a bare `gate issue create`.
+[issues]
+types = ["bug", "enhancement", "chore"]
+priorities = ["P0", "P1", "P2", "P3", "P4"]
+milestones = [
+  "release:v0.1.0-alpha",
+  "release:v0.2.0-alpha",
+  "release:v0.3.0-alpha",
+  "release:v0.4",
+  "release:v0.5",
+  "release:v0.6",
+  "release:v0.7",
+  "release:v0.8",
+  "release:v0.9.0-beta",
+  "release:v1.0",
+  "release:backlog",
+]
+
+# How `gate review run` fires the reviewer: the repo's branch-review
+# prompt and the model it runs. The command template defaults to an
+# `opencode run` invocation; substituted values are shell-quoted by gate.
+# `{variant}` expands to `--variant X` (or nothing when unset), `{pr}`,
+# `{tip}` and `{log}` name the proposal, its tip and this run's log.
+# Prompts live at the workspace meta-root, shared by the master and
+# pr/* checkouts, so the path climbs one level from the checkout root.
+[review]
+prompt = ".agents/prompts/branch-review.md"
+model = "opencode-go/deepseek-v4.1-flash"
+variant = "max"
 
 # Odin suite resource: the forced-command ssh path. The machine id comes
 # from the key entry server-side; nothing here can forge it.

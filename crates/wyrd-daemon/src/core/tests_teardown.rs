@@ -376,9 +376,10 @@ fn release_after_loop_return_commits_dirty_handle() {
 }
 
 /// Submissions racing the admission close resolve boundedly: each
-/// one either executed before the close or refused by it — never
-/// stranded, never hung. The exact mix is scheduling, so the test
-/// pins the allowed set, not the split.
+/// one either executed before the close, refused by it, or lost a
+/// same-path create race decided before it — never stranded, never
+/// hung. The exact mix is scheduling, so the test pins the allowed
+/// set, not the split.
 #[test]
 fn submissions_racing_admission_close_resolve_bounded() {
     let (engine, dir, _) = scratch_drive();

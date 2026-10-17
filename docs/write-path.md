@@ -6,7 +6,7 @@ when a change is durable versus visible versus announced, and what the
 mount refuses. It is the write-side companion to `fetch-on-open.md` (the
 read side).
 
-Tracking issues (titles; fetch nevents with `ngit issue list`):
+Tracking issues (titles; fetch nevents with `gate issue list`):
 
 - `docs(write-path): design the mounted write path`
 - `feat(format): mkdir, rmdir, and rename mutations`

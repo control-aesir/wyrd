@@ -51,8 +51,8 @@ These three categories are a closed set: do not invent labels outside them
 scopes for the subject line, not labels). Creation labels cannot be removed
 through a later ngit label event, so prefer creating bare — when in doubt,
 list existing issues first to see the labels in use rather than guessing a
-new one (no gate verb lists issues; `ngit issue list --json --offline`
-does). Capture the created
+new one (`gate issue list --limit 20` lists open issues; `--search`,
+`--label` and `--status` refine it, never pipe through `head`/`grep`). Capture the created
 issue's id from the `create` output and reuse it; never run `create`
 again to "check" something, and verify any unfamiliar subcommand flag with
 `--help` before running a command that writes.

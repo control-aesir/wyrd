@@ -1,16 +1,16 @@
-//! `wyrd update`: quiesced, verified upgrade from a local archive (U1=B).
+//! `wyrd update`: quiesced, verified upgrade from a local archive.
 //!
-//! Step 1 owns the artifact contract only: resolve the archive path,
-//! validate the canonical name, and identify the artifact. The blake3
-//! digest below is an identity for reports and the transaction log —
-//! never trust. A locally supplied archive is verified structurally
-//! (it unpacks, it names a wyrd binary); integrity is separate from
-//! compatibility, and neither implies the other.
+//! One concern per module: `identity` resolves the archive path and
+//! names the artifact, `snapshot` reads the durable files the checks
+//! compare against, `verify` opens the drive without disturbing it,
+//! `state` owns the phased swap state machine (stage, swap, converge),
+//! `supervise` runs the verification child and commits or rolls back,
+//! `run` orchestrates the transaction, and `preflight` checks the
+//! staged binary before the swap. Normative in `docs/update.md`.
 //!
 //! Nothing here stops a process, opens a store, or takes a lock: the
 //! drive directory gets a metadata check only, so validation always
-//! runs before the running service is disturbed. The swap state
-//! machine (U2/U3 as one transaction) arrives in a later step.
+//! runs before the running service is disturbed.
 
 mod identity;
 mod preflight;

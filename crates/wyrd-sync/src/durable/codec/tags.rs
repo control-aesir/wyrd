@@ -1,3 +1,10 @@
+//! The tag registry: every record tag, the KNOWN_TAGS table, the
+//! commit limits, the AAD domains, and the header length. One file
+//! that answers what tags exist and what is reserved.
+//!
+//! The tag space is append-only and byte-stable: gaps stay documented
+//! where they occur, and retired values are never reused.
+
 // --- record tags -----------------------------------------------------------
 
 pub(super) const COMMIT_VERSION: u8 = 0x00;

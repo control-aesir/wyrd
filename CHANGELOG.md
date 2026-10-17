@@ -627,6 +627,23 @@ version say exactly what changed.
 
 ### Changed
 
+- CLI update split
+  (`nostr:nevent1qqs2fgewlxc8cl0qpygqeaumxrudlzqnm49zdrhyaea39t2w3aty52gpz9mhxue69uhkwunpwdczuap49eehgc0c9ej`):
+  `cli/update.rs` becomes the `cli/update/` directory: archive
+  identity and platform compat move to `identity.rs`,
+  durable-snapshot reads to `snapshot.rs`, update verification to
+  `verify.rs`, the phased state machine (paths, fs helpers, converge,
+  stage, swap) to `state.rs`, verify-child/commit/rollback/verdict/
+  supervise to `supervise.rs`, the `update_run` orchestration to
+  `run.rs`, and preflight plus build info to `preflight.rs`. Pure
+  move. Items called across the new boundary take `pub(crate)`
+  (path helpers, `Phase`, `UpdateState`, snapshot/error surfaces,
+  record and clock helpers); the `main.rs` paths (`update_run`,
+  `UpdateRequest`, `UpdateOutcome`, `supervise`, build-info and
+  verify entry points) are unchanged. The whole CLI update suite
+  moves verbatim to `tests.rs` (39 tests, names intact). No behavior
+  change.
+
 - FUSE backend split by concern
   (`nostr:nevent1qqsw0hd8phl0udfr8v3s9pzly8q80yhyemkaa5ux4cdgpz4wsmwxw2gpz9mhxue69uhkwunpwdczuap49eehgnct839`):
   the 3867-line `fuse/backend.rs` becomes `fuse/backend/` with one

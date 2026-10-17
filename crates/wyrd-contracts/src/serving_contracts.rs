@@ -438,7 +438,7 @@ fn fetch_recovers_after_serving_restart_with_accumulated_failures() {
 /// cooldown after the restart — pinning end to end that the
 /// deadline/fault boundary did not move single-route behavior.
 /// (The multi-candidate walk itself is pinned in-crate by the
-/// budgeted walk tests over real iroh in `wyrd-sync/src/bulk.rs`,
+/// budgeted walk tests over real iroh in `wyrd-sync/src/bulk/tests_bulk.rs`,
 /// where candidate lists can be built dead-first by hand — route
 /// publication replaces, never prepends, so engine state cannot
 /// order a dead provider first.)

@@ -627,6 +627,19 @@ version say exactly what changed.
 
 ### Changed
 
+- Mailbox supervision split from the relay adapter
+  (`nostr:nevent1qqspr9cys8gunnx6gtrp2g8pwsrgw5mensrdkewgdgjy2gxlf9y3v2gpz9mhxue69uhkwunpwdczuap49eehg52pxs4`):
+  the 1841-line `mailbox/mod.rs` keeps the `LiveMailbox` relay adapter
+  (construction, handover, the `Mailbox` trait) while the background
+  supervision tasks move to `mailbox/supervision.rs`: the tick loop,
+  stream and relay recovery episodes, the drainer lifecycle, the
+  resubscribe transaction, and the shared `SupervisorState` /
+  `SupervisorContext` / `MailboxHealth` vocabulary. Pure move: all
+  function signatures are unchanged (moved items take `pub(super)`,
+  the health type keeps its `mailbox::MailboxHealth` path), and the
+  test modules resolve the moved names through `super::*` as before.
+  No behavior change: the full core suite passes unmodified.
+
 - Runtime state split by accounting concern
   (`nostr:nevent1qqswvpnd3kw744wy54puey5mqnzl2f4a4d90a7yutvcdn7utx8khlccpz9mhxue69uhkwunpwdczuap49eehglvxvpt`):
   the 1388-line `runtime/state.rs` becomes `runtime/state/` with one

@@ -497,7 +497,11 @@ pub(super) async fn resubscribe(
 /// disconnecting a relay with a connection attempt in flight strands its
 /// connection task (the spawn guard never clears), so re-driving always
 /// goes through `connect`, which is a no-op for relays whose task is
-/// already driving or retrying. Stream and relay episodes never give up
+/// already driving or retrying. The replacement drainer is always
+/// established before the resubscribe whose replay it must catch
+/// ([`establish_drainer`] awaits readiness, so the order is a handshake,
+/// not timing) — reversing that order drops relay history into the
+/// broadcast void. Stream and relay episodes never give up
 /// — the composer owns lifecycle. Every (re)subscribe goes through
 /// [`resubscribe`]: one stable subscription ID per mailbox, CLOSE before
 /// REQ, so recovery never accumulates relay-side subscriptions. Relay

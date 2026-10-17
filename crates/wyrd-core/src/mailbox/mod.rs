@@ -168,16 +168,16 @@ use supervision::{establish_drainer, supervise, SupervisorContext, SupervisorSta
 
 pub use supervision::MailboxHealth;
 
-// Test-support re-exports: the test modules resolve these through
-// `use super::*`, which the unused-imports lint cannot see through,
-// so the allowance keeps lib-only and test builds warning-free.
-#[allow(unused_imports)]
+// Test-support imports: the `tests_*` modules resolve these through
+// `use super::*`. They are `#[cfg(test)]`-gated so lib builds stay
+// honest about what the adapter itself uses.
+#[cfg(test)]
 use futures_util::StreamExt;
-#[allow(unused_imports)]
+#[cfg(test)]
 use nostr::message::RelayMessage;
-#[allow(unused_imports)]
+#[cfg(test)]
 use nostr_sdk::prelude::ClientNotification;
-#[allow(unused_imports)]
+#[cfg(test)]
 use supervision::{
     await_drainer_ready, note_supervisor_observation, recovery_delay, resubscribe,
     saturation_replay_due, RECOVERY_BASE_DELAY, RECOVERY_MAX_DELAY, SATURATION_REPLAY_COOLDOWN,

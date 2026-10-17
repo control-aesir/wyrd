@@ -627,6 +627,22 @@ version say exactly what changed.
 
 ### Changed
 
+- Outbox delivery split: rotation extraction
+  (`nostr:nevent1qqsrdtwq9seytyxmtgumfl2ckv0s0d4ymz0atlt07tw244t3egu7degpz9mhxue69uhkwunpwdczuap49eehgc7m8vd`):
+  the rotation arm moves from `author/deliver.rs` to `author/rotation.rs`
+  (`Reused`, `verify_reused_rotation`, `mint_fresh_rotation`,
+  `supersede_stale_rotation`, `mint_fresh_rotation_bytes`,
+  `epoch_secrets`, `mint_wrap`); the delivery half stays as
+  `author/delivery.rs` (entry points, sealed-outbox primitives, the two
+  loops). Pure move. Items called across the new boundary take
+  `pub(super)` (the three delivery-called arms, the test-called mint
+  entry, and `Reused`); `announce.rs` re-points its shared-primitive
+  import at `delivery`. The outbox tests follow the code:
+  `mint_setup` moves to `tests_harness.rs` as shared fixture, the
+  warn-marker test becomes `tests_delivery.rs`, and the session and
+  supersede rotation-arm tests join `tests_rotation.rs`. The
+  engine crash-matrix tests are untouched. No behavior change.
+
 - Bump `negentropy` 0.5.1 → 0.5.2 (RUSTSEC-2026-0365: remote DoS
   through unchecked `IdList` allocation in reconciliation parsing).
 

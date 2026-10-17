@@ -6,7 +6,7 @@
 use super::admission::ADMISSION_OBLIGATION_BATCH;
 use crate::control::seal;
 use crate::durable::{AuthorizeSnapshot, AuthorizedCapability, AuthorizedSnapshot, Fact};
-use crate::keys::capability::Capability;
+use crate::keys::capability::{Capability, DriveKeyring};
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret, EpochSecret};
 use crate::membership::test_util::{drive as member_drive, key, sign, Builder};
 use crate::membership::TransitionStatus;
@@ -121,6 +121,37 @@ pub(super) fn stranger_engine(label: &str) -> Engine {
     };
     stranger.drain(&mut mailbox).unwrap();
     stranger
+}
+
+/// Owner engine, recipient, keyring, and transition id wired for a
+/// mint: the owner mints its epoch-1 vector to itself. The
+/// directory rides along so the caller keeps the store alive.
+pub(super) fn mint_setup() -> (
+    crate::runtime::test_util::TestDir,
+    Engine,
+    DriveKeyring,
+    DeviceId,
+    wyrd_format::TransitionId,
+) {
+    let (dir, engine, genesis_id) = owner_engine("signer-session-mint");
+    let owner = key(10).1;
+    let state = engine.log.state_of(&genesis_id).expect("genesis has state");
+    let registered = state
+        .encryption_key_of(&owner)
+        .copied()
+        .expect("owner key registered");
+    let cap = Capability::new(
+        member_drive(),
+        owner,
+        registered,
+        genesis_id,
+        1,
+        vec![EpochSecret::from_bytes([0x07; 32])],
+    )
+    .expect("mintable");
+    let mut keyring = DriveKeyring::new(member_drive(), owner);
+    keyring.install(&cap, &engine.log).expect("installs");
+    (dir, engine, keyring, owner, genesis_id)
 }
 
 /// The device id an identity secret names.

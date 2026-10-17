@@ -10,8 +10,10 @@
 //! test was built by a fixture.
 //!
 //! One concept per file: [`snapshot`] authors bodies, [`admission`]
-//! admits devices, [`announce`] sends snapshot announcements, and
-//! [`deliver`] discharges the transition/capability catch-up outbox.
+//! admits devices, [`announce`] sends snapshot announcements,
+//! [`delivery`] discharges the transition/capability catch-up
+//! outbox, and [`rotation`] mints the stale-capability replacement
+//! wraps delivery sends.
 //! Semantics follow `docs/epochs.md` ("local write"): snapshots parent
 //! onto the locally live-lineage eligible heads, bind `membership` to
 //! the canonical epoch-K transition, and set `epoch` to that
@@ -22,12 +24,13 @@
 mod admission;
 mod announce;
 mod common;
-mod deliver;
+mod delivery;
 mod merge;
 mod recover;
 mod remove_device;
 mod resolve_conflict;
 mod rotate_epoch;
+mod rotation;
 mod set_owners;
 mod snapshot;
 
@@ -37,6 +40,8 @@ mod tests_admission;
 mod tests_admission_failures;
 #[cfg(test)]
 mod tests_carry;
+#[cfg(test)]
+mod tests_delivery;
 #[cfg(test)]
 mod tests_epoch;
 #[cfg(test)]
@@ -74,9 +79,9 @@ pub use admission::AdmitOutcome;
 pub use admission::ResumeOutcome;
 pub(super) use announce::redelivery_scope_set;
 pub(super) use announce::{announce, announce_pending};
-pub(super) use deliver::deliver_pending;
-pub(super) use deliver::deliver_scoped;
-pub(super) use deliver::{announcement_obligation, capability_obligation, transition_obligation};
+pub(super) use delivery::deliver_pending;
+pub(super) use delivery::deliver_scoped;
+pub(super) use delivery::{announcement_obligation, capability_obligation, transition_obligation};
 pub(super) use merge::merge;
 pub(super) use merge::plan as plan_merge;
 pub(super) use merge::preview as preview_merge;

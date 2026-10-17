@@ -1,4 +1,4 @@
-use super::deliver::{
+use super::delivery::{
     announcement_obligation, control_key_for, open_reused_sealed, seal_fresh_for, send_sealed_to,
     verify_reused_sealed,
 };

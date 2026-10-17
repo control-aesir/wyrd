@@ -24,7 +24,7 @@ use crate::control::nip46::{SignMessageRequest, SignMessageResponse};
 /// which converges by waiting, so callers fail loud on those.
 /// Classification rule for future session clients: a truncated or
 /// corrupt transport frame is `Unreachable`, never `MalformedResponse`
-/// — the owner-proof mint's loud arm (`runtime/author/deliver.rs`)
+/// — the owner-proof mint's loud arm (`runtime/author/rotation.rs`)
 /// calls that "static misconfiguration", and the claim holds only
 /// under this mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

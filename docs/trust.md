@@ -844,7 +844,7 @@ mode below, so no shipped build satisfies T6 yet.
   mount` read the device identity secret from `--identity-file` (32 raw
   bytes or 64 hex characters), and the daemon process holds it for its whole
   lifetime. The engine signs snapshots and announcements with it and seals
-  NIP-44 envelopes with it (`wyrd-sync/src/runtime/author/deliver.rs`); the live
+  NIP-44 envelopes with it (`wyrd-sync/src/runtime/author/delivery.rs`); the live
   mailbox is built from the same key, which unwraps inbound gift wraps
   (`LiveMailbox::connect`, called from `mount` in
   `wyrd-cli/src/commands/mount.rs`, from `vault` in

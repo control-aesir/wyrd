@@ -157,7 +157,7 @@ Rules:
    the inverted case is explicit: the losing member's handle is
    terminal `EIO` at the fold, before it ever makes its own forcing
    call. More than one eligible live head refuses the whole fold
-   (`ConflictedHeads`); nothing commits.
+   (`Conflicted`); nothing commits.
 3. **`flush` ≡ `fsync` stays the reportable persistence point for the
    calling handle's own data** and `O_SYNC` stays commit-per-write;
    coalescing applies only to demand that does not explicitly require
@@ -208,16 +208,16 @@ Rules:
    submit nothing and force nothing, and a member whose namespace
    precondition fails during fold application (the `create` arm's
    `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
-   inside application at `live/mod.rs:1621`/`:1623`/`:1625-1626`/
-   `:1628-1629`, never at admission; the clause is generic over
+   inside application at `live/apply.rs:554`/`:556`/`:559`/`:562`,
+   never at admission; the clause is generic over
    every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
    fail the same way)
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
    bytes durable. A fold-fatal refusal raised before the commit
-   begins — the pre-commit quota (`live/mod.rs:1455`, `live/mod.rs:2020-2025`
-   under folding) and `ConflictedHeads` (`live/mod.rs:2004-2019`) — leaves members
+   begins — the pre-commit quota (`live/apply.rs:281`, `:293`
+   under folding) and `Conflicted` (`crates/wyrd-core/src/mutation.rs:409`) — leaves members
    retryable and non-terminal, as does a failed forcing member; a
    `StaleHandle` is terminal, and so is a store, authoring, or
    fact-commit failure wherever it occurs (the stale/`EIO` rule
@@ -225,7 +225,7 @@ Rules:
    covered below). A fold with no surviving member authors nothing:
    no empty snapshot, no dangling announcement obligation.
    Fold-fatal (whole-fold, unattributable to one member):
-   `ConflictedHeads` (refuses the entire fold, nothing commits);
+   `Conflicted` (refuses the entire fold, nothing commits);
    store, authoring, or fact-commit failure; the pre-commit
    retained-bytes quota, which under folding covers the aggregate of
    the whole pending set before the commit's first write; and a
@@ -489,7 +489,7 @@ B writes "CCCC"; B commits  →  STALE: foo@H1 ≠ base
 
 Two distinct conflicts, both surfaced as `EIO` with separate diagnostics:
 
-- **Drive-level** (`ConflictedHeads`): more than one eligible live head,
+- **Drive-level** (`Conflicted`): more than one eligible live head,
   so there is no single tree to mutate.
 - **Handle-level** (`StaleHandle`): one live head, but this path changed
   since the handle opened.
@@ -871,7 +871,7 @@ merely implementation properties.
 
 A path mutation is a read-modify-write of one tree, so the mount requires
 exactly one eligible live head. With more than one, writes fail closed
-with `EIO` (`ConflictedHeads`). This does not conflict with `epochs.md`'s
+with `EIO` (`Conflicted`). This does not conflict with `epochs.md`'s
 "local write" rule (a member may publish a snapshot parenting onto any
 subset of heads): that authorizes a device to *resolve* a conflict by
 publishing a snapshot whose parents are all heads; resolution is not a
@@ -1173,7 +1173,7 @@ Each row locks a decided invariant.
 
 **Conflicted drives**
 
-- Write → `EIO` (`ConflictedHeads`); read still serves the merged view.
+- Write → `EIO` (`Conflicted`); read still serves the merged view.
 - Zero heads: the first `create`/`mkdir` authors an initial root and
   succeeds.
 

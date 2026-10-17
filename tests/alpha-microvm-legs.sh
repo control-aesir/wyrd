@@ -810,7 +810,7 @@ leg_fetch_member() {
 # no relay needed). Observed on odin: partitioned same-path commits
 # both succeed locally (single head each); after heal the two heads
 # surface as name@N versions with SnapshotId byte-order numbering,
-# a further write fails EIO (ConflictedHeads), reads keep serving.
+# a further write fails EIO (Conflicted), reads keep serving.
 leg_conflict_owner() {
   local d="$1" c="$2" relay="$3"
   step 10 "partition-conflict owner leg"

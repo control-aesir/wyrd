@@ -1,8 +1,18 @@
-use super::tests_harness::{device_of, owner_engine, stranger_engine};
+use super::rotation::{mint_fresh_rotation, mint_fresh_rotation_bytes, supersede_stale_rotation};
+use super::tests_harness::{device_of, mint_setup, owner_engine, stranger_engine};
+use crate::control::seal_rotation;
+use crate::durable::Fact;
 use crate::keys::{DeviceEncryptionSecret, DeviceIdentitySecret};
 use crate::membership::test_util::{drive as member_drive, key};
 use crate::runtime::engine::EngineError;
 use crate::runtime::test_util::encryption_key;
+use crate::transport::signer::fake::{
+    unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
+    UnreachableSession,
+};
+use crate::transport::signer::SignerError;
+use secp256k1::SecretKey;
+use wyrd_format::DeviceId;
 
 #[test]
 fn rotate_bumps_epoch_keeps_membership_mints_fresh_secret() {
@@ -71,18 +81,6 @@ fn rotate_requires_owner_authority() {
 // Delivery-rotation arm: minting and superseding the stale-capability
 // wraps `deliver_pending` sends. The epoch-rotation tests above cover
 // opening a new epoch; these cover delivering its secrets.
-
-use super::rotation::{mint_fresh_rotation, mint_fresh_rotation_bytes, supersede_stale_rotation};
-use super::tests_harness::mint_setup;
-use crate::control::seal_rotation;
-use crate::durable::Fact;
-use crate::transport::signer::fake::{
-    unrelated_identity, unrelated_secret, FakeSignerSession, GarbageSession, MismatchedSession,
-    UnreachableSession,
-};
-use crate::transport::signer::SignerError;
-use secp256k1::SecretKey;
-use wyrd_format::DeviceId;
 
 /// A domain refusal is a misconfiguration retry will not heal: it
 /// fails loudly. Driven through the committing wrapper (not the

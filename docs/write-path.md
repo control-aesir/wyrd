@@ -217,7 +217,7 @@ Rules:
    committed — a failed syscall never makes another member's pending
    bytes durable. A fold-fatal refusal raised before the commit
    begins — the pre-commit quota (`live/apply.rs:281`, `:293`
-   under folding) and `Conflicted` (`crates/wyrd-core/src/mutation.rs:409`) — leaves members
+   under folding) and `Conflicted` (`crates/wyrd-core/src/mutation/kind.rs:191`) — leaves members
    retryable and non-terminal, as does a failed forcing member; a
    `StaleHandle` is terminal, and so is a store, authoring, or
    fact-commit failure wherever it occurs (the stale/`EIO` rule

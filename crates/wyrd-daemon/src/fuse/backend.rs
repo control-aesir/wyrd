@@ -13,7 +13,22 @@ use wyrd_core::mutation::{MutationError, MutationQueue};
 use wyrd_core::projection::Projection;
 use wyrd_core::quarantine::QuarantineQueue;
 use wyrd_core::scrub::ScrubQueue;
-use wyrd_core::session::BudgetError;
+use wyrd_core::session::{BudgetError, WriteBudget};
+use wyrd_core::want::WantRegistry;
+
+/// Backend internals, split by concern: `setup` constructs and wires,
+/// `projection` reads the published generation, `handles` owns the
+/// open-handle table, `read` and `write` serve the data path, `fold`
+/// takes and settles dirty images, `attr` serves metadata and
+/// namespace mutations, and `ops` adapts kernel ops onto them.
+mod attr;
+mod fold;
+mod handles;
+mod ops;
+mod projection;
+mod read;
+mod setup;
+mod write;
 
 /// How long a reported repair keeps a later boundary verdict
 /// from completing its waiter. The window covers the repair the
@@ -77,8 +92,6 @@ impl RecentRepairs {
 fn complete_waiter_on_terminal(repair_in_flight: bool) -> bool {
     !repair_in_flight
 }
-use wyrd_core::session::WriteBudget;
-use wyrd_core::want::WantRegistry;
 
 /// The FUSE backend over one drive's published projection: read-write
 /// when the live daemon's mutation channel is wired, read-only without
@@ -448,19 +461,6 @@ where
     }
 }
 
-/// Backend internals, split by concern: `setup` constructs and wires,
-/// `projection` reads the published generation, `handles` owns the
-/// open-handle table, `read` and `write` serve the data path, `fold`
-/// takes and settles dirty images, `attr` serves metadata and
-/// namespace mutations, and `ops` adapts kernel ops onto them.
-mod attr;
-mod fold;
-mod handles;
-mod ops;
-mod projection;
-mod read;
-mod setup;
-mod write;
 pub(super) fn mounted_symlink_traversal_error<S: ObjectStore, M: Materialization>(
     view: &DriveView<S, M>,
     path: &str,

@@ -96,7 +96,7 @@ where
     /// The reservation is consumed by [`insert_reserved`](Self::insert_reserved)
     /// or returned by [`release_slot`](Self::release_slot) on every
     /// path — a leaked promise only shrinks future capacity, so
-    /// audit callers accordingly. `pub(super)` for the accounting
+    /// audit callers accordingly. `pub(crate)` for the accounting
     /// unit test; production callers go through `create_at`.
     pub(crate) fn reserve_slot(&self) -> Result<(), fuser::Errno> {
         let Ok(mut files) = self.files.lock() else {
@@ -111,7 +111,7 @@ where
 
     /// Return a promised slot the create abandoned (mutation refused,
     /// handle construction failed). Idempotent by saturation: only
-    /// ever called with a slot this caller promised. `pub(super)`
+    /// ever called with a slot this caller promised. `pub(crate)`
     /// for the accounting unit test alongside `reserve_slot`.
     pub(crate) fn release_slot(&self) {
         if let Ok(mut files) = self.files.lock() {
@@ -132,7 +132,7 @@ where
     /// no promise held the insert refuses instead of bypassing the
     /// cap: a missing reservation is a caller bug, and failing closed
     /// keeps it from becoming a silent over-admission. Lock poison
-    /// still fails `EIO`. `pub(super)` for the accounting unit test;
+    /// still fails `EIO`. `pub(crate)` for the accounting unit test;
     /// production callers go through `open_write` and `create_at`.
     pub(crate) fn insert_reserved(&self, handle: Handle) -> Result<FileHandle, fuser::Errno> {
         let Ok(mut files) = self.files.lock() else {

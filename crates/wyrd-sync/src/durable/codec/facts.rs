@@ -1,213 +1,28 @@
-//! Commit envelope and fact records: tags, limits, hashing, encoding,
-//! decoding, and the capability/manifest record codecs. The commit
-//! format and CURRENT protocol are byte-for-byte stable; unknown record
-//! tags are skipped for forward compatibility.
-//!
-//! v0 development note: fact *payloads* are not yet migration-stable —
-//! the manifest record gained its transport column (object-model.md
-//! decision 26) by changing the layout in place. A store whose manifest
-//! facts predate the change fails its rebuild loudly (an unparsable
-//! record poisons the commit file, so `open`/`resync` refuse it), which
-//! is the deliberate pre-alpha contract: fail closed on old formats,
-//! no silent interpretation, no migration until v1 freezes the format.
+//! Fact records: per-tag encoders, decoders, and the decoded-fact
+//! type. Consults the tag registry, never touches the commit file
+//! envelope.
 
+use super::tags::{
+    CAPABILITY_STORE_AAD, MAX_RECORDS_PER_COMMIT, TAG_ANNOUNCEMENT, TAG_ANNOUNCEMENT_DELIVERED,
+    TAG_ANNOUNCEMENT_DELIVERED_ROUTE, TAG_ANNOUNCEMENT_QUEUED, TAG_ANNOUNCEMENT_RECONCILED,
+    TAG_ANNOUNCEMENT_ROUTE_SEALED, TAG_ANNOUNCEMENT_SEALED, TAG_BOOTSTRAP_PENDING, TAG_CAPABILITY,
+    TAG_CAPABILITY_DELIVERED, TAG_CAPABILITY_QUEUED, TAG_CAPABILITY_RECONCILED,
+    TAG_CAPABILITY_SEALED, TAG_CAPABILITY_SEALED_REPLACED, TAG_CARRY_DONE, TAG_CARRY_QUEUED,
+    TAG_CONTROL_MESSAGE, TAG_LOCAL_OBJECT, TAG_MANIFEST, TAG_MATERIALIZATION, TAG_OBJECT_REMOVED,
+    TAG_RECONCILIATION_REQUEST, TAG_RECONCILIATION_VIEW, TAG_SNAPSHOT_BODY, TAG_TRANSITION,
+    TAG_TRANSITION_DELIVERED, TAG_TRANSITION_QUEUED, TAG_TRANSITION_RECONCILED,
+    TAG_TRANSITION_SEALED,
+};
+use crate::control::message::{ControlKind, Message, SnapshotAnnouncement};
+use crate::control::{ControlMessageId, SealedControl, SealedRotation};
+use crate::durable::{DurableError, Fact, ReconciliationEvidence, SealedCapabilityFactId};
+use crate::keys::capability::{encoding, Capability};
+use crate::keys::{aead, random_bytes};
+use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
 use wyrd_format::{
     BaoRoot, ContentId, DeviceId, DriveId, Manifest, MembershipTransition, ObjectKind, Snapshot,
     SnapshotId, StorageId, TransitionId,
 };
-
-use super::{DurableError, Fact, ReconciliationEvidence, SealedCapabilityFactId};
-use crate::control::message::{ControlKind, Message};
-use crate::control::{ControlMessageId, SealedControl, SealedRotation, SnapshotAnnouncement};
-use crate::keys::capability::{encoding, Capability};
-
-use crate::keys::{aead, random_bytes};
-use crate::runtime::{ManifestRecord, MaterializationState, RuntimeError};
-
-// --- record tags -----------------------------------------------------------
-
-pub(super) const COMMIT_VERSION: u8 = 0x00;
-pub(super) const TAG_TRANSITION: u8 = 0x01;
-const TAG_CAPABILITY: u8 = 0x02;
-const TAG_ANNOUNCEMENT: u8 = 0x03;
-const TAG_MANIFEST: u8 = 0x04;
-const TAG_LOCAL_OBJECT: u8 = 0x05;
-const TAG_MATERIALIZATION: u8 = 0x06;
-const TAG_CONTROL_MESSAGE: u8 = 0x07;
-const TAG_OBJECT_REMOVED: u8 = 0x08;
-/// Crate-visible for the raw-commit test seam: the planted-forgery tests
-/// encode records no typed `Fact` can carry.
-pub(crate) const TAG_SNAPSHOT_BODY: u8 = 0x09;
-/// One announcement obligation: snapshot id (32) ‖ recipient (32).
-const TAG_ANNOUNCEMENT_QUEUED: u8 = 0x0A;
-/// Sealed announcement bytes: snapshot id (32) ‖ sealed control bytes.
-/// Crate-visible for the raw-commit test seam.
-pub(crate) const TAG_ANNOUNCEMENT_SEALED: u8 = 0x0B;
-/// One discharged obligation: snapshot id (32) ‖ recipient (32).
-const TAG_ANNOUNCEMENT_DELIVERED: u8 = 0x0C;
-/// One transition-delivery obligation: transition id (32) ‖ recipient (32).
-const TAG_TRANSITION_QUEUED: u8 = 0x0D;
-/// Sealed transition bytes: transition id (32) ‖ sealed control bytes.
-const TAG_TRANSITION_SEALED: u8 = 0x0E;
-/// One discharged transition obligation: transition id (32) ‖ recipient (32).
-const TAG_TRANSITION_DELIVERED: u8 = 0x0F;
-/// One capability-delivery obligation: epoch u64 LE (8) ‖ recipient (32).
-const TAG_CAPABILITY_QUEUED: u8 = 0x10;
-/// Sealed capability bytes: epoch u64 LE (8) ‖ recipient (32) ‖ sealed
-/// control bytes.
-const TAG_CAPABILITY_SEALED: u8 = 0x11;
-/// One discharged capability obligation: epoch u64 LE (8) ‖ recipient (32).
-const TAG_CAPABILITY_DELIVERED: u8 = 0x12;
-/// `0x16`, not `0x13`: that byte is `TAG_BOOTSTRAP_PENDING`, and a tag
-/// collision silently decodes as the wrong fact kind.
-pub(super) const TAG_CAPABILITY_SEALED_REPLACED: u8 = 0x16;
-/// Pending invitation material: raw wrapped-capability bytes (non-empty).
-const TAG_BOOTSTRAP_PENDING: u8 = 0x13;
-/// One namespace-carry obligation: head SnapshotId (32).
-const TAG_CARRY_QUEUED: u8 = 0x14;
-/// One discharged carry obligation: head SnapshotId (32).
-const TAG_CARRY_DONE: u8 = 0x15;
-/// One route-specific announcement reseal: snapshot (32) ‖ route length
-/// u32 LE ‖ route ‖ sealed announcement envelope. Tag 0x17: 0x16 is
-/// the capability-sealed-replaced record, and the tag space is
-/// append-only.
-const TAG_ANNOUNCEMENT_ROUTE_SEALED: u8 = 0x17;
-/// A stated reconciliation view: u32 LE transition count ‖ 32 bytes
-/// each ‖ u32 LE snapshot count ‖ 32 bytes each ‖ u32 LE capability
-/// count ‖ (device 32 ‖ epoch u64 LE) each. Tag 0x18: 0x17 is the
-/// route-sealed record, and the tag space is append-only.
-pub(super) const TAG_RECONCILIATION_VIEW: u8 = 0x18;
-/// A received reconciliation request: requester DeviceId (32) ‖ the
-/// stated-view body above. Tag 0x19: the tag space is append-only.
-/// Same per-section ceiling as the stated view — one evidence layout
-/// across the wire statement, the stated record, and this record.
-/// Crate-visible for the tag-boundary pin below.
-pub(super) const TAG_RECONCILIATION_REQUEST: u8 = 0x19;
-/// A retired transition obligation: transition id (32) ‖ recipient
-/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1A:
-/// the tag space is append-only. Fixed 96 bytes — a retirement names
-/// the obligation, whom it is retired for, and exactly which
-/// statement proved it, nothing else.
-pub(super) const TAG_TRANSITION_RECONCILED: u8 = 0x1A;
-/// A retired capability obligation: epoch u64 LE (8) ‖ recipient
-/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1B,
-/// fixed 72 bytes, same shape and same scope note as above.
-pub(super) const TAG_CAPABILITY_RECONCILED: u8 = 0x1B;
-/// The endpoint identity one discharged announcement was sent
-/// against: snapshot (32) ‖ recipient DeviceId (32) ‖ endpoint id
-/// (32). Tag 0x1C: the tag space is append-only. Fixed 96 bytes —
-/// a redelivery record names the obligation, whom it went to, and
-/// exactly which serving endpoint carried it, nothing else.
-/// Crate-visible for the tag-boundary pin below.
-pub(super) const TAG_ANNOUNCEMENT_DELIVERED_ROUTE: u8 = 0x1C;
-/// A retired announcement obligation: snapshot id (32) ‖ recipient
-/// DeviceId (32) ‖ authenticated statement digest (32). Tag 0x1D:
-/// the tag space is append-only. Fixed 96 bytes — a retirement names
-/// the obligation, whom it is retired for, and exactly which
-/// statement proved it, nothing else. The announcement-class half of
-/// reconciliation: the late-joiner retirement the 21c scope boundary
-/// deferred.
-/// Crate-visible for the tag-boundary pin below.
-pub(super) const TAG_ANNOUNCEMENT_RECONCILED: u8 = 0x1D;
-/// Record tags this version understands. Unknown tags are skipped on
-/// decode for forward compatibility.
-pub(super) const KNOWN_TAGS: [u8; 29] = [
-    TAG_TRANSITION,
-    TAG_CAPABILITY,
-    TAG_ANNOUNCEMENT,
-    TAG_MANIFEST,
-    TAG_LOCAL_OBJECT,
-    TAG_MATERIALIZATION,
-    TAG_CONTROL_MESSAGE,
-    TAG_OBJECT_REMOVED,
-    TAG_SNAPSHOT_BODY,
-    TAG_ANNOUNCEMENT_QUEUED,
-    TAG_ANNOUNCEMENT_SEALED,
-    TAG_ANNOUNCEMENT_DELIVERED,
-    TAG_TRANSITION_QUEUED,
-    TAG_TRANSITION_SEALED,
-    TAG_TRANSITION_DELIVERED,
-    TAG_CAPABILITY_QUEUED,
-    TAG_CAPABILITY_SEALED,
-    TAG_CAPABILITY_DELIVERED,
-    TAG_CAPABILITY_SEALED_REPLACED,
-    TAG_BOOTSTRAP_PENDING,
-    TAG_CARRY_QUEUED,
-    TAG_CARRY_DONE,
-    TAG_ANNOUNCEMENT_ROUTE_SEALED,
-    TAG_RECONCILIATION_VIEW,
-    TAG_RECONCILIATION_REQUEST,
-    TAG_TRANSITION_RECONCILED,
-    TAG_CAPABILITY_RECONCILED,
-    TAG_ANNOUNCEMENT_DELIVERED_ROUTE,
-    TAG_ANNOUNCEMENT_RECONCILED,
-];
-
-/// Resource limits: a corrupt local file must not cause unbounded
-/// allocation. Commits hold small canonical facts; anything beyond
-/// these bounds is damage, not data.
-pub(super) const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
-/// Visible crate-wide (not just load) because the admission refusal
-/// names this ceiling in its structured error variant.
-pub(crate) const MAX_RECORDS_PER_COMMIT: usize = 65_536;
-const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
-
-/// Domain tag for the commit-chain hash: integrity and ordering of the
-/// durable log itself, not confidentiality.
-const COMMIT_HASH_DOMAIN: &[u8] = b"wyrd durable commit v1";
-// The chain genesis: commit 1 links from all-zero bytes.
-
-/// AAD domain for the store key envelope (keystore-shaped, own domain so
-/// a wrapped store key can never open as a root or device secret).
-pub(super) const STORE_KEY_AAD: &[u8] = b"wyrd store key v1";
-/// AAD domain for sealed capabilities at rest. The store key is fresh
-/// random per store, so no cross-context confusion is possible; the
-/// distinct domain states the intent anyway.
-const CAPABILITY_STORE_AAD: &[u8] = b"wyrd capability store v1";
-
-/// Commit header length: version (1) + sequence (8) + previous hash (32).
-/// The records section hashed into the trailer starts right after it.
-const HEADER_LEN: usize = 41;
-
-/// The chain hash of one commit: domain tag, drive id, sequence,
-/// previous hash, and the exact serialized records section. Binds
-/// integrity and ordering; confidentiality is not the point (secrets
-/// carry their own AEAD inside capability records).
-fn commit_hash(drive: &DriveId, seq: u64, prev: &[u8; 32], records: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(COMMIT_HASH_DOMAIN);
-    hasher.update(drive.as_bytes());
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(prev);
-    hasher.update(records);
-    *hasher.finalize().as_bytes()
-}
-
-/// Serialize one commit and hash it: header (version, sequence,
-/// previous hash) + records + trailer hash. Crate-visible for the
-/// raw-commit test seam alongside `TAG_SNAPSHOT_BODY`.
-pub(crate) fn encode_commit(
-    drive: &DriveId,
-    seq: u64,
-    prev: &[u8; 32],
-    records: &[(u8, Vec<u8>)],
-) -> (Vec<u8>, [u8; 32]) {
-    let mut records_bytes = Vec::new();
-    records_bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
-    for (tag, record) in records {
-        records_bytes.push(*tag);
-        records_bytes.extend_from_slice(&(record.len() as u32).to_le_bytes());
-        records_bytes.extend_from_slice(record);
-    }
-    let hash = commit_hash(drive, seq, prev, &records_bytes);
-    let mut out = Vec::with_capacity(HEADER_LEN + records_bytes.len() + 32);
-    out.push(COMMIT_VERSION);
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(prev);
-    out.extend_from_slice(&records_bytes);
-    out.extend_from_slice(&hash);
-    (out, hash)
-}
 
 /// The AAD for sealed capabilities: domain plus drive. Device and
 /// epoch live inside the sealed plaintext and are cross-checked on
@@ -224,7 +39,7 @@ fn capability_aad(drive: &DriveId) -> Vec<u8> {
 /// Encode one fact to its (tag, record) pair, running the commit-time
 /// checks: manifest identity is derived (fail the commit, store
 /// untouched), capabilities arrive pre-authorized by type.
-pub(super) fn encode_fact(
+pub(crate) fn encode_fact(
     store_key: &[u8],
     drive: &DriveId,
     fact: &Fact,
@@ -506,7 +321,7 @@ pub(super) fn encode_fact(
 /// the evidence: hashing and comparison use the unbounded canonical
 /// bytes below, so no public API can panic on a legitimately large
 /// drive.
-pub(super) fn encode_reconciliation_view(
+pub(crate) fn encode_reconciliation_view(
     view: &ReconciliationEvidence,
 ) -> Result<Vec<u8>, DurableError> {
     for (section, count) in [
@@ -606,89 +421,14 @@ pub(crate) fn encode_reconciliation_view_canonical(view: &ReconciliationEvidence
     bytes
 }
 
-/// Decode and verify one commit file, returning the decoded facts and
-/// the verified trailer hash. Every structural failure — wrong version,
-/// sequence or previous-hash mismatch, over-limit counts or lengths,
-/// malformed known records, trailing bytes, a hash mismatch — fails the
-/// file: inside the committed prefix there is no such thing as an
-/// ignorable commit. Unknown record tags are the only skips, for
-/// forward compatibility.
-pub(super) fn decode_commit_file(
-    drive: &DriveId,
-    store_key: &[u8],
-    bytes: &[u8],
-    seq: u64,
-    prev_hash: &[u8; 32],
-) -> Result<(Vec<DecodedFact>, [u8; 32]), DurableError> {
-    let corrupt = || DurableError::CorruptCommit(seq);
-    let mut pos = 0usize;
-    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
-        let end = pos.checked_add(n)?;
-        if end > bytes.len() {
-            return None;
-        }
-        let slice = &bytes[*pos..end];
-        *pos = end;
-        Some(slice)
-    };
-    if take(&mut pos, 1).ok_or_else(&corrupt)? != [COMMIT_VERSION] {
-        return Err(corrupt());
-    }
-    if u64::from_le_bytes(
-        take(&mut pos, 8)
-            .ok_or_else(&corrupt)?
-            .try_into()
-            .expect("take"),
-    ) != seq
-    {
-        return Err(corrupt());
-    }
-    if take(&mut pos, 32).ok_or_else(&corrupt)? != prev_hash {
-        return Err(corrupt());
-    }
-    let count = u32::from_le_bytes(
-        take(&mut pos, 4)
-            .ok_or_else(&corrupt)?
-            .try_into()
-            .expect("take"),
-    ) as usize;
-    if count > MAX_RECORDS_PER_COMMIT {
-        return Err(corrupt());
-    }
-    let mut out = Vec::with_capacity(count.min(1024));
-    for _ in 0..count {
-        let tag = take(&mut pos, 1).ok_or_else(&corrupt)?[0];
-        let len = u32::from_le_bytes(
-            take(&mut pos, 4)
-                .ok_or_else(&corrupt)?
-                .try_into()
-                .expect("take"),
-        ) as usize;
-        if len > MAX_RECORD_BYTES {
-            return Err(corrupt());
-        }
-        let record = take(&mut pos, len).ok_or_else(&corrupt)?.to_vec();
-        if !KNOWN_TAGS.contains(&tag) {
-            continue;
-        }
-        let fact = decode_record(drive, store_key, tag, &record).ok_or_else(&corrupt)?;
-        out.push(fact);
-    }
-    // The trailer hash sits exactly at the end: no trailing bytes.
-    if pos.checked_add(32) != Some(bytes.len()) {
-        return Err(corrupt());
-    }
-    let expected = commit_hash(drive, seq, prev_hash, &bytes[HEADER_LEN..pos]);
-    let trailer: &[u8; 32] = bytes[pos..].try_into().expect("trailer bounds");
-    if trailer != &expected {
-        return Err(corrupt());
-    }
-    Ok((out, expected))
-}
-
 /// Decode one known record: `None` poisons the file (the caller
 /// filters unknown tags before calling).
-fn decode_record(drive: &DriveId, store_key: &[u8], tag: u8, record: &[u8]) -> Option<DecodedFact> {
+pub(crate) fn decode_record(
+    drive: &DriveId,
+    store_key: &[u8],
+    tag: u8,
+    record: &[u8],
+) -> Option<DecodedFact> {
     match tag {
         TAG_TRANSITION => {
             let t = MembershipTransition::from_canonical_bytes(record).ok()?;
@@ -1116,7 +856,7 @@ fn parse_manifest_record(record: &[u8]) -> Option<ManifestRecord> {
 // --- decoded facts -------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(super) enum DecodedFact {
+pub(crate) enum DecodedFact {
     Transition(MembershipTransition),
     Capability(Capability),
     Announcement(SnapshotAnnouncement),
@@ -1152,9 +892,3 @@ pub(super) enum DecodedFact {
     CapabilityReconciled(u64, DeviceId, [u8; 32]),
     AnnouncementReconciled(SnapshotId, DeviceId, [u8; 32]),
 }
-
-// Sibling test file under the workspace tests_* naming: #[path] is required
-// because default resolution from this parent would look for tests.rs, not this name.
-#[cfg(test)]
-#[path = "codec/tests_codec.rs"]
-mod tests;

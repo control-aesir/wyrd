@@ -565,6 +565,18 @@ version say exactly what changed.
 
 ### Fixed
 
+- Admission-close race assertion admitted only two of three outcomes
+  (`nostr:nevent1qqs2c6zzkudr6lc2xc6r8m52dtt36e77alh6ejaj4xthh94vw5q2qdqpz9mhxue69uhkwunpwdczuap49eehg8su7ks`):
+  `submissions_racing_admission_close_resolve_bounded` races eight
+  same-path `mkdir` submissions against the admission close, but its
+  allowed set named only `Done` and `Shutdown`. Whenever the drain
+  won the race, the first mkdir committed and the other seven
+  resolved `AlreadyExists` — a legitimate bounded refusal, not a
+  strand — and the assertion failed. The test now allows
+  `AlreadyExists` alongside the other two and additionally pins that
+  at most one racer commits, so every interleaving (close-first,
+  drain-first, split) passes by construction. No product change:
+  queue, drain, and close semantics are untouched.
 - ENOSPC attribution across the write path
   (`nostr:nevent1qqs2rnte3r0tqlfhmtfv56hwuxrqez6z6jrv0hc7usj40puvv0trscqpz9mhxue69uhkwunpwdczuap49eehgmle0y8`):
   every `ENOSPC` source — daemon write budget, open-capture ceiling,

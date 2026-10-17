@@ -211,7 +211,7 @@ fn conflicted_drive_rejects_mounted_writes() {
 }
 
 /// Contract 46: a conflicted drive refuses a fold with members and
-/// restores them: the whole fold aborts with `ConflictedHeads`,
+/// restores them: the whole fold aborts with `Conflicted`,
 /// nothing commits, and every non-forcing member is restored
 /// retryable (`docs/write-path.md`, DG-1 rule 6). Submitted straight
 /// through the queue — no backend can even open a handle on a

@@ -24,7 +24,7 @@
 #      on a fresh endpoint, dedupe log with no double-append)
 #   microvm 10. relay-partition conflict legs: rename-then-commit
 #      StaleHandle, concurrent same-file commits under tap-r down,
-#      ConflictedHeads write EIO with reads still serving, name@N
+#      Conflicted write EIO with reads still serving, name@N
 #      versions identical on both sides
 #   microvm 11. offline reopen of both drives on the host (exports
 #      now assert the conflict siblings too)

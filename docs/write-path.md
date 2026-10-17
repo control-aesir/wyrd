@@ -208,16 +208,16 @@ Rules:
    submit nothing and force nothing, and a member whose namespace
    precondition fails during fold application (the `create` arm's
    `EEXIST` and `ENOENT`/`ESTALE`/`ENOTDIR` parent races — decided
-    inside application at `live/apply.rs:554`/`:556`/`:559`/`:562`,
-    never at admission; the clause is generic over
+   inside application at `live/apply.rs:554`/`:556`/`:559`/`:562`,
+   never at admission; the clause is generic over
    every namespace mutation — `mkdir`, `unlink`, `rename` preconditions
    fail the same way)
    reports its own errno without forcing. If the forcing member
    itself is the one that fails, the fold aborts with nothing
    committed — a failed syscall never makes another member's pending
    bytes durable. A fold-fatal refusal raised before the commit
-    begins — the pre-commit quota (`live/apply.rs:281`, `:293`
-    under folding) and `Conflicted` (`crates/wyrd-core/src/mutation.rs:409`) — leaves members
+   begins — the pre-commit quota (`live/apply.rs:281`, `:293`
+   under folding) and `Conflicted` (`crates/wyrd-core/src/mutation.rs:409`) — leaves members
    retryable and non-terminal, as does a failed forcing member; a
    `StaleHandle` is terminal, and so is a store, authoring, or
    fact-commit failure wherever it occurs (the stale/`EIO` rule

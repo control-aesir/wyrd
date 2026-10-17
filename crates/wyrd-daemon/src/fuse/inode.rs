@@ -136,7 +136,7 @@ pub(super) struct DirectoryState {
 }
 
 #[derive(Clone)]
-pub(super) struct ReadHandle {
+pub(crate) struct ReadHandle {
     pub(super) ino: Option<u64>,
     pub(super) capture: OpenFile,
     pub(super) executable: bool,
@@ -145,7 +145,7 @@ pub(super) struct ReadHandle {
 /// Open file handles: the immutable read capture, or the buffered
 /// writable session. A read descriptor serves the object that was
 /// opened; a writable handle adds one mutable logical image on top.
-pub(super) enum Handle {
+pub(crate) enum Handle {
     Read(ReadHandle),
     Write(Arc<Mutex<WriteHandle>>),
 }
@@ -185,7 +185,7 @@ impl Handle {
 /// image (plus its own operation) into one snapshot, then settles each
 /// taken handle from its disposition — re-pinned, failed, or restored
 /// to pending when an aborted fold leaves it untouched.
-pub(super) struct WriteHandle {
+pub(crate) struct WriteHandle {
     pub(super) path: String,
     pub(super) ino: Option<u64>,
     /// The open-time capture: clean reads serve exactly these bytes, so

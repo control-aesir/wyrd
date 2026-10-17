@@ -627,6 +627,20 @@ version say exactly what changed.
 
 ### Changed
 
+- FUSE backend split by concern
+  (`nostr:nevent1qqsw0hd8phl0udfr8v3s9pzly8q80yhyemkaa5ux4cdgpz4wsmwxw2gpz9mhxue69uhkwunpwdczuap49eehgnct839`):
+  the 3867-line `fuse/backend.rs` becomes `fuse/backend/` with one
+  module per area (`setup`, `projection`, `handles`, `read`, `write`,
+  `fold`, `attr`, `ops`), keeping the `FuseBackend` struct, its
+  constructors, and the shared helpers in the root. Pure move. Items
+  called across the new boundary take `pub(super)` (the cross-cluster
+  helpers, the fold bookkeeping types, the shared-mount helpers);
+  the eight test-pinned entry points the `fuse/tests_*` modules call
+  take `pub(crate)`. The `Filesystem` adapters move untouched to
+  `ops.rs`; the repair-window helper moves to the root beside the
+  errno helpers. No behavior change: daemon, CLI, and contract
+  suites pass unmodified.
+
 - Outbox delivery split: rotation extraction
   (`nostr:nevent1qqsrdtwq9seytyxmtgumfl2ckv0s0d4ymz0atlt07tw244t3egu7degpz9mhxue69uhkwunpwdczuap49eehgc7m8vd`):
   the rotation arm moves from `author/deliver.rs` to `author/rotation.rs`

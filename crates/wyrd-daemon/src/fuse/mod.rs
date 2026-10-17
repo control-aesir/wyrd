@@ -1,7 +1,9 @@
 //! FUSE presentation backend, split by concern: [`inode`] owns the
-//! inode table and open-state tracking, [`backend`] maps kernel ops
-//! onto the daemon's [`DriveView`](wyrd_fuse::DriveView). Behavior
-//! tests live alongside, one file per theme.
+//! inode table and open-state tracking, and [`backend`] maps kernel
+//! ops onto the daemon's [`DriveView`](wyrd_fuse::DriveView) — itself
+//! split by area (`setup`, `projection`, `handles`, `read`, `write`,
+//! `fold`, `attr`, `ops`). Behavior tests live alongside, one file
+//! per theme.
 //!
 //! The composed view type is re-exported for hosts: a process host
 //! (like `wyrd-cli`) builds its node over the same view the backend

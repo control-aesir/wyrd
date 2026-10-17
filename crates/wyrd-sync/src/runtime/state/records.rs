@@ -1,3 +1,6 @@
+//! Durable intake records: snapshot announcements, manifest records,
+//! snapshot bodies, and the derived indexes replay rebuilds.
+
 use std::collections::BTreeSet;
 
 use wyrd_format::{ContentId, ManifestEntry, ObjectKind, Snapshot, SnapshotId};

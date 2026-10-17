@@ -1,3 +1,6 @@
+//! Locality and residency accounting: local-object possession,
+//! materialization policy, and the restart reconcile projection.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_format::{

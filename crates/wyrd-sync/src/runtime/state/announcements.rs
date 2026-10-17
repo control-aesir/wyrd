@@ -1,3 +1,6 @@
+//! Announcement outbox accounting: queued/sealed/delivered markers,
+//! route tracking, and reconciliation retirement per snapshot.
+
 use std::collections::BTreeSet;
 
 use wyrd_format::{DeviceId, SnapshotId};

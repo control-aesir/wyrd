@@ -1,3 +1,6 @@
+//! Capability-delivery outbox accounting: the queued/sealed
+//! triple keyed by (epoch, recipient), plus reconciliation retirement.
+
 use wyrd_format::DeviceId;
 
 use super::RuntimeState;

@@ -1,3 +1,6 @@
+//! Transition-delivery outbox accounting: the queued/sealed
+//! triple keyed by transition id, plus reconciliation retirement.
+
 use wyrd_format::{DeviceId, TransitionId};
 
 use super::RuntimeState;

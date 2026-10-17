@@ -1,3 +1,6 @@
+//! Namespace-carry queue accounting: pre-transition eligible heads
+//! still to re-author at the new epoch, minus discharged ones.
+
 use wyrd_format::SnapshotId;
 
 use super::RuntimeState;

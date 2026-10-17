@@ -26,7 +26,7 @@ Three nested fallbacks inside one fetch pass, all fail-closed:
 - across routes of one representation (`fetch_representation`, same
   file `:285`): transport root, then storage address;
 - across providers of one address (`IrohBulkSource::fetch_candidates`,
-  `crates/wyrd-sync/src/bulk.rs:467`) — populated with more than one
+  `crates/wyrd-sync/src/bulk/iroh.rs:749`) — populated with more than one
   entry only in tests; production publishes one peer per snapshot
   (`transport/routes.rs:34,61`), so live alternates arrive as
   representations recorded via different snapshots.
@@ -264,7 +264,7 @@ after older routes. Coherent trade, tiny footprint.
 ### Scheduler before routes
 
 `fetch_candidates`' fair-share geometry thins slices geometrically
-with candidate count (`bulk.rs:193-213`, documented starvation
+with candidate count (`bulk/iroh.rs:179-201`, documented starvation
 tail), so turning one provider into N under the current walk can
 make repair *worse* under tight budgets. Part 2's prerequisite is a
 candidate-scheduling abstraction — ordered candidates, bounded

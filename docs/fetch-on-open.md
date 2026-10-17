@@ -209,7 +209,7 @@ Decided properties:
    live one after a serving restart). The walk orders candidates
    from the source's provider memory (failed routes sink, order
    stable within each tier) and attempts the first three
-   (`FETCH_WALK_CAP` in `bulk.rs`, retry policy). Under a pass budget each
+   (`FETCH_WALK_CAP` in `bulk/iroh.rs`, retry policy). Under a pass budget each
    attempted candidate gets a fair share of the time left, floored so
    an early slow-but-live candidate gets a usable attempt. No
    candidate takes more than half of what's left, so a dead-first

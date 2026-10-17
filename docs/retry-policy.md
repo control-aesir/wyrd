@@ -5,7 +5,7 @@ route freshness`). All three items optimize correct behavior — the
 fair-share floor bounds dead-dial cost, cooling is correct, no
 freshness evidence exists — so none of them changes fetch
 correctness. The demand contract they serve is property 8 in
-`docs/fetch-on-open.md`; the implementation is `bulk.rs`'s candidate
+`docs/fetch-on-open.md`; the implementation is `bulk/iroh.rs`'s candidate
 walk in `wyrd-sync`.
 
 ## Status

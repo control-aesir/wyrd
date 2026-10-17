@@ -257,7 +257,7 @@ fn serving_mount_refuses_push_and_leaves_the_mirror_unchanged() {
     );
     // Poll the fetch plane while the endpoint is live: a landed
     // push becomes servable within milliseconds. Fewer, longer
-    // sleeps than the first version: each fetch dials (bulk.rs),
+    // sleeps than the first version: each fetch dials (bulk/iroh.rs),
     // so this is 10 dials over ~2.5s instead of 40 over ~1s.
     source.publish_transport(crate::bulk::IrohBlobRef {
         provider: serving.addr(),

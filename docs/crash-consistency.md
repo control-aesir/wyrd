@@ -531,7 +531,7 @@ Pinned by
 `graceful_close_inside_the_deadline_reports_finished`, and
 `stalled_close_reports_unfinished_inside_a_bound`
 (`wyrd-sync/src/close.rs`),
-`live_close_returns_past_a_zero_deadline` (`wyrd-sync/src/bulk.rs`),
+`live_close_returns_past_a_zero_deadline` (`wyrd-sync/src/bulk/tests_bulk.rs`),
 `live_serving_stop_returns_past_a_zero_deadline` and
 `poisoned_mirror_lock_reports_but_still_shuts_down`
 (`wyrd-sync/src/serving/tests_serving.rs`), and

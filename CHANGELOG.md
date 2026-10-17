@@ -640,6 +640,26 @@ version say exactly what changed.
   test modules resolve the moved names through `super::*` as before.
   No behavior change: the full core suite passes unmodified.
 
+- Bulk transport split by backend
+  (`nostr:nevent1qqstx87tcsy8mmfedl570ukmt3wlccvk73tzagauvgpr04dcpjzghqqpz9mhxue69uhkwunpwdczuap49eehg8jcky8`):
+  the 1395-line `sync/bulk.rs` becomes `sync/bulk/` with the fetch
+  contract (`SealedManifest`, `BulkError`, `AttemptBudget`,
+  `BulkSource`) in `mod.rs`, the network backend (`IrohBulkSource`,
+  candidate walk, provider memory, dial/transfer allowances, bounded
+  blob accumulator) in `iroh.rs`, and the in-memory double
+  (`MemoryBulkSource`) in `memory.rs`, ungated — the workspace suites
+  name it directly, so gating stays a follow-up. Pure move: every
+  `wyrd_sync::bulk::{BulkSource, AttemptBudget, BulkError,
+  SealedManifest, IrohBulkSource, MemoryBulkSource}` path is unchanged,
+  and the 2113-line unit suite now resolves from the already extracted
+  `tests_bulk.rs`, taking only the `::iroh` disambiguation. The
+  walk/timeout helpers the tests probe
+  take `pub(crate)` (fields, methods, and probe functions in `iroh.rs`);
+  `iroh::` paths take the `::` head where the new child module would
+  otherwise shadow the external crate. No behavior change: workspace
+  check, nextest (2007 passed / 21 skipped), doctests, clippy, and fmt
+  green.
+
 - Runtime state split by accounting concern
   (`nostr:nevent1qqswvpnd3kw744wy54puey5mqnzl2f4a4d90a7yutvcdn7utx8khlccpz9mhxue69uhkwunpwdczuap49eehglvxvpt`):
   the 1388-line `runtime/state.rs` becomes `runtime/state/` with one

@@ -1,151 +1,24 @@
-//! Bulk object transport: the sync fetch boundary for sealed bytes.
+//! Network bulk backend: `IrohBulkSource` and the walk/timeout machinery.
 //!
-//! The control plane (mailbox) carries small control messages; everything bulky —
-//! sealed manifests and sealed objects — moves through [`BulkSource`],
-//! synchronously by design like the rest of `wyrd-sync`: the in-memory
-//! fake serves tests, and [`IrohBulkSource`] provides the network backend.
-//!
-//! Fetches are size-aware: the caller passes the pre-decode byte ceiling
-//! with every request, and the source classifies an oversize
-//! representation as [`BulkError::Oversize`] instead of handing over
-//! undecodable bytes. Both sources enforce the ceiling before buffering
-//! the representation: the memory source checks its stored bytes, and
-//! the iroh source checks the cryptographically verified blob size
-//! first, then streams the body into a buffer pre-sized from that
-//! size which checks each leaf against the remaining budget before
-//! copying — a hostile peer cannot force more than `max` bytes of
-//! content, and accepted fetches allocate exactly what was verified.
-//!
-//! Addressing mirrors what each party may know. Sealed objects are
-//! vault-visible, so they fetch by [`StorageId`]; representations also
-//! carry their transport root (object-model.md decision 26), and
-//! [`BulkSource::fetch_transport`] serves a representation whose raw
-//! BLAKE3 (Bao root) is the requested address — the author-attested
-//! routing column, verified by the transfer itself. The root manifest of
-//! a snapshot is additionally fetchable by [`SnapshotId`] from a member
-//! peer holding that snapshot's metadata (the eager manifest exchange of
-//! sync-and-peers.md, not a vault read); fetch::root prefers the
-//! announcement's transport root and falls back to the exchange. Snapshot
-//! bodies are plaintext CAS objects whose content id equals the snapshot
-//! id (`ObjectKind::Snapshot`), fetchable the same way; the transport
-//! path prefers the announcement's body root. The returned
-//! [`ContentId`] of a root fetch is an untrusted hint:
-//! `seal::open_manifest` still enforces it as AAD before the record is
-//! trusted.
+//! The candidate walk, provider memory, dial/transfer allowances, and the
+//! bounded blob accumulator live here with the source that runs them.
+//! The fetch contract they implement is `super::BulkSource`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use ::iroh::{Endpoint, EndpointAddr};
 use bao_tree::io::BaoContentItem;
-use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::{
     get::request::{get_blob, get_verified_size, GetBlobItem},
     Hash,
 };
 use n0_future::{Stream, StreamExt};
-use thiserror::Error;
 use tokio::runtime::Runtime;
 use wyrd_format::{BaoRoot, ContentId, SnapshotId, StorageId};
 
-/// A sealed root manifest as a member peer serves it: the claimed
-/// logical identity alongside the sealed bytes. The claim verifies as
-/// the AAD of the seal on open; a lying peer fails the tag, never the
-/// record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealedManifest {
-    pub content_id: ContentId,
-    pub sealed: Vec<u8>,
-}
-
-/// Bulk fetch failures. Absence is `Ok(None)` — the peer simply does
-/// not hold the bytes — while transport trouble and oversize
-/// representations surface here. The engine treats absence and
-/// transport trouble as "try again later": nothing commits, nothing
-/// is lost. Oversize is classified at this boundary so the plan layer
-/// counts it as invalid remote data, not transport trouble.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum BulkError {
-    #[error("bulk transport failed: {0}")]
-    Transport(String),
-    /// The attempt ran out of its pass-budget slice before completing:
-    /// evidence about the budget, never about the provider. The plan
-    /// counts it but does not strike on it (a sliced timeout carries
-    /// no fault information — with a bigger share the attempt might
-    /// have succeeded). Only attempts the candidate walk subdivided
-    /// report it: a full-share attempt (the only or last candidate,
-    /// or any single-route fetch) reports [`BulkError::Transport`] on
-    /// expiry exactly as before, so a hanging route with no one
-    /// behind it still backs off. `slice` is the budget that actually
-    /// expired at the reporting site: the attempt's slice at the
-    /// outer timeout, the dial's slice (`FETCH_DIAL_TIMEOUT` capped)
-    /// at the dial timeout — the two coincide at default budgets and
-    /// diverge only when a pass budget exceeds the dial bound.
-    /// Zero when the walk stopped before granting any. Instant
-    /// failures under a slice — refused dials, protocol errors,
-    /// oversize — stay [`BulkError::Transport`]: those completed
-    /// observations are fault information even when the budget is
-    /// tight.
-    #[error("bulk attempt ran out of its {slice:?} pass-budget slice")]
-    Deadline { slice: std::time::Duration },
-    #[error("sealed representation of {bytes} bytes exceeds the {max}-byte fetch ceiling")]
-    Oversize { bytes: usize, max: usize },
-}
-
-/// Per-attempt fetch deadline knob: the plan hands the source the
-/// absolute instant its budget runs out (the nearest held-mutation
-/// deadline), and the source clamps **every** attempt to the time
-/// remaining at that attempt — a deadline, not a duration, so a later
-/// attempt in the same pass cannot re-arm with a stale budget after an
-/// earlier attempt burned its share. One stalled provider can no
-/// longer push a timeout decision past its wall-clock bound. The
-/// default is a no-op (attempts run under the source's own built-in
-/// timeouts); sources with real per-attempt deadlines override it.
-/// `IrohBulkSource` goes further and divides the remaining time
-/// across the candidates that are still unattempted, so each attempt
-/// re-arms to a *smaller* share, not the live remaining. The knob is
-/// plan-run state: the plan sets it at entry and clears
-/// it on the way out.
-pub trait AttemptBudget {
-    fn set_attempt_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
-}
-
-/// The synchronous bulk boundary: sealed manifests and sealed objects
-/// by their fetch addresses. Every fetch is size-aware: `max` is the
-/// caller's pre-decode byte ceiling, and a representation over it must
-/// fail with [`BulkError::Oversize`] rather than return bytes.
-pub trait BulkSource: AttemptBudget {
-    /// The sealed root manifest a member peer holds for a snapshot, if any.
-    fn fetch_root_manifest(
-        &mut self,
-        snapshot: &SnapshotId,
-        max: usize,
-    ) -> Result<Option<SealedManifest>, BulkError>;
-
-    /// The snapshot body a member peer holds: the plaintext CAS object
-    /// whose content id equals the snapshot id, if any.
-    fn fetch_snapshot(
-        &mut self,
-        snapshot: &SnapshotId,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, BulkError>;
-
-    /// Sealed bytes (manifest or object) at a vault-visible address, if held.
-    fn fetch_sealed(
-        &mut self,
-        storage: &StorageId,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, BulkError>;
-
-    /// Sealed (or plaintext, for bodies) bytes at a transport-root
-    /// address: the representation whose raw BLAKE3 over its bytes is
-    /// `root` (object-model.md decision 26). The address is the
-    /// author-attested routing column carried by announcements and
-    /// manifest mappings; the transfer itself verifies against it on the
-    /// live path. Absence is `Ok(None)`.
-    fn fetch_transport(&mut self, root: &BaoRoot, max: usize)
-        -> Result<Option<Vec<u8>>, BulkError>;
-}
+use super::{AttemptBudget, BulkError, BulkSource, SealedManifest};
 
 /// A remotely addressable iroh blob.
 ///
@@ -185,7 +58,7 @@ fn push_unique(candidates: &mut Vec<IrohBlobRef>, blob: IrohBlobRef) {
 /// operator action. Revisit when the attempt forensics show flapping
 /// (marks re-laid every pass) or sticking (live routes sunk for the
 /// whole TTL).
-const PROVIDER_BAD_MARK_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const PROVIDER_BAD_MARK_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// One provider's last completed failure observation: when it
 /// happened. Only failures live here — a fulfilled attempt removes
@@ -194,8 +67,8 @@ const PROVIDER_BAD_MARK_TTL: std::time::Duration = std::time::Duration::from_sec
 /// not pass-counted: the memory belongs to the source and spans
 /// passes, while pass numbering belongs to the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProviderMark {
-    failed_at: std::time::Instant,
+pub(crate) struct ProviderMark {
+    pub(crate) failed_at: std::time::Instant,
 }
 
 /// Order one walk's candidates from the provider memory: marked
@@ -207,7 +80,7 @@ struct ProviderMark {
 /// marks prune here, so the map holds only live evidence. Pure over
 /// the map so tests pin the tiers without a network; the live walk
 /// passes its own memory with the current instant.
-fn order_candidates(
+pub(crate) fn order_candidates(
     candidates: &[IrohBlobRef],
     memory: &mut HashMap<[u8; 32], ProviderMark>,
     now: std::time::Instant,
@@ -239,13 +112,13 @@ fn order_candidates(
 /// the rule without a network; `fetch` applies it where phase and
 /// error class meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderLesson {
+pub(crate) enum ProviderLesson {
     Clear,
     Mark,
     Ignore,
 }
 
-fn provider_lesson(
+pub(crate) fn provider_lesson(
     result: &Result<Vec<u8>, BulkError>,
     outcome: &AttemptOutcome,
 ) -> ProviderLesson {
@@ -260,7 +133,10 @@ fn provider_lesson(
 
 /// Lay (or refresh) one provider's failure mark. Only `fetch` calls
 /// this, only for the lesson above — never directly for an error.
-fn mark_provider_failed(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &[u8; 32]) {
+pub(crate) fn mark_provider_failed(
+    memory: &mut HashMap<[u8; 32], ProviderMark>,
+    provider: &[u8; 32],
+) {
     memory.insert(
         *provider,
         ProviderMark {
@@ -300,7 +176,7 @@ fn clear_provider_mark(memory: &mut HashMap<[u8; 32], ProviderMark>, provider: &
 /// The last attempted candidate always gets everything left; a spent budget
 /// shares nothing (the caller stops the walk on a zero share rather
 /// than attempting).
-fn candidate_share(
+pub(crate) fn candidate_share(
     remaining: std::time::Duration,
     index: usize,
     total: usize,
@@ -324,7 +200,7 @@ fn candidate_share(
 /// construction. One helper, one call site per attempt, so the
 /// timeout that fires and the class it maps to agree structurally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptBound {
+pub(crate) enum AttemptBound {
     Full,
     Shared,
 }
@@ -334,7 +210,7 @@ enum AttemptBound {
 /// built-in blob timeout): a share roomier than the built-ins leaves
 /// a `Full` attempt whose expiry is fault evidence, not budget
 /// evidence. Pure so tests pin the boundary without a network.
-fn attempt_bound(
+pub(crate) fn attempt_bound(
     share: Option<std::time::Duration>,
     remaining: std::time::Duration,
 ) -> AttemptBound {
@@ -391,12 +267,12 @@ const FETCH_WALK_CAP: usize = 3;
 /// a faultily slow provider reads as budget pressure.
 /// Instant dial failures (refused, unreachable) stay
 /// transport errors — those completed even under the slice.
-async fn dial(
+pub(crate) async fn dial(
     endpoint: &Endpoint,
     provider: EndpointAddr,
     timeout: std::time::Duration,
     bound: AttemptBound,
-) -> Result<iroh::endpoint::Connection, BulkError> {
+) -> Result<::iroh::endpoint::Connection, BulkError> {
     tokio::time::timeout(timeout, endpoint.connect(provider, iroh_blobs::ALPN))
         .await
         .map_err(|_| {
@@ -414,7 +290,7 @@ async fn dial(
 /// and as this transport error on a full share. Shared here so the
 /// split's phase attribution (`dial_timed_out`) matches on exactly
 /// the shapes `dial` promises, never on re-derived strings.
-const DIAL_TIMED_OUT: &str = "provider dial timed out";
+pub(crate) const DIAL_TIMED_OUT: &str = "provider dial timed out";
 
 /// Upper bound for the dial phase of one attempt: the dial runs under
 /// its own allowance — the dial bound capped to the attempt budget —
@@ -423,7 +299,7 @@ const DIAL_TIMED_OUT: &str = "provider dial timed out";
 /// subdivided share the allowance shrinks with the share, on a full
 /// share it holds at the dial bound. Pure so tests pin the boundary
 /// without a network.
-fn dial_allowance(blob_timeout: std::time::Duration) -> std::time::Duration {
+pub(crate) fn dial_allowance(blob_timeout: std::time::Duration) -> std::time::Duration {
     FETCH_DIAL_TIMEOUT.min(blob_timeout)
 }
 
@@ -435,7 +311,7 @@ fn dial_allowance(blob_timeout: std::time::Duration) -> std::time::Duration {
 /// every classification in `fetch` is unchanged. Saturating: a dial
 /// that consumed the whole budget leaves the transfer nothing to
 /// spend. Pure so tests pin the boundary without a network.
-fn transfer_allowance(
+pub(crate) fn transfer_allowance(
     blob_timeout: std::time::Duration,
     dial_elapsed: std::time::Duration,
 ) -> std::time::Duration {
@@ -447,7 +323,7 @@ fn transfer_allowance(
 /// is timeout evidence by phase; instant failures completed their
 /// observation. Structural companion to [`dial`]'s contract —
 /// timeouts report exactly these two shapes.
-fn dial_timed_out(error: &BulkError) -> bool {
+pub(crate) fn dial_timed_out(error: &BulkError) -> bool {
     matches!(error, BulkError::Deadline { .. })
         || matches!(error, BulkError::Transport(message) if message == DIAL_TIMED_OUT)
 }
@@ -457,7 +333,7 @@ fn dial_timed_out(error: &BulkError) -> bool {
 /// stats attribute every attempt outcome to its phase, so a budget
 /// eaten by dialing reads as dial cost, never as transfer trouble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptPhase {
+pub(crate) enum AttemptPhase {
     Dial,
     Transfer,
 }
@@ -467,7 +343,7 @@ enum AttemptPhase {
 /// flowed before the failure (partial progress — the resume
 /// decision's numerator), fulfillment carries its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptOutcome {
+pub(crate) enum AttemptOutcome {
     Fulfilled {
         bytes: usize,
     },
@@ -554,7 +430,7 @@ impl BulkFetchStats {
     /// every failed attempt banks its streamed bytes as waste —
     /// including instant failures, whose partial progress is just as
     /// lost to a restart as a timeout's.
-    fn record(&self, outcome: &AttemptOutcome) {
+    pub(crate) fn record(&self, outcome: &AttemptOutcome) {
         self.attempts.fetch_add(1, Ordering::Relaxed);
         match *outcome {
             AttemptOutcome::Fulfilled { bytes } => {
@@ -577,7 +453,7 @@ impl BulkFetchStats {
         }
     }
 
-    fn snapshot(&self) -> BulkFetchStatsSnapshot {
+    pub(crate) fn snapshot(&self) -> BulkFetchStatsSnapshot {
         BulkFetchStatsSnapshot {
             attempts: self.attempts.load(Ordering::Relaxed),
             dial_timeouts: self.dial_timeouts.load(Ordering::Relaxed),
@@ -642,31 +518,31 @@ pub struct IrohBulkSource {
     endpoint: Endpoint,
     runtime: Arc<Runtime>,
     roots: BTreeMap<SnapshotId, (ContentId, IrohBlobRef)>,
-    snapshots: BTreeMap<SnapshotId, IrohBlobRef>,
+    pub(crate) snapshots: BTreeMap<SnapshotId, IrohBlobRef>,
     /// Sealed representations by storage address. A representation is
     /// immutable and may be advertised by several members, so each
     /// address keeps every provider in publication order rather than a
     /// single overwritten one: a dead route must not displace a live
     /// alternate.
-    sealed: BTreeMap<StorageId, Vec<IrohBlobRef>>,
+    pub(crate) sealed: BTreeMap<StorageId, Vec<IrohBlobRef>>,
     /// Representations by Bao root, same multi-provider rule. Snapshot
     /// and root-manifest addresses are different: the author-signed
     /// announcement names exactly one route per snapshot, and a route
     /// update replaces it (last accepted wins), so those maps stay
     /// single-valued by policy.
-    transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
+    pub(crate) transport: BTreeMap<BaoRoot, Vec<IrohBlobRef>>,
     /// Plan-run deadline from [`AttemptBudget`]: the instant the pass's
     /// budget runs out, re-clamped to the remaining time on every
     /// attempt. `None` runs under the built-in timeouts. Plan-run
     /// state, reset by the plan — never source configuration.
-    attempt_deadline: Option<std::time::Instant>,
+    pub(crate) attempt_deadline: Option<std::time::Instant>,
     /// The candidate walk's bound for the in-flight attempt, set
     /// alongside the re-armed [`IrohBulkSource::attempt_deadline`] and
     /// read by `fetch` to classify a timeout as budget evidence
     /// (`Shared`) or fault evidence (`Full`). `None` outside a walk:
     /// single-route fetches are never subdivided. Plan-run state like
     /// the deadline, restored on the same exits.
-    attempt_bound: Option<AttemptBound>,
+    pub(crate) attempt_bound: Option<AttemptBound>,
     /// Cumulative fetch telemetry for the split's failure modes (see
     /// [`BulkFetchStats`]): recorded by every attempt, read through
     /// [`IrohBulkSource::fetch_stats`]. Source configuration, never
@@ -679,7 +555,7 @@ pub struct IrohBulkSource {
     /// fulfilled attempt clears the provider's mark, and marks
     /// expire after [`PROVIDER_BAD_MARK_TTL`]. Spans passes and
     /// addresses — plan-run state never resets it.
-    provider_memory: HashMap<[u8; 32], ProviderMark>,
+    pub(crate) provider_memory: HashMap<[u8; 32], ProviderMark>,
 }
 
 impl std::fmt::Debug for IrohBulkSource {
@@ -733,7 +609,7 @@ impl IrohBulkSource {
             .build()?;
         let endpoint = runtime
             .block_on(async {
-                iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                ::iroh::Endpoint::builder(::iroh::endpoint::presets::N0)
                     .bind()
                     .await
             })
@@ -760,7 +636,7 @@ impl IrohBulkSource {
     /// This provider's failure mark, if any: tests pin the record
     /// rules through it.
     #[cfg(test)]
-    fn provider_mark(&self, provider: &[u8; 32]) -> Option<ProviderMark> {
+    pub(crate) fn provider_mark(&self, provider: &[u8; 32]) -> Option<ProviderMark> {
         self.provider_memory.get(provider).copied()
     }
 
@@ -818,7 +694,7 @@ impl IrohBulkSource {
     /// fail a shutdown whose application work already stopped. The
     /// only observable difference between the paths is the warning.
     pub fn shutdown(&self, deadline: std::time::Duration) {
-        let finished = self.runtime.block_on(super::close::graceful_or_abort(
+        let finished = self.runtime.block_on(crate::close::graceful_or_abort(
             self.endpoint.close(),
             deadline,
         ));
@@ -975,7 +851,7 @@ impl IrohBulkSource {
     /// freshness-orders the same loop, fair-shares the pass budget
     /// across it, and attempts at most [`FETCH_WALK_CAP`].
     #[cfg(test)]
-    fn fetch_candidates_with<F>(
+    pub(crate) fn fetch_candidates_with<F>(
         candidates: &[IrohBlobRef],
         max: usize,
         mut fetch: F,
@@ -997,7 +873,7 @@ impl IrohBulkSource {
         }
     }
 
-    fn fetch(&mut self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
+    pub(crate) fn fetch(&mut self, blob: &IrohBlobRef, max: usize) -> Result<Vec<u8>, BulkError> {
         // The ceiling is enforced twice: the verified size rejects an
         // oversize blob before anything transfers, and the bounded
         // accumulator below pre-sizes from that verified size and
@@ -1155,17 +1031,6 @@ impl IrohBulkSource {
     }
 }
 
-impl crate::runtime::RoutePublishing for MemoryBulkSource {
-    /// The in-memory fake never carries live routes: its tests publish
-    /// addresses by hand.
-    fn publish_routes(
-        &mut self,
-        _state: &crate::runtime::RuntimeState,
-    ) -> Result<crate::runtime::RouteReport, crate::runtime::EngineError> {
-        Ok(crate::runtime::RouteReport::default())
-    }
-}
-
 /// Concatenate one blob stream into a buffer capped at `max` content
 /// bytes: the buffer is pre-sized from `reserve` — the verified blob
 /// size on the live path, so accepted fetches never reallocate — and
@@ -1179,7 +1044,7 @@ impl crate::runtime::RoutePublishing for MemoryBulkSource {
 /// counts accepted leaf bytes as they land, so a caller whose timeout
 /// cancels this future still learns the partial progress — the resume
 /// decision's numerator. `None` skips the counting.
-async fn bounded_blob_bytes<S>(
+pub(crate) async fn bounded_blob_bytes<S>(
     stream: S,
     max: usize,
     reserve: usize,
@@ -1277,119 +1142,3 @@ impl BulkSource for IrohBulkSource {
         self.fetch_candidates(&candidates, max)
     }
 }
-
-/// An in-memory bulk peer for tests: preloaded sealed bytes keyed by
-/// their fetch addresses. No network, no async.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MemoryBulkSource {
-    roots: BTreeMap<SnapshotId, SealedManifest>,
-    snapshots: BTreeMap<SnapshotId, Vec<u8>>,
-    sealed: BTreeMap<StorageId, Vec<u8>>,
-    transport: BTreeMap<BaoRoot, Vec<u8>>,
-}
-
-impl MemoryBulkSource {
-    /// Serve a sealed root manifest for a snapshot.
-    pub fn publish_root(&mut self, snapshot: SnapshotId, manifest: SealedManifest) {
-        self.roots.insert(snapshot, manifest);
-    }
-
-    /// Publish sealed (or plaintext) bytes under the transport root the
-    /// bytes themselves carry: the map key is derived from the content,
-    /// so the address the publisher hands out is exactly what the
-    /// transfer verifies against. A publisher cannot place bytes under a
-    /// root they do not hash to.
-    pub fn publish_transport(&mut self, bytes: Vec<u8>) {
-        self.transport.insert(crate::seal::blob_root(&bytes), bytes);
-    }
-
-    /// Serve a snapshot body at its snapshot address.
-    pub fn publish_snapshot(&mut self, snapshot: SnapshotId, body: Vec<u8>) {
-        self.snapshots.insert(snapshot, body);
-    }
-
-    /// Serve sealed bytes at a storage address.
-    pub fn publish_sealed(&mut self, storage: StorageId, sealed: Vec<u8>) {
-        self.sealed.insert(storage, sealed);
-    }
-}
-
-/// In-memory: attempts are instant, so the plan's per-attempt cap
-/// has nothing to bound.
-impl AttemptBudget for MemoryBulkSource {}
-
-impl BulkSource for MemoryBulkSource {
-    fn fetch_root_manifest(
-        &mut self,
-        snapshot: &SnapshotId,
-        max: usize,
-    ) -> Result<Option<SealedManifest>, BulkError> {
-        let Some(manifest) = self.roots.get(snapshot).cloned() else {
-            return Ok(None);
-        };
-        if manifest.sealed.len() > max {
-            return Err(BulkError::Oversize {
-                bytes: manifest.sealed.len(),
-                max,
-            });
-        }
-        Ok(Some(manifest))
-    }
-
-    fn fetch_snapshot(
-        &mut self,
-        snapshot: &SnapshotId,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(body) = self.snapshots.get(snapshot).cloned() else {
-            return Ok(None);
-        };
-        if body.len() > max {
-            return Err(BulkError::Oversize {
-                bytes: body.len(),
-                max,
-            });
-        }
-        Ok(Some(body))
-    }
-
-    fn fetch_sealed(
-        &mut self,
-        storage: &StorageId,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(sealed) = self.sealed.get(storage).cloned() else {
-            return Ok(None);
-        };
-        if sealed.len() > max {
-            return Err(BulkError::Oversize {
-                bytes: sealed.len(),
-                max,
-            });
-        }
-        Ok(Some(sealed))
-    }
-
-    fn fetch_transport(
-        &mut self,
-        root: &BaoRoot,
-        max: usize,
-    ) -> Result<Option<Vec<u8>>, BulkError> {
-        let Some(bytes) = self.transport.get(root).cloned() else {
-            return Ok(None);
-        };
-        if bytes.len() > max {
-            return Err(BulkError::Oversize {
-                bytes: bytes.len(),
-                max,
-            });
-        }
-        Ok(Some(bytes))
-    }
-}
-
-// Sibling test file under the workspace tests_* naming: #[path] is required
-// because default resolution from this parent would look for tests.rs, not this name.
-#[cfg(test)]
-#[path = "bulk/tests_bulk.rs"]
-mod tests;

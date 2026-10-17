@@ -195,7 +195,7 @@ fn published_bytes_serve_by_address() {
 
 #[test]
 fn iroh_source_fetches_bao_verified_bytes() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -248,7 +248,7 @@ fn iroh_source_fetches_bao_verified_bytes() {
 
 #[test]
 fn idle_endpoint_close_is_bounded_and_clean() {
-    use iroh::{endpoint::presets, Endpoint};
+    use ::iroh::{endpoint::presets, Endpoint};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -272,7 +272,7 @@ fn idle_endpoint_close_is_bounded_and_clean() {
 
 #[test]
 fn live_close_returns_past_a_zero_deadline() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -374,7 +374,7 @@ fn candidate_share_floors_early_candidates_and_preserves_the_walk() {
 
 #[test]
 fn spent_budget_stops_the_walk_as_deadline_never_absence() {
-    use iroh::{endpoint::presets, Endpoint};
+    use ::iroh::{endpoint::presets, Endpoint};
 
     // Candidates exist but the pass budget is already spent: the
     // walk must stop with no attempt and report a deadline — never
@@ -400,7 +400,7 @@ fn spent_budget_stops_the_walk_as_deadline_never_absence() {
         source.publish_sealed(
             storage,
             IrohBlobRef {
-                provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public()),
+                provider: EndpointAddr::new(::iroh::SecretKey::from_bytes(&[seed; 32]).public()),
                 hash: [0xBB; 32],
             },
         );
@@ -418,7 +418,7 @@ fn spent_budget_stops_the_walk_as_deadline_never_absence() {
 
 #[test]
 fn sliced_dial_reports_deadline_not_transport() {
-    use iroh::{endpoint::presets, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, Endpoint, RelayUrl};
     use std::time::{Duration, Instant};
 
     // Same silent relay as the unsliced dial test: the handshake
@@ -439,8 +439,8 @@ fn sliced_dial_reports_deadline_not_transport() {
             .unwrap()
     });
     let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
-    let provider =
-        EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x77; 32]).public()).with_relay_url(relay);
+    let provider = EndpointAddr::new(::iroh::SecretKey::from_bytes(&[0x77; 32]).public())
+        .with_relay_url(relay);
     let start = Instant::now();
     let result = runtime.block_on(dial(
         &client,
@@ -462,7 +462,7 @@ fn sliced_dial_reports_deadline_not_transport() {
 
 #[test]
 fn fetch_classifies_expiry_by_bound_not_budget() {
-    use iroh::{endpoint::presets, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, Endpoint, RelayUrl};
 
     // A live-silent relay under a 100 ms deadline, driven through
     // `fetch` directly with a preset bound: the only reachable
@@ -490,7 +490,7 @@ fn fetch_classifies_expiry_by_bound_not_budget() {
     let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
     let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
     let blob = IrohBlobRef {
-        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x78; 32]).public())
+        provider: EndpointAddr::new(::iroh::SecretKey::from_bytes(&[0x78; 32]).public())
             .with_relay_url(relay),
         hash: [0xBC; 32],
     };
@@ -701,7 +701,7 @@ fn cancelled_transfer_keeps_partial_progress_on_the_probe() {
 
 #[test]
 fn split_success_records_fulfilled_stats() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // One live provider serving small content over loopback: the
@@ -760,7 +760,7 @@ fn split_success_records_fulfilled_stats() {
 
 #[test]
 fn split_dial_timeout_records_phase_and_preserves_class() {
-    use iroh::{endpoint::presets, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, Endpoint, RelayUrl};
     use std::time::{Duration, Instant};
 
     // Same silent relay as the unsliced dial test: the handshake
@@ -789,7 +789,7 @@ fn split_dial_timeout_records_phase_and_preserves_class() {
     let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
     let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
     let blob = IrohBlobRef {
-        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x79; 32]).public())
+        provider: EndpointAddr::new(::iroh::SecretKey::from_bytes(&[0x79; 32]).public())
             .with_relay_url(relay),
         hash: [0xBD; 32],
     };
@@ -834,7 +834,7 @@ fn split_dial_timeout_records_phase_and_preserves_class() {
 
 #[test]
 fn split_transfer_timeout_records_phase_and_preserves_slice() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use std::time::{Duration, Instant};
 
     /// A provider that completes the handshake and then never
@@ -843,11 +843,11 @@ fn split_transfer_timeout_records_phase_and_preserves_slice() {
     /// shared deadline would have reported, with the same class.
     #[derive(Debug, Clone)]
     struct StallProtocol;
-    impl iroh::protocol::ProtocolHandler for StallProtocol {
+    impl ::iroh::protocol::ProtocolHandler for StallProtocol {
         async fn accept(
             &self,
-            _connection: iroh::endpoint::Connection,
-        ) -> Result<(), iroh::protocol::AcceptError> {
+            _connection: ::iroh::endpoint::Connection,
+        ) -> Result<(), ::iroh::protocol::AcceptError> {
             std::future::pending().await
         }
     }
@@ -925,7 +925,7 @@ fn split_transfer_timeout_records_phase_and_preserves_slice() {
 
 #[test]
 fn capped_walk_pages_through_dead_heads_across_passes() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Seven dead providers (unroutable: no addresses, no lookup —
@@ -967,7 +967,7 @@ fn capped_walk_pages_through_dead_heads_across_passes() {
     let mut source = IrohBulkSource::with_runtime(client, runtime.clone());
     let root = BaoRoot::from_bytes(*hash.as_bytes());
     let dead = |seed: u8| IrohBlobRef {
-        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public()),
+        provider: EndpointAddr::new(::iroh::SecretKey::from_bytes(&[seed; 32]).public()),
         hash: *hash.as_bytes(),
     };
     for seed in 0xC0..0xC7 {
@@ -1028,7 +1028,7 @@ fn capped_walk_pages_through_dead_heads_across_passes() {
 
 #[test]
 fn budgeted_walk_reaches_live_behind_hanging_candidates() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Two hanging providers (live-silent relays: each consumes
@@ -1080,7 +1080,7 @@ fn budgeted_walk_reaches_live_behind_hanging_candidates() {
     for (i, relay) in relays.into_iter().enumerate() {
         source.publish_transport(IrohBlobRef {
             provider: EndpointAddr::new(
-                iroh::SecretKey::from_bytes(&[0xD0 + i as u8; 32]).public(),
+                ::iroh::SecretKey::from_bytes(&[0xD0 + i as u8; 32]).public(),
             )
             .with_relay_url(relay),
             hash: *hash.as_bytes(),
@@ -1108,7 +1108,7 @@ fn budgeted_walk_reaches_live_behind_hanging_candidates() {
 
 #[test]
 fn capped_walk_leaves_tail_unmarked_and_unattempted() {
-    use iroh::{endpoint::presets, Endpoint};
+    use ::iroh::{endpoint::presets, Endpoint};
 
     // Five routeless providers, no pass budget: the walk attempts
     // the first three and stops at the cap. The attempted three
@@ -1162,7 +1162,7 @@ fn capped_walk_leaves_tail_unmarked_and_unattempted() {
 
 #[test]
 fn capped_walk_pages_dial_hangs_one_per_pass() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint, RelayUrl};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Three hanging providers (live-silent relays: each consumes
@@ -1222,7 +1222,7 @@ fn capped_walk_pages_dial_hangs_one_per_pass() {
     for (i, relay) in relays.into_iter().enumerate() {
         let blob = IrohBlobRef {
             provider: EndpointAddr::new(
-                iroh::SecretKey::from_bytes(&[0xEA + i as u8; 32]).public(),
+                ::iroh::SecretKey::from_bytes(&[0xEA + i as u8; 32]).public(),
             )
             .with_relay_url(relay),
             hash: *hash.as_bytes(),
@@ -1320,7 +1320,7 @@ fn attempt_bound_marks_only_subdivided_attempts_shared() {
 
 #[test]
 fn fetch_candidates_tries_providers_in_order_and_falls_through() {
-    let key = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+    let key = |seed: u8| ::iroh::SecretKey::from_bytes(&[seed; 32]).public();
     let a = IrohBlobRef {
         provider: EndpointAddr::new(key(0x11)),
         hash: [0xAA; 32],
@@ -1370,12 +1370,12 @@ fn fetch_candidates_tries_providers_in_order_and_falls_through() {
 /// tests below prove record behavior with no network traffic.
 fn dead_ref(seed: u8) -> IrohBlobRef {
     IrohBlobRef {
-        provider: EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public()),
+        provider: EndpointAddr::new(::iroh::SecretKey::from_bytes(&[seed; 32]).public()),
         hash: [0xAA; 32],
     }
 }
 
-fn ordered_ids(blobs: &[IrohBlobRef]) -> Vec<iroh::PublicKey> {
+fn ordered_ids(blobs: &[IrohBlobRef]) -> Vec<::iroh::PublicKey> {
     blobs.iter().map(|blob| blob.provider.id).collect()
 }
 
@@ -1505,7 +1505,7 @@ fn provider_lesson_marks_only_dial_phase_transport_failures() {
 
 #[test]
 fn iroh_source_falls_back_across_providers_for_one_root() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1595,7 +1595,7 @@ fn iroh_source_falls_back_across_providers_for_one_root() {
 
 #[test]
 fn failed_walk_marks_every_completed_provider() {
-    use iroh::{endpoint::presets, Endpoint};
+    use ::iroh::{endpoint::presets, Endpoint};
 
     // Two routeless providers: both dials fail fast without packets,
     // and both failures are completed observations — instant
@@ -1666,7 +1666,7 @@ fn failed_walk_marks_every_completed_provider() {
 
 #[test]
 fn fulfilled_walk_clears_the_mark_and_never_skips() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Dead-first publication with the LIVE provider pre-marked: the
@@ -1736,7 +1736,7 @@ fn fulfilled_walk_clears_the_mark_and_never_skips() {
 
 #[test]
 fn sunk_dead_provider_is_tried_last() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Dead-first publication with the DEAD provider pre-marked: the
@@ -1802,7 +1802,7 @@ fn sunk_dead_provider_is_tried_last() {
 
 #[test]
 fn single_route_failure_marks_for_later_walks() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // The mark's other write path: a single-route fetch (no walk
@@ -1879,7 +1879,7 @@ fn single_route_failure_marks_for_later_walks() {
 
 #[test]
 fn dial_against_a_silent_relay_times_out_instead_of_hanging() {
-    use iroh::{endpoint::presets, Endpoint, RelayUrl};
+    use ::iroh::{endpoint::presets, Endpoint, RelayUrl};
     use std::time::{Duration, Instant};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1901,8 +1901,8 @@ fn dial_against_a_silent_relay_times_out_instead_of_hanging() {
             .unwrap()
     });
     let relay: RelayUrl = format!("https://127.0.0.1:{port}").parse().unwrap();
-    let provider =
-        EndpointAddr::new(iroh::SecretKey::from_bytes(&[0x77; 32]).public()).with_relay_url(relay);
+    let provider = EndpointAddr::new(::iroh::SecretKey::from_bytes(&[0x77; 32]).public())
+        .with_relay_url(relay);
     let start = Instant::now();
     let result = runtime.block_on(dial(
         &client,
@@ -1924,7 +1924,7 @@ fn dial_against_a_silent_relay_times_out_instead_of_hanging() {
 
 #[test]
 fn iroh_source_serves_transport_roots() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1983,7 +1983,7 @@ fn iroh_source_serves_transport_roots() {
 
 #[test]
 fn iroh_source_rejects_oversize_blob_before_buffering() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     // Multi-chunk blob (bao leaves are 1 KiB) over the ceiling: the
@@ -2043,7 +2043,7 @@ fn iroh_source_rejects_oversize_blob_before_buffering() {
 
 #[test]
 fn iroh_source_fetches_root_manifest_by_snapshot() {
-    use iroh::{endpoint::presets, protocol::Router, Endpoint};
+    use ::iroh::{endpoint::presets, protocol::Router, Endpoint};
     use iroh_blobs::{store::mem::MemStore, BlobsProtocol};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2104,7 +2104,7 @@ fn iroh_source_fetches_root_manifest_by_snapshot() {
     source.shutdown(std::time::Duration::from_secs(10));
 }
 
-fn direct_addr(endpoint: &iroh::Endpoint) -> EndpointAddr {
+fn direct_addr(endpoint: &::iroh::Endpoint) -> EndpointAddr {
     let mut address = EndpointAddr::new(endpoint.id());
     for ip in endpoint.addr().ip_addrs() {
         address = address.with_ip_addr(*ip);

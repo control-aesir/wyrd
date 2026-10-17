@@ -638,8 +638,9 @@ version say exactly what changed.
   from `mod.rs`. Pure move: every used `durable::codec::*` path
   resolves as before (durable-internal items take `pub(crate)`, the
   crate seams keep theirs; the never-used `COMMIT_VERSION` path is
-  intentionally not re-exported), the test-only surface is `#[cfg(test)]` gated, and the
-  already extracted `tests_codec.rs` stays byte-identical. No behavior
+  intentionally not re-exported), the test-only surface is
+  `#[cfg(test)]` gated, and the already extracted `tests_codec.rs`
+  stays byte-identical. No behavior
   change: workspace check, nextest (2007 passed / 21 skipped),
   doctests, clippy, and fmt are green.
 

@@ -420,7 +420,7 @@ version say exactly what changed.
   `resolve-pr` maps the
   current branch to its PR id offline-first, `pr-context` prints the PR
   view with its comment thread, and `post-comment` takes the body on
-  stdin, posts exactly once as Wyrd AI Review, and verifies. Review
+  stdin, posts exactly once as Scout, and verifies. Review
   agents call these instead of re-deriving ngit ceremony.
 
 - Crash-consistency window pins (G4, tests only — no behavior

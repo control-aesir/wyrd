@@ -87,7 +87,7 @@ cat > "$LIST_TWO" <<'EOF'
 EOF
 cat > "$VIEW_WITH" <<'EOF'
 {"id": "nevent1testpr1", "comments": [
-  {"id": "nevent1comment1", "author": "Wyrd AI Review",
+  {"id": "nevent1comment1", "author": "scout",
    "body": "hello review", "created_at": 1, "reply_to": null}]}
 EOF
 echo '{"id": "nevent1testpr1", "comments": []}' > "$VIEW_WITHOUT"
@@ -232,12 +232,12 @@ else
 fi
 unset STUB_VIEW_FIRST
 
-# 14. Default signer is Wyrd AI Review when REVIEW_SIGNER is unset.
+# 14. Default signer is scout when REVIEW_SIGNER is unset.
 export STUB_VIEW_FIRST="$VIEW_WITHOUT" STUB_VIEW_JSON="$VIEW_WITH"
 : > "$STUB_LOG"
 printf 'hello review' | env -u REVIEW_SIGNER "$REVIEW_SH" post-comment nevent1testpr1 >/dev/null 2>&1
-if grep -q -- '--signer Wyrd AI Review' "$STUB_LOG"; then
-  ok "post-comment defaults to the Wyrd AI Review signer"
+if grep -q -- '--signer scout' "$STUB_LOG"; then
+  ok "post-comment defaults to the scout signer"
 else
   bad "post-comment default signer: $(cat "$STUB_LOG")"
 fi

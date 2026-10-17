@@ -7,7 +7,7 @@ repo_naddr = "naddr1qqz8w7tjvspzpv7ftn3nm75yxfnpr69h48qsk7xl9p65cw93q6jtcqvkhxl9
 # Branch prefix that marks a proposal branch.
 branch_prefix = "pr/"
 # Signer whose comments count as review (resolved to an npub at runtime).
-review_signer = "Wyrd AI Review"
+review_signer = "scout"
 
 [ci]
 # Trust floor passed to `ngit ci status --require-ci-trust`.

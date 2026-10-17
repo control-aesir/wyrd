@@ -36,7 +36,7 @@ source "$LIB_DIR/ngit.sh"
 
 # Review identity for published comments. Overridable for tests; the
 # prompt pins the default.
-REVIEW_SIGNER="${REVIEW_SIGNER:-Wyrd AI Review}"
+REVIEW_SIGNER="${REVIEW_SIGNER:-scout}"
 
 usage() {
   cat >&2 <<'EOF'

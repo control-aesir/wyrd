@@ -627,6 +627,18 @@ version say exactly what changed.
 
 ### Changed
 
+- Runtime state split by accounting concern
+  (`nostr:nevent1qqswvpnd3kw744wy54puey5mqnzl2f4a4d90a7yutvcdn7utx8khlccpz9mhxue69uhkwunpwdczuap49eehglvxvpt`):
+  the 1388-line `runtime/state.rs` becomes `runtime/state/` with one
+  module per obligation class (`announcements`, `transitions`,
+  `capabilities`, `carries`), plus `records` (manifest/snapshot intake)
+  and `materialization` (locality, residency policy, restart
+  reconcile), keeping the `RuntimeState` struct, its error type, and
+  the route-less-send sentinel in the root. Pure move: all 64 methods
+  keep their signatures, the `pub(super)` fields stay visible to the
+  whole `runtime` tree, and the sibling modules' field accesses are
+  untouched. No behavior change: the full sync suite passes unmodified.
+
 - FUSE backend split by concern
   (`nostr:nevent1qqsw0hd8phl0udfr8v3s9pzly8q80yhyemkaa5ux4cdgpz4wsmwxw2gpz9mhxue69uhkwunpwdczuap49eehgnct839`):
   the 3867-line `fuse/backend.rs` becomes `fuse/backend/` with one

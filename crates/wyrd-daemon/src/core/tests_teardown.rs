@@ -376,9 +376,10 @@ fn release_after_loop_return_commits_dirty_handle() {
 }
 
 /// Submissions racing the admission close resolve boundedly: each
-/// one either executed before the close or refused by it — never
-/// stranded, never hung. The exact mix is scheduling, so the test
-/// pins the allowed set, not the split.
+/// one either executed before the close, refused by it, or lost a
+/// same-path create race decided before it — never stranded, never
+/// hung. The exact mix is scheduling, so the test pins the allowed
+/// set, not the split.
 #[test]
 fn submissions_racing_admission_close_resolve_bounded() {
     let (engine, dir, _) = scratch_drive();
@@ -395,7 +396,10 @@ fn submissions_racing_admission_close_resolve_bounded() {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     std::thread::scope(|scope| {
         // Blocked submitters first: no drain runs yet, so every
-        // submission parks admitted.
+        // submission parks admitted. All eight race the same path,
+        // so at most one commits: the rest either refuse at the
+        // close (`Shutdown`) or lose the create race
+        // (`AlreadyExists`) — every variant bounded, none stranded.
         for _ in 0..8 {
             let submitter = Arc::clone(&queue);
             let outcomes = Arc::clone(&outcomes);
@@ -403,10 +407,7 @@ fn submissions_racing_admission_close_resolve_bounded() {
                 let result = submitter.submit(MutationKind::Mkdir {
                     path: "race".to_string(),
                 });
-                outcomes.lock().unwrap().push(matches!(
-                    result,
-                    Ok(MutationOutcome::Done) | Err(MutationError::Shutdown)
-                ));
+                outcomes.lock().unwrap().push(result);
             });
         }
         await_outstanding(&queue, 8);
@@ -421,8 +422,21 @@ fn submissions_racing_admission_close_resolve_bounded() {
     let outcomes = outcomes.lock().unwrap();
     assert_eq!(outcomes.len(), 8, "every racer resolved");
     assert!(
-        outcomes.iter().all(|allowed| *allowed),
+        outcomes.iter().all(|outcome| matches!(
+            outcome,
+            Ok(MutationOutcome::Done)
+                | Err(MutationError::Shutdown)
+                | Err(MutationError::AlreadyExists(_))
+        )),
         "every racer either committed or refused fast: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(MutationOutcome::Done)))
+            .count()
+            <= 1,
+        "one path admits one mkdir: {outcomes:?}"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

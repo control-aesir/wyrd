@@ -16,7 +16,7 @@ use super::{ExportError, ExportReport};
 /// merges into a populated tree.
 ///
 /// The walk lands in a uniquely named staging sibling (see
-/// [`claim_staging`]) and renames it into place on success. A failed
+/// `claim_staging`) and renames it into place on success. A failed
 /// export removes its own staging, so `dest` is either the complete
 /// tree or untouched — every error after the claim, from the root
 /// lookup to the final rename, funnels through the one cleanup

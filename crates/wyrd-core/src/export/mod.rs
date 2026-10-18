@@ -7,7 +7,7 @@
 //! survive. The output needs no wyrd software to read afterward —
 //! that is the point. Export is offline by construction: it never
 //! touches relays, the mailbox, or the bulk source, so
-//! [`ViewError::NotMaterialized`](crate::view::ViewError::NotMaterialized)
+//! [`ViewError::NotMaterialized`]
 //! content fails the export closed instead of fetching.
 //!
 //! Failure is atomic: the walk lands in a uniquely named staging
@@ -20,7 +20,7 @@
 //!
 //! Crashed runs leave their staging behind, so every run heartbeats
 //! its staging directory (a timestamp rewritten per read window) and
-//! sweeps siblings whose heartbeat is older than [`STALE_AFTER`](staging::STALE_AFTER)
+//! sweeps siblings whose heartbeat is older than `STALE_AFTER`
 //! before starting. Fresh staging is always left alone — the safe
 //! direction under clock skew is treating a directory as live — so
 //! concurrent same-destination exports race to publish instead of

@@ -23,6 +23,48 @@ fn send_after_shutdown_returns_a_typed_error() {
     );
 }
 
+/// Recv-after-shutdown serves held mail: a delivery taken before
+/// shutdown stays offerable after it — `recv` never touches the
+/// runtime, so the round-robin over held handovers keeps working and
+/// shutdown strands nothing already received. Settle-after-shutdown
+/// works too: `Ack` records to the (synchronous) dedupe log.
+#[test]
+fn recv_after_shutdown_still_serves_held_mail() {
+    let relay = MiniRelay::spawn();
+    let url = relay.url().to_string();
+    let sender = sender_keys();
+    let receiver = keys();
+    let mut mailbox = live_mailbox(
+        &receiver,
+        std::slice::from_ref(&url),
+        temp_path("seen-held-after-shutdown"),
+    );
+    {
+        let mut outbox = live_mailbox(
+            &sender,
+            std::slice::from_ref(&url),
+            temp_path("seen-held-after-shutdown-sender"),
+        );
+        outbox
+            .send(envelope(device_id(&sender), device_id(&receiver), "held"))
+            .expect("publish reaches the relay");
+    }
+    let held = wait_for_delivery(&mut mailbox, DELIVERY_TIMEOUT).expect("offered");
+    let held_id = held.id();
+    // Drop without settling: the handover stays held, like a retry.
+    drop(held);
+    mailbox.shutdown(Duration::from_secs(5));
+    let reoffered = mailbox
+        .recv()
+        .expect("recv works after shutdown")
+        .expect("held mail re-offered");
+    assert_eq!(reoffered.id(), held_id, "same held handover, stable id");
+    mailbox
+        .settle(reoffered.id(), Disposition::Ack)
+        .expect("acks after shutdown");
+    assert!(mailbox.recv().unwrap().is_none());
+}
+
 /// Recv-after-shutdown is graceful, not an error: `recv` never touches
 /// the runtime, so it serves whatever the channel still holds and then
 /// reads empty once the dead drainer's senders drop. Pins that shutdown

@@ -47,6 +47,14 @@
 //! the unsafe token constructor appears in code exactly twice — its
 //! definition and the verification authority's single call — so the
 //! audit marker stays honest without review vigilance.
+//!
+//! A fourth rule pins the release KDF posture (`check_kdf_feature_edges`,
+//! `check_release_build_args`): `insecure-fast-kdf` may only appear in
+//! `[dev-dependencies]` and never in the flake's distribution-build
+//! args, so no shipped artifact derives through the 8 MiB / t=1 table.
+//! Manifests see member-declared edges only, so the resolved-graph
+//! backstop stays in CI (`cargo tree -e normal` in workflow.yml);
+//! this pins the declared intent where the PR gate runs it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1061,6 +1069,140 @@ fn consumer_link_graph_excludes_presentation() {
     );
 }
 
+/// Collect every manifest edge that enables `insecure-fast-kdf` outside
+/// test-only tables: `[dependencies]` and `[build-dependencies]` (plus
+/// any `[target.*]` nesting) are production edges; only
+/// `[dev-dependencies]` may carry the fast profile. The `[features]`
+/// definition section is skipped — declaring the feature in
+/// `wyrd-sync` is not enabling it. Pure over the manifest so the
+/// negative tests below can prove the checker bites without touching
+/// the filesystem.
+fn check_kdf_feature_edges(member: &str, manifest: &toml::Table) -> Vec<String> {
+    fn walk(table: &toml::Table, path: &str, dev: bool, member: &str, out: &mut Vec<String>) {
+        for (key, value) in table {
+            let Some(inner) = value.as_table() else {
+                continue;
+            };
+            if key == "features" {
+                // The feature-definition section, not an edge.
+                continue;
+            }
+            if key == "dev-dependencies" {
+                walk(inner, &format!("{path}.{key}"), true, member, out);
+            } else if key == "dependencies" || key == "build-dependencies" {
+                walk(inner, &format!("{path}.{key}"), false, member, out);
+            } else if inner
+                .get("features")
+                .and_then(|f| f.as_array())
+                .is_some_and(|fs| fs.iter().any(|f| f.as_str() == Some("insecure-fast-kdf")))
+            {
+                if !dev {
+                    out.push(format!(
+                        "`{member}` enables `insecure-fast-kdf` on `{key}` via `{path}`: \
+                         the fast KDF profile is test-only — keep it in `[dev-dependencies]`"
+                    ));
+                }
+            } else {
+                walk(inner, &format!("{path}.{key}"), dev, member, out);
+            }
+        }
+    }
+    let mut violations = Vec::new();
+    walk(manifest, "manifest", false, member, &mut violations);
+    violations
+}
+
+/// Check the distribution build's cargo args from the flake text: the
+/// release closure builds `-p wyrd-cli` with default features, so no
+/// `cargoExtraArgs` line may enable `insecure-fast-kdf` or pass
+/// `--all-features` (an all-features artifact is never production; see
+/// the feature's security note in `crates/wyrd-sync/Cargo.toml`). A
+/// structural guard over the flake text — not a substitute for the
+/// resolved-graph check in CI (`cargo tree -e normal` in
+/// workflow.yml) — matching every `cargoExtraArgs` line rather than
+/// trusting line layout, and failing closed when the flag vanishes.
+fn check_release_build_args(text: &str) -> Vec<String> {
+    let args: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("cargoExtraArgs"))
+        .collect();
+    if args.is_empty() {
+        return vec![
+            "flake names no cargoExtraArgs at all: the distribution build must declare \
+             its cargo flags where this gate can see them"
+                .to_owned(),
+        ];
+    }
+    let mut violations = Vec::new();
+    for line in args {
+        if line.contains("insecure-fast-kdf") {
+            violations.push(format!(
+                "distribution build enables `insecure-fast-kdf`: {line:?}"
+            ));
+        }
+        if line.contains("--all-features") {
+            violations.push(format!(
+                "distribution build passes `--all-features`: {line:?}"
+            ));
+        }
+    }
+    violations
+}
+
+/// Contract 55, manifest half: no member's production manifest edge
+/// enables `insecure-fast-kdf`. The current edges all live in
+/// `[dev-dependencies]` (fast per-test `Engine`s); a production edge
+/// would bake the 8 MiB / t=1 table into a shipped artifact through
+/// feature unification, silently. The resolved-graph backstop stays in
+/// CI (`cargo tree -e normal,features` in workflow.yml); this is the
+/// in-suite pin that fails the PR gate first.
+#[test]
+fn release_manifests_exclude_insecure_fast_kdf() {
+    let root = workspace_root();
+    let root_manifest = read_manifest(&root);
+    let members: Vec<String> = root_manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("workspace members list")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_owned))
+        .collect();
+    // Never pass vacuously: an empty member list would check nothing.
+    assert!(!members.is_empty(), "workspace declares no members");
+    let mut violations = Vec::new();
+    for member in &members {
+        let name = member.rsplit('/').next().unwrap_or(member);
+        violations.extend(check_kdf_feature_edges(
+            name,
+            &read_manifest(&root.join(member)),
+        ));
+    }
+    assert!(
+        violations.is_empty(),
+        "fast-KDF production edges:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+/// Contract 55, flake half: the distribution build compiles `-p
+/// wyrd-cli` with default features, so `kdf_key` takes the production
+/// arm (keystore.rs) and derives with the pinned 64 MiB / t=3 table
+/// (pinned in turn by `kdf_parameters_are_pinned`). Fails closed on a
+/// `cargoExtraArgs` line that enables the feature or passes
+/// `--all-features`.
+#[test]
+fn release_build_args_exclude_insecure_fast_kdf() {
+    let text =
+        fs::read_to_string(workspace_root().join("flake.nix")).expect("flake.nix is readable");
+    let violations = check_release_build_args(&text);
+    assert!(
+        violations.is_empty(),
+        "release-build violations:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -1175,6 +1317,127 @@ mod policy_tests {
         );
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("some-new-crate"));
+    }
+
+    fn kdf_manifest(manifest: &str) -> toml::Table {
+        manifest.parse().unwrap()
+    }
+
+    #[test]
+    fn prod_kdf_edge_is_rejected() {
+        let violations = check_kdf_feature_edges(
+            "wyrd-core",
+            &kdf_manifest(
+                r#"
+                [dependencies]
+                wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-core"));
+        assert!(violations[0].contains("wyrd-sync"));
+    }
+
+    #[test]
+    fn target_scoped_prod_kdf_edge_is_rejected() {
+        let violations = check_kdf_feature_edges(
+            "wyrd-daemon",
+            &kdf_manifest(
+                r#"
+                [target.'cfg(unix)'.dependencies]
+                wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-daemon"));
+    }
+
+    #[test]
+    fn build_dep_kdf_edge_is_rejected() {
+        let violations = check_kdf_feature_edges(
+            "wyrd-cli",
+            &kdf_manifest(
+                r#"
+                [build-dependencies]
+                wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-cli"));
+    }
+
+    #[test]
+    fn dev_only_kdf_edge_is_allowed() {
+        let violations = check_kdf_feature_edges(
+            "wyrd-core",
+            &kdf_manifest(
+                r#"
+                [dependencies]
+                wyrd-sync.workspace = true
+
+                [dev-dependencies]
+                wyrd-sync = { workspace = true, features = ["insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert!(
+            violations.is_empty(),
+            "dev-only fast-KDF edge must stay allowed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn kdf_feature_definition_is_not_an_edge() {
+        // `wyrd-sync` declares the feature itself; the declaration is
+        // not an enablement and must not trip the checker.
+        let violations = check_kdf_feature_edges(
+            "wyrd-sync",
+            &kdf_manifest(
+                r#"
+                [features]
+                insecure-fast-kdf = []
+            "#,
+            ),
+        );
+        assert!(
+            violations.is_empty(),
+            "feature definition must not read as an edge: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn flake_all_features_is_rejected() {
+        let violations =
+            check_release_build_args("cargoExtraArgs = \"-p wyrd-cli --all-features\";\n");
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("--all-features"));
+    }
+
+    #[test]
+    fn flake_kdf_feature_is_rejected() {
+        let violations = check_release_build_args(
+            "cargoExtraArgs = \"-p wyrd-cli --features insecure-fast-kdf\";\n",
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("insecure-fast-kdf"));
+    }
+
+    #[test]
+    fn flake_clean_args_pass() {
+        let violations = check_release_build_args("cargoExtraArgs = \"-p wyrd-cli\";\n");
+        assert!(
+            violations.is_empty(),
+            "default-feature release args must pass: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn flake_missing_args_fails_closed() {
+        let violations = check_release_build_args("# no cargo flags here\n");
+        assert_eq!(violations.len(), 1);
     }
 
     #[test]

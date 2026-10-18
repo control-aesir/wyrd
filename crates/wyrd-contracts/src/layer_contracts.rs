@@ -1070,16 +1070,57 @@ fn consumer_link_graph_excludes_presentation() {
     );
 }
 
+/// One feature string enables the fast KDF profile when it names the
+/// token outright (`insecure-fast-kdf`), in `dep/token` form
+/// (`wyrd-sync/insecure-fast-kdf`, weak or strong), or through one
+/// level of aliasing: a local feature whose definition lists the
+/// token in either form. Anything deeper (an alias of an alias) is
+/// out of scope for this structural check — name the token plainly
+/// or not at all.
+fn feature_enables_fast_kdf(name: &str, features: &toml::Table) -> bool {
+    if name.contains("insecure-fast-kdf") {
+        return true;
+    }
+    features
+        .get(name)
+        .and_then(|def| def.as_array())
+        .is_some_and(|targets| {
+            targets.iter().any(|target| {
+                target
+                    .as_str()
+                    .is_some_and(|s| s.contains("insecure-fast-kdf"))
+            })
+        })
+}
+
+/// The member's own `[features]` table for alias expansion below.
+/// Absent means no aliases to expand through.
+fn member_features(manifest: &toml::Table) -> toml::Table {
+    manifest
+        .get("features")
+        .and_then(|f| f.as_table())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Collect every manifest edge that enables `insecure-fast-kdf` outside
 /// test-only tables: `[dependencies]` and `[build-dependencies]` (plus
 /// any `[target.*]` nesting) are production edges; only
-/// `[dev-dependencies]` may carry the fast profile. The `[features]`
-/// definition section is skipped — declaring the feature in
-/// `wyrd-sync` is not enabling it. Pure over the manifest so the
-/// negative tests below can prove the checker bites without touching
-/// the filesystem.
+/// `[dev-dependencies]` may carry the fast profile. Alias forms count
+/// (`dep/token`, or a local feature expanding to the token — see
+/// `feature_enables_fast_kdf`). The `[features]` definition section is
+/// skipped — declaring the feature in `wyrd-sync` is not enabling it.
+/// Pure over the manifest so the negative tests below can prove the
+/// checker bites without touching the filesystem.
 fn check_kdf_feature_edges(member: &str, manifest: &toml::Table) -> Vec<String> {
-    fn walk(table: &toml::Table, path: &str, dev: bool, member: &str, out: &mut Vec<String>) {
+    fn walk(
+        table: &toml::Table,
+        features: &toml::Table,
+        path: &str,
+        dev: bool,
+        member: &str,
+        out: &mut Vec<String>,
+    ) {
         for (key, value) in table {
             let Some(inner) = value.as_table() else {
                 continue;
@@ -1089,13 +1130,25 @@ fn check_kdf_feature_edges(member: &str, manifest: &toml::Table) -> Vec<String> 
                 continue;
             }
             if key == "dev-dependencies" {
-                walk(inner, &format!("{path}.{key}"), true, member, out);
+                walk(inner, features, &format!("{path}.{key}"), true, member, out);
             } else if key == "dependencies" || key == "build-dependencies" {
-                walk(inner, &format!("{path}.{key}"), false, member, out);
+                walk(
+                    inner,
+                    features,
+                    &format!("{path}.{key}"),
+                    false,
+                    member,
+                    out,
+                );
             } else if inner
                 .get("features")
                 .and_then(|f| f.as_array())
-                .is_some_and(|fs| fs.iter().any(|f| f.as_str() == Some("insecure-fast-kdf")))
+                .is_some_and(|fs| {
+                    fs.iter().any(|f| {
+                        f.as_str()
+                            .is_some_and(|name| feature_enables_fast_kdf(name, features))
+                    })
+                })
             {
                 if !dev {
                     out.push(format!(
@@ -1104,12 +1157,19 @@ fn check_kdf_feature_edges(member: &str, manifest: &toml::Table) -> Vec<String> 
                     ));
                 }
             } else {
-                walk(inner, &format!("{path}.{key}"), dev, member, out);
+                walk(inner, features, &format!("{path}.{key}"), dev, member, out);
             }
         }
     }
     let mut violations = Vec::new();
-    walk(manifest, "manifest", false, member, &mut violations);
+    walk(
+        manifest,
+        &member_features(manifest),
+        "manifest",
+        false,
+        member,
+        &mut violations,
+    );
     violations
 }
 
@@ -1211,18 +1271,19 @@ fn check_release_build_args(text: &str) -> Vec<String> {
 /// feature set: `default = ["insecure-fast-kdf"]` in any `[features]`
 /// table would bake the fast table into default builds while the
 /// edge walker above stays green (it skips `[features]` by design).
-/// Pure over the manifest so the negative tests below can prove the
-/// checker bites without touching the filesystem.
+/// Alias forms count the same way they do on edges. Pure over the
+/// manifest so the negative tests below can prove the checker bites
+/// without touching the filesystem.
 fn check_feature_default_enables_kdf(member: &str, manifest: &toml::Table) -> Vec<String> {
-    let default_enables = manifest
-        .get("features")
-        .and_then(|f| f.as_table())
-        .and_then(|f| f.get("default"))
+    let features = member_features(manifest);
+    let default_enables = features
+        .get("default")
         .and_then(|d| d.as_array())
         .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.as_str() == Some("insecure-fast-kdf"))
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|name| feature_enables_fast_kdf(name, &features))
+            })
         });
     if default_enables {
         vec![format!(
@@ -1632,6 +1693,79 @@ mod policy_tests {
             violations.is_empty(),
             "unrelated defaults must stay allowed: {violations:?}"
         );
+    }
+
+    #[test]
+    fn dep_slash_token_edge_is_rejected() {
+        // The `dep/token` form on an edge names the token without the
+        // literal string standing alone.
+        let violations = check_kdf_feature_edges(
+            "wyrd-core",
+            &kdf_manifest(
+                r#"
+                [dependencies]
+                wyrd-sync = { workspace = true, features = ["wyrd-sync/insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-core"));
+    }
+
+    #[test]
+    fn aliased_kdf_edge_is_rejected() {
+        // A local feature expanding to the token must not smuggle it
+        // onto a production edge.
+        let violations = check_kdf_feature_edges(
+            "wyrd-core",
+            &kdf_manifest(
+                r#"
+                [dependencies]
+                wyrd-sync = { workspace = true, features = ["fast-tests"] }
+
+                [features]
+                fast-tests = ["insecure-fast-kdf"]
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-core"));
+    }
+
+    #[test]
+    fn unrelated_alias_is_allowed() {
+        let violations = check_kdf_feature_edges(
+            "wyrd-core",
+            &kdf_manifest(
+                r#"
+                [dependencies]
+                wyrd-sync = { workspace = true, features = ["fast-tests"] }
+
+                [features]
+                fast-tests = ["std"]
+            "#,
+            ),
+        );
+        assert!(
+            violations.is_empty(),
+            "unrelated aliases must stay allowed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn aliased_default_enabling_kdf_is_rejected() {
+        let violations = check_feature_default_enables_kdf(
+            "wyrd-cli",
+            &kdf_manifest(
+                r#"
+                [features]
+                default = ["fast-tests"]
+                fast-tests = ["wyrd-sync/insecure-fast-kdf"]
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-cli"));
     }
 
     #[test]

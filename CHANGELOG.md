@@ -571,8 +571,10 @@ version say exactly what changed.
   inherited it, so nix refused the `git+file://` release input with
   `revCount is not available` on every master merge. `build.sh` now
   runs `git fetch --unshallow` when the checkout is shallow (full
-  clones skip it untouched) and aborts with the fetch error instead of
-  nix's cryptic failure when deepening is impossible. Pinned by the
+  clones skip it untouched), verifies the deepen landed (a fetch with
+  no remote configured succeeds silently without deepening), and
+  aborts loudly instead of nix's cryptic failure when deepening fails
+  or no-ops. Pinned by the
   hermetic `test-build-shallow.sh` suite (file:// fixture, stub nix),
   which fails on the export's shallowness with the step disabled.
   Local `--strict` release runs are byte-identical.

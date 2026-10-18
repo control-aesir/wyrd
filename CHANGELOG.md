@@ -681,6 +681,16 @@ version say exactly what changed.
   `ComponentLimit`; every such input was and remains a refusal —
   export maps all confinement errors to `ExportError::Symlink`, and
   the contract suite pins `EscapesRoot` only for a short target.
+- CI shell suites run only when the PR is ready
+  (`nostr:nevent1qqstms4zyq5jczmvaylp4k4g6jzhjgfh6sn8zx3aj8cvh9g7nwauh7qpz9mhxue69uhkwunpwdczuap49eehgc35fze`):
+  the `shell-tests` job ran on every trigger including draft open,
+  while `rust` and `nix` already gated on `ready_for_review` or
+  `master`. The job carries the same gate now, and the `opened`
+  trigger is removed from the workflow — every job skipped on it,
+  so it minted no-op runs that spent a workflow slot and reported
+  nothing. Draft pushes spend no CI; the failure reporter (which
+  only reads these logs on PR failures) is unaffected, and the
+  stale comment naming removed draft jobs is corrected.
 
 ### Changed
 

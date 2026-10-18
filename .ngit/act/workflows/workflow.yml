@@ -18,7 +18,12 @@ on:
       - ".ngit/scripts/build.sh"
       - ".ngit/scripts/tests/**"
   pull_request:
-    types: [opened, ready_for_review]
+    # Ready-gated only: every job skips unless the action is
+    # ready_for_review, so an `opened` trigger would mint a no-op
+    # run that spends a workflow slot and reports nothing. Draft
+    # creation needs no CI record — `gate ci status` reads `none`
+    # until the first ready transition, which is a handled state.
+    types: [ready_for_review]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -36,10 +41,12 @@ on:
 
 jobs:
   shell-tests:
+    if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
     # Hermetic shell suites (stubbed ngit/timeout: no relay, secret,
-    # or cache needed). The cheapest gate in the pipeline; pins the
-    # resolve/publish bound arithmetic the draft and reporter jobs
-    # depend on.
+    # or cache needed). The cheapest gate in the pipeline; gated like
+    # the rust and nix jobs so draft-open pushes spend no CI — the
+    # failure reporter only reads these logs on PR failures, which
+    # can only happen once the jobs run.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -301,9 +308,9 @@ jobs:
     # time is worth slower failure feedback.
     needs: [rust, nix, shell-tests]
     runs-on: ubuntu-latest
-    # Same pathology cover as the draft job: healthy runs finish fast.
+    # Same pathology cover as the parallel gate jobs: healthy runs finish fast.
     timeout-minutes: 10
-    # Same workspace-absolute cache location as the draft job (see it).
+    # Same workspace-absolute cache location as the save step below (see it).
     env:
       NGIT_CACHE_DIR: ${{ github.workspace }}/.ngit-event-cache
     steps:
@@ -315,7 +322,7 @@ jobs:
       # Warms the reporter's event cache first: cold full-state relay
       # syncs cost minutes per ngit call, and the scan makes several.
       # Restores both cache layers (global plus the per-repo cache in
-      # the git common directory); see the draft job.
+      # the git common directory); the save step below mirrors these paths.
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:

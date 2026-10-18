@@ -667,13 +667,13 @@ fn resolve_symlink_components<V: NamespaceView>(
                         // nested target is rejected before its segments are
                         // copied into the pending queue. Verdict-preserving:
                         // these segments would each consume the shared
-                        // component budget downstream. Reports the nested
-                        // target's segment count, mirroring the entry guard.
+                        // component budget downstream. Reports the combined
+                        // tripping sum, so observed always exceeds max.
                         let nested_segments = next.split('/').count();
-                        if state.components.saturating_add(nested_segments) > MAX_SYMLINK_COMPONENTS
-                        {
+                        let combined = state.components.saturating_add(nested_segments);
+                        if combined > MAX_SYMLINK_COMPONENTS {
                             return Err(ConfinementError::ComponentLimit {
-                                observed: nested_segments,
+                                observed: combined,
                                 max: MAX_SYMLINK_COMPONENTS,
                             });
                         }

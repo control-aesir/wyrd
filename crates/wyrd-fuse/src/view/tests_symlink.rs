@@ -211,7 +211,40 @@ fn symlink_confinement_rejects_nested_flood_before_allocating() {
     assert_eq!(
         confine_symlink_target(&view, "link", "big"),
         Err(ConfinementError::ComponentLimit {
-            observed: 300,
+            observed: 301,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
+fn symlink_confinement_reports_combined_count_for_nested_overflow() {
+    // Nested segments below the limit that overflow only combined
+    // with already-consumed components report the combined tripping
+    // sum, never a below-max segment count.
+    let mut store = MemoryObjectStore::default();
+    let nested = vec!["x"; 200].join("/");
+    let mut leaf = tree_of(&mut store, vec![Entry::symlink("s0", &nested).unwrap()]);
+    for depth in (0..60).rev() {
+        leaf = tree_of(
+            &mut store,
+            vec![Entry::dir(&format!("d{depth}"), leaf).unwrap()],
+        );
+    }
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(leaf)]),
+    );
+    let link = (0..60)
+        .map(|depth| format!("d{depth}"))
+        .collect::<Vec<_>>()
+        .join("/")
+        + "/link";
+    assert_eq!(
+        confine_symlink_target(&view, &link, "s0"),
+        Err(ConfinementError::ComponentLimit {
+            observed: 261,
             max: MAX_SYMLINK_COMPONENTS,
         })
     );

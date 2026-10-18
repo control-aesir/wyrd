@@ -308,9 +308,9 @@ jobs:
     # time is worth slower failure feedback.
     needs: [rust, nix, shell-tests]
     runs-on: ubuntu-latest
-    # Same pathology cover as the draft job: healthy runs finish fast.
+    # Same pathology cover as the parallel gate jobs: healthy runs finish fast.
     timeout-minutes: 10
-    # Same workspace-absolute cache location as the draft job (see it).
+    # Same workspace-absolute cache location as the save step below (see it).
     env:
       NGIT_CACHE_DIR: ${{ github.workspace }}/.ngit-event-cache
     steps:
@@ -322,7 +322,7 @@ jobs:
       # Warms the reporter's event cache first: cold full-state relay
       # syncs cost minutes per ngit call, and the scan makes several.
       # Restores both cache layers (global plus the per-repo cache in
-      # the git common directory); see the draft job.
+      # the git common directory); the save step below mirrors these paths.
       - name: Restore ngit event cache
         uses: actions/cache/restore@v4
         with:

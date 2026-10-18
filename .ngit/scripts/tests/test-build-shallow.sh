@@ -28,9 +28,12 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/build-shallow-test.XXXXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
 # Fixture origin: three commits, so a depth-1 clone is genuinely
-# shallow (no user config on the harness: -c flags inline).
+# shallow (no user config on the harness: -c flags inline). The tag
+# sits on the oldest commit, so a depth-1 clone lacks it until
+# deepened — phase 4's shallow-tag case.
 git init -q -b master "$T/origin"
 git -C "$T/origin" -c user.email=t@t -c user.name=t commit -q --allow-empty -m one
+git -C "$T/origin" -c user.email=t@t -c user.name=t tag v9.9.9-tag HEAD
 git -C "$T/origin" -c user.email=t@t -c user.name=t commit -q --allow-empty -m two
 git -C "$T/origin" -c user.email=t@t -c user.name=t commit -q --allow-empty -m three
 git clone -q --depth 1 "file://$T/origin" "$T/clone" 2>/dev/null
@@ -65,7 +68,6 @@ export SHALLOW_LOG="$T/shallow.log"
 
 # Phase 1: shallow clone with a reachable origin. build.sh must
 # deepen it, exit 0, and hand nix a full-history export.
-: > "$SHALLOW_LOG"
 (cd "$T/clone" && bash "$SCRIPT_DIR/../build.sh" 0.0.0-test --ref HEAD aarch64-darwin >"$T/build.log" 2>&1)
 code=$?
 if [ "$code" -eq 0 ]; then
@@ -114,6 +116,24 @@ if [ "$code" -ne 0 ] && grep -q "cannot deepen this checkout" "$T/build-stranded
   ok "unreachable remote aborts loudly before nix runs"
 else
   bad "stranded shallow phase: code=$code (want nonzero with the deepen error, no nix call)"
+fi
+
+# Phase 4: shallow clone resolving a ref only full history provides.
+# The tag sits on the oldest commit, so the depth-1 clone lacks it;
+# deepen-first must fetch it before PIN verification. Proves the
+# reorder's motivating case, not just `--ref HEAD`.
+git clone -q --depth 1 "file://$T/origin" "$T/tagged" 2>/dev/null
+if git -C "$T/tagged" rev-parse --verify --quiet v9.9.9-tag >/dev/null 2>&1; then
+  bad "tag phase setup: tag unexpectedly present in the depth-1 clone"
+else
+  : > "$SHALLOW_LOG"
+  (cd "$T/tagged" && bash "$SCRIPT_DIR/../build.sh" 9.9.9 --ref v9.9.9-tag aarch64-darwin >"$T/build-tag.log" 2>&1)
+  code=$?
+  if [ "$code" -eq 0 ] && [ "$(cat "$SHALLOW_LOG")" = "false" ]; then
+    ok "shallow tag ref deepens first, then builds"
+  else
+    bad "tag phase: code=$code export=[$(cat "$SHALLOW_LOG")] (want 0 / [false])"
+  fi
 fi
 
 echo "---"

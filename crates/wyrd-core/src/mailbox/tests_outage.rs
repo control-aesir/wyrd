@@ -305,7 +305,10 @@ fn concurrent_resubscribes_serialize_under_one_subscription() {
 
     // Overlap the real transaction on the runtime: same client, filter,
     // subscription ID, and lock the supervisor paths share.
-    let outcomes = mailbox.rt().block_on(async {
+    let runtime = mailbox
+        .rt()
+        .expect("runtime present: no shutdown on this path");
+    let outcomes = runtime.block_on(async {
         let mut tasks = Vec::with_capacity(CALLERS);
         for _ in 0..CALLERS {
             let client = Arc::clone(&mailbox.client);
@@ -377,7 +380,10 @@ fn resubscribe_waits_on_the_shared_lock() {
     // Hold the mailbox's own lock inside the runtime: no supervisor
     // path contends for it on a healthy idle mailbox (no saturation,
     // no episode), so the only waiter is the spawned transaction.
-    mailbox.rt().block_on(async {
+    let runtime = mailbox
+        .rt()
+        .expect("runtime present: no shutdown on this path");
+    runtime.block_on(async {
         let held = mailbox.resubscribe_lock.lock().await;
         let client = Arc::clone(&mailbox.client);
         let filter = mailbox.filter.clone();

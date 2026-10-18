@@ -165,6 +165,92 @@ fn symlink_confinement_enforces_component_budget() {
 }
 
 #[test]
+fn symlink_confinement_rejects_separator_flood_before_allocating() {
+    // A separator flood previously allocated one `String` per segment
+    // before the component budget fired. The pre-collect bound
+    // rejects it up front with the same error.
+    let view = view(small_drive());
+    let flood = "x/".repeat(10_000);
+    assert_eq!(
+        confine_symlink_target(&view, "link", &flood),
+        Err(ConfinementError::ComponentLimit {
+            observed: 10_001,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
+fn symlink_confinement_enforces_combined_parent_plus_target_budget() {
+    // The entry pre-check passes (the target alone is within budget);
+    // the combined parent-plus-target count still fails per component
+    // with the running count.
+    let view = view(small_drive());
+    let target = vec!["x"; MAX_SYMLINK_COMPONENTS].join("/");
+    assert_eq!(
+        confine_symlink_target(&view, "sub/link", &target),
+        Err(ConfinementError::ComponentLimit {
+            observed: MAX_SYMLINK_COMPONENTS + 1,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
+fn symlink_confinement_rejects_nested_flood_before_allocating() {
+    // A nested target with more segments than the budget is rejected
+    // before its segments are copied into the pending queue.
+    let mut store = MemoryObjectStore::default();
+    let flood = vec!["x"; 300].join("/");
+    let root = tree_of(&mut store, vec![Entry::symlink("big", &flood).unwrap()]);
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(root)]),
+    );
+    assert_eq!(
+        confine_symlink_target(&view, "link", "big"),
+        Err(ConfinementError::ComponentLimit {
+            observed: 301,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
+fn symlink_confinement_reports_combined_count_for_nested_overflow() {
+    // Nested segments below the limit that overflow only combined
+    // with already-consumed components report the combined tripping
+    // sum, never a below-max segment count.
+    let mut store = MemoryObjectStore::default();
+    let nested = vec!["x"; 200].join("/");
+    let mut leaf = tree_of(&mut store, vec![Entry::symlink("s0", &nested).unwrap()]);
+    for depth in (0..60).rev() {
+        leaf = tree_of(
+            &mut store,
+            vec![Entry::dir(format!("d{depth}"), leaf).unwrap()],
+        );
+    }
+    let view = DriveView::new(
+        store,
+        FakeMaterialization::empty(),
+        heads(vec![snapshot(leaf)]),
+    );
+    let link = (0..60)
+        .map(|depth| format!("d{depth}"))
+        .collect::<Vec<_>>()
+        .join("/")
+        + "/link";
+    assert_eq!(
+        confine_symlink_target(&view, &link, "s0"),
+        Err(ConfinementError::ComponentLimit {
+            observed: 261,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
 fn drive_resolution_refuses_over_budget_tree_before_decode() {
     let view = view(small_drive());
     let result = NamespaceView::resolve_root(&view, 0).unwrap();

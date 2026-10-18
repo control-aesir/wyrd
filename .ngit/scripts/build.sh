@@ -68,6 +68,14 @@ if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
       echo "cannot deepen this checkout (no reachable remote?); refusing a release from shallow history" >&2
       exit 1
     }
+  # A fetch can succeed without deepening (no remote configured is a
+  # silent no-op): verify instead of trusting the exit code, so a
+  # still-shallow tree aborts here and never reaches nix's cryptic
+  # `revCount is not available`.
+  if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+    echo "checkout is still shallow after deepening; refusing a release from shallow history" >&2
+    exit 1
+  fi
 fi
 git rev-parse --verify --quiet "$PIN" >/dev/null \
   || { echo "ref $PIN does not exist" >&2; exit 1; }

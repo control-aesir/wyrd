@@ -13,8 +13,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Hook runners export GIT_DIR into hook processes; drop repo discovery
-# so the fixture below is a real fresh repo.
+# so the scratch repo below is a real fresh repo. Isolate host git
+# config too: a global branch.*.remote would leak warnings into the
+# fixture's remote operations.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 command -v git >/dev/null || { echo "SKIP: git is required" >&2; exit 1; }
 
@@ -105,17 +108,19 @@ else
 fi
 
 # Phase 3: shallow clone with no reachable remote. Deepening must fail
-# loudly with the fetch error, before nix ever runs.
+# loudly, before nix ever runs. (A fetch with no remote configured is
+# a silent no-op success, so the stranded shape also proves the
+# still-shallow verification, not just the fetch error path.)
 git clone -q --depth 1 "file://$T/origin" "$T/stranded" 2>/dev/null
 git -C "$T/stranded" remote remove origin
 : > "$SHALLOW_LOG"
 (cd "$T/stranded" && bash "$SCRIPT_DIR/../build.sh" 0.0.0-test --ref HEAD aarch64-darwin >"$T/build-stranded.log" 2>&1)
 code=$?
-if [ "$code" -ne 0 ] && grep -q "cannot deepen this checkout" "$T/build-stranded.log" &&
+if [ "$code" -ne 0 ] && grep -q "refusing a release from shallow history" "$T/build-stranded.log" &&
   [ ! -s "$SHALLOW_LOG" ]; then
   ok "unreachable remote aborts loudly before nix runs"
 else
-  bad "stranded shallow phase: code=$code (want nonzero with the deepen error, no nix call)"
+  bad "stranded shallow phase: code=$code (want nonzero with the shallow-history refusal, no nix call)"
 fi
 
 # Phase 4: shallow clone resolving a ref only full history provides.

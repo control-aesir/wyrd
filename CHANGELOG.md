@@ -576,8 +576,9 @@ version say exactly what changed.
   channel still holds, then reads empty — shutdown cannot strand
   buffered mail behind an error. The `shutdown` doc comment says exactly
   that. Pinned by `send_after_shutdown_returns_a_typed_error` (panics
-  before the fix) and `recv_after_shutdown_reads_empty_instead_of_failing`,
-  plus a new row in the fixed-error Display table.
+  before the fix), `recv_after_shutdown_reads_empty_instead_of_failing`,
+  and `recv_after_shutdown_still_serves_held_mail`, plus a new row in
+  the fixed-error Display table.
 
 - Release archive smoke test deepens shallow checkouts before export
   (`nostr:nevent1qqsrryqv8g482yq2vqddhsmw9k9yqxvka8suhw8qqltnyu9w8hsuegcpz9mhxue69uhkwunpwdczuap49eehg9k38z9`):

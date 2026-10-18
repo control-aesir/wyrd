@@ -644,6 +644,26 @@ version say exactly what changed.
   change: workspace check, nextest (2007 passed / 21 skipped),
   doctests, clippy, and fmt are green.
 
+- Drive bootstrap split by protocol
+  (`nostr:nevent1qqsgm9cqmxy74vwwyphyq9flswvn2yhdxfhcnp7lztz9eql0r6a2l6cpz9mhxue69uhkwunpwdczuap49eehgpl09vm`):
+  the 938-line `runtime/bootstrap.rs` becomes `runtime/bootstrap/` with
+  the owner custody record and lifecycle (`create`, `open_keystore`,
+  `genesis_transition`, encode/decode, `rollback`, read helpers) in
+  `keystore.rs`, the invitee flow (`accept_invitation`,
+  `verify_invitation`, `accept_with_store`, `install_invitation_keys`)
+  in `invitation.rs`, and pairing (`pairing_request`, `PairingRequest`,
+  `join`, the staged-secret helpers) in `pairing.rs`, re-exported from
+  `mod.rs`. The already extracted `tests_bootstrap.rs` splits into
+  `tests_keystore.rs`, `tests_invitation.rs`, and `tests_pairing.rs`
+  with bodies byte-identical; the two helpers shared across them
+  (`drive_id`, `invitation`) move to `mod.rs` under `#[cfg(test)]`.
+  Pure move: engine-facing paths keep their exact visibility
+  (`pub(in crate::runtime)`, `pub` for `PairingRequest`), sibling- and
+  test-shared names take `pub(super)`, and the `Engine` method
+  signatures are unchanged. No behavior
+  change: workspace check, nextest (2007 passed / 21 skipped),
+  doctests, clippy, and fmt are green.
+
 - Mailbox supervision split from the relay adapter
   (`nostr:nevent1qqspr9cys8gunnx6gtrp2g8pwsrgw5mensrdkewgdgjy2gxlf9y3v2gpz9mhxue69uhkwunpwdczuap49eehg52pxs4`):
   the 1841-line `mailbox/mod.rs` keeps the `LiveMailbox` relay adapter

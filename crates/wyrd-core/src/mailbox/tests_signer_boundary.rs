@@ -103,6 +103,7 @@ fn fixed_mailbox_errors_render_constant_strings() {
             "identity mismatch: the signer, envelope, or open key disagree with the mailbox owner",
         ),
         (MailboxError::Signer, "signer operation failed"),
+        (MailboxError::Shutdown, "mailbox is shut down"),
     ];
     for (error, expected) in cases {
         assert_eq!(error.to_string(), expected, "error text must stay fixed");

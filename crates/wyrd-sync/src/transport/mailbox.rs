@@ -48,6 +48,12 @@ pub enum MailboxError {
     /// logs or diagnostics.
     #[error("signer operation failed")]
     Signer,
+    /// The mailbox was shut down: the runtime is gone, so `send` has
+    /// no transport to publish through. Unit by design — like
+    /// `Signer`, a shutdown carries no identity an operator could act
+    /// on; the fix is always "do not use the mailbox after shutdown".
+    #[error("mailbox is shut down")]
+    Shutdown,
     #[error("relay transport failed: {0}")]
     Transport(String),
 }

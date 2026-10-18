@@ -565,6 +565,20 @@ version say exactly what changed.
 
 ### Fixed
 
+- Mailbox `send` after shutdown returns a typed error instead of panicking
+  (`nostr:nevent1qqsp7k9z65n96p9xa93glsu6ra4zu6lwa25gwfqae4jxjmqgpykwmfqpz9mhxue69uhkwunpwdczuap49eehg4hq3vx`):
+  `LiveMailbox::shutdown` takes the runtime, but `send` unwrapped it
+  with `.expect`, so the ordering the public API allows panicked the
+  process. `rt()` now returns `MailboxError::Shutdown` (new unit
+  variant — a shutdown carries no actionable identity, like `Signer`),
+  and `send` propagates it through both `block_on` call sites. `recv`
+  never touches the runtime: after shutdown it serves whatever the
+  channel still holds, then reads empty — shutdown cannot strand
+  buffered mail behind an error. The `shutdown` doc comment says exactly
+  that. Pinned by `send_after_shutdown_returns_a_typed_error` (panics
+  before the fix) and `recv_after_shutdown_reads_empty_instead_of_failing`,
+  plus a new row in the fixed-error Display table.
+
 - Release archive smoke test deepens shallow checkouts before export
   (`nostr:nevent1qqsrryqv8g482yq2vqddhsmw9k9yqxvka8suhw8qqltnyu9w8hsuegcpz9mhxue69uhkwunpwdczuap49eehg9k38z9`):
   the CI coordinator clones shallow, and `build.sh`'s worktree export

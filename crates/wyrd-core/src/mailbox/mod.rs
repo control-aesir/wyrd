@@ -702,21 +702,25 @@ where
     /// The daemon calls this after its live loop returns. Until then the
     /// tasks keep the relay attachment alive (recovery never gives up);
     /// shutdown is the composer's bounded backstop, not a background
-    /// policy. A later `send`/`recv` fails as transport trouble rather
-    /// than blocking: the loop that would call them is already gone.
+    /// policy. A later `send` fails as [`MailboxError::Shutdown`];
+    /// `recv` serves whatever the channel still holds, then reads
+    /// empty once the dead tasks' senders drop — it never touches the
+    /// runtime, so shutdown cannot strand buffered mail behind an
+    /// error. The loop that would call either is already gone.
     pub fn shutdown(&mut self, deadline: Duration) {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(deadline);
         }
     }
 
-    /// The task runtime. Only absent after [`shutdown`](Self::shutdown),
-    /// which no live-pass caller can race (the composer shuts down only
-    /// after the loop that drives the mailbox has returned).
-    fn rt(&self) -> &Runtime {
-        self.runtime
-            .as_ref()
-            .expect("mailbox runtime is present until shutdown")
+    /// The task runtime. Absent after [`shutdown`](Self::shutdown):
+    /// a `send` past that point fails as [`MailboxError::Shutdown`]
+    /// instead of panicking — the public API allows the ordering, so
+    /// the error is typed, not a crash. `recv` never touches the
+    /// runtime (it serves the buffered channel, then reads empty), so
+    /// it needs no gate here.
+    fn rt(&self) -> Result<&Runtime, MailboxError> {
+        self.runtime.as_ref().ok_or(MailboxError::Shutdown)
     }
 
     /// Pull the next gift-wrap candidate event from the relay stream.
@@ -924,12 +928,11 @@ where
         let rumor: UnsignedEvent = EventBuilder::new(Kind::Custom(RUMOR_KIND), envelope.ciphertext)
             .tag(Tag::public_key(recipient))
             .finalize_unsigned(self.sender_pk);
-        let wrap = self
-            .rt()
+        let runtime = self.rt()?;
+        let wrap = runtime
             .block_on(GiftWrapBuilder::new(recipient, rumor).finalize_async(&*self.signer))
             .map_err(|_| MailboxError::Signer)?;
-        let output = self
-            .rt()
+        let output = runtime
             .block_on(async { self.client.send_event(&wrap).await })
             .map_err(|error| MailboxError::Transport(error.to_string()))?;
         // Per-relay send forensics at the same level as the outbox send

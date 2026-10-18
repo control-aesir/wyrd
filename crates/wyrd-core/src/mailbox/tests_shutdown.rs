@@ -1,10 +1,42 @@
 use super::mini_relay::MiniRelay;
 use super::tests_harness::{
-    assert_quiet, device_id, envelope, keys, live_mailbox, seal_rumor, sender_keys, temp_path,
-    wait_for_delivery, wait_for_health, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT,
+    assert_quiet, device_id, envelope, keys, live_mailbox, offline_mailbox, seal_rumor,
+    sender_keys, temp_path, wait_for_delivery, wait_for_health, DELIVERY_TIMEOUT, OUTAGE_TIMEOUT,
 };
 use super::*;
 use std::time::{Duration, Instant};
+
+/// Use-after-shutdown: `send` on a shut-down mailbox returns a typed
+/// error instead of panicking on the missing runtime. The offline
+/// mailbox (no relays) isolates the shutdown path: the envelope passes
+/// the identity and curve-point gates, so the only thing left to fail
+/// is the absent runtime.
+#[test]
+fn send_after_shutdown_returns_a_typed_error() {
+    let device = keys();
+    let mut mailbox = offline_mailbox(&device);
+    mailbox.shutdown(Duration::from_secs(5));
+    let result = mailbox.send(envelope(device_id(&device), device_id(&device), "late"));
+    assert!(
+        matches!(result, Err(MailboxError::Shutdown)),
+        "send after shutdown must fail typed, got {result:?}",
+    );
+}
+
+/// Recv-after-shutdown is graceful, not an error: `recv` never touches
+/// the runtime, so it serves whatever the channel still holds and then
+/// reads empty once the dead drainer's senders drop. Pins that shutdown
+/// does not strand buffered mail behind a failure.
+#[test]
+fn recv_after_shutdown_reads_empty_instead_of_failing() {
+    let device = keys();
+    let mut mailbox = offline_mailbox(&device);
+    mailbox.shutdown(Duration::from_secs(5));
+    assert!(
+        mailbox.recv().unwrap().is_none(),
+        "nothing buffered, so shutdown reads as empty",
+    );
+}
 
 /// Acceptance: shutdown cancels the mailbox tasks within a bounded
 /// deadline, and is idempotent. Without a deadline a wedged recovery

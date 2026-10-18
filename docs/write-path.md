@@ -1193,9 +1193,18 @@ behaviour), which leaves the fixed per-snapshot overhead term in
 because otherwise open/write/close churn defeats most of the
 coalescing and the storage-growth term stays proportional to file
 count rather than save events. No bounded idle window in v0.3: a
-timer would commit without a caller-invoked durability boundary.
+ timer would commit without a caller-invoked durability boundary.
 Namespace operations are folding forcing events; submissions that
-resolve to no change submit and force nothing. Full options,
+resolve to no change submit and force nothing. The crash-discard
+rule rests on two independent claims: pending state is
+intentionally volatile (discard-on-crash is the contract, not a
+failure mode), and pending accumulation is bounded by explicit
+submission limits — `max_pending_mutations` (4096, submission
+rejected as `Saturated`/`EAGAIN`) bounds pending work, and the fold
+transient cap (`write_aggregate_bytes`, 256 MiB, fold refused
+before submitting) bounds fold size, each according to its own
+scope. Volatility without a bound would be data loss with a better
+name. Full options,
 reasoning, and decider in `nostr:nevent1qqsgsh7jz4em9k8mzu9v46dyrsgpcvqlrm4ematxz3lra4r8zuyenwspz9mhxue69uhkwunpwdczuap49eehgu8xt8t`
 (republish of
 `nostr:nevent1qqspp78nadn9vyghn7hak7guydzxwquvy4av83qxc6hha476ky2lhlgpz9mhxue69uhkwunpwdczuap49eehgkxrkd3`).

@@ -375,7 +375,9 @@ gate.
 1. **Sender crash after sealing, before any send report.** The
    sealed bytes are durable before the first send, so the obligation
    survives by construction; a send report that never arrived leaves
-   it pending. Normative, not just tested.
+   it pending. Normative, not just tested. Sender's next action:
+   retry on the next pass with the identical sealed bytes — no
+   re-authoring, no reconciliation needed.
 2. **Recipient crash after accepting, before durably committing.**
    No fact was committed, so the recipient's state proves nothing;
    if the relay still holds the envelope, at-least-once redelivery
@@ -384,24 +386,41 @@ gate.
    not know that this particular envelope was lost. This case
    rejects message-shaped receipts: a receipt sent before the
    durable commit attests a message the recipient does not have.
+   Sender's next action: keep the obligation pending and keep
+   retrying; the recipient's next statement (which cannot contain
+   the message) leaves it in the missing set, and the sender
+   retransmits. Never retire on a pre-commit receipt.
 3. **Relay retention expiry.** No acknowledgement can be produced
    or delivered. The recipient's durable state is the evidence and
    the relay is irrelevant; reconciling after expiry behaves
-   identically to a delivery that was never relayed.
+   identically to a delivery that was never relayed. Sender's next
+   action: stop relying on the relay copy; wait for (or solicit via
+   the gap trigger) the recipient's next statement, then retransmit
+   the missing set or retire on subsuming evidence.
 4. **Recipient offline longer than relay retention, then
    reconnect.** The reconnect is where the recipient discovers the
    gap — this is the pull path's raison d'être. No re-push path is
-   required.
+   required. Sender's next action: answer the recipient's pull
+   statement through the response pass — retire what the evidence
+   covers, retransmit (at most 32 sends per statement) what it does
+   not through the existing deliver paths.
 5. **Duplicate delivery.** Engines stay idempotent over redelivery;
    the forget contract must not weaken that, and reconciliation
    itself is duplicate-prone, so the comparison is set membership.
+   Sender's next action on a duplicate statement: re-answer
+   idempotently — reconciling twice retires nothing new.
 6. **Reconnect after both sides progressed independently.** The
    comparison is over state, not over messages — the one case a
-   receipt cannot answer at all.
+   receipt cannot answer at all. Sender's next action: compute the
+   set difference against the recipient's projected view and
+   retransmit the difference; retire the intersection.
 7. **Durable possession proof.** The contract names what the proof
    *is* — which durable facts, on the recipient, constitute it, per
    the subsumes predicates above — and the reconciliation statement
-   is how the sender learns of it.
+   is how the sender learns of it. Sender's next action: commit the
+   `*Reconciled` fact naming the proving statement and retire; if
+   the statement evidences only part of the obligation set, retire
+   that part and keep the remainder pending.
 
 The reconciliation implementation has landed (21a–21c): the
 operative rule is the forget condition above — an obligation

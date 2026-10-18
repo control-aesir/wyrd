@@ -121,17 +121,43 @@ bound one commit. They do not bound the count of commits.
    "I promised this". Boot rebuild consults durable refusal state;
    serving maps offer only recorded-as-servable state.
 
+## Record status (OD-3 ratification)
+
+The contract above is decided; implementation status is recorded
+here so the decision is never mistaken for a completed
+implementation:
+
+| Item | Status | Required action |
+| --- | --- | --- |
+| SD-1 retained-byte subtraction | Implemented; documentation corrected above | None — every future removal path must call it |
+| A: receive-side admission ceiling | Decided, not implemented (enforcement exists only on the authoring path) | Track implementation and refusal tests; until it lands, a remote author can still spend a peer's local-write headroom |
+| B: residency-based refusal | Decided, implementation status unverified ("residency" in code currently means materialization possession, not refusal-to-advertise) | Inspect the advertisement and serving paths before claiming anything |
+| Four refusal acceptance tests | Missing | Add alongside implementation, not after it |
+
+Two misrepresentations are forbidden, and they are different
+failures with separate observable outcomes, tested separately:
+
+* A serving (B-side) refusal must never be represented as content
+  loss. Observable: the operator surface distinguishes "declined
+  under local policy" from "unavailable" and "corrupt"; refused
+  content never enters loss/repair as lost.
+* A receive-side (A-side) admission refusal must never be
+  represented as successful replication. Observable: no provider
+  claim is recorded, no serving request is satisfied by the refused
+  bytes, no announcement advances on their account.
+
 ## Accounting prerequisites (part of the contract)
 
 These are not incidental implementation work; DG-4 enforcement is gated
 on them:
 
-* `RetainedBytes` decrement or authoritative recomputation for any
-  existing non-GC path that removes, quarantines, or otherwise ceases
-  to count stored objects (today add and get only; without it a
-  scrubbed or quarantined object keeps its charge forever). v0.3 does
-  not use it to reclaim storage: the decrement must exist before any
-  future path can remove or cease charging stored bytes. GC is not
+* `RetainedBytes` subtraction for removal paths is implemented
+  (`subtract`, saturating; wired into quarantine, scrub, and store
+  removal), so this prerequisite is satisfied, not pending: every
+  future path that removes stored bytes or stops charging them must
+  call it, and the authoritative-recomputation alternative is reserved
+  for a store whose bookkeeping cannot be trusted incrementally.
+  v0.3 does not use subtraction to reclaim storage, and GC is not
   introduced by this prerequisite.
 * A vault-seeing counter beside mirror accounting in `wyrd-sync`,
   recording the retained body and manifest bytes observed through

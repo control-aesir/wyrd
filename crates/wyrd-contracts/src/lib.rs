@@ -148,6 +148,14 @@
 //!     the view crate's production-edge closure reaches neither
 //!     `wyrd-sync` nor any `iroh*` package.
 //!
+//! 56. `release_manifests_exclude_insecure_fast_kdf` — no member's
+//!     production manifest edge enables `insecure-fast-kdf` (test-only
+//!     edges stay in `[dev-dependencies]`), and
+//!     `release_build_args_exclude_insecure_fast_kdf` is the flake half:
+//!     the distribution build compiles `-p wyrd-cli` with default
+//!     features, so the shipped binary derives with the pinned KDF
+//!     table (`docs/trust.md`, recorded KDF decision).
+//!
 //! The node contracts (provider-neutral boundary):
 //!
 //! 35. `node_composes_and_serves_without_a_presentation_backend` —

@@ -565,6 +565,20 @@ version say exactly what changed.
 
 ### Fixed
 
+- Release archive smoke test deepens shallow checkouts before export
+  (`nostr:nevent1qqsrryqv8g482yq2vqddhsmw9k9yqxvka8suhw8qqltnyu9w8hsuegcpz9mhxue69uhkwunpwdczuap49eehg9k38z9`):
+  the CI coordinator clones shallow, and `build.sh`'s worktree export
+  inherited it, so nix refused the `git+file://` release input with
+  `revCount is not available` on every master merge. `build.sh` now
+  runs `git fetch --unshallow` when the checkout is shallow (full
+  clones skip it untouched), verifies the deepen landed (a fetch with
+  no remote configured succeeds silently without deepening), and
+  aborts loudly instead of nix's cryptic failure when deepening fails
+  or no-ops. Pinned by the
+  hermetic `test-build-shallow.sh` suite (file:// fixture, stub nix),
+  which fails on the export's shallowness with the step disabled.
+  Local `--strict` release runs are byte-identical.
+
 - Release gate forbids the fast KDF in production artifacts
   (`nostr:nevent1qqszdd7320em6s6ckjc2vymr7uv5u8t35nj9tzan39njw730sjsqmkgpz9mhxue69uhkwunpwdczuap49eehgx8uzpp`):
   contract 56 (`release_manifests_exclude_insecure_fast_kdf`,

@@ -50,6 +50,33 @@ while [ $# -gt 0 ]; do
 done
 
 PIN="${REF:-v$VERSION}"
+
+# Nix locks `git+file://` flake inputs by revision count, which a
+# shallow checkout cannot provide — and the export below inherits the
+# checkout's shallowness, so the CI coordinator's shallow clone fails
+# the smoke test with `revCount is not available` before building
+# anything. Deepen to full history so the release input evaluates;
+# full clones (every local release run) skip this untouched. A failed
+# or no-op deepen aborts here instead of nix's cryptic failure
+# later. Runs before PIN verification so a shallow clone
+# missing the requested ref (e.g. a tag) still gets its history
+# first.
+if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+  echo "shallow checkout detected, deepening to full history for nix..." >&2
+  git fetch --unshallow \
+    || {
+      echo "cannot deepen this checkout (no reachable remote?); refusing a release from shallow history" >&2
+      exit 1
+    }
+  # A fetch can succeed without deepening (no remote configured is a
+  # silent no-op): verify instead of trusting the exit code, so a
+  # still-shallow tree aborts here and never reaches nix's cryptic
+  # `revCount is not available`.
+  if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+    echo "checkout is still shallow after deepening; refusing a release from shallow history" >&2
+    exit 1
+  fi
+fi
 git rev-parse --verify --quiet "$PIN" >/dev/null \
   || { echo "ref $PIN does not exist" >&2; exit 1; }
 ROOT=$(git rev-parse --show-toplevel)

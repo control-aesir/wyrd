@@ -11,7 +11,7 @@ Diff stats:!`git diff master..HEAD --stat`
 ## Hard constraints (violations abort the run)
 
 **Sandbox**
-* Never read, write, list, redirect to, or delete anything outside the repository: no `/tmp`, no home directory, no scratch checkouts, worktrees, or clones. Parse output only through stdin pipes, never scratch files. If a check needs a scratch file, put it in the worktree and delete it before posting, or skip the check and mark the claim `Unverified`.
+* Never read, write, list, redirect to, or delete anything outside the repository: no `/tmp`, no home directory, no scratch checkouts, worktrees, or clones. Shell redirection (`>`, `>>`) outside the repository is forbidden — compare revisions with stdin pipes (`git show master:path | wc -l`), never scratch files. If a check needs a scratch file, put it in the worktree and delete it before posting, or skip the check and mark the claim `Unverified`. If the harness refuses a tool call, never retry it: route around it (stdin pipe, worktree scratch) or skip as `Unverified`. A refusal is information, never a fatal error — the run continues.
 * Sole exception: read-only access to `~/.cargo/registry/src/**` for vendored dependency semantics.
 * Never touch live external systems: VMs, containers, daemons, devices, relays, or their CLIs (`limactl`, `ssh`, `nix/microvm/run-microvm.sh`, `~/.lima`, `/var/lib/wyrd-microvm`), not even read-only probes. Validate orchestration code by reading it against repo templates and scripts. Anything needing a live machine is `Unverified` with that reason.
 

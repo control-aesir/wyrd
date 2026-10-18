@@ -627,6 +627,26 @@ version say exactly what changed.
 
 ### Changed
 
+- Export staging split by protocol
+  (`nostr:nevent1qqs8n8vmjpvgdq4c6gntcjaza7zn07jv6afjvm7gw6u26uejds9fgfspz9mhxue69uhkwunpwdczuap49eehgcl5r4d`):
+  the 688-line `export.rs` becomes `export/` with the namespace walk
+  (`export_tree`, `run_export`, `ExportState`, `export_node`,
+  `stream_file`, `set_executable`, `create_symlink`, `is_populated`,
+  `READ_WINDOW`) in `walk.rs` and the concurrent-runs staging protocol
+  (`claim_staging`, the sweep with its test seam, `is_stale`,
+  `read_marker`, `Heartbeat`, the staging-shape and marker constants)
+  in `staging.rs`, with `ExportReport`, `ExportError`, the module doc,
+  and the re-exports in `mod.rs`. The already extracted
+  `tests_export.rs` splits into `tests_walk.rs` (walk, symlink,
+  conflict-sibling, short-read, and depth tests), `tests_staging.rs`
+  (the seven heartbeat/sweep tests plus the two failed-export tests),
+  and `tests_harness.rs` holding the shared `FakeView` fixture with
+  `tmp`, `drive`, and `assert_no_staging`. Pure move: the public paths
+  `wyrd_core::export::{export_tree, ExportReport, ExportError}` resolve
+  as before and sibling- and test-shared names take `pub(super)`. No
+  behavior change: workspace check, nextest (2007 passed / 21 skipped),
+  doctests, clippy, and fmt are green.
+
 - Commit codec split by layer
   (`nostr:nevent1qqsdkewxxnpumay79klcpda7lufmmg4fg34v3yrsmggfhljzug6afccpz9mhxue69uhkwunpwdczuap49eehgwzkd7z`):
   the 1160-line `durable/codec.rs` becomes `durable/codec/` with the

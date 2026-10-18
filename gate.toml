@@ -55,7 +55,7 @@ milestones = [
 # their own copy), so the path is checkout-relative.
 [review]
 prompt = ".agents/prompts/branch-review.md"
-model = "opencode-go/deepseek-v4.1-flash"
+model = "opencode-go/beam-free"
 variant = "max"
 
 # Odin suite resource: the forced-command ssh path. The machine id comes

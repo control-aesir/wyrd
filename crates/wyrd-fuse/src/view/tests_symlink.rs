@@ -165,6 +165,22 @@ fn symlink_confinement_enforces_component_budget() {
 }
 
 #[test]
+fn symlink_confinement_rejects_separator_flood_before_allocating() {
+    // A separator flood previously allocated one `String` per segment
+    // before the component budget fired. The pre-collect bound
+    // rejects it up front with the same error.
+    let view = view(small_drive());
+    let flood = "x/".repeat(10_000);
+    assert_eq!(
+        confine_symlink_target(&view, "link", &flood),
+        Err(ConfinementError::ComponentLimit {
+            observed: 10_001,
+            max: MAX_SYMLINK_COMPONENTS,
+        })
+    );
+}
+
+#[test]
 fn drive_resolution_refuses_over_budget_tree_before_decode() {
     let view = view(small_drive());
     let result = NamespaceView::resolve_root(&view, 0).unwrap();

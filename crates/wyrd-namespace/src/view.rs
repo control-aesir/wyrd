@@ -503,6 +503,21 @@ pub fn confine_symlink_target_with_budget<V: NamespaceView>(
         });
     };
 
+    // Bound allocation before collecting: count segments first (no
+    // allocation — `split` yields borrowed slices) so a
+    // many-separator target is rejected before any per-component
+    // `String` is built. Verdict-preserving: a target exceeding
+    // `MAX_SYMLINK_COMPONENTS` alone would exceed it combined with
+    // the link's parent components too, so the per-component
+    // accounting below still enforces the combined bound.
+    let target_segments = target.split('/').count();
+    if target_segments > MAX_SYMLINK_COMPONENTS {
+        return Err(ConfinementError::ComponentLimit {
+            observed: target_segments,
+            max: MAX_SYMLINK_COMPONENTS,
+        });
+    }
+
     let mut state = SymlinkResolutionState {
         root: &root,
         current: Some(root.clone()),

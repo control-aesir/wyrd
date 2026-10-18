@@ -665,6 +665,16 @@ version say exactly what changed.
   labels): the reported shape is now built by `triageSuccessResult` in
   `.opencode/lib/ngit-triage.ts`, pinned by the offline suite, and the
   entry only stringifies it.
+- Symlink component budget enforced before per-component allocation
+  (`nostr:nevent1qqsrpc37zu6rgcdhw5pu7jeed2s6ygtu0pszrwlymeg858pux3uchkspz9mhxue69uhkwunpwdczuap49eehg4zl90v`):
+  `confine_symlink_target_with_budget` collected one `String` per
+  path segment before enforcing `MAX_SYMLINK_COMPONENTS`, so a
+  separator-heavy target allocated proportionally before failing.
+  The segment count is now checked first (allocation-free) with the
+  identical `ComponentLimit` verdict — including the combined
+  link-parent-plus-target bound, still enforced per component — and
+  a separator-flood regression test pins the pre-allocation
+  rejection. No behavior change for legitimate targets.
 
 ### Changed
 

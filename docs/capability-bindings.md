@@ -88,7 +88,7 @@ alongside the message. The table proves the rule row by row.
   genesis fails closed before disk.
 - Pinned by: another-device refusal, invalid-genesis refusal,
   foreign-capability refusal, substituted-key refusal
-  (`bootstrap.rs` accept-invitation tests).
+  (`runtime/bootstrap/tests_invitation.rs`).
 
 ## EscrowRecord
 

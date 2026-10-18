@@ -7,10 +7,10 @@
 //! trust model assigns to the local keystore so the drive survives the
 //! creating process.
 //!
-//! A single-device drive only; admitting more devices (bootstrap
-//! invitations, capabilities) and root recovery are later slices. The
-//! drive starts headless; the first snapshot comes from
+//! The drive starts headless; the first snapshot comes from
 //! [`Engine::author_snapshot`](super::engine::Engine::author_snapshot).
+//! It grows by invitation (`accept_invitation`) and pairing (`join`);
+//! root recovery is a later slice.
 
 mod invitation;
 mod keystore;

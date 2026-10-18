@@ -627,6 +627,23 @@ version say exactly what changed.
 
 ### Changed
 
+- Commit codec split by layer
+  (`nostr:nevent1qqsdkewxxnpumay79klcpda7lufmmg4fg34v3yrsmggfhljzug6afccpz9mhxue69uhkwunpwdczuap49eehgwzkd7z`):
+  the 1160-line `durable/codec.rs` becomes `durable/codec/` with the
+  tag registry (`TAG_*`, `KNOWN_TAGS`, limits, AAD domains,
+  `HEADER_LEN`) in `tags.rs`, the commit envelope (`commit_hash`,
+  `encode_commit`, `decode_commit_file`) in `framing.rs`, and the fact
+  codecs (`encode_fact`, `decode_record`, reconciliation encoders,
+  `parse_manifest_record`, `DecodedFact`) in `facts.rs`, re-exported
+  from `mod.rs`. Pure move: every used `durable::codec::*` path
+  resolves as before (durable-internal items take `pub(crate)`, the
+  crate seams keep theirs; the never-used `COMMIT_VERSION` path is
+  intentionally not re-exported), the test-only surface is
+  `#[cfg(test)]` gated, and the already extracted `tests_codec.rs`
+  stays byte-identical. No behavior
+  change: workspace check, nextest (2007 passed / 21 skipped),
+  doctests, clippy, and fmt are green.
+
 - Mailbox supervision split from the relay adapter
   (`nostr:nevent1qqspr9cys8gunnx6gtrp2g8pwsrgw5mensrdkewgdgjy2gxlf9y3v2gpz9mhxue69uhkwunpwdczuap49eehg52pxs4`):
   the 1841-line `mailbox/mod.rs` keeps the `LiveMailbox` relay adapter

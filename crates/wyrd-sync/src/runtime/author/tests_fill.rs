@@ -199,7 +199,7 @@ fn admission_queues_the_lineage_closure_for_the_newcomer() {
 fn admission_commit_is_bounded_by_the_pass_budget() {
     use wyrd_format::MemoryObjectStore;
 
-    // 65,536 mirrors MAX_RECORDS_PER_COMMIT (durable/codec.rs),
+    // 65,536 mirrors MAX_RECORDS_PER_COMMIT (durable/codec/tags.rs),
     // hardcoded deliberately: the ceiling is load's `pub(super)`
     // business, and the commit-delta assertion below is relative,
     // so a moved ceiling changes the margin, never the verdict.

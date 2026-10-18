@@ -53,8 +53,9 @@
 //! `[dev-dependencies]` and never in the flake's distribution-build
 //! args, so no shipped artifact derives through the 8 MiB / t=1 table.
 //! Manifests see member-declared edges only, so the resolved-graph
-//! backstop stays in CI (`cargo tree -e normal` in workflow.yml);
-//! this pins the declared intent where the PR gate runs it.
+//! backstop stays in CI (`cargo tree -e normal,features` in
+//! workflow.yml); this pins the declared intent where the PR gate runs
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1113,20 +1114,81 @@ fn check_kdf_feature_edges(member: &str, manifest: &toml::Table) -> Vec<String> 
 }
 
 /// Check the distribution build's cargo args from the flake text: the
-/// release closure builds `-p wyrd-cli` with default features, so no
-/// `cargoExtraArgs` line may enable `insecure-fast-kdf` or pass
-/// `--all-features` (an all-features artifact is never production; see
-/// the feature's security note in `crates/wyrd-sync/Cargo.toml`). A
-/// structural guard over the flake text — not a substitute for the
-/// resolved-graph check in CI (`cargo tree -e normal` in
-/// workflow.yml) — matching every `cargoExtraArgs` line rather than
-/// trusting line layout, and failing closed when the flag vanishes.
+/// release closure builds `-p wyrd-cli` with default features, so the
+/// live (non-comment) flake text may contain neither
+/// `insecure-fast-kdf` nor `--all-features` — in any string form,
+/// single-line or multiline, under any variable name. Comment stripping
+/// is string-aware (a `#` inside `"..."` or `''...''` never starts a
+/// comment), so a commented-out `cargoExtraArgs` neither satisfies the
+/// presence check nor trips the token check, and a token that only
+/// reaches the build through string concatenation is out of scope for
+/// this structural guard (name it plainly or not at all). Not a
+/// substitute for the resolved-graph check in CI
+/// (`cargo tree -e normal,features` in workflow.yml) — matching the
+/// whole live text rather than trusting line layout, and failing
+/// closed when the flag vanishes.
+/// Strip Nix `#` comments, string-aware: `"..."` (with `\` escapes)
+/// and `''...''` (with `'''` escape) pass through intact, so a `#`
+/// inside a string never starts a comment. Newlines are preserved so
+/// diagnostics below keep their line numbers. Enough grammar for a
+/// convention check; interpolation nesting beyond balanced quotes is
+/// out of scope.
+fn strip_nix_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"\"") {
+            // Double-quoted string: copy through, honoring escapes.
+            out.push('"');
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                out.push(c as char);
+                i += 1;
+                if c == b'\\' && i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                } else if c == b'"' {
+                    break;
+                }
+            }
+        } else if rest.starts_with(b"''") {
+            // Indented string: copy through, honoring `'''`.
+            out.push_str("''");
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"'''") {
+                    out.push_str("'''");
+                    i += 3;
+                } else if bytes[i..].starts_with(b"''") {
+                    out.push_str("''");
+                    i += 2;
+                    break;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'#' {
+            // Comment: skip to (not through) the newline.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn check_release_build_args(text: &str) -> Vec<String> {
-    let args: Vec<&str> = text
-        .lines()
-        .filter(|line| line.contains("cargoExtraArgs"))
-        .collect();
-    if args.is_empty() {
+    // Live code only: comments are stripped, so a commented-out
+    // `cargoExtraArgs` neither counts as declared nor hides a token.
+    let code = strip_nix_comments(text);
+    if !code.contains("cargoExtraArgs") {
         return vec![
             "flake names no cargoExtraArgs at all: the distribution build must declare \
              its cargo flags where this gate can see them"
@@ -1134,23 +1196,47 @@ fn check_release_build_args(text: &str) -> Vec<String> {
         ];
     }
     let mut violations = Vec::new();
-    for line in args {
-        if line.contains("insecure-fast-kdf") {
+    for token in ["insecure-fast-kdf", "--all-features"] {
+        if code.contains(token) {
             violations.push(format!(
-                "distribution build enables `insecure-fast-kdf`: {line:?}"
-            ));
-        }
-        if line.contains("--all-features") {
-            violations.push(format!(
-                "distribution build passes `--all-features`: {line:?}"
+                "distribution build text enables `{token}`: an all-features or \
+                 fast-KDF artifact is never production"
             ));
         }
     }
     violations
 }
 
-/// Contract 55, manifest half: no member's production manifest edge
-/// enables `insecure-fast-kdf`. The current edges all live in
+/// No member may enable `insecure-fast-kdf` through its default
+/// feature set: `default = ["insecure-fast-kdf"]` in any `[features]`
+/// table would bake the fast table into default builds while the
+/// edge walker above stays green (it skips `[features]` by design).
+/// Pure over the manifest so the negative tests below can prove the
+/// checker bites without touching the filesystem.
+fn check_feature_default_enables_kdf(member: &str, manifest: &toml::Table) -> Vec<String> {
+    let default_enables = manifest
+        .get("features")
+        .and_then(|f| f.as_table())
+        .and_then(|f| f.get("default"))
+        .and_then(|d| d.as_array())
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("insecure-fast-kdf"))
+        });
+    if default_enables {
+        vec![format!(
+            "`{member}` enables `insecure-fast-kdf` through its default features: \
+             the fast KDF profile must stay opt-in and test-only"
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Contract 56, manifest half: no member's production manifest edge
+/// enables `insecure-fast-kdf`, and no member (or the workspace root)
+/// carries it in a default feature set. The current edges all live in
 /// `[dev-dependencies]` (fast per-test `Engine`s); a production edge
 /// would bake the 8 MiB / t=1 table into a shipped artifact through
 /// feature unification, silently. The resolved-graph backstop stays in
@@ -1173,11 +1259,17 @@ fn release_manifests_exclude_insecure_fast_kdf() {
     let mut violations = Vec::new();
     for member in &members {
         let name = member.rsplit('/').next().unwrap_or(member);
-        violations.extend(check_kdf_feature_edges(
-            name,
-            &read_manifest(&root.join(member)),
-        ));
+        let manifest = read_manifest(&root.join(member));
+        violations.extend(check_kdf_feature_edges(name, &manifest));
+        violations.extend(check_feature_default_enables_kdf(name, &manifest));
     }
+    // The root's `[workspace.dependencies]` is walked too: a feature
+    // there is inherited by every `workspace = true` edge.
+    violations.extend(check_kdf_feature_edges("workspace-root", &root_manifest));
+    violations.extend(check_feature_default_enables_kdf(
+        "workspace-root",
+        &root_manifest,
+    ));
     assert!(
         violations.is_empty(),
         "fast-KDF production edges:\n- {}",
@@ -1185,7 +1277,7 @@ fn release_manifests_exclude_insecure_fast_kdf() {
     );
 }
 
-/// Contract 55, flake half: the distribution build compiles `-p
+/// Contract 56, flake half: the distribution build compiles `-p
 /// wyrd-cli` with default features, so `kdf_key` takes the production
 /// arm (keystore.rs) and derives with the pinned 64 MiB / t=3 table
 /// (pinned in turn by `kdf_parameters_are_pinned`). Fails closed on a
@@ -1435,9 +1527,111 @@ mod policy_tests {
     }
 
     #[test]
+    fn flake_multiline_args_with_all_features_are_rejected() {
+        // F1's bypass shape: the token rides a continuation line of a
+        // multiline Nix string, which a line-literal scan never sees.
+        let violations =
+            check_release_build_args("cargoExtraArgs = ''\n  -p wyrd-cli\n  --all-features\n'';\n");
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("--all-features"));
+    }
+
+    #[test]
+    fn flake_commented_tokens_are_ignored() {
+        let violations = check_release_build_args(
+            "# never enable insecure-fast-kdf or --all-features here\n\
+             cargoExtraArgs = \"-p wyrd-cli\";\n",
+        );
+        assert!(
+            violations.is_empty(),
+            "commented tokens must not trip the gate: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn flake_commented_out_args_fail_closed() {
+        // Only a commented-out declaration: the live build is
+        // undeclared, so the gate must fail, not pass.
+        let violations = check_release_build_args("# cargoExtraArgs = \"-p wyrd-cli\";\n");
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn flake_hash_inside_a_string_is_not_a_comment() {
+        // The `#` rides inside the string, so the args line stays
+        // live and the token scan sees the whole value.
+        let violations = check_release_build_args("cargoExtraArgs = \"-p wyrd-cli # pinned\";\n");
+        assert!(
+            violations.is_empty(),
+            "a hash inside a string must not start a comment: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn flake_hash_inside_a_string_hides_no_token() {
+        // Same quoting shape, but the string carries the feature: the
+        // token is live text and must trip the gate.
+        let violations =
+            check_release_build_args("cargoExtraArgs = \"-p wyrd-cli # --all-features\";\n");
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("--all-features"));
+    }
+
+    #[test]
     fn flake_missing_args_fails_closed() {
         let violations = check_release_build_args("# no cargo flags here\n");
         assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn workspace_root_prod_kdf_edge_is_rejected() {
+        // A feature on the root `[workspace.dependencies]` entry is
+        // inherited by every `workspace = true` edge.
+        let violations = check_kdf_feature_edges(
+            "workspace-root",
+            &kdf_manifest(
+                r#"
+                [workspace.dependencies]
+                wyrd-sync = { path = "crates/wyrd-sync", features = ["insecure-fast-kdf"] }
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("workspace-root"));
+    }
+
+    #[test]
+    fn default_feature_enabling_kdf_is_rejected() {
+        let violations = check_feature_default_enables_kdf(
+            "wyrd-sync",
+            &kdf_manifest(
+                r#"
+                [features]
+                default = ["insecure-fast-kdf"]
+                insecure-fast-kdf = []
+            "#,
+            ),
+        );
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("wyrd-sync"));
+    }
+
+    #[test]
+    fn default_feature_without_kdf_is_allowed() {
+        let violations = check_feature_default_enables_kdf(
+            "wyrd-sync",
+            &kdf_manifest(
+                r#"
+                [features]
+                default = ["std"]
+                insecure-fast-kdf = []
+            "#,
+            ),
+        );
+        assert!(
+            violations.is_empty(),
+            "unrelated defaults must stay allowed: {violations:?}"
+        );
     }
 
     #[test]

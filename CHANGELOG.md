@@ -567,7 +567,7 @@ version say exactly what changed.
 
 - Release gate forbids the fast KDF in production artifacts
   (`nostr:nevent1qqszdd7320em6s6ckjc2vymr7uv5u8t35nj9tzan39njw730sjsqmkgpz9mhxue69uhkwunpwdczuap49eehgx8uzpp`):
-  contract 55 (`release_manifests_exclude_insecure_fast_kdf`,
+  contract 56 (`release_manifests_exclude_insecure_fast_kdf`,
   `release_build_args_exclude_insecure_fast_kdf`) pins the release
   posture in-suite: no member's production manifest edge may enable
   `insecure-fast-kdf` (the five current edges stay in

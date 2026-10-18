@@ -228,7 +228,7 @@ fn symlink_confinement_reports_combined_count_for_nested_overflow() {
     for depth in (0..60).rev() {
         leaf = tree_of(
             &mut store,
-            vec![Entry::dir(&format!("d{depth}"), leaf).unwrap()],
+            vec![Entry::dir(format!("d{depth}"), leaf).unwrap()],
         );
     }
     let view = DriveView::new(

@@ -63,7 +63,9 @@ export PATH="$T/bin:$PATH"
 export SHALLOW_LOG="$T/shallow.log"
 : > "$SHALLOW_LOG"
 
-# Real build.sh, fixture checkout, stubbed nix only.
+# Phase 1: shallow clone with a reachable origin. build.sh must
+# deepen it, exit 0, and hand nix a full-history export.
+: > "$SHALLOW_LOG"
 (cd "$T/clone" && bash "$SCRIPT_DIR/../build.sh" 0.0.0-test --ref HEAD aarch64-darwin >"$T/build.log" 2>&1)
 code=$?
 if [ "$code" -eq 0 ]; then
@@ -85,6 +87,33 @@ if [ "$(git -C "$T/clone" rev-parse --is-shallow-repository)" = "false" ]; then
   ok "fixture checkout is deepened in place"
 else
   bad "fixture checkout is still shallow after build.sh"
+fi
+
+# Phase 2: full clone. The deepen step must skip untouched: exit 0,
+# export full, and no deepening message in the log.
+git clone -q "file://$T/origin" "$T/full" 2>/dev/null
+: > "$SHALLOW_LOG"
+(cd "$T/full" && bash "$SCRIPT_DIR/../build.sh" 0.0.0-test --ref HEAD aarch64-darwin >"$T/build-full.log" 2>&1)
+code=$?
+if [ "$code" -eq 0 ] && [ "$(cat "$SHALLOW_LOG")" = "false" ] &&
+  ! grep -q "shallow checkout detected" "$T/build-full.log"; then
+  ok "full clone skips the deepen step untouched"
+else
+  bad "full clone phase: code=$code export=[$(cat "$SHALLOW_LOG")]"
+fi
+
+# Phase 3: shallow clone with no reachable remote. Deepening must fail
+# loudly with the fetch error, before nix ever runs.
+git clone -q --depth 1 "file://$T/origin" "$T/stranded" 2>/dev/null
+git -C "$T/stranded" remote remove origin
+: > "$SHALLOW_LOG"
+(cd "$T/stranded" && bash "$SCRIPT_DIR/../build.sh" 0.0.0-test --ref HEAD aarch64-darwin >"$T/build-stranded.log" 2>&1)
+code=$?
+if [ "$code" -ne 0 ] && grep -q "cannot deepen this checkout" "$T/build-stranded.log" &&
+  [ ! -s "$SHALLOW_LOG" ]; then
+  ok "unreachable remote aborts loudly before nix runs"
+else
+  bad "stranded shallow phase: code=$code (want nonzero with the deepen error, no nix call)"
 fi
 
 echo "---"

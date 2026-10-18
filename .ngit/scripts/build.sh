@@ -50,8 +50,6 @@ while [ $# -gt 0 ]; do
 done
 
 PIN="${REF:-v$VERSION}"
-git rev-parse --verify --quiet "$PIN" >/dev/null \
-  || { echo "ref $PIN does not exist" >&2; exit 1; }
 
 # Nix locks `git+file://` flake inputs by revision count, which a
 # shallow checkout cannot provide — and the export below inherits the
@@ -60,7 +58,9 @@ git rev-parse --verify --quiet "$PIN" >/dev/null \
 # anything. Deepen to full history so the release input evaluates;
 # full clones (every local release run) skip this untouched. A failed
 # deepen aborts here with the fetch error instead of nix's cryptic
-# failure later.
+# failure later. Runs before PIN verification so a shallow clone
+# missing the requested ref (e.g. a tag) still gets its history
+# first.
 if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
   echo "shallow checkout detected, deepening to full history for nix..." >&2
   git fetch --unshallow \
@@ -69,6 +69,8 @@ if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
       exit 1
     }
 fi
+git rev-parse --verify --quiet "$PIN" >/dev/null \
+  || { echo "ref $PIN does not exist" >&2; exit 1; }
 ROOT=$(git rev-parse --show-toplevel)
 EXPORT=$(mktemp -d)
 trap 'cd "$ROOT"; git worktree remove --force "$EXPORT" >/dev/null 2>&1 || rm -rf "$EXPORT"' EXIT

@@ -670,11 +670,17 @@ version say exactly what changed.
   `confine_symlink_target_with_budget` collected one `String` per
   path segment before enforcing `MAX_SYMLINK_COMPONENTS`, so a
   separator-heavy target allocated proportionally before failing.
-  The segment count is now checked first (allocation-free) with the
-  identical `ComponentLimit` verdict — including the combined
-  link-parent-plus-target bound, still enforced per component — and
-  a separator-flood regression test pins the pre-allocation
-  rejection. No behavior change for legitimate targets.
+  The segment count is now checked first (allocation-free) — for the
+  entry target and for every nested target the resolver materializes
+  — with the identical `ComponentLimit` verdict, including the
+  combined link-parent-plus-target bound, still enforced per
+  component. Separator-flood and combined-bound regression tests pin
+  the pre-allocation rejection. No behavior change for legitimate
+  targets. Precedence note: an over-limit target that would previously
+  have failed earlier with another confinement error now reports
+  `ComponentLimit`; every such input was and remains a refusal —
+  export maps all confinement errors to `ExportError::Symlink`, and
+  the contract suite pins `EscapesRoot` only for a short target.
 
 ### Changed
 

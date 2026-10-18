@@ -661,6 +661,22 @@ fn resolve_symlink_components<V: NamespaceView>(
                             state.followed.remove(&symlink_path);
                             return Err(ConfinementError::Absolute);
                         }
+                        // Same bound as the entry guard, applied to every
+                        // nested target the resolver materializes: count
+                        // first (allocation-free) so a separator-heavy
+                        // nested target is rejected before its segments are
+                        // copied into the pending queue. Verdict-preserving:
+                        // these segments would each consume the shared
+                        // component budget downstream. Reports the nested
+                        // target's segment count, mirroring the entry guard.
+                        let nested_segments = next.split('/').count();
+                        if state.components.saturating_add(nested_segments) > MAX_SYMLINK_COMPONENTS
+                        {
+                            return Err(ConfinementError::ComponentLimit {
+                                observed: nested_segments,
+                                max: MAX_SYMLINK_COMPONENTS,
+                            });
+                        }
                         for next_component in next.split('/').rev() {
                             state.pending.push_front(next_component.to_owned());
                         }

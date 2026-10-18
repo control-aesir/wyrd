@@ -18,7 +18,12 @@ on:
       - ".ngit/scripts/build.sh"
       - ".ngit/scripts/tests/**"
   pull_request:
-    types: [opened, ready_for_review]
+    # Ready-gated only: every job skips unless the action is
+    # ready_for_review, so an `opened` trigger would mint a no-op
+    # run that spends a workflow slot and reports nothing. Draft
+    # creation needs no CI record — `gate ci status` reads `none`
+    # until the first ready transition, which is a handled state.
+    types: [ready_for_review]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -36,10 +41,12 @@ on:
 
 jobs:
   shell-tests:
+    if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
     # Hermetic shell suites (stubbed ngit/timeout: no relay, secret,
-    # or cache needed). The cheapest gate in the pipeline; pins the
-    # resolve/publish bound arithmetic the draft and reporter jobs
-    # depend on.
+    # or cache needed). The cheapest gate in the pipeline; gated like
+    # the rust and nix jobs so draft-open pushes spend no CI — the
+    # failure reporter only reads these logs on PR failures, which
+    # can only happen once the jobs run.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

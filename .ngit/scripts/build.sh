@@ -57,8 +57,7 @@ PIN="${REF:-v$VERSION}"
 # the smoke test with `revCount is not available` before building
 # anything. Deepen to full history so the release input evaluates;
 # full clones (every local release run) skip this untouched. A failed
-# deepen aborts here with the fetch error instead of nix's cryptic
-# failure later. Runs before PIN verification so a shallow clone
+# or no-op deepen aborts here instead of nix's cryptic failure later. Runs before PIN verification so a shallow clone
 # missing the requested ref (e.g. a tag) still gets its history
 # first.
 if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then

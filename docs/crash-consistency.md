@@ -300,7 +300,9 @@ member custody writes before the accept commits. A crash in either
 window resumes on open: the genesis is deterministic and
 owner-verified, the member secret is reused idempotently. Pinned by
 `an_interrupted_bootstrap_resumes_on_open`, `join_round_trip_reopens_as_member`,
-and the lifecycle create/open roundtrips (`runtime/bootstrap.rs`,
+and the lifecycle create/open roundtrips
+(`runtime/bootstrap/tests_keystore.rs`,
+`runtime/bootstrap/tests_pairing.rs`,
 `engine/tests_lifecycle.rs`). The open itself takes the store lock
 before reading the custody record, so the read is serialized against
 cooperating writers; a missing record is refused before the store
@@ -319,7 +321,7 @@ closed (`EscrowConflict`) on a sidecar disagreeing with held
 material. Pinned by `failed_escrow_persist_heals_on_next_authoring`,
 `per_transition_escrow_restores_later_epochs_from_root_alone`, and
 `conflicting_escrow_sidecar_fails_owner_open_closed`
-(`runtime/bootstrap.rs`).
+(`runtime/bootstrap/tests_keystore.rs`).
 
 ## Vault
 

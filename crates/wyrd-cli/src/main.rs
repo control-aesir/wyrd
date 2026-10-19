@@ -21,7 +21,8 @@ use crate::commands::export::export;
 use crate::commands::member::member;
 #[cfg(test)]
 pub(crate) use crate::commands::member::{
-    member_list_report, member_log_report, member_status_report, render_invited, render_resumed,
+    member_list_report, member_log_report, member_status_report, render_invited,
+    render_pending_lines, render_resumed,
 };
 use crate::commands::mount::mount;
 #[cfg(test)]

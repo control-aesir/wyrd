@@ -682,12 +682,41 @@ fn each_fsync_folds_its_own_snapshot() {
         2,
         "two forcing events submit two folds, saw {seen:?}"
     );
+    let mut contents = Vec::new();
     for submitted in seen.iter() {
-        assert!(
-            matches!(submitted, MutationKind::Fold { .. }),
-            "every forcing event submits a fold, saw {submitted:?}"
-        );
+        match submitted {
+            MutationKind::Fold { members } => {
+                assert_eq!(members.len(), 1, "each fsync folds exactly one image");
+                match &members[0].kind {
+                    MutationKind::CommitFile { path, content, .. } => {
+                        assert_eq!(path, "f.txt");
+                        contents.push(content.clone());
+                    }
+                    other => panic!("every forcing event folds the file image, saw {other:?}"),
+                }
+            }
+            other => panic!("every forcing event submits a fold, saw {other:?}"),
+        }
     }
+    assert_eq!(contents.len(), 2, "two forcing events, two images");
+    // No-drop, not exact bytes: the fake loop records without
+    // publishing, so the second image merges against the last
+    // *published* base rather than the first fold's commit (in
+    // production the base advances per commit and the second image
+    // would be b"onetwo"). What the seam guarantees is that every
+    // forcing event carries the writes made since the previous one —
+    // the full accumulation chain is pinned end-to-end in
+    // core/tests_coalescing.rs.
+    assert!(
+        contents[0].windows(3).any(|w| w == b"one"),
+        "the first fold carries the first write, saw {:?}",
+        String::from_utf8_lossy(&contents[0])
+    );
+    assert!(
+        contents[1].windows(3).any(|w| w == b"two"),
+        "the second fold carries the second write, saw {:?}",
+        String::from_utf8_lossy(&contents[1])
+    );
 }
 
 /// OD-1 namespace forcing: a namespace op folds the pending writes
@@ -737,9 +766,9 @@ fn namespace_op_folds_pending_writes_with_it() {
             assert!(
                 members.iter().any(
                     |member| !member.forcer
-                        && matches!(&member.kind, MutationKind::CommitFile { path, .. } if path == "f.txt")
+                        && matches!(&member.kind, MutationKind::CommitFile { path, content, .. } if path == "f.txt" && content == b"dirty")
                 ),
-                "the pending write rides as a member"
+                "the pending write rides as a member with its image, saw {members:?}"
             );
             batch.record(
                 0,
@@ -819,8 +848,10 @@ fn create_submits_a_lone_forcer_fold() {
     batch.record(
         0,
         Ok(MutationOutcome::Fold {
+            // Created empty file: identity size 0, matching the
+            // loop's real created-empty outcome (not a placeholder).
             forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Created(
-                FileIdentity::new(5, false, Vec::new()),
+                FileIdentity::new(0, false, Vec::new()),
             ))),
             members: Vec::new(),
         }),

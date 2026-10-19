@@ -15,7 +15,12 @@
 //! the ignored `regenerate_dev_fixture` below, never cross-version
 //! evidence. Per-release fixtures land under their tag; the
 //! `v0.2.0-alpha` release cut the first one, and the generator for
-//! the next is `regenerate_release_fixture` below.
+//! the next is `regenerate_release_fixture` below. Two roles, one
+//! rule: `RELEASE_FIXTURE` is the one live baseline (the current
+//! release's frozen bytes) and `PREVIOUS_RELEASE_FIXTURE` is the
+//! previous release the current build must still replay — each with
+//! its own test, so a cut can never replace cross-version evidence
+//! with same-version bytes.
 //!
 //! Reachability note (contract-issue point 4): `COMMIT_VERSION` is
 //! `pub(super)` inside wyrd-sync's private codec, so the suite does
@@ -62,10 +67,22 @@ fn dev_fixture_dir() -> PathBuf {
 }
 
 /// Tag directory of the checked-in release fixture: the store bytes
-/// `upgrade_previous_release_store_replays` replays above. Frozen at
+/// `upgrade_release_baseline_is_frozen` replays below. Frozen at
 /// release-cut time; the next release adds its own tag directory and
-/// repoints this constant, keeping exactly one live baseline.
-const RELEASE_FIXTURE: &str = "v0.2.0-alpha";
+/// repoints this constant. This is the one live baseline: exactly one
+/// authoritative frozen fixture for the current release. It does not
+/// prohibit retaining the previous release's fixture alongside it —
+/// that is `PREVIOUS_RELEASE_FIXTURE` below, with its own test.
+const RELEASE_FIXTURE: &str = "v0.3.0-alpha";
+
+/// Tag directory of the previous release's fixture: the store bytes
+/// `upgrade_previous_release_store_replays` replays below, proving the
+/// current build reads the previous release's data (invariant 3's
+/// previous-release clause). Frozen at the previous release-cut time;
+/// each cut moves the old `RELEASE_FIXTURE` tag here before repointing
+/// `RELEASE_FIXTURE` at the new tag, so cross-version evidence is never
+/// replaced by same-version bytes.
+const PREVIOUS_RELEASE_FIXTURE: &str = "v0.2.0-alpha";
 
 #[test]
 fn regenerate_targets_dev_never_the_root() {
@@ -237,11 +254,17 @@ fn regenerate_dev_fixture() {
 }
 
 /// Cut the release fixture: the same store bytes as `dev`, frozen
-/// under the release tag for `upgrade_previous_release_store_replays`
-/// to replay. Run explicitly at release-cut time; CI uses the
-/// checked-in bytes so the replay test pins stored history, not fresh
-/// output. The next release re-runs this under its own tag and
-/// repoints `RELEASE_FIXTURE`, keeping exactly one live baseline.
+/// under the release tag for `upgrade_release_baseline_is_frozen`
+/// to replay (the previous tag stays replayed by
+/// `upgrade_previous_release_store_replays`). Run explicitly at
+/// release-cut time; CI uses the checked-in bytes so the replay tests
+/// pin stored history, not fresh output. Order is load-bearing: each
+/// cut first moves the old `RELEASE_FIXTURE` tag to
+/// `PREVIOUS_RELEASE_FIXTURE`, then repoints `RELEASE_FIXTURE` at the
+/// new tag, and only then re-runs this generator. Generating while
+/// this constant still names the previous release's directory deletes
+/// that directory (`remove_dir_all` below) and destroys the
+/// cross-version evidence the cut is meant to keep.
 ///
 /// `cargo test -p wyrd-contracts regenerate_release_fixture -- --ignored`
 #[test]
@@ -259,6 +282,11 @@ fn regenerate_release_fixture() {
         dev_fixture_dir(),
         "repointing the release tag at dev/ would wipe the smoke fixture"
     );
+    assert_ne!(
+        dst,
+        fixture_release(PREVIOUS_RELEASE_FIXTURE),
+        "generating over the previous release's directory would wipe cross-version evidence: move the old tag to PREVIOUS_RELEASE_FIXTURE and repoint RELEASE_FIXTURE first"
+    );
     if dst.exists() {
         std::fs::remove_dir_all(&dst).unwrap();
     }
@@ -271,7 +299,7 @@ fn regenerate_release_fixture() {
              `regenerate_release_fixture` (ignored, run explicitly) through the public\n\
              delivery path: genesis and admission transitions plus an epoch-1..2\n\
              capability for the deterministic `device(0x20)` recipient, store\n\
-             passphrase `contracts`. Frozen store bytes: `upgrade_previous_release_store_replays`\n\
+             passphrase `contracts`. Frozen store bytes: `upgrade_release_baseline_is_frozen`\n\
              replays exactly these files, so regenerating them by hand breaks\n\
              the pin — re-run the generator instead.\n",
         ),
@@ -340,14 +368,13 @@ fn upgrade_replays_previous_fact_payload_versions() {
 /// pre-v1 breakage the upgrade contract announces (every alpha may
 /// break compatibility before the format freezes), and carrying a
 /// legacy transition decoder for unshipped software would be the
-/// wrong trade. The v0.2.0-alpha fixture below is the baseline the
-/// next release replays against; until a second fixture exists, the
-/// dev fixture plus the same-version reopen tests carry the rest of
-/// the replay evidence.
+/// wrong trade. This test reads `PREVIOUS_RELEASE_FIXTURE`, never the
+/// live baseline, so cutting a new release cannot silently replace
+/// cross-version evidence with same-version bytes.
 #[test]
 fn upgrade_previous_release_store_replays() {
     let dir = copy_store(
-        &fixture_release(RELEASE_FIXTURE),
+        &fixture_release(PREVIOUS_RELEASE_FIXTURE),
         "upgrade-previous-release",
     );
     let recipient = device(0x20);
@@ -375,6 +402,47 @@ fn upgrade_previous_release_store_replays() {
     assert_eq!(
         fixture_digest(&dir),
         "2abd4973a20cbed7bc9cba9a021daa3bfdf6cdd434d84fc61309d11cd9ad1d67",
+        "release fixture bytes are frozen: regenerate via regenerate_release_fixture, never by hand"
+    );
+}
+
+/// The live-baseline half of the two-fixture convention: the current
+/// release's fixture replays under the build that cut it and its bytes
+/// are frozen, so the next release inherits valid replay evidence.
+/// Reads `RELEASE_FIXTURE`, never the previous release's directory —
+/// each cut repoints this constant at the new tag while the old tag
+/// moves to `PREVIOUS_RELEASE_FIXTURE` (see the generator below).
+#[test]
+fn upgrade_release_baseline_is_frozen() {
+    let dir = copy_store(
+        &fixture_release(RELEASE_FIXTURE),
+        "upgrade-release-baseline",
+    );
+    let recipient = device(0x20);
+    let state = Engine::open(
+        dir.clone(),
+        drive(),
+        recipient.id,
+        "contracts",
+        recipient.identity.clone(),
+        recipient.encryption.clone(),
+    )
+    .unwrap()
+    .runtime_state()
+    .unwrap();
+    assert!(
+        state.pending_transitions().is_empty() && state.pending_capabilities().is_empty(),
+        "the release fixture replays with nothing left pending"
+    );
+    let facts = DurableStore::open(dir.clone(), drive(), "contracts")
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(facts.transitions.len(), 2, "genesis and admission replay");
+    assert_eq!(facts.capabilities.len(), 1, "the epoch-1..2 grant replays");
+    assert_eq!(
+        fixture_digest(&dir),
+        "8f8bce4f6381ee7b0efdcd738f1d5770e86e90b2f8dfbe311625e51d4b451510",
         "release fixture bytes are frozen: regenerate via regenerate_release_fixture, never by hand"
     );
 }

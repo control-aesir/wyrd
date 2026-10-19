@@ -242,9 +242,11 @@ Releases are not required to write every format they read:
 
 `wyrd-contracts` carries one named test per invariant direction
 (catalog 23-33), over fixture stores checked in under
-`crates/wyrd-contracts/tests/fixtures/stores/<release>/`. Two fixtures exist: the `dev`
-harness-smoke store and the `v0.2.0-alpha` release baseline; per-release
-fixtures continue under their tag with each release. (The `v0.1.0-alpha.1`
+`crates/wyrd-contracts/tests/fixtures/stores/<release>/`. Three fixtures exist: the `dev`
+harness-smoke store, the `v0.2.0-alpha` previous release (kept replayed
+for cross-version evidence), and the `v0.3.0-alpha` live baseline;
+per-release fixtures continue under their tag with each release, the
+old baseline moving to previous. (The `v0.1.0-alpha.1`
 fixture went out with the reader-set format break: pre-v1 alphas may break
 compatibility, and no legacy transition decoder is carried for
 unshipped software. The v0.2.0-alpha release cut a fresh fixture and
@@ -254,8 +256,9 @@ payload clause, pending the v0.9.0 payload-versioning issue)
 and the full version matrix
 (invariant 5's matrix half, pending capability negotiation). Release
 checklist, so this coverage cannot silently remain absent: cutting a
-release checks in `crates/wyrd-contracts/tests/fixtures/stores/<tag>/` and re-enables
-`upgrade_previous_release_store_replays` against it. The list below is the acceptance set for
+release checks in `crates/wyrd-contracts/tests/fixtures/stores/<tag>/`,
+points the release baseline at it, and keeps the previous tag replayed
+by `upgrade_previous_release_store_replays`. The list below is the acceptance set for
 the contract issue — one bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their

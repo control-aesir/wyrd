@@ -565,6 +565,25 @@ version say exactly what changed.
 
 ### Fixed
 
+- OD-1 coalescing policy pinned at the FUSE edge
+  (`nostr:nevent1qqst2cp8rlacd3hpfaq4yz5pg69dw33v8mrl0gl2ajn48ks8mydg52qpz9mhxue69uhkwunpwdczuap49eehgy73j8e`):
+  the fold machinery and forcing entry points already implement the
+  decided table (writes accumulate in dirty images; fsync/fdatasync,
+  dirty release, namespace ops, O_SYNC, and destroy each fold exactly
+  once); what was missing was the acceptance proof. New pins:
+  buffered writes submit nothing until a forcing event
+  (`buffered_writes_accumulate_until_fsync_folds_once`), each fsync
+  folds its own snapshot (`each_fsync_folds_its_own_snapshot`),
+  namespace ops fold pending writes with the op as forcer
+  (`namespace_op_folds_pending_writes_with_it`), dirty release folds
+  (`dirty_release_folds_the_handle`), O_SYNC commits before return
+  (`o_sync_write_commits_before_return`), forcing events with nothing
+  pending submit nothing
+  (`fsync_without_pending_data_submits_nothing`), and two folds
+  commit two snapshots at the loop
+  (`two_folds_commit_two_snapshots`). Explicit checkpoint remains
+  reserved with no CLI surface (deferred, not silently dropped).
+
 - `member status` names devices with pending admission catch-up
   (`nostr:nevent1qqsqufuj24ttsndlug9usn904axmy4m2sslgs2hk3u9n592sy0hlvdspz9mhxue69uhkwunpwdczuap49eehg4rsmla`,
   child 2): after an invite the newcomer's queued announcement

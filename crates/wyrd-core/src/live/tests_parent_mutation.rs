@@ -598,6 +598,36 @@ fn a_pending_window_commits_without_operator_action() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// OD-1 one snapshot per forcing event: two submitted folds commit two
+/// snapshots — folds accumulate within an event (pinned above), never
+/// across them.
+#[test]
+fn two_folds_commit_two_snapshots() {
+    let (engine, dir, store, _root, head) = scratch_fixed_drive("bounded-window-two");
+    let mut live = live_over_tree(engine, store, &[head]);
+    let current = live.engine.current();
+    for name in ["parent/a", "parent/b"] {
+        live.apply_mutation(
+            &MutationKind::Fold {
+                members: vec![FoldMember {
+                    kind: MutationKind::Mkdir {
+                        path: name.to_string(),
+                    },
+                    forcer: true,
+                }],
+            },
+            None,
+        )
+        .expect("each forcing fold commits in the one call");
+    }
+    assert_eq!(
+        live.engine.current(),
+        current + 2,
+        "two forcing events commit two snapshots, never one merged fold"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// DG-2 hard criterion: device-local state creates no announcement
 /// obligation and appears in no manifest. Two shapes: a held mutation
 /// attempt (volatile intent), and bytes staged in the store the way a

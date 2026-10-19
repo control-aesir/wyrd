@@ -608,6 +608,223 @@ fn commit_without_image_fails_closed_instead_of_authoring_empty() {
     );
 }
 
+/// OD-1 accumulation: buffered writes submit nothing until a forcing
+/// event arrives; one fsync then folds the whole pending set into
+/// exactly one fold submission — one snapshot per forcing event,
+/// not one per mutation.
+#[test]
+fn buffered_writes_accumulate_until_fsync_folds_once() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"one").unwrap();
+    backend.write_handle(fh, 3, b"two").unwrap();
+    assert_eq!(
+        queue.outstanding(),
+        0,
+        "buffered writes accumulate: no submission without a forcing event"
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    backend.fsync_handle(fh).unwrap();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    let seen = seen.lock().unwrap();
+    match &seen[..] {
+        [MutationKind::Fold { members }] => {
+            assert!(
+                members.iter().filter(|member| member.forcer).count() == 1,
+                "the fsync fold carries exactly one forcer"
+            );
+            for member in members {
+                match &member.kind {
+                    MutationKind::CommitFile { path, .. }
+                    | MutationKind::AppendFile { path, .. } => assert_eq!(
+                        path, "f.txt",
+                        "the fold carries the pending writes, nothing else"
+                    ),
+                    other => panic!("fold member must be a file write, saw {other:?}"),
+                }
+            }
+        }
+        other => panic!("one fsync submits exactly one fold, saw {other:?}"),
+    }
+}
+
+/// OD-1 per-forcer snapshots: each fsync folds what accumulated since
+/// the previous forcing event, so two fsyncs submit two folds even on
+/// one handle.
+#[test]
+fn each_fsync_folds_its_own_snapshot() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"one").unwrap();
+    backend.fsync_handle(fh).unwrap();
+    backend.write_handle(fh, 3, b"two").unwrap();
+    backend.fsync_handle(fh).unwrap();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "two forcing events submit two folds, saw {seen:?}"
+    );
+    for submitted in seen.iter() {
+        assert!(
+            matches!(submitted, MutationKind::Fold { .. }),
+            "every forcing event submits a fold, saw {submitted:?}"
+        );
+    }
+}
+
+/// OD-1 namespace forcing: a namespace op folds the pending writes
+/// with it — the op is the forcer, the dirty image rides as a member —
+/// so one mode change over dirty state is one snapshot, not two.
+/// (`unlink`/`mkdir` rebind their path, so writers on it stay pending
+/// for their own boundary by design; `setattr` rebinds nothing and
+/// folds same-path writers in.) Driven through `set_exec_at` in a
+/// worker (the submit blocks until the test takes the batch).
+#[test]
+fn namespace_op_folds_pending_writes_with_it() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"dirty").unwrap();
+    let (file_ino, _, _) = backend.resolve_inode("f.txt").unwrap();
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || worker_backend.set_exec_at(file_ino, true));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the namespace op was not admitted"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1, "one namespace op submits one fold");
+    match batch.request(0).kind() {
+        MutationKind::Fold { members } => {
+            assert_eq!(
+                members.len(),
+                2,
+                "the namespace fold carries the forcer plus the pending write"
+            );
+            let forcer = members
+                .iter()
+                .find(|member| member.forcer)
+                .expect("a namespace fold has a forcer");
+            assert!(
+                matches!(forcer.kind, MutationKind::SetAttrs { .. }),
+                "the namespace op is the forcer, saw {:?}",
+                forcer.kind
+            );
+            assert!(
+                members.iter().any(
+                    |member| !member.forcer
+                        && matches!(&member.kind, MutationKind::CommitFile { path, .. } if path == "f.txt")
+                ),
+                "the pending write rides as a member"
+            );
+            batch.record(
+                0,
+                Ok(MutationOutcome::Fold {
+                    forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
+                    members: vec![FoldDisposition::Committed(FileIdentity::new(
+                        5,
+                        false,
+                        Vec::new(),
+                    ))],
+                }),
+            );
+        }
+        other => panic!("one namespace op submits exactly one fold, saw {other:?}"),
+    }
+    batch.finish();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
+/// OD-1 no-op rows: fsync on a clean handle, and on a path with no
+/// pending data, commits nothing — a commit boundary with nothing
+/// pending is a silent Ok, never an empty snapshot.
+#[test]
+fn fsync_without_pending_data_submits_nothing() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.fsync_handle(fh).unwrap();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a forcing event with nothing pending submits nothing"
+    );
+}
+
+/// OD-1 dirty-handle release/close: closing a dirty handle folds it — release is
+/// a commit boundary, not a silent drop.
+#[test]
+fn dirty_release_folds_the_handle() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    let fh = backend.open_write("f.txt", libc::O_RDWR).unwrap();
+    backend.write_handle(fh, 0, b"dirty").unwrap();
+    backend.release_handle(fh).unwrap();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    let seen = seen.lock().unwrap();
+    match &seen[..] {
+        [MutationKind::Fold { members }] => {
+            assert!(
+                members.iter().any(|member| member.forcer),
+                "the release fold carries a forcer"
+            );
+        }
+        other => panic!("one dirty release submits exactly one fold, saw {other:?}"),
+    }
+}
+
+/// OD-1 O_SYNC: a write on a synchronous handle commits before
+/// returning — no accumulation, no later forcing event required.
+#[test]
+fn o_sync_write_commits_before_return() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = spawn_drainer(&queue, &seen, &done);
+    let fh = backend
+        .open_write("f.txt", libc::O_RDWR | libc::O_SYNC)
+        .unwrap();
+    backend.write_handle(fh, 0, b"sync").unwrap();
+    done.store(true, Ordering::Relaxed);
+    drainer.join().expect("drainer exits");
+    let seen = seen.lock().unwrap();
+    match &seen[..] {
+        [MutationKind::Fold { .. }] => {}
+        other => panic!("one O_SYNC write submits exactly one fold, saw {other:?}"),
+    }
+}
+
 /// Destroy after admission closed (the teardown is past the session
 /// join) fails the commit fast instead of blocking forever, and
 /// still drops the table: the loss is reported through the commit's

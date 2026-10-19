@@ -87,9 +87,11 @@ cd "$ROOT"
 
 # nix (libgit2) enforces repo ownership and ignores safe.directory, so
 # the builds run as the checkout owner; devices/network stay root.
+# HOME via tilde expansion, not getent: the suite unit's PATH is
+# minimal and getent is not on it (bash builtins always are).
 BUILD_USER="$(stat -c %U "$ROOT")"
 BUILD_GROUP="$(stat -c %G "$ROOT")"
-BUILD_HOME="$(getent passwd "$BUILD_USER" | cut -d: -f6)"
+BUILD_HOME="$(eval echo "~$BUILD_USER")"
 
 # Tools per mode, checked after flag parsing so --teardown only
 # demands what it uses. Flag combos with --teardown fail loudly

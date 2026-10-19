@@ -100,6 +100,10 @@ fi
 BUILD_USER="$(stat -c %U "$ROOT")"
 BUILD_GROUP="$(stat -c %G "$ROOT")"
 BUILD_HOME="$(eval echo "~$BUILD_USER")"
+# The expansion above is syntax, not trust: a missing passwd entry
+# would leave a literal `~name`, so fail fast on a non-directory
+# before any build inherits a bogus HOME.
+[[ -d "$BUILD_HOME" ]] || die "cannot resolve a home directory for $BUILD_USER"
 
 # Tools per mode, checked after flag parsing so --teardown only
 # demands what it uses. Flag combos with --teardown fail loudly
@@ -283,7 +287,10 @@ echo "    $NAK_BIN"
 declare -A RUNNER_OUT=()
 for role in peer-o peer-n relay; do
   RUNNER_OUT[$role]="$(tail -n 1 "$BUILD_LOGS/nix-build-$role.out")"
-  [[ -n "${RUNNER_OUT[$role]}" ]] || die "$role runner build produced no store path (see build-logs/nix-build-$role.log)"
+  [[ -x "${RUNNER_OUT[$role]}/bin/virtiofsd-run" ]] || die "$role runner build produced no virtiofsd-run (see build-logs/nix-build-$role.log)"
+  # Kept runs outlive the build: pin the closures as store GC roots
+  # so a later collection cannot invalidate a debugging session.
+  nix-store --add-root "$STATE_DIR/gc-runner-$role" -r "${RUNNER_OUT[$role]}" >/dev/null
 done
 
 echo "==> network: $BRIDGE ${NET}.0/24"

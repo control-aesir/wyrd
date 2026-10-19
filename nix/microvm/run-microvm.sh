@@ -100,10 +100,6 @@ fi
 BUILD_USER="$(stat -c %U "$ROOT")"
 BUILD_GROUP="$(stat -c %G "$ROOT")"
 BUILD_HOME="$(eval echo "~$BUILD_USER")"
-# The expansion above is syntax, not trust: a missing passwd entry
-# would leave a literal `~name`, so fail fast on a non-directory
-# before any build inherits a bogus HOME.
-[[ -d "$BUILD_HOME" ]] || die "cannot resolve a home directory for $BUILD_USER"
 
 # Tools per mode, checked after flag parsing so --teardown only
 # demands what it uses. Flag combos with --teardown fail loudly
@@ -115,7 +111,7 @@ if [[ "$TEARDOWN" == 1 ]]; then
   [[ "$STATE_DIR" == "/var/lib/wyrd-microvm/state" ]] || { echo "error: --teardown ignores --state-dir (host-global)" >&2; exit 2; }
   for t in git pgrep ps kill pkill ip flock; do need "$t"; done
 else
-  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill fallocate setpriv; do need "$t"; done
+  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill fallocate setpriv nix-store; do need "$t"; done
 fi
 
 # One run at a time per host, not per state dir: taps, the bridge,
@@ -236,6 +232,11 @@ mkdir -p "$RUN" "$RUN/logs" "$WORK" "$BUILD_LOGS"
 chown -R 1000:1000 "$RUN"
 
 echo "==> building wyrd + nak + 3 VM runners (parallel: wall time is the slowest, not the sum)"
+# The expansion above is syntax, not trust: a missing passwd entry
+# would leave a literal `~name`. This check lives here — not next to
+# the derivation — because `die` is defined below; calling it earlier
+# would abort with `die: command not found` instead of this message.
+[[ -d "$BUILD_HOME" ]] || die "cannot resolve a home directory for $BUILD_USER"
 # Fail fast with no orphans: the first failed wait kills the siblings
 # before dying, so a dead build never burns CPU through teardown. The
 # array is complete before any wait below runs; kill errors on reaped
@@ -288,10 +289,16 @@ declare -A RUNNER_OUT=()
 for role in peer-o peer-n relay; do
   RUNNER_OUT[$role]="$(tail -n 1 "$BUILD_LOGS/nix-build-$role.out")"
   [[ -x "${RUNNER_OUT[$role]}/bin/virtiofsd-run" ]] || die "$role runner build produced no virtiofsd-run (see build-logs/nix-build-$role.log)"
-  # Kept runs outlive the build: pin the closures as store GC roots
-  # so a later collection cannot invalidate a debugging session.
-  nix-store --add-root "$STATE_DIR/gc-runner-$role" -r "${RUNNER_OUT[$role]}" >/dev/null
 done
+# Kept runs outlive the build: pin the closures as store GC roots so
+# a later collection cannot invalidate a debugging session. Non-kept
+# runs skip this — their state is torn down with the run and nothing
+# may outlive it into the shared store.
+if [[ "$KEEP" == 1 ]]; then
+  for role in peer-o peer-n relay; do
+    nix-store --add-root "$STATE_DIR/gc-runner-$role" -r "${RUNNER_OUT[$role]}" >/dev/null
+  done
+fi
 
 echo "==> network: $BRIDGE ${NET}.0/24"
 ip link add "$BRIDGE" type bridge 2>/dev/null || true

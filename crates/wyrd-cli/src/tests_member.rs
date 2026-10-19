@@ -108,6 +108,10 @@ fn member_reports_describe_a_fresh_drive() {
     assert!(status.contains("members 1 owners 1"), "one owner-member");
     assert!(status.contains("frozen: no"), "nothing frozen");
     assert!(status.contains("held secrets: 1"), "epoch-1 secret held");
+    assert!(
+        !status.contains("announcements pending for"),
+        "fresh drive names no pending catch-up: {status}"
+    );
 }
 
 /// Remove administrates membership: the device leaves at a new epoch
@@ -300,11 +304,11 @@ fn member_invite_carries_files_forward() {
 }
 
 /// Child-2 progress surface: after an invite the newcomer's queued
-/// catch-up is visible in `member status` per device, so the
+/// announcements are visible in `member status` per device, so the
 /// operator sees who has not caught up without rerunning invite.
-/// Silence means caught up (pinned for the fresh drive by
-/// `member_reports_describe_a_fresh_drive`, which asserts no such
-/// lines appear).
+/// The count is every pending announcement, not only admission
+/// catch-up; silence means caught up (pinned for the fresh drive
+/// above, which asserts no such lines appear).
 #[test]
 fn member_status_names_devices_with_pending_catch_up() {
     let fixture = Fixture::new();
@@ -317,6 +321,46 @@ fn member_status_names_devices_with_pending_catch_up() {
     assert!(
         status.contains(&line),
         "newcomer catch-up is visible in status: {status}"
+    );
+    let owner = device_id_of(&[0x22; 32]);
+    assert!(
+        !status.contains(&format!("announcements pending for {owner}")),
+        "the caught-up owner is not named: {status}"
+    );
+}
+
+/// The pending-line renderer pins the exact rules without an
+/// engine: empty renders empty (after-drain silence), counts render
+/// exactly, the reader branch renders like the member branch, and a
+/// device outside the roster never renders even with pending
+/// entries (removed devices keep stale outbox rows silently).
+#[test]
+fn pending_lines_render_exactly_and_scope_to_the_roster() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let member = device_id_of(&[0x44; 32]);
+    let reader = device_id_of(&[0x55; 32]);
+    let removed = device_id_of(&[0x66; 32]);
+
+    assert_eq!(
+        render_pending_lines(&BTreeSet::new(), &BTreeSet::new(), &BTreeMap::new()),
+        "",
+        "empty outbox renders nothing"
+    );
+
+    let members: BTreeSet<DeviceId> = [member].into_iter().collect();
+    let readers: BTreeSet<DeviceId> = [reader].into_iter().collect();
+    let outstanding: BTreeMap<DeviceId, usize> = [(member, 3), (reader, 1), (removed, 9)]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        render_pending_lines(&members, &readers, &outstanding),
+        format!("announcements pending for {member}: 3\nannouncements pending for {reader}: 1\n"),
+        "counts render exactly on both branches"
+    );
+    assert!(
+        !render_pending_lines(&members, &readers, &outstanding).contains(&removed.to_string()),
+        "a device outside the roster never renders"
     );
 }
 

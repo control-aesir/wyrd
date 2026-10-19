@@ -415,14 +415,20 @@ pub(crate) fn member_status_report(engine: &Engine) -> Result<String, CliError> 
         }
         None => "frozen: no".into(),
     };
-    // Outstanding catch-up per device, read off the durable outbox:
-    // after an invite the newcomer's announcement obligations sit
-    // here until sync passes discharge them, and a crash mid-fill
-    // leaves exactly this set behind for an `invite` rerun to
-    // resume. Grouped by recipient so the operator sees *who* has
-    // not caught up rather than a bare snapshot list (which `sync
-    // status` already breaks out per snapshot). Only devices with
-    // pending obligations are named; silence means caught up.
+    // Outstanding announcements per device, read off the durable
+    // outbox (one store rebuild — the same one-shot read posture as
+    // `sync status`'s projections; no fsync, crypto, or relay work).
+    // After an invite the newcomer's catch-up obligations sit here
+    // until sync passes discharge them, and a crash mid-fill leaves
+    // exactly this set behind for an `invite` rerun to resume — but
+    // the count is every pending announcement, not only admission
+    // catch-up, so routine gossip counts too. Grouped by recipient
+    // so the operator sees *who* has not caught up rather than a
+    // bare snapshot list (which `sync status` already breaks out per
+    // snapshot). Only current members and readers with pending
+    // obligations are named — a removed device's stale entries stay
+    // silent (removal queues no announcements, so this is latent,
+    // not reachable) — and silence means caught up.
     let mut outstanding: std::collections::BTreeMap<DeviceId, usize> =
         std::collections::BTreeMap::new();
     for (_, recipient) in engine.pending_announcements().map_err(CliError::Engine)? {
@@ -436,12 +442,29 @@ pub(crate) fn member_status_report(engine: &Engine) -> Result<String, CliError> 
         owners.len(),
     );
     let readers = log.readers_of(&tip.transition_id).unwrap_or_default();
+    out.push_str(&render_pending_lines(&members, &readers, &outstanding));
+    Ok(out)
+}
+
+/// Render the per-recipient pending-announcement lines for the
+/// current roster: one `announcements pending for {device}:
+/// {count}` line per member or reader with a nonzero count, roster
+/// order, nothing otherwise. Pure so the silence, count, branch,
+/// and scoping rules pin without an engine: an empty map renders
+/// empty (caught up), a device outside the roster never renders
+/// even with pending entries, and counts render exactly.
+pub(crate) fn render_pending_lines(
+    members: &std::collections::BTreeSet<DeviceId>,
+    readers: &std::collections::BTreeSet<DeviceId>,
+    outstanding: &std::collections::BTreeMap<DeviceId, usize>,
+) -> String {
+    let mut out = String::new();
     for device in members.iter().chain(readers.iter()) {
         if let Some(count) = outstanding.get(device) {
             out.push_str(&format!("announcements pending for {device}: {count}\n"));
         }
     }
-    Ok(out)
+    out
 }
 
 /// One-word canonical status for the log view; invalid transitions

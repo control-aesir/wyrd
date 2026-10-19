@@ -134,10 +134,15 @@ characters (x-only pubkeys).
   `pending`, `invalid:<reason>`) and author; frozen conflict epochs
   are marked.
 - `status`: known tip epoch and id, member/owner counts, frozen
-  state, and held epoch secrets. Knowledge is not possession: a
+  state, held epoch secrets, and per-device outstanding announcement
+  counts for members and readers with pending catch-up (`announcements
+  pending for <device>: <n>`; silence means caught up). Knowledge is not
+  possession: a
   known epoch without its secret authorizes nothing until the
   capability arrives. A frozen conflict epoch lists its rival tips —
-  the live contenders the epoch waits on.
+  the live contenders the epoch waits on. The pending counts are read
+  off the durable outbox (a store rebuild, like `sync status`'s
+  projections), not the membership log alone.
 - `resolve <winner> --void <sibling>...`: resolve a frozen
   membership conflict (owner-only) by naming the winning tip and
   exactly the voided siblings. The engine proves the closed
@@ -890,7 +895,8 @@ passphrase_file = "/etc/wyrd/passphrase"
   DeviceIds never reach the durable `sync status` surface or the
   structured dispatch lines; `sync now` alone names the senders its
   intake actually heard, because that process connected and the
-  operator holds the keys. (`member list`, `member log`, and `snapshot heads` are
+  operator holds the keys. (`member list`, `member log`, `member status`,
+  and `snapshot heads` are
   separate read surfaces with their own contract — they name
   members and authors explicitly, and this paragraph does not cover
   them.) Debug-level tracing is the exception: `mount.log` is the

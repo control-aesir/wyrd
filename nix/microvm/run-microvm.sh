@@ -85,6 +85,22 @@ fi
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
 
+# Unit runs get a minimal closure PATH; fall back to the NixOS system
+# profile for everyday tools the suite scripts assume (tar, gzip, ...).
+# Append, never prepend: the closure's nix proved itself in the build
+# phase and must not be shadowed by system versions.
+if [[ -d /run/current-system/sw/bin ]]; then
+  export PATH="$PATH:/run/current-system/sw/bin"
+fi
+
+# nix (libgit2) enforces repo ownership and ignores safe.directory, so
+# the builds run as the checkout owner; devices/network stay root.
+# HOME via tilde expansion, not getent: the suite unit's PATH is
+# minimal and getent is not on it (bash builtins always are).
+BUILD_USER="$(stat -c %U "$ROOT")"
+BUILD_GROUP="$(stat -c %G "$ROOT")"
+BUILD_HOME="$(eval echo "~$BUILD_USER")"
+
 # Tools per mode, checked after flag parsing so --teardown only
 # demands what it uses. Flag combos with --teardown fail loudly
 # instead of silently ignoring the rest; a non-default --state-dir
@@ -95,7 +111,7 @@ if [[ "$TEARDOWN" == 1 ]]; then
   [[ "$STATE_DIR" == "/var/lib/wyrd-microvm/state" ]] || { echo "error: --teardown ignores --state-dir (host-global)" >&2; exit 2; }
   for t in git pgrep ps kill pkill ip flock; do need "$t"; done
 else
-  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill fallocate; do need "$t"; done
+  for t in nix ssh ssh-keygen ip ss timeout flock ps pgrep pkill fallocate setpriv nix-store; do need "$t"; done
 fi
 
 # One run at a time per host, not per state dir: taps, the bridge,
@@ -216,6 +232,11 @@ mkdir -p "$RUN" "$RUN/logs" "$WORK" "$BUILD_LOGS"
 chown -R 1000:1000 "$RUN"
 
 echo "==> building wyrd + nak + 3 VM runners (parallel: wall time is the slowest, not the sum)"
+# The expansion above is syntax, not trust: a missing passwd entry
+# would leave a literal `~name`. This check lives here — not next to
+# the derivation — because `die` is defined below; calling it earlier
+# would abort with `die: command not found` instead of this message.
+[[ -d "$BUILD_HOME" ]] || die "cannot resolve a home directory for $BUILD_USER"
 # Fail fast with no orphans: the first failed wait kills the siblings
 # before dying, so a dead build never burns CPU through teardown. The
 # array is complete before any wait below runs; kill errors on reaped
@@ -225,21 +246,27 @@ wait_build() { # <pid> <what>
   wait "$1" || { kill "${BUILD_PIDS[@]}" 2>/dev/null || true; die "$2"; }
 }
 BUILD_START=$(date +%s)
-nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs \
+setpriv --reuid "$BUILD_USER" --regid "$BUILD_GROUP" --init-groups \
+  env HOME="$BUILD_HOME" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+  nix build "$ROOT#packages.x86_64-linux.wyrd" --no-link --print-out-paths --print-build-logs \
   >"$BUILD_LOGS/nix-build-wyrd.out" 2>"$BUILD_LOGS/nix-build-wyrd.log" 9>&- &
 BUILD_WYRD=$!
 BUILD_PIDS=("$BUILD_WYRD")
 # Pinned nak for the opacity probe (see the flake comment): same
 # no-link pattern as wyrd, so the suite never floats the registry.
-nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs \
+setpriv --reuid "$BUILD_USER" --regid "$BUILD_GROUP" --init-groups \
+  env HOME="$BUILD_HOME" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+  nix build "$ROOT#packages.x86_64-linux.nak" --no-link --print-out-paths --print-build-logs \
   >"$BUILD_LOGS/nix-build-nak.out" 2>"$BUILD_LOGS/nix-build-nak.log" 9>&- &
 BUILD_NAK=$!
 BUILD_PIDS+=("$BUILD_NAK")
 declare -A BUILD_PID=()
 for role in peer-o peer-n relay; do
-  nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
-    --out-link "$WORK/runner-$role" --print-build-logs \
-    >"$BUILD_LOGS/nix-build-$role.log" 2>&1 9>&- &
+  setpriv --reuid "$BUILD_USER" --regid "$BUILD_GROUP" --init-groups \
+    env HOME="$BUILD_HOME" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    nix build "$ROOT#nixosConfigurations.wyrd-$role.config.microvm.runner.qemu" \
+    --no-link --print-out-paths --print-build-logs \
+    >"$BUILD_LOGS/nix-build-$role.out" 2>"$BUILD_LOGS/nix-build-$role.log" 9>&- &
   BUILD_PID[$role]=$!
   BUILD_PIDS+=("${BUILD_PID[$role]}")
 done
@@ -258,6 +285,20 @@ NAK_OUT="$(tail -n 1 "$BUILD_LOGS/nix-build-nak.out")"
 NAK_BIN="$NAK_OUT/bin/nak"
 [[ -x "$NAK_BIN" ]] || die "host build produced no nak binary (see build-logs/nix-build-nak.log)"
 echo "    $NAK_BIN"
+declare -A RUNNER_OUT=()
+for role in peer-o peer-n relay; do
+  RUNNER_OUT[$role]="$(tail -n 1 "$BUILD_LOGS/nix-build-$role.out")"
+  [[ -x "${RUNNER_OUT[$role]}/bin/virtiofsd-run" ]] || die "$role runner build produced no virtiofsd-run (see build-logs/nix-build-$role.log)"
+done
+# Kept runs outlive the build: pin the closures as store GC roots so
+# a later collection cannot invalidate a debugging session. Non-kept
+# runs skip this — their state is torn down with the run and nothing
+# may outlive it into the shared store.
+if [[ "$KEEP" == 1 ]]; then
+  for role in peer-o peer-n relay; do
+    nix-store --add-root "$STATE_DIR/gc-runner-$role" -r "${RUNNER_OUT[$role]}" >/dev/null
+  done
+fi
 
 echo "==> network: $BRIDGE ${NET}.0/24"
 ip link add "$BRIDGE" type bridge 2>/dev/null || true
@@ -300,7 +341,7 @@ for role in peer-o peer-n relay; do
   ip link set "$tap" master "$BRIDGE"
   vmdir="$WORK/vm-$role"
   mkdir -p "$vmdir"
-  ln -sfn "$WORK/runner-$role" "$vmdir/runner"
+  ln -sfn "${RUNNER_OUT[$role]}" "$vmdir/runner"
   # Stale sockets from a kept run must go: a leftover .sock passes
   # the readiness check below while no daemon listens, and qemu
   # then dies with "Connection refused".

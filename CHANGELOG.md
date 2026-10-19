@@ -735,6 +735,19 @@ version say exactly what changed.
 
 ### Changed
 
+- OD-1 coalescing policy pinned at the FUSE-edge submission seam
+  (`nostr:nevent1qqst2cp8rlacd3hpfaq4yz5pg69dw33v8mrl0gl2ajn48ks8mydg52qpz9mhxue69uhkwunpwdczuap49eehgy73j8e`):
+  the fold machinery and forcing entry points already implement the
+  decided table, and the loop-level coalescing suite
+  (`core/tests_coalescing.rs`) already pins the same policy
+  end-to-end — so this change pins only what that suite cannot see:
+  the raw submission shape (one `Fold` per forcing event, forcer
+  identity, explicit member set including accumulated content) at the
+  backend seam. New pins: accumulation with exact committed content,
+  per-forcer folds, namespace/create/rename forcers with members,
+  dirty-release forcer kind, O_SYNC, and the no-op row. Explicit
+  checkpoint remains reserved with no CLI surface (deferred).
+
 - Export staging split by protocol
   (`nostr:nevent1qqs8n8vmjpvgdq4c6gntcjaza7zn07jv6afjvm7gw6u26uejds9fgfspz9mhxue69uhkwunpwdczuap49eehgcl5r4d`):
   the 688-line `export.rs` becomes `export/` with the namespace walk

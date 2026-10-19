@@ -834,10 +834,11 @@ fn create_submits_a_lone_forcer_fold() {
         let store = backend.store_handle().unwrap();
         let mut store = store.write().unwrap();
         let first = store.insert(ObjectKind::Chunk, b"first").unwrap();
-        let empty = store.insert(ObjectKind::Chunk, b"").unwrap();
         let root_tree = Tree::from_entries(vec![
             Entry::file("f.txt", 5, false, vec![first]).unwrap(),
-            Entry::file("new.txt", 0, false, vec![empty]).unwrap(),
+            // Created-empty means no chunks, exactly like the loop's
+            // real created-file entry — not a zero-length chunk.
+            Entry::file("new.txt", 0, false, Vec::new()).unwrap(),
         ])
         .unwrap()
         .insert_into(&mut *store)
@@ -974,7 +975,21 @@ fn o_sync_write_commits_before_return() {
     drainer.join().expect("drainer exits");
     let seen = seen.lock().unwrap();
     match &seen[..] {
-        [MutationKind::Fold { .. }] => {}
+        [MutationKind::Fold { members }] => {
+            assert_eq!(members.len(), 1, "one O_SYNC write folds alone");
+            assert!(members[0].forcer, "the write carries the privilege");
+            match &members[0].kind {
+                MutationKind::CommitFile { path, content, .. } => {
+                    assert_eq!(path, "f.txt");
+                    assert!(
+                        content.windows(4).any(|w| w == b"sync"),
+                        "the committed image carries the written bytes, saw {:?}",
+                        String::from_utf8_lossy(content)
+                    );
+                }
+                other => panic!("O_SYNC folds the file image, saw {other:?}"),
+            }
+        }
         other => panic!("one O_SYNC write submits exactly one fold, saw {other:?}"),
     }
 }

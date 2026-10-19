@@ -39,11 +39,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1792397135,
-        "narHash": "sha256-oDROFhg0P3Q0cNOPTEg95LtIFvxNtmGz3a2LYwV6BmY=",
+        "lastModified": 1792406649,
+        "narHash": "sha256-yvGAWwwYUmjh7cLE5TbEbRZhFcPrg0DVyF+SDNSrh+U=",
         "ref": "refs/heads/master",
-        "rev": "b450bd78cb7727fda1b3730aabd1b5801f14e0b1",
-        "revCount": 49,
+        "rev": "5ad441c78e41842879e1f13125c4230b0ac98d45",
+        "revCount": 53,
         "type": "git",
         "url": "https://grasp.t5.st/npub1k0y4eceal2zryes3azm6nsgt0r0jsa2v8zcsdf9uqxttn0jlfe9q04c9h8/gate.git"
       },

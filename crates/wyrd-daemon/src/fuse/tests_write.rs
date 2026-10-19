@@ -12,7 +12,7 @@ use wyrd_core::mutation::{
     MutationQueue,
 };
 use wyrd_core::session::WriteBudget;
-use wyrd_format::{Entry, MemoryObjectStore, Tree};
+use wyrd_format::{Entry, MemoryObjectStore, ObjectKind, ObjectStore, Tree};
 use wyrd_fuse::{DriveView, Node};
 
 /// The `O_TRUNC` half of an open is bound to the identity that open
@@ -634,20 +634,25 @@ fn buffered_writes_accumulate_until_fsync_folds_once() {
     let seen = seen.lock().unwrap();
     match &seen[..] {
         [MutationKind::Fold { members }] => {
-            assert!(
-                members.iter().filter(|member| member.forcer).count() == 1,
-                "the fsync fold carries exactly one forcer"
+            assert_eq!(
+                members.len(),
+                1,
+                "both buffered writes ride one image in one member, saw {members:?}"
             );
-            for member in members {
-                match &member.kind {
-                    MutationKind::CommitFile { path, .. }
-                    | MutationKind::AppendFile { path, .. } => assert_eq!(
-                        path, "f.txt",
-                        "the fold carries the pending writes, nothing else"
-                    ),
-                    other => panic!("fold member must be a file write, saw {other:?}"),
+            match &members[0].kind {
+                MutationKind::CommitFile { path, content, .. } => {
+                    assert_eq!(path, "f.txt");
+                    assert_eq!(
+                        content, b"onetwo",
+                        "the committed image accumulates both writes, losing neither"
+                    );
                 }
+                other => panic!("the fsync fold commits the file image, saw {other:?}"),
             }
+            assert!(
+                members[0].forcer,
+                "the single member carries the fsync privilege"
+            );
         }
         other => panic!("one fsync submits exactly one fold, saw {other:?}"),
     }
@@ -754,6 +759,120 @@ fn namespace_op_folds_pending_writes_with_it() {
     assert_eq!(worker.join().unwrap(), Ok(()));
 }
 
+/// OD-1 create forcing: creating a file is its own snapshot — the
+/// create op is the forcer even with nothing pending. Driven in a
+/// worker with a manual take (no drainer): the submit blocks until the
+/// test takes the batch, so there is no poll race. The fake loop
+/// records without publishing, so a snapshot carrying the new file is
+/// published before the record lets the worker resolve it.
+#[test]
+fn create_submits_a_lone_forcer_fold() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (root, _, _) = backend.resolve_inode("").unwrap();
+    queue.capture_parent("").expect("root parent token");
+    let worker_backend = Arc::clone(&backend);
+    let worker = std::thread::spawn(move || {
+        worker_backend
+            .create_at(root, "new.txt", libc::O_RDWR)
+            .map(|_| ())
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "the create was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1, "one create submits one fold");
+    match batch.request(0).kind() {
+        MutationKind::Fold { members } => {
+            assert_eq!(members.len(), 1, "a lone create folds alone");
+            assert!(members[0].forcer, "the create carries the privilege");
+            assert!(
+                matches!(&members[0].kind, MutationKind::CreateFile { path, .. } if path == "new.txt"),
+                "the forcer is the create itself, saw {:?}",
+                members[0].kind
+            );
+        }
+        other => panic!("one create submits exactly one fold, saw {other:?}"),
+    }
+    // Publish the created file before recording: the fake loop never
+    // publishes, so without this the worker's post-submit resolve
+    // fails on a view that lacks what was just committed.
+    {
+        let store = backend.store_handle().unwrap();
+        let mut store = store.write().unwrap();
+        let first = store.insert(ObjectKind::Chunk, b"first").unwrap();
+        let empty = store.insert(ObjectKind::Chunk, b"").unwrap();
+        let root_tree = Tree::from_entries(vec![
+            Entry::file("f.txt", 5, false, vec![first]).unwrap(),
+            Entry::file("new.txt", 0, false, vec![empty]).unwrap(),
+        ])
+        .unwrap()
+        .insert_into(&mut *store)
+        .unwrap();
+        drop(store);
+        publish(&backend, snapshot_of(root_tree));
+    }
+    batch.record(
+        0,
+        Ok(MutationOutcome::Fold {
+            forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Created(
+                FileIdentity::new(5, false, Vec::new()),
+            ))),
+            members: Vec::new(),
+        }),
+    );
+    batch.finish();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
+/// OD-1 rename forcing: renaming over a clean drive submits exactly
+/// one fold with the rename as forcer. The rename rebinds locally
+/// after the submit, so no publish is needed for the worker to
+/// resolve.
+#[test]
+fn rename_submits_a_lone_forcer_fold() {
+    let (mut backend, _) = evolving_backend(b"first", b"second");
+    let queue = Arc::new(MutationQueue::default());
+    backend.mutations = Some(Arc::clone(&queue));
+    let backend = Arc::new(backend);
+    let (root, _, _) = backend.resolve_inode("").unwrap();
+    let worker_backend = Arc::clone(&backend);
+    let worker =
+        std::thread::spawn(move || worker_backend.rename_at(root, "f.txt", root, "g.txt", false));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while queue.outstanding() == 0 {
+        assert!(Instant::now() < deadline, "the rename was not admitted");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut batch = queue.take_batch();
+    assert_eq!(batch.len(), 1, "one rename submits one fold");
+    match batch.request(0).kind() {
+        MutationKind::Fold { members } => {
+            assert_eq!(members.len(), 1, "a lone rename folds alone");
+            assert!(members[0].forcer, "the rename carries the privilege");
+            assert!(
+                matches!(&members[0].kind, MutationKind::Rename { .. }),
+                "the forcer is the rename itself, saw {:?}",
+                members[0].kind
+            );
+            batch.record(
+                0,
+                Ok(MutationOutcome::Fold {
+                    forcer: FoldForcerOutcome::Applied(Box::new(MutationOutcome::Done)),
+                    members: Vec::new(),
+                }),
+            );
+        }
+        other => panic!("one rename submits exactly one fold, saw {other:?}"),
+    }
+    batch.finish();
+    assert_eq!(worker.join().unwrap(), Ok(()));
+}
+
 /// OD-1 no-op rows: fsync on a clean handle, and on a path with no
 /// pending data, commits nothing — a commit boundary with nothing
 /// pending is a silent Ok, never an empty snapshot.
@@ -794,8 +913,12 @@ fn dirty_release_folds_the_handle() {
     match &seen[..] {
         [MutationKind::Fold { members }] => {
             assert!(
-                members.iter().any(|member| member.forcer),
-                "the release fold carries a forcer"
+                members.iter().any(|member| member.forcer
+                    && matches!(
+                        &member.kind,
+                        MutationKind::CommitFile { path, content, .. } if path == "f.txt" && content == b"dirty"
+                    )),
+                "the release fold commits the dirty image as its forcer, saw {members:?}"
             );
         }
         other => panic!("one dirty release submits exactly one fold, saw {other:?}"),

@@ -224,8 +224,9 @@ retransmission); the reverse ordering would lose it.
 
 ### Explicitly not evidence
 
-Relay acceptance. Relay retention. Recipient liveness. A
-transport-level ACK. Knowledge without possession. And a recipient
+Relay acceptance. Relay retention. Recipient liveness or a successful
+connection. Elapsed time. Mere announcement without durable receipt.
+A transport-level ACK. Knowledge without possession. And a recipient
 statement about a *message* ("I received #123") as opposed to
 durable state: message-shaped receipts are rejected as the primitive
 because they die to exactly the four failure modes this contract
@@ -422,7 +423,7 @@ gate.
    the statement evidences only part of the obligation set, retire
    that part and keep the remainder pending.
 
-The reconciliation implementation has landed (21a–21c): the
+The reconciliation implementation has landed (21a–21d): the
 operative rule is the forget condition above — an obligation
 retires only on durable evidence the recipient's state subsumes
 it, committed as a `*Reconciled` fact naming the proving

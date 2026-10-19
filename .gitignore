@@ -32,3 +32,6 @@ repomix*
 
 # Wrangler local state (per-command cache under the repo root)
 .wrangler/
+
+# gate skill loaded directly via package
+.agents/skills/gate/

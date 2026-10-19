@@ -85,6 +85,14 @@ fi
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { echo 'error: run from the wyrd checkout' >&2; exit 2; })"
 cd "$ROOT"
 
+# Unit runs get a minimal closure PATH; fall back to the NixOS system
+# profile for everyday tools the suite scripts assume (tar, gzip, ...).
+# Append, never prepend: the closure's nix proved itself in the build
+# phase and must not be shadowed by system versions.
+if [[ -d /run/current-system/sw/bin ]]; then
+  export PATH="$PATH:/run/current-system/sw/bin"
+fi
+
 # nix (libgit2) enforces repo ownership and ignores safe.directory, so
 # the builds run as the checkout owner; devices/network stay root.
 # HOME via tilde expansion, not getent: the suite unit's PATH is

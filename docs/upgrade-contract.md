@@ -254,8 +254,9 @@ payload clause, pending the v0.9.0 payload-versioning issue)
 and the full version matrix
 (invariant 5's matrix half, pending capability negotiation). Release
 checklist, so this coverage cannot silently remain absent: cutting a
-release checks in `crates/wyrd-contracts/tests/fixtures/stores/<tag>/` and re-enables
-`upgrade_previous_release_store_replays` against it. The list below is the acceptance set for
+release checks in `crates/wyrd-contracts/tests/fixtures/stores/<tag>/`,
+points the release baseline at it, and keeps the previous tag replayed
+by `upgrade_previous_release_store_replays`. The list below is the acceptance set for
 the contract issue — one bullet per invariant, in the same order:
 
 1. new encodings are new representations: old objects keep their

@@ -73,7 +73,7 @@ fn dev_fixture_dir() -> PathBuf {
 /// authoritative frozen fixture for the current release. It does not
 /// prohibit retaining the previous release's fixture alongside it —
 /// that is `PREVIOUS_RELEASE_FIXTURE` below, with its own test.
-const RELEASE_FIXTURE: &str = "v0.2.0-alpha";
+const RELEASE_FIXTURE: &str = "v0.3.0-alpha";
 
 /// Tag directory of the previous release's fixture: the store bytes
 /// `upgrade_previous_release_store_replays` replays below, proving the
@@ -299,7 +299,7 @@ fn regenerate_release_fixture() {
              `regenerate_release_fixture` (ignored, run explicitly) through the public\n\
              delivery path: genesis and admission transitions plus an epoch-1..2\n\
              capability for the deterministic `device(0x20)` recipient, store\n\
-             passphrase `contracts`. Frozen store bytes: `upgrade_previous_release_store_replays`\n\
+             passphrase `contracts`. Frozen store bytes: `upgrade_release_baseline_is_frozen`\n\
              replays exactly these files, so regenerating them by hand breaks\n\
              the pin — re-run the generator instead.\n",
         ),
@@ -442,7 +442,7 @@ fn upgrade_release_baseline_is_frozen() {
     assert_eq!(facts.capabilities.len(), 1, "the epoch-1..2 grant replays");
     assert_eq!(
         fixture_digest(&dir),
-        "2abd4973a20cbed7bc9cba9a021daa3bfdf6cdd434d84fc61309d11cd9ad1d67",
+        "8f8bce4f6381ee7b0efdcd738f1d5770e86e90b2f8dfbe311625e51d4b451510",
         "release fixture bytes are frozen: regenerate via regenerate_release_fixture, never by hand"
     );
 }

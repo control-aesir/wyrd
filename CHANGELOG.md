@@ -702,6 +702,20 @@ version say exactly what changed.
   the reporter invocation passes `/tmp/logs/shell.log` through — a
   missing sibling stays skipped, never fatal. Step failure semantics
   are unchanged (`pipefail` preserves the suite exit through `tee`).
+- Upgrade contracts keep a previous-release fixture beside the live
+  baseline (SD-3, Option B): one constant did two jobs — the
+  generator's destination and the replay test's target — so
+  regenerating before repointing would delete the previous release's
+  evidence. `PREVIOUS_RELEASE_FIXTURE` now names the tag the current
+  build must still replay (`upgrade_previous_release_store_replays`,
+  v0.2 digest unchanged), and `upgrade_release_baseline_is_frozen`
+  pins the current tag's bytes (fresh v0.3.0-alpha fixture generated
+  through the public delivery path). The generator refuses a
+  destination equal to the previous release's directory, making the
+  repoint-before-generate order machine-checked. "One live baseline"
+  means one authoritative current-release fixture, not one fixture
+  total; `docs/upgrade-contract.md` invariant 3 already required the
+  previous-release replay this restores.
 
 ### Changed
 

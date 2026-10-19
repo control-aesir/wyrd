@@ -427,8 +427,9 @@ pub(crate) fn member_status_report(engine: &Engine) -> Result<String, CliError> 
     // bare snapshot list (which `sync status` already breaks out per
     // snapshot). Only current members and readers with pending
     // obligations are named — a removed device's stale entries stay
-    // silent (removal queues no announcements, so this is latent,
-    // not reachable) — and silence means caught up.
+    // silent (removal queues no new announcements, so this is
+    // reachable only if a device is removed before its queued
+    // announcements drain) — and silence means caught up.
     let mut outstanding: std::collections::BTreeMap<DeviceId, usize> =
         std::collections::BTreeMap::new();
     for (_, recipient) in engine.pending_announcements().map_err(CliError::Engine)? {

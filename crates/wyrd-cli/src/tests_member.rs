@@ -299,6 +299,27 @@ fn member_invite_carries_files_forward() {
     assert_eq!(heads[0].snapshot().parents, vec![first]);
 }
 
+/// Child-2 progress surface: after an invite the newcomer's queued
+/// catch-up is visible in `member status` per device, so the
+/// operator sees who has not caught up without rerunning invite.
+/// Silence means caught up (pinned for the fresh drive by
+/// `member_reports_describe_a_fresh_drive`, which asserts no such
+/// lines appear).
+#[test]
+fn member_status_names_devices_with_pending_catch_up() {
+    let fixture = Fixture::new();
+    write_file(&fixture, "kept.txt", b"kept");
+    let newcomer = admit(&fixture, &[0x44; 32]);
+
+    let engine = fixture.open();
+    let status = member_status_report(&engine).unwrap();
+    let line = format!("announcements pending for {newcomer}:");
+    assert!(
+        status.contains(&line),
+        "newcomer catch-up is visible in status: {status}"
+    );
+}
+
 /// Remove carries the namespace for the remaining owner.
 #[test]
 fn member_remove_carries_files_forward() {

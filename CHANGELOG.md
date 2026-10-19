@@ -565,6 +565,19 @@ version say exactly what changed.
 
 ### Fixed
 
+- `member status` names devices with pending admission catch-up
+  (`nostr:nevent1qqsqufuj24ttsndlug9usn904axmy4m2sslgs2hk3u9n592sy0hlvdspz9mhxue69uhkwunpwdczuap49eehg4rsmla`,
+  child 2): after an invite the newcomer's queued announcement
+  obligations sat in the outbox invisible until a rerun — the only
+  progress surface was rerunning `member invite` itself. Status now
+  reports per-recipient outstanding announcements
+  (`announcements pending for {device}: {count}`), read off the
+  durable outbox, so the operator sees who has not caught up and
+  whether a resume is worthwhile; silence means caught up. Pinned by
+  `member_status_names_devices_with_pending_catch_up` (invite with
+  history shows the newcomer's line; the fresh-drive reports test
+  pins the silent case).
+
 - Mailbox `send` after shutdown returns a typed error instead of panicking
   (`nostr:nevent1qqsp7k9z65n96p9xa93glsu6ra4zu6lwa25gwfqae4jxjmqgpykwmfqpz9mhxue69uhkwunpwdczuap49eehg4hq3vx`):
   `LiveMailbox::shutdown` takes the runtime, but `send` unwrapped it

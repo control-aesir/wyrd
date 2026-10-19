@@ -415,13 +415,33 @@ pub(crate) fn member_status_report(engine: &Engine) -> Result<String, CliError> 
         }
         None => "frozen: no".into(),
     };
-    Ok(format!(
+    // Outstanding catch-up per device, read off the durable outbox:
+    // after an invite the newcomer's announcement obligations sit
+    // here until sync passes discharge them, and a crash mid-fill
+    // leaves exactly this set behind for an `invite` rerun to
+    // resume. Grouped by recipient so the operator sees *who* has
+    // not caught up rather than a bare snapshot list (which `sync
+    // status` already breaks out per snapshot). Only devices with
+    // pending obligations are named; silence means caught up.
+    let mut outstanding: std::collections::BTreeMap<DeviceId, usize> =
+        std::collections::BTreeMap::new();
+    for (_, recipient) in engine.pending_announcements().map_err(CliError::Engine)? {
+        *outstanding.entry(recipient).or_default() += 1;
+    }
+    let mut out = format!(
         "epoch {} tip {}\nmembers {} owners {}\n{frozen_line}\nheld secrets: {held_list}\n",
         tip.epoch,
         tip.transition_id,
         members.len(),
         owners.len(),
-    ))
+    );
+    let readers = log.readers_of(&tip.transition_id).unwrap_or_default();
+    for device in members.iter().chain(readers.iter()) {
+        if let Some(count) = outstanding.get(device) {
+            out.push_str(&format!("announcements pending for {device}: {count}\n"));
+        }
+    }
+    Ok(out)
 }
 
 /// One-word canonical status for the log view; invalid transitions

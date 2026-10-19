@@ -44,9 +44,10 @@ jobs:
     if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
     # Hermetic shell suites (stubbed ngit/timeout: no relay, secret,
     # or cache needed). The cheapest gate in the pipeline; gated like
-    # the rust and nix jobs so draft-open pushes spend no CI — the
-    # failure reporter only reads these logs on PR failures, which
-    # can only happen once the jobs run.
+    # the rust and nix jobs so draft-open pushes spend no CI. Output
+    # is captured to /tmp/shell.log and uploaded like the rust/nix
+    # logs, so the failure reporter can show the shell tail on PR
+    # failures (which can only happen once the jobs run).
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -55,19 +56,33 @@ jobs:
           fetch-depth: 1
 
       - name: Shell suites
-        run: bash .ngit/scripts/tests/run-all.sh
+        run: |
+          set -o pipefail
+          echo "===== shell suites =====" >> /tmp/shell.log
+          bash .ngit/scripts/tests/run-all.sh 2>&1 | tee -a /tmp/shell.log
 
       # Revision-bound evidence for the e2e harness claims that are
       # provable without a guest: pure bash, no relay, secret, or cache.
       - name: E2E harness stubs
         run: |
-          bash tests/test-step-grammar.sh
-          bash tests/test-baked-set.sh
-          bash tests/test-runner-fd.sh
-          bash tests/test-probe-mark.sh
-          bash tests/test-e2e-guard.sh
-          bash tests/test-bash-syntax.sh
-          bash tests/test-relay-forensics.sh
+          set -o pipefail
+          echo "===== e2e harness stubs =====" >> /tmp/shell.log
+          bash tests/test-step-grammar.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-baked-set.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-runner-fd.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-probe-mark.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-e2e-guard.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-bash-syntax.sh 2>&1 | tee -a /tmp/shell.log
+          bash tests/test-relay-forensics.sh 2>&1 | tee -a /tmp/shell.log
+
+      # /tmp is per-job, so this log only reaches the reporter via the
+      # artifact (same shape as the rust/nix combined-log uploads).
+      - name: Upload combined log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-log
+          path: /tmp/shell.log
 
   rust:
     if: github.event.action == 'ready_for_review' || github.ref == 'refs/heads/master'
@@ -341,8 +356,8 @@ jobs:
 
       # Collect the per-job logs uploaded with `if: always()`. /tmp is
       # per-job, so failed-gate logs only reach this job via artifacts.
-      # Pattern matches rust-log + nix-log; a missing sibling (e.g. a
-      # cancelled job that never uploaded) still matches the other.
+      # Pattern matches rust-log + nix-log + shell-log; a missing sibling
+      # (e.g. a cancelled job that never uploaded) still matches the others.
       - name: Download job logs
         uses: actions/download-artifact@v4
         with:
@@ -364,7 +379,7 @@ jobs:
           # shellcheck disable=SC1091
           source .ngit/scripts/ngit.sh
           report_failure_to_pr \
-            /tmp/logs/rust.log /tmp/logs/nix.log
+            /tmp/logs/rust.log /tmp/logs/nix.log /tmp/logs/shell.log
 
       # Saves whatever the reporter synced (even on resolution failure:
       # partial warmth still helps the next run).

@@ -691,6 +691,17 @@ version say exactly what changed.
   nothing. Draft pushes spend no CI; the failure reporter (which
   only reads these logs on PR failures) is unaffected, and the
   stale comment naming removed draft jobs is corrected.
+- CI failure reporter carries the shell tail
+  (`nostr:nevent1qqstvarumdw8nk35vdvhh3g4tms9lfmdz4k6lzu49x0jymsh7d53qacpz9mhxue69uhkwunpwdczuap49eehg7qn6hs`):
+  when the `shell-tests` job failed on a ready PR, the reporter posted
+  its comment and returned the PR to draft with no shell output — the
+  job uploaded no log and the reporter was invoked with only
+  `rust.log` and `nix.log`. Both shell steps now capture to
+  `/tmp/shell.log` (uploaded `if: always()` as `shell-log`, matching
+  the rust/nix shape), the download pattern already matches it, and
+  the reporter invocation passes `/tmp/logs/shell.log` through — a
+  missing sibling stays skipped, never fatal. Step failure semantics
+  are unchanged (`pipefail` preserves the suite exit through `tee`).
 
 ### Changed
 

@@ -279,11 +279,11 @@ pub(super) fn now_nanos(now: SystemTime) -> u128 {
 /// observes when its staging disappears underneath it — either way
 /// the export fails loudly instead of publishing from a tree it no
 /// longer owns.
+#[derive(Debug)]
 pub(super) struct Heartbeat {
     path: PathBuf,
     calls: u64,
 }
-
 impl Heartbeat {
     pub(super) fn new(path: PathBuf) -> Self {
         Heartbeat { path, calls: 0 }
@@ -300,4 +300,21 @@ impl Heartbeat {
         fs::rename(&pending, &self.path)?;
         Ok(())
     }
+}
+
+/// Start the heartbeat for a freshly claimed container: the first
+/// beat proves the container is writable before any walk output
+/// exists. A beat failure removes the just-claimed container, so it
+/// never strands a markerless directory the sweep would refuse for
+/// lack of ownership proof.
+pub(super) fn start_heartbeat(staging: &Path) -> Result<Heartbeat, ExportError> {
+    let mut heartbeat = Heartbeat::new(staging.join(HEARTBEAT_FILE));
+    heartbeat.beat().map_err(|source| {
+        let _ = fs::remove_dir_all(staging);
+        ExportError::Io {
+            path: staging.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(heartbeat)
 }

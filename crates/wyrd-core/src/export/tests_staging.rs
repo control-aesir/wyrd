@@ -4,8 +4,8 @@ use std::time::SystemTime;
 use crate::view::ViewError;
 
 use super::staging::{
-    now_nanos, staging_payload, sweep_staging_with_probe, sweep_stale_staging, HEARTBEAT_FILE,
-    HEARTBEAT_MAGIC,
+    claim_staging, now_nanos, staging_payload, start_heartbeat, sweep_staging_with_probe,
+    sweep_stale_staging, HEARTBEAT_FILE, HEARTBEAT_MAGIC,
 };
 use super::tests_harness::{assert_no_staging, drive, tmp};
 use super::{export_tree, ExportError};
@@ -83,6 +83,32 @@ fn stale_container_with_payload_layout_is_swept() {
             .all(|entry| entry.unwrap().file_name() != "junk.txt"),
         "the crashed run's payload never merges"
     );
+    std::fs::remove_dir_all(dest).unwrap();
+}
+
+#[test]
+fn claim_time_beat_failure_leaves_no_staging() {
+    // The first beat must prove the container is writable before
+    // any walk output exists — and its failure must not strand a
+    // markerless container the sweep would refuse for lack of
+    // ownership proof. A directory planted at the pending path
+    // makes the beat's write fail deterministically.
+    let dest = tmp();
+    let out = dest.join("out");
+    let staging = claim_staging(&out).unwrap();
+    std::fs::create_dir(staging.join(HEARTBEAT_FILE).with_extension("tmp")).unwrap();
+
+    let error = start_heartbeat(&staging).unwrap_err();
+
+    assert!(
+        matches!(error, ExportError::Io { .. }),
+        "unexpected: {error:?}"
+    );
+    assert!(
+        !staging.exists(),
+        "no markerless container survives a beat failure"
+    );
+    assert_no_staging(&out);
     std::fs::remove_dir_all(dest).unwrap();
 }
 

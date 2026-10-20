@@ -325,8 +325,9 @@ fn fails_closed_on_short_reads() {
 
 #[test]
 fn heartbeat_tmp_user_file_survives_renewal_beats() {
-    // B1, silent-loss mode: the heartbeat marker and its rename
-    // sibling used to live inside the walked tree, so a stored
+    // B1 (fix-sprint release blocker: heartbeat control state
+    // shared the walked tree with user content), silent-loss mode:
+    // the heartbeat marker and its rename sibling used to live
     // `.wyrd-heartbeat.tmp` exported before a renewal beat was
     // truncated by the pending write, renamed over the marker, and
     // deleted at cleanup — while the export still returned Ok with
@@ -351,11 +352,12 @@ fn heartbeat_tmp_user_file_survives_renewal_beats() {
 
 #[test]
 fn heartbeat_named_user_file_is_representable() {
-    // B1, loud mode: a stored `.wyrd-heartbeat` used to meet the
-    // claim-time marker already sitting in the walked tree and fail
-    // the whole export with a bogus `NameCollision`. It is an
-    // ordinary payload entry now. Fillers force renewal beats past
-    // it, as above.
+    // B1 (fix-sprint release blocker: heartbeat control state
+    // shared the walked tree with user content), loud mode: a stored
+    // `.wyrd-heartbeat` used to meet the claim-time marker already
+    // sitting in the walked tree and fail the whole export with a
+    // bogus `NameCollision`. It is an ordinary payload entry now.
+    // Fillers force renewal beats past it, as above.
     let names: Vec<(String, Vec<u8>)> =
         std::iter::once((".wyrd-heartbeat".to_owned(), b"also user content".to_vec()))
             .chain((0..80).map(|index| {

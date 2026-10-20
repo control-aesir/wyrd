@@ -9,7 +9,7 @@ use wyrd_namespace::view::{confine_symlink_target_with_budget, SymlinkResolution
 use crate::view::{NamespaceView, Node, OpenFile};
 
 use super::staging::{
-    claim_staging, staging_payload, sweep_stale_staging, Heartbeat, HEARTBEAT_FILE,
+    claim_staging, staging_payload, start_heartbeat, sweep_stale_staging, Heartbeat,
 };
 use super::{ExportError, ExportReport};
 
@@ -24,11 +24,12 @@ use super::{ExportError, ExportReport};
 /// writes can neither observe nor disturb user content — a stored
 /// `.wyrd-heartbeat` or `.wyrd-heartbeat.tmp` is an ordinary payload
 /// entry. A failed export removes its own container, so `dest` is
-/// either the complete tree or untouched — every error after the
-/// claim, from the root lookup to the final rename, funnels through
-/// the one cleanup below. Remote-only content fails the whole
-/// export: a partial tree that silently drops files is worse than
-/// no tree.
+/// either the complete tree or untouched — every error inside
+/// `run_export`, from the root lookup to the final rename, funnels
+/// through the one cleanup below, and the claim-time beat removes
+/// its container on its own failure path before that scope exists.
+/// Remote-only content fails the whole export: a partial tree
+/// that silently drops files is worse than no tree.
 ///
 /// Concurrent same-destination exports each walk their own staging;
 /// the first atomic rename publishes and later ones fail with
@@ -54,18 +55,7 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
     let now = SystemTime::now();
     sweep_stale_staging(dest, now)?;
     let staging = claim_staging(dest)?;
-    let mut heartbeat = Heartbeat::new(staging.join(HEARTBEAT_FILE));
-    heartbeat.beat().map_err(|source| {
-        // The claim-time beat runs before `run_export`'s cleanup
-        // scope exists: remove the just-claimed container here so a
-        // beat failure leaves no markerless staging behind (the
-        // sweep would refuse it for lack of ownership proof).
-        let _ = fs::remove_dir_all(&staging);
-        ExportError::Io {
-            path: staging.clone(),
-            source,
-        }
-    })?;
+    let mut heartbeat = start_heartbeat(&staging)?;
     match run_export(view, &staging, dest, &mut heartbeat) {
         Ok(report) => Ok(report),
         Err(error) => {
@@ -80,11 +70,18 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
 /// cleanup, so staging never survives a failed export — including a
 /// failed root lookup (before anything is written) and a failed
 /// final rename (after a complete walk), which would otherwise
-/// strand a whole plaintext tree behind a reported failure. The
-/// heartbeat file is removed before the rename, and only the
-/// payload is renamed, so control state never lands in the published
-/// tree by construction (the exact-entry-set contract tests pin its
-/// absence). The emptied container is removed last.
+/// strand a whole plaintext tree behind a reported failure. Only
+/// the payload is renamed, so control state never lands in the
+/// published tree by construction (the exact-entry-set contract
+/// tests pin its absence) — not because the marker is removed
+/// first. The marker deliberately outlives the publish: a crash in
+/// the window still leaves a marker-proven container the sweep
+/// reclaims once stale, never a markerless one it must refuse.
+/// Post-publish container removal is best-effort for the same
+/// reason in reverse: the publish already succeeded, so a removal
+/// failure returns success — a leftover carries a fresh marker and
+/// is swept when stale, while reporting failure would wedge every
+/// retry behind the destination rule on a complete tree.
 fn run_export<V: NamespaceView>(
     view: &V,
     staging: &Path,
@@ -108,10 +105,6 @@ fn run_export<V: NamespaceView>(
         budget: &mut budget,
     };
     export_node(view, &root, "", &payload, 0, &mut state)?;
-    fs::remove_file(staging.join(HEARTBEAT_FILE)).map_err(|source| ExportError::Io {
-        path: staging.to_path_buf(),
-        source,
-    })?;
     // A rename failure with a now-populated destination is the
     // concurrent-publisher race (or a user populating mid-run): name
     // it as the destination rule it is, not a bare errno. Anything
@@ -126,14 +119,11 @@ fn run_export<V: NamespaceView>(
             }
         }
     })?;
-    // The payload became `dest`; what remains is the emptied
-    // container. Its removal failing after a publish names the
-    // container, and the caller's cleanup retries it — `dest`
-    // already holds the complete tree either way.
-    fs::remove_dir(staging).map_err(|source| ExportError::Io {
-        path: staging.to_path_buf(),
-        source,
-    })?;
+    // The payload became `dest`; the marker-proven container is now
+    // garbage. Its removal is best-effort: the export already
+    // succeeded, and a leftover still carries a fresh marker, so the
+    // next run's sweep reclaims it once stale.
+    let _ = fs::remove_dir_all(staging);
     Ok(report)
 }
 

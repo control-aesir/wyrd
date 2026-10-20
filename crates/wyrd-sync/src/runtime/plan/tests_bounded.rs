@@ -7,14 +7,14 @@ use crate::keys::EpochSecret;
 use crate::membership::test_util::{drive as member_drive, Builder};
 use crate::runtime::test_util::{
     admit_engine, announce_snapshot, body_root, capability_message, deliver, drain, empty_roots,
-    fixture, intake_body, intake_body_with_tree, intake_published, intake_snapshot, queue,
+    fixture, intake_body, intake_body_with_tree, intake_published, intake_snapshot, queue, reopen,
     transition_message, AnnouncedRoots, Fixture, TestDir,
 };
 use crate::runtime::MaterializationState;
 use crate::seal::{blob_root, entry_for, seal_manifest, SEAL_VERSION};
 use crate::serving::{ServingEndpoint, Vault};
 use crate::transport::decode_node_addr;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use wyrd_format::{
@@ -908,4 +908,254 @@ fn served_but_invalid_cools_without_committing() {
     );
     assert_eq!(bulk.transport_failed, 0);
     assert_eq!(bulk.eager_failed, 0);
+}
+
+/// A bulk peer that stalls the first object fetch past the run's
+/// budget: bodies and roots delegate instantly, the first sealed
+/// fetch sleeps out the slice, and everything after delegates
+/// instantly again. Models one slow representation behind an
+/// otherwise live peer.
+struct StallFirstObjectBulk {
+    inner: MemoryBulkSource,
+    stalled: bool,
+}
+
+impl AttemptBudget for StallFirstObjectBulk {}
+
+impl BulkSource for StallFirstObjectBulk {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        if !self.stalled {
+            self.stalled = true;
+            // Past any tight slice the test arms: the pass fulfills
+            // the prefix, then meets a spent deadline with work left.
+            // The attempt cap is deliberately not honored here — the
+            // test needs the expiry to be certain, not raced.
+            std::thread::sleep(Duration::from_millis(2000));
+        }
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_transport(root, max)
+    }
+}
+
+/// A bulk peer that records every fetch address per method: proves
+/// the second run serves from durable state instead of re-requesting
+/// the checkpointed prefix.
+struct RefetchProbeBulk {
+    inner: MemoryBulkSource,
+    snapshots: usize,
+    roots: usize,
+    sealed: BTreeMap<StorageId, usize>,
+}
+
+impl AttemptBudget for RefetchProbeBulk {}
+
+impl BulkSource for RefetchProbeBulk {
+    fn fetch_root_manifest(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<SealedManifest>, BulkError> {
+        self.roots += 1;
+        self.inner.fetch_root_manifest(snapshot, max)
+    }
+
+    fn fetch_snapshot(
+        &mut self,
+        snapshot: &SnapshotId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.snapshots += 1;
+        self.inner.fetch_snapshot(snapshot, max)
+    }
+
+    fn fetch_sealed(
+        &mut self,
+        storage: &StorageId,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        *self.sealed.entry(*storage).or_default() += 1;
+        self.inner.fetch_sealed(storage, max)
+    }
+
+    fn fetch_transport(
+        &mut self,
+        root: &BaoRoot,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, BulkError> {
+        self.inner.fetch_transport(root, max)
+    }
+}
+
+/// A spent deadline checkpoints the fulfilled prefix instead of
+/// dropping it: one body, one root, and one of two pinned objects
+/// land in a sliced run whose budget expires mid-pass, and the
+/// reopened engine converges without re-requesting any of them.
+#[test]
+fn spent_deadline_checkpoints_the_fulfilled_prefix() {
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let drive = member_drive();
+    // Two pinned chunks under one flat root: body, root, and two
+    // objects — enough work that the stall lands mid-pass with one
+    // object still pending.
+    let mut entries = Vec::new();
+    let mut pinned = Vec::new();
+    for index in 0u8..2 {
+        let plaintext = vec![index, b'-', b'p', b'a', b'y', b'l', b'o', b'a', b'd'];
+        let content = ContentId::derive(ObjectKind::Chunk, &plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, &plaintext).unwrap();
+        entries
+            .push(entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, &plaintext).unwrap());
+        pinned.push((content, plaintext, sealed_object));
+    }
+    let body = intake_body(&builder, &admission);
+    let snapshot = body.snapshot_id();
+    let manifest = Manifest::new(snapshot, entries, Vec::new()).unwrap();
+    let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+    let (id, sealed) = seal_manifest(&manifest_key, &manifest).unwrap();
+    let mut inner = MemoryBulkSource::default();
+    inner.publish_root(
+        snapshot,
+        SealedManifest {
+            content_id: id,
+            sealed: sealed.encode(),
+        },
+    );
+    for (_, _, sealed_object) in &pinned {
+        inner.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+    }
+    intake_published(
+        &mut fixture,
+        &mut inner,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret.clone()],
+        AnnouncedRoots {
+            manifest: id,
+            transport: crate::seal::transport_root(&sealed),
+        },
+    );
+    let mut objects = MemoryObjectStore::default();
+    fixture
+        .engine
+        .set_materializations(
+            &pinned
+                .iter()
+                .map(|(content, _, _)| (*content, MaterializationState::Pinned))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let rev_pinned = fixture.engine.current();
+    let mut stalling = StallFirstObjectBulk {
+        inner,
+        stalled: false,
+    };
+    let report = fixture
+        .engine
+        .execute_plan_sliced(
+            &mut stalling,
+            &mut objects,
+            Some(Instant::now() + Duration::from_millis(500)),
+        )
+        .unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the body lands before the stall");
+    assert_eq!(report.manifests, 1, "the root lands before the stall");
+    assert_eq!(
+        report.objects, 1,
+        "the first object lands after the stall expires the budget"
+    );
+    assert_eq!(
+        report.unfulfilled, 1,
+        "the second object stays pending past the spent deadline"
+    );
+    assert_eq!(
+        report.deadlines, 0,
+        "the stall is invisible to the plan: nothing sliced, only spent"
+    );
+    assert_eq!(
+        fixture.engine.current() - rev_pinned,
+        2,
+        "two commits: the pass bottom plus the deadline checkpoint"
+    );
+
+    // Restart: the checkpointed prefix rehydrates from durable facts.
+    fixture.engine = reopen(&mut fixture);
+    let mut counting = RefetchProbeBulk {
+        inner: stalling.inner.clone(),
+        snapshots: 0,
+        roots: 0,
+        sealed: BTreeMap::new(),
+    };
+    let report = fixture
+        .engine
+        .execute_plan(&mut counting, &mut objects)
+        .unwrap();
+    assert_eq!(report.objects, 1, "only the remaining object lands");
+    assert_eq!(
+        report.snapshot_bodies, 0,
+        "the checkpointed body is not re-fetched"
+    );
+    assert_eq!(
+        report.manifests, 0,
+        "the checkpointed root is not re-fetched"
+    );
+    assert_eq!(report.unfulfilled, 0, "the drive converges");
+    assert_eq!(counting.snapshots, 0, "no body re-requested");
+    assert_eq!(counting.roots, 0, "no root re-requested");
+    assert_eq!(
+        counting.sealed.values().sum::<usize>(),
+        1,
+        "exactly one sealed fetch: the still-pending object"
+    );
+    assert_eq!(
+        counting.sealed.len(),
+        1,
+        "the checkpointed object's bytes are not re-requested"
+    );
+    assert_eq!(
+        fixture.engine.current() - rev_pinned,
+        3,
+        "one commit per landed batch, no duplicate commits"
+    );
+    for (content, plaintext, _) in &pinned {
+        assert_eq!(
+            objects.get(content).unwrap().as_deref(),
+            Some(plaintext.as_slice()),
+            "both chunks materialize without a second transfer of the prefix"
+        );
+    }
 }

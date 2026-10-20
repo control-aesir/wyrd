@@ -31,7 +31,7 @@ the envelope version and the ephemeral key into the AAD, so seals minted
 by older builds (including v0.2.0-alpha) are refused by design. Pairing
 is transient — no drive data is affected.
 
-## [Unreleased]
+## [0.3.0-alpha]
 
 ### Added
 

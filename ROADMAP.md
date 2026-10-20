@@ -342,7 +342,10 @@ releases, signed manifests, multi-source retrieval, `wyrd-get`, frozen
 public-read subset. Wyrd uses Wyrd to distribute Wyrd. Distribution is a
 v0.3 target for dogfooding — an optional validation track, not a v0.3 exit
 criterion — and must never become the schedule driver for the core
-durability and recovery work above.
+durability and recovery work above (the v0.3.0-alpha cut ships without
+the dogfood track: seeder, fetcher, manifest, and drive-distribution
+stayed out per the frame's staffing rule, and the manual flow in
+`docs/release-process.md` remains the distribution mechanism).
 
 ### v0.3 architecture: consolidation after the semantics stabilize
 

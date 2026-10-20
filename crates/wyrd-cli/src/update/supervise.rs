@@ -67,10 +67,17 @@ pub(crate) fn run_verify_child(
     }
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child
-            .try_wait()
-            .map_err(|source| CliError::Usage(format!("verification wait failed ({source})")))?
-        {
+        match child.try_wait().map_err(|source| {
+            // A wait failure must not orphan the child: Rust
+            // never kills on drop, and the post-swap caller
+            // rolls back and (under `--restart`) supervises the
+            // restored vault — which would fail to open a store
+            // the orphan still holds. Best-effort, mirroring
+            // the timeout arm below.
+            let _ = child.kill();
+            let _ = child.wait();
+            CliError::Usage(format!("verification wait failed ({source})"))
+        })? {
             Some(status) => break status,
             None => {
                 if Instant::now() >= deadline {

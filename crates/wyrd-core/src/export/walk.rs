@@ -8,19 +8,27 @@ use wyrd_namespace::view::{confine_symlink_target_with_budget, SymlinkResolution
 
 use crate::view::{NamespaceView, Node, OpenFile};
 
-use super::staging::{claim_staging, sweep_stale_staging, Heartbeat, HEARTBEAT_FILE};
+use super::staging::{
+    claim_staging, staging_payload, start_heartbeat, sweep_stale_staging, Heartbeat,
+};
 use super::{ExportError, ExportReport};
 
 /// Materialize the view's namespace under `dest` and report what
 /// landed. `dest` must not exist or must be empty — export never
 /// merges into a populated tree.
 ///
-/// The walk lands in a uniquely named staging sibling (see
-/// `claim_staging`) and renames it into place on success. A failed
-/// export removes its own staging, so `dest` is either the complete
-/// tree or untouched — every error after the claim, from the root
-/// lookup to the final rename, funnels through the one cleanup
-/// below. Remote-only content fails the whole export: a partial tree
+/// The walk lands in the payload subdirectory of a uniquely named
+/// staging container (see `claim_staging`) and renames the payload
+/// alone into place on success. The heartbeat marker lives in the
+/// container next to the payload, never inside it, so renewal
+/// writes can neither observe nor disturb user content — a stored
+/// `.wyrd-heartbeat` or `.wyrd-heartbeat.tmp` is an ordinary payload
+/// entry. A failed export removes its own container, so `dest` is
+/// either the complete tree or untouched — every error inside
+/// `run_export`, from the root lookup to the final rename, funnels
+/// through the one cleanup below, and the claim-time beat removes
+/// its container on its own failure path before that scope exists.
+/// Remote-only content fails the whole export: a partial tree
 /// that silently drops files is worse than no tree.
 ///
 /// Concurrent same-destination exports each walk their own staging;
@@ -47,11 +55,7 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
     let now = SystemTime::now();
     sweep_stale_staging(dest, now)?;
     let staging = claim_staging(dest)?;
-    let mut heartbeat = Heartbeat::new(staging.join(HEARTBEAT_FILE));
-    heartbeat.beat().map_err(|source| ExportError::Io {
-        path: staging.clone(),
-        source,
-    })?;
+    let mut heartbeat = start_heartbeat(&staging)?;
     match run_export(view, &staging, dest, &mut heartbeat) {
         Ok(report) => Ok(report),
         Err(error) => {
@@ -62,14 +66,27 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
 }
 
 /// The fallible export body: root lookup, walk, publish, and
-/// heartbeat removal. Every error here returns through the caller's
+/// container removal. Every error here returns through the caller's
 /// cleanup, so staging never survives a failed export — including a
 /// failed root lookup (before anything is written) and a failed
 /// final rename (after a complete walk), which would otherwise
-/// strand a whole plaintext tree behind a reported failure. The
-/// heartbeat file is removed before the rename so it never lands in
-/// the published tree (the exact-entry-set contract tests pin its
-/// absence).
+/// strand a whole plaintext tree behind a reported failure. Only
+/// the payload is renamed, so control state never lands in the
+/// published tree by construction (the exact-entry-set contract
+/// tests pin its absence) — not because the marker is removed
+/// first. The marker deliberately outlives the publish: a crash in
+/// the window still leaves a marker-proven container — eligible
+/// under the sweep's ownership proof, where a markerless one would
+/// never be. It is reclaimed by the next run that reaches the sweep
+/// once stale; runs to the populated destination stop at the
+/// destination rule first, so until such a run the leftover waits
+/// beside the published tree.
+/// Post-publish container removal is best-effort for the same
+/// reason in reverse: the publish already succeeded, so a removal
+/// failure returns success — a leftover carries a fresh marker and
+/// is reclaimed by a later run that reaches the sweep once stale,
+/// while reporting failure would wedge every retry behind the
+/// destination rule on a complete tree.
 fn run_export<V: NamespaceView>(
     view: &V,
     staging: &Path,
@@ -80,6 +97,11 @@ fn run_export<V: NamespaceView>(
         path: String::new(),
         source,
     })?;
+    let payload = staging_payload(staging);
+    fs::create_dir(&payload).map_err(|source| ExportError::Io {
+        path: payload.clone(),
+        source,
+    })?;
     let mut report = ExportReport::default();
     let mut budget = SymlinkResolutionBudget::default();
     let mut state = ExportState {
@@ -87,16 +109,12 @@ fn run_export<V: NamespaceView>(
         report: &mut report,
         budget: &mut budget,
     };
-    export_node(view, &root, "", staging, 0, &mut state)?;
-    fs::remove_file(staging.join(HEARTBEAT_FILE)).map_err(|source| ExportError::Io {
-        path: staging.to_path_buf(),
-        source,
-    })?;
+    export_node(view, &root, "", &payload, 0, &mut state)?;
     // A rename failure with a now-populated destination is the
     // concurrent-publisher race (or a user populating mid-run): name
     // it as the destination rule it is, not a bare errno. Anything
     // else is a genuine I/O failure.
-    fs::rename(staging, dest).map_err(|source| {
+    fs::rename(&payload, dest).map_err(|source| {
         if is_populated(dest) {
             ExportError::DestinationNotEmpty(dest.to_path_buf())
         } else {
@@ -106,6 +124,11 @@ fn run_export<V: NamespaceView>(
             }
         }
     })?;
+    // The payload became `dest`; the marker-proven container is now
+    // garbage. Its removal is best-effort: the export already
+    // succeeded, and a leftover still carries a fresh marker, so a
+    // later run that reaches the sweep reclaims it once stale.
+    let _ = fs::remove_dir_all(staging);
     Ok(report)
 }
 
@@ -129,8 +152,8 @@ struct ExportState<'a> {
 }
 
 /// Write one resolved node to `dest`. `vpath` is the drive path for
-/// error context (`""` at the root, whose destination — the staging
-/// directory — already exists). `depth` counts directory levels from
+/// error context (`""` at the root, whose destination — the payload
+/// subdirectory — already exists). `depth` counts directory levels from
 /// the root and fails closed past the format limit, so a provider
 /// outside the format contract cannot recurse unbounded. Every arm
 /// checks for a pre-existing destination first so a stored name

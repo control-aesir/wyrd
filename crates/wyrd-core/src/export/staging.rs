@@ -4,14 +4,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::ExportError;
 
-/// Liveness marker for one export run: a timestamp file inside the
-/// run's own staging directory, rewritten as the walk progresses. A
+/// Liveness marker for one export run: a timestamp file in the
+/// run's own staging container, rewritten as the walk progresses. A
 /// later export's sweep reads it to tell crashed runs (stale
 /// heartbeat, safe to remove) from live ones (fresh heartbeat, never
-/// touched). The marker lives inside staging so it shares the run's
-/// fate — published trees never contain it, failed runs remove it
-/// with everything else — and it is written by exactly one owner, so
-/// no coordination beyond the filesystem is needed.
+/// touched). The marker lives in the container next to the payload
+/// subdirectory — never inside the payload — so it shares the run's
+/// fate without ever sharing a namespace with user content: the
+/// payload alone is renamed into place, and no exporter-chosen name
+/// inside the walked tree can collide with, truncate, or delete a
+/// stored file. Every legal name stays representable, including
+/// `.wyrd-heartbeat` and `.wyrd-heartbeat.tmp`. The marker is
+/// written by exactly one owner, so no coordination beyond the
+/// filesystem is needed.
 ///
 /// The marker carries a magic value plus the timestamp, and staging
 /// names follow an exact generated shape (see [`staging_shape`]):
@@ -26,8 +31,18 @@ use super::ExportError;
 /// Updates are atomic (write-then-rename), never truncate-in-place:
 /// a concurrent reader sees the old complete marker or the new
 /// complete one, never a torn file. Without that, a sweeper reading
-/// mid-rewrite would misread a live run as marker-less.
+/// mid-rewrite would misread a live run as marker-less. Both the
+/// marker and its rename sibling live in the container, outside the
+/// payload, so the atomic update can never observe user content.
 pub(super) const HEARTBEAT_FILE: &str = ".wyrd-heartbeat";
+
+/// The payload subdirectory of a staging container: the walked tree
+/// lands here, and only here is renamed into place on success. The
+/// name is exporter-chosen and invisible after publish (the payload
+/// itself becomes `dest`), so it can never collide with user
+/// content — user names live one level down, control state one
+/// level up.
+pub(super) const PAYLOAD_DIR: &str = "tree";
 
 /// A heartbeat older than this marks its staging as crashed: no
 /// healthy export goes this long without 128KiB of progress, while a
@@ -61,11 +76,13 @@ fn staging_shape(remainder: &str) -> bool {
     }
 }
 
-/// Claim a staging directory for one export invocation: a uniquely
+/// Claim a staging container for one export invocation: a uniquely
 /// named sibling of `dest` (`<name>.wyrd-export.<pid>.<nanos>`), so
-/// concurrent runs never share a tree. Parents are created; the
-/// staging itself is `create_dir`, retried on the vanishingly narrow
-/// same-nanosecond collision.
+/// concurrent runs never share a tree. The container holds the
+/// heartbeat marker and the payload subdirectory (see
+/// [`staging_payload`]) side by side; only the payload publishes.
+/// Parents are created; the staging itself is `create_dir`, retried
+/// on the vanishingly narrow same-nanosecond collision.
 pub(super) fn claim_staging(dest: &Path) -> Result<PathBuf, ExportError> {
     let (stem, parent) = staging_parts(dest);
     if !parent.as_os_str().is_empty() {
@@ -113,6 +130,13 @@ fn staging_parts(dest: &Path) -> (String, PathBuf) {
         .to_owned();
     let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
     (stem, parent)
+}
+
+/// The payload subdirectory of a staging container: the walked tree
+/// lands here, and only this directory is renamed into place (see
+/// [`PAYLOAD_DIR`]).
+pub(super) fn staging_payload(staging: &Path) -> PathBuf {
+    staging.join(PAYLOAD_DIR)
 }
 
 /// Remove crashed runs' staging siblings of `dest`: entries with
@@ -255,11 +279,11 @@ pub(super) fn now_nanos(now: SystemTime) -> u128 {
 /// observes when its staging disappears underneath it — either way
 /// the export fails loudly instead of publishing from a tree it no
 /// longer owns.
+#[derive(Debug)]
 pub(super) struct Heartbeat {
     path: PathBuf,
     calls: u64,
 }
-
 impl Heartbeat {
     pub(super) fn new(path: PathBuf) -> Self {
         Heartbeat { path, calls: 0 }
@@ -276,4 +300,21 @@ impl Heartbeat {
         fs::rename(&pending, &self.path)?;
         Ok(())
     }
+}
+
+/// Start the heartbeat for a freshly claimed container: the first
+/// beat proves the container is writable before any walk output
+/// exists. A beat failure removes the just-claimed container, so it
+/// never strands a markerless directory the sweep would refuse for
+/// lack of ownership proof.
+pub(super) fn start_heartbeat(staging: &Path) -> Result<Heartbeat, ExportError> {
+    let mut heartbeat = Heartbeat::new(staging.join(HEARTBEAT_FILE));
+    heartbeat.beat().map_err(|source| {
+        let _ = fs::remove_dir_all(staging);
+        ExportError::Io {
+            path: staging.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(heartbeat)
 }

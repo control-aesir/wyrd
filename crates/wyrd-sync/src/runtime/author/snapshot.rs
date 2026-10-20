@@ -183,8 +183,7 @@ where
         .map(|snapshot| snapshot.timestamp)
         .max()
         .unwrap_or(0);
-    let timestamp =
-        next_timestamp(max_seen, wall_clock_ms()).ok_or(EngineError::TimestampExhausted)?;
+    let timestamp = next_timestamp(max_seen, wall_clock_ms());
 
     let mut snapshot = Snapshot::new(
         parents,
@@ -640,13 +639,16 @@ where
 /// never below the wall clock. This keeps the local authoring sequence
 /// monotonic across clock rollback, same-millisecond writes, and
 /// restarts (the durable DAG carries the previous maximum). The field is
-/// display and `(timestamp, author)` tiebreak only; authorization never
-/// reads it. Returns `None` once the observed maximum reaches
-/// `u64::MAX`, where no strictly greater value exists, so the caller
-/// fails instead of repeating the maximum.
-pub(super) fn next_timestamp(max_seen: u64, now: u64) -> Option<u64> {
-    let next = max_seen.checked_add(1)?;
-    Some(now.max(next))
+/// display and `(timestamp, author, snapshot_id)` tiebreak only;
+/// authorization never reads it. Saturates at `u64::MAX`: once the
+/// observed maximum reaches the top of the range no greater value
+/// exists, so further writes reuse `u64::MAX` instead of failing — a
+/// single member-signed extreme body can never veto all recipients
+/// forever on an append-only store. Repeats at saturation keep a total
+/// order via author then snapshot id (distinct per snapshot), and
+/// retained history is never rewritten.
+pub(super) fn next_timestamp(max_seen: u64, now: u64) -> u64 {
+    now.max(max_seen.saturating_add(1))
 }
 
 /// Wall-clock milliseconds. A clock before the Unix epoch yields zero,

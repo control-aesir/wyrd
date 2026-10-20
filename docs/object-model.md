@@ -289,7 +289,7 @@ Snapshot {
     epoch:      u64 — must equal the referenced transition's epoch
     flags:      u8 — bit 0 = recovery snapshot (epochs.md); all other bits reserved zero
     timestamp:  u64 (ms; the authoring path keeps it strictly increasing
-                over the local DAG; display/tiebreak only)
+                over the local DAG, saturating (repeating) at u64::MAX; display/tiebreak only)
     signature:  BIP-340 signature over
                 "wyrd snapshot v1" || DriveId || signing preimage (trust.md)
 }

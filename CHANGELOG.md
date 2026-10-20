@@ -19,6 +19,18 @@ alpha can change the format, the trust protocol, and the CLI: drives created
 by one alpha may not open under the next, and the release notes for each
 version say exactly what changed.
 
+v0.3.0-alpha notes: no on-disk drive/store format break. The envelope
+version is unchanged (`0x00` = v0), and a drive created by v0.2.0-alpha
+opens under this build — proven by the previous-release fixture replay
+(`upgrade_previous_release_store_replays`). Two fail-closed hardenings
+refuse bytes outside any live drive: capabilities naming an off-curve
+device no longer decode (durable replay reads the commit as corrupt
+rather than installing it; genuine device ids are valid curve points, so
+no real v0.2 store contains one), and bootstrap invitation seals now bind
+the envelope version and the ephemeral key into the AAD, so seals minted
+by older builds (including v0.2.0-alpha) are refused by design. Pairing
+is transient — no drive data is affected.
+
 ## [Unreleased]
 
 ### Added

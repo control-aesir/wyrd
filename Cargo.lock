@@ -5192,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-cli"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "blake3",
  "clap",
@@ -5220,7 +5220,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-contracts"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "blake3",
  "fuser",
@@ -5239,7 +5239,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-core"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "futures-util",
  "getrandom 0.2.17",
@@ -5261,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-daemon"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "fuser",
  "iroh",
@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-embed"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "wyrd-core",
  "wyrd-format",
@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-format"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "blake3",
  "fastcdc",
@@ -5297,7 +5297,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-fuse"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "thiserror 2.0.20",
  "wyrd-core",
@@ -5307,7 +5307,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-namespace"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "thiserror 2.0.20",
  "wyrd-format",
@@ -5315,7 +5315,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-sync"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "argon2",
  "bao-tree",

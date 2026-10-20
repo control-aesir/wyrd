@@ -285,7 +285,12 @@ leg_upgrade_owner() {
   # the suite baking the bytes.
   head -c 1048576 /dev/urandom > "$MNTS/xowner-u2/payload.bin"
   sha256sum "$MNTS/xowner-u2/payload.bin" | cut -d' ' -f1 > "$E2E_ROOT/upgrade-blob.sha256"
-  poll_until 120 test -f "$E2E_ROOT/member-u-done" \
+  # Bulk budget rationale: the 1MB re-fetch over the re-announced
+  # post-upgrade route legitimately takes minutes — the green pass
+  # needed ~146s of a ~155s step envelope (9s margin, flaky by
+  # construction). Small-file convergence keeps its 120s polls; only
+  # the bulk-blob waits move.
+  poll_until 300 test -f "$E2E_ROOT/member-u-done" \
     || die "member never converged on the upgraded owner"
   stop_mount xowner-u2 INT
   check_no_leaks "$LOGDIR/mount-xowner-u2.err" "$(cat "$c/identity")" "$(cat "$c/passphrase")"
@@ -314,7 +319,9 @@ leg_upgrade_member() {
   pass "re-announcement recovers the route from the upgraded binary"
   poll_until 120 test -f "$E2E_ROOT/upgrade-blob.sha256" \
     || die "owner never published the payload hash"
-  poll_until 120 blob_converged \
+  # Same bulk rationale as the owner's member-u-done wait above: the
+  # 1MB sha256-match over the re-announced route is the long pole.
+  poll_until 300 blob_converged \
     || die "member payload diverged from the upgraded owner"
   pass "post-upgrade views are byte-identical"
   touch "$E2E_ROOT/member-u-done"

@@ -75,13 +75,18 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
 /// published tree by construction (the exact-entry-set contract
 /// tests pin its absence) — not because the marker is removed
 /// first. The marker deliberately outlives the publish: a crash in
-/// the window still leaves a marker-proven container the sweep
-/// reclaims once stale, never a markerless one it must refuse.
+/// the window still leaves a marker-proven container — eligible
+/// under the sweep's ownership proof, where a markerless one would
+/// never be. It is reclaimed by the next run that reaches the sweep
+/// once stale; runs to the populated destination stop at the
+/// destination rule first, so until such a run the leftover waits
+/// beside the published tree.
 /// Post-publish container removal is best-effort for the same
 /// reason in reverse: the publish already succeeded, so a removal
 /// failure returns success — a leftover carries a fresh marker and
-/// is swept when stale, while reporting failure would wedge every
-/// retry behind the destination rule on a complete tree.
+/// is reclaimed by a later run that reaches the sweep once stale,
+/// while reporting failure would wedge every retry behind the
+/// destination rule on a complete tree.
 fn run_export<V: NamespaceView>(
     view: &V,
     staging: &Path,
@@ -121,8 +126,8 @@ fn run_export<V: NamespaceView>(
     })?;
     // The payload became `dest`; the marker-proven container is now
     // garbage. Its removal is best-effort: the export already
-    // succeeded, and a leftover still carries a fresh marker, so the
-    // next run's sweep reclaims it once stale.
+    // succeeded, and a leftover still carries a fresh marker, so a
+    // later run that reaches the sweep reclaims it once stale.
     let _ = fs::remove_dir_all(staging);
     Ok(report)
 }

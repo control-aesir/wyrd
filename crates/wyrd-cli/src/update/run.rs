@@ -185,41 +185,28 @@ pub(crate) fn update_run(request: &UpdateRequest<'_>) -> Result<UpdateOutcome, C
         identity_file,
         passphrase_file,
         VERIFY_TIMEOUT,
-    )? {
-        VerifyOutcome::Verified => {}
-        VerifyOutcome::Rejected => {
-            rollback(exe, &identity.canonical_name)?;
-            println!("update rollback: restored {own}");
-            record_verdict(
-                exe,
-                &UpdateVerdict {
-                    version: 1,
-                    outcome: "rolled-back".into(),
-                    drive: drive_dir.to_path_buf(),
-                    new_version: identity.version.clone(),
-                    in_place: own.clone(),
-                    at: now_unix(),
-                },
+    ) {
+        Ok(VerifyOutcome::Verified) => {}
+        Ok(VerifyOutcome::Rejected) => {
+            return rollback_swapped(
+                request,
+                &identity,
+                &own,
+                CliError::Verification(format!(
+                    "new build {} did not verify the drive; restored {own}",
+                    identity.version
+                )),
             );
-            if *restart {
-                // Rollback with continuity: the drive must not sit
-                // unserved with nothing started — hand the restored
-                // binary to supervision. The refusal is carried by
-                // the `update rollback:` line above (exit status
-                // reports the supervised run, §6).
-                println!("update continuity: supervising restored {own} as the vault child");
-                return Ok(supervise_outcome(
-                    exe,
-                    drive_dir,
-                    relays,
-                    identity_file,
-                    passphrase_file,
-                ));
-            }
-            return Err(CliError::Verification(format!(
-                "new build {} did not verify the drive; restored {own}",
-                identity.version
-            )));
+        }
+        // Operational failures (spawn, wait, timeout) take the same
+        // restoration as a rejection: the swapped-in binary is
+        // equally unverified, and returning early would strand it
+        // in place with phase Swapped — the exact exit the
+        // transaction exists to prevent. The cause travels in the
+        // returned error unchanged, never relabeled as
+        // incompatibility.
+        Err(operational) => {
+            return rollback_swapped(request, &identity, &own, operational);
         }
     }
     set_phase(exe, drive_dir, &identity, Phase::Verified)?;
@@ -261,6 +248,52 @@ fn rollback_staging(exe: &Path) -> Result<(), CliError> {
     remove_dir_if_present(&stage_dir(exe))?;
     remove_if_present(&state_path(exe))?;
     Ok(())
+}
+
+/// Restore after every unsuccessful post-swap outcome — rejection
+/// or operational failure alike: the old binary back in place,
+/// staging and the record dropped, a `rolled-back` verdict
+/// recorded. Then continuity or the failure, per `--restart`: the
+/// drive must not sit unserved with nothing started, so supervision
+/// takes the restored binary (the outcome rides the printed lines
+/// and the verdict; exit status reports the supervised run, §6),
+/// otherwise the failure returns unchanged — an operational cause
+/// stays operational, never a reported incompatibility.
+fn rollback_swapped(
+    request: &UpdateRequest<'_>,
+    identity: &ArchiveIdentity,
+    own: &str,
+    failure: CliError,
+) -> Result<UpdateOutcome, CliError> {
+    rollback(request.exe, &identity.canonical_name)?;
+    println!("update rollback: restored {own}");
+    record_verdict(
+        request.exe,
+        &UpdateVerdict {
+            version: 1,
+            outcome: "rolled-back".into(),
+            drive: request.drive_dir.to_path_buf(),
+            new_version: identity.version.clone(),
+            in_place: own.to_owned(),
+            at: now_unix(),
+        },
+    );
+    if request.restart {
+        // Rollback with continuity: the drive must not sit
+        // unserved with nothing started — hand the restored
+        // binary to supervision. The refusal is carried by the
+        // `update rollback:` line above (exit status reports the
+        // supervised run, §6).
+        println!("update continuity: supervising restored {own} as the vault child");
+        return Ok(supervise_outcome(
+            request.exe,
+            request.drive_dir,
+            request.relays,
+            request.identity_file,
+            request.passphrase_file,
+        ));
+    }
+    Err(failure)
 }
 
 fn supervise_outcome(

@@ -709,6 +709,39 @@ fn counting_script(dir: &Path) -> PathBuf {
     script
 }
 
+/// A verifier double that passes its FIRST `__update_verify`
+/// and is unspawnable for the second: the early call rewrites its
+/// own file (`$0` is the invoked path, `<exe>.next` early) with a
+/// nonexistent interpreter line, which travels with the swap
+/// rename — so the authoritative spawn fails and the transaction
+/// must roll back an operational error, not a rejection. A bad
+/// interpreter (not missing exec bits, not shebang-less bytes)
+/// fails the spawn on every platform and uid: the kernel reports
+/// ENOENT with no shell fallback, where macOS would otherwise run
+/// interpreter-less bytes through `/bin/sh` to a 127 rejection.
+#[cfg(unix)]
+fn unspawnable_second_script(dir: &Path) -> PathBuf {
+    let script = dir.join("unspawnable-wyrd");
+    fs::write(
+        &script,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"__build_info\" ]; then\n\
+           printf 'update build: 0.4.0-alpha\\nupdate envelope: 0x00\\nupdate control: 0x00\\n'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"__update_verify\" ]; then\n\
+           printf 'update compatibility: verified (1 checks)\\nupdate check: script\\n'\n\
+           printf '#!/nonexistent/c2-nope\\nC2: unspawnable second verify\\n' > \"$0\"\n\
+           exit 0\n\
+         fi\n\
+         exit 9\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
 #[test]
 #[cfg(unix)]
 fn update_run_commits_a_verified_swap() {
@@ -822,6 +855,80 @@ fn update_run_rolls_back_a_post_swap_rejection() {
     let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
     assert_eq!(verdict.outcome, "rolled-back");
     assert_eq!(verdict.new_version, "0.4.0-alpha");
+    assert_eq!(verdict.in_place, own_build_info().app);
+}
+
+#[test]
+#[cfg(unix)]
+fn update_run_rolls_back_a_post_swap_spawn_failure() {
+    // C2: the double passes early, then its post-swap spawn fails
+    // (nonexistent interpreter) — an operational Err from
+    // `run_verify_child`, not a rejection. The transaction must
+    // restore the old binary, drop staging and the record, record
+    // `rolled-back`, and report the operational cause unchanged:
+    // never strand the unverified binary, never mislabel the
+    // failure as incompatibility. (A post-swap timeout shares this
+    // arm; it is untestable through `update_run` at the 300s
+    // `VERIFY_TIMEOUT`, and its error shape is pinned directly by
+    // `verify_child_timeout_is_an_operational_rollback`.)
+    let temp = TempDir::new();
+    let exe = fake_exe(&temp.0);
+    let drive = fake_drive(&temp.0);
+    let creds = forward_creds(&temp.0);
+    let script = unspawnable_second_script(&temp.0);
+    let archive = script_archive(&temp.0, &script);
+    let error =
+        update_run(&update_request(&drive, &archive, &creds, &[], false, &exe)).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("failed to start"), "{message}");
+    assert!(!message.contains("did not verify"), "{message}");
+    assert!(!message.contains("rejected"), "{message}");
+    assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+    assert!(!prev_path(&exe).exists());
+    assert!(!state_path(&exe).exists());
+    assert!(!next_path(&exe).exists());
+    let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+    assert_eq!(verdict.outcome, "rolled-back");
+    assert_eq!(verdict.new_version, "0.4.0-alpha");
+    assert_eq!(verdict.in_place, own_build_info().app);
+}
+
+#[test]
+#[cfg(unix)]
+fn update_run_spawn_failure_under_restart_supervises_the_restored_binary() {
+    // C2 with continuity: after a post-swap operational failure
+    // under `--restart`, the transaction hands the RESTORED binary
+    // to supervision instead of returning — same handoff as the
+    // rejection path, since the drive must not sit unserved.
+    let temp = TempDir::new();
+    let exe = fake_exe(&temp.0);
+    let drive = fake_drive(&temp.0);
+    let creds = forward_creds(&temp.0);
+    let script = unspawnable_second_script(&temp.0);
+    let archive = script_archive(&temp.0, &script);
+    let relays = vec!["ws://localhost:9".to_owned()];
+    let outcome = update_run(&update_request(
+        &drive, &archive, &creds, &relays, true, &exe,
+    ))
+    .unwrap();
+    assert_eq!(fs::read(&exe).unwrap(), b"old-binary");
+    assert!(!prev_path(&exe).exists());
+    assert!(!state_path(&exe).exists());
+    match outcome {
+        UpdateOutcome::Supervise {
+            exe: supervised,
+            drive: supervised_drive,
+            relays: supervised_relays,
+            ..
+        } => {
+            assert_eq!(supervised, exe);
+            assert_eq!(supervised_drive, drive);
+            assert_eq!(supervised_relays, relays);
+        }
+        UpdateOutcome::Done => panic!("restart spawn failure must supervise, got Done"),
+    }
+    let verdict = read_verdict(&exe).unwrap().expect("verdict recorded");
+    assert_eq!(verdict.outcome, "rolled-back");
     assert_eq!(verdict.in_place, own_build_info().app);
 }
 

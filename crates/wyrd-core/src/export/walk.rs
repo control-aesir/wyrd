@@ -55,9 +55,16 @@ pub fn export_tree<V: NamespaceView>(view: &V, dest: &Path) -> Result<ExportRepo
     sweep_stale_staging(dest, now)?;
     let staging = claim_staging(dest)?;
     let mut heartbeat = Heartbeat::new(staging.join(HEARTBEAT_FILE));
-    heartbeat.beat().map_err(|source| ExportError::Io {
-        path: staging.clone(),
-        source,
+    heartbeat.beat().map_err(|source| {
+        // The claim-time beat runs before `run_export`'s cleanup
+        // scope exists: remove the just-claimed container here so a
+        // beat failure leaves no markerless staging behind (the
+        // sweep would refuse it for lack of ownership proof).
+        let _ = fs::remove_dir_all(&staging);
+        ExportError::Io {
+            path: staging.clone(),
+            source,
+        }
     })?;
     match run_export(view, &staging, dest, &mut heartbeat) {
         Ok(report) => Ok(report),

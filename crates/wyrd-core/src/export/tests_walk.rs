@@ -324,6 +324,95 @@ fn fails_closed_on_short_reads() {
 }
 
 #[test]
+fn heartbeat_tmp_user_file_survives_renewal_beats() {
+    // B1, silent-loss mode: the heartbeat marker and its rename
+    // sibling used to live inside the walked tree, so a stored
+    // `.wyrd-heartbeat.tmp` exported before a renewal beat was
+    // truncated by the pending write, renamed over the marker, and
+    // deleted at cleanup — while the export still returned Ok with
+    // counted-but-missing bytes. Control state now lives in the
+    // container next to the payload. Eighty filler entries force
+    // renewal beats (calls 65 and 129) well after the user file
+    // lands: each small file costs one stream beat plus one entry
+    // beat on top of the claim-time beat.
+    let names: Vec<(String, Vec<u8>)> = std::iter::once((
+        ".wyrd-heartbeat.tmp".to_owned(),
+        b"user content, not a marker".to_vec(),
+    ))
+    .chain((0..80).map(|index| {
+        (
+            format!("filler-{index:03}.txt"),
+            format!("payload {index}").into_bytes(),
+        )
+    }))
+    .collect();
+    assert_export_round_trips_exactly(&names);
+}
+
+#[test]
+fn heartbeat_named_user_file_is_representable() {
+    // B1, loud mode: a stored `.wyrd-heartbeat` used to meet the
+    // claim-time marker already sitting in the walked tree and fail
+    // the whole export with a bogus `NameCollision`. It is an
+    // ordinary payload entry now. Fillers force renewal beats past
+    // it, as above.
+    let names: Vec<(String, Vec<u8>)> =
+        std::iter::once((".wyrd-heartbeat".to_owned(), b"also user content".to_vec()))
+            .chain((0..80).map(|index| {
+                (
+                    format!("filler-{index:03}.txt"),
+                    format!("payload {index}").into_bytes(),
+                )
+            }))
+            .collect();
+    assert_export_round_trips_exactly(&names);
+}
+
+/// Export `names` (drive path → bytes) and assert the destination
+/// holds exactly that map with matching report totals and no
+/// staging leftovers.
+fn assert_export_round_trips_exactly(names: &[(String, Vec<u8>)]) {
+    use std::collections::BTreeMap;
+
+    let mut view = FakeView::default();
+    let mut expected: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut children = Vec::new();
+    for (name, bytes) in names {
+        children.push((name.clone(), view.file(bytes, false)));
+        expected.insert(name.clone(), bytes.clone());
+    }
+    view.set_root(children);
+    let dest = tmp();
+    let out = dest.join("out");
+
+    let report = export_tree(&view, &out).unwrap();
+
+    assert_eq!(report.files, expected.len() as u64);
+    assert_eq!(
+        report.bytes,
+        expected
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>(),
+        "counted bytes match landed bytes"
+    );
+    let landed: BTreeMap<String, Vec<u8>> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            (name.clone(), std::fs::read(out.join(&name)).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        landed, expected,
+        "destination holds exactly the source tree"
+    );
+    assert_no_staging(&out);
+    std::fs::remove_dir_all(dest).unwrap();
+}
+
+#[test]
 fn fails_closed_beyond_max_depth() {
     let mut view = FakeView::default();
     let leaf = view.file(b"deep", false);

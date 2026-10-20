@@ -10,11 +10,14 @@
 //! [`ViewError::NotMaterialized`]
 //! content fails the export closed instead of fetching.
 //!
-//! Failure is atomic: the walk lands in a uniquely named staging
-//! sibling and renames it into place only after the whole tree
-//! succeeds, so a failed export leaves no partial tree behind —
-//! neither a retry-blocking `DestinationNotEmpty` nor a tree that
-//! looks complete but silently dropped files. Staging names are
+//! Failure is atomic: the walk lands in a payload subdirectory of a
+//! uniquely named staging container and only the payload is renamed
+//! into place after the whole tree succeeds, so a failed export
+//! leaves no partial tree behind — neither a retry-blocking
+//! `DestinationNotEmpty` nor a tree that looks complete but silently
+//! dropped files. The heartbeat marker lives in the container next
+//! to the payload, never inside it, so control state shares no
+//! namespace with user content. Staging names are
 //! unique per run, never shared: no export can ever delete or
 //! observe another export's live tree.
 //!

@@ -4,7 +4,8 @@ use std::time::SystemTime;
 use crate::view::ViewError;
 
 use super::staging::{
-    now_nanos, sweep_staging_with_probe, sweep_stale_staging, HEARTBEAT_FILE, HEARTBEAT_MAGIC,
+    now_nanos, staging_payload, sweep_staging_with_probe, sweep_stale_staging, HEARTBEAT_FILE,
+    HEARTBEAT_MAGIC,
 };
 use super::tests_harness::{assert_no_staging, drive, tmp};
 use super::{export_tree, ExportError};
@@ -42,6 +43,45 @@ fn stale_staging_is_swept_by_the_next_export() {
             .unwrap()
             .all(|entry| entry.unwrap().file_name() != "junk.txt"),
         "the crashed run's junk never merges"
+    );
+    std::fs::remove_dir_all(dest).unwrap();
+}
+
+#[test]
+fn stale_container_with_payload_layout_is_swept() {
+    // Crashed runs now leave a container (heartbeat beside the
+    // payload subdirectory): the sweep removes the whole container
+    // and the next export publishes normally, with no payload
+    // fragment merging into the published tree.
+    let (view, expected) = drive();
+    let dest = tmp();
+    let out = dest.join("out");
+    let staging = out.with_file_name("out.wyrd-export.5.5");
+    let payload = staging_payload(&staging);
+    std::fs::create_dir_all(&payload).unwrap();
+    std::fs::write(
+        staging.join(HEARTBEAT_FILE),
+        format!("{HEARTBEAT_MAGIC}\n1\n"),
+    )
+    .unwrap();
+    std::fs::write(payload.join("junk.txt"), b"stale").unwrap();
+
+    let report = export_tree(&view, &out).unwrap();
+
+    assert_eq!(report.files, 6);
+    assert!(!staging.exists(), "the crashed run's container is gone");
+    for (rel, bytes) in &expected {
+        assert_eq!(
+            &std::fs::read(out.join(rel)).unwrap(),
+            bytes,
+            "mismatch at {rel}"
+        );
+    }
+    assert!(
+        out.read_dir()
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() != "junk.txt"),
+        "the crashed run's payload never merges"
     );
     std::fs::remove_dir_all(dest).unwrap();
 }

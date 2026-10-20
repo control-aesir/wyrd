@@ -12,7 +12,7 @@ use super::fetch::FetchOutcome;
 use super::{PendingObjectFetch, RuntimeState};
 use crate::bulk::BulkSource;
 use crate::control::SnapshotAnnouncement;
-use crate::durable::AuthorizeSnapshot;
+use crate::durable::{AuthorizeSnapshot, DurableError, Fact};
 
 /// Look up the announcement a planned body derives from. The plan's
 /// pending bodies come from the same projection, so a miss is a
@@ -61,6 +61,42 @@ fn spent(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
+/// Commit `facts` through the existing landing path, splitting an
+/// over-ceiling batch into admissible commits instead of refusing the
+/// whole batch identically every pass (zero progress past either
+/// durable ceiling). Each half lands before the next is attempted, so
+/// a giant pass converges in several commits. Returns whether the
+/// batch landed: a torn commit reports `Ok(false)` and the caller must
+/// rebuild from disk before trusting its in-memory projection — the
+/// landed prefix stays durable and the remainder re-derives on the
+/// next pass, preserving the torn-commit rebuild semantics. A single
+/// fact that refuses on its own is genuinely inadmissible and errors
+/// exactly like today's whole-batch refusal.
+fn commit_admissible(engine: &mut Engine, facts: &[Fact]) -> Result<bool, EngineError> {
+    if facts.is_empty() {
+        return Ok(true);
+    }
+    match engine.commit_facts_landing(facts) {
+        Ok(landed) => Ok(landed),
+        Err(DurableError::TooManyRecords { .. }) | Err(DurableError::CommitTooLarge { .. })
+            if facts.len() > 1 =>
+        {
+            // Over either ceiling: split the batch and retry, as the
+            // refusal itself prescribes. A torn half stops the split —
+            // the landed prefix stays durable — and the caller rebuilds.
+            let mid = facts.len() / 2;
+            if !commit_admissible(engine, &facts[..mid])? {
+                return Ok(false);
+            }
+            commit_admissible(engine, &facts[mid..])
+        }
+        Err(error) => {
+            let _ = engine.resync();
+            Err(error.into())
+        }
+    }
+}
+
 /// Execute the current fetch plan to convergence, optionally under a
 /// wall-clock budget.
 fn execute_inner(
@@ -98,6 +134,14 @@ fn execute_inner(
         for snapshot in &plan.pending_snapshot_bodies {
             if spent(deadline) {
                 report.unfulfilled = remaining;
+                // Checkpoint the fulfilled prefix before the normal
+                // return: the vault imports already happened, and
+                // dropping the batch would re-request it every tight
+                // slice. A torn checkpoint leaves nothing durable (the
+                // next run rebuilds from disk anyway); a genuine
+                // refusal or store failure surfaces like the
+                // end-of-pass commit.
+                commit_admissible(engine, &facts)?;
                 return Ok(report);
             }
             // Backoff: a repeatedly invalid body stops being attempted
@@ -192,6 +236,14 @@ fn execute_inner(
         for snapshot in &plan.pending_snapshots {
             if spent(deadline) {
                 report.unfulfilled = remaining;
+                // Checkpoint the fulfilled prefix before the normal
+                // return: the vault imports already happened, and
+                // dropping the batch would re-request it every tight
+                // slice. A torn checkpoint leaves nothing durable (the
+                // next run rebuilds from disk anyway); a genuine
+                // refusal or store failure surfaces like the
+                // end-of-pass commit.
+                commit_admissible(engine, &facts)?;
                 return Ok(report);
             }
             // Backoff: a repeatedly invalid root stops being attempted
@@ -243,6 +295,14 @@ fn execute_inner(
         for (id, link) in &plan.pending_manifests {
             if spent(deadline) {
                 report.unfulfilled = remaining;
+                // Checkpoint the fulfilled prefix before the normal
+                // return: the vault imports already happened, and
+                // dropping the batch would re-request it every tight
+                // slice. A torn checkpoint leaves nothing durable (the
+                // next run rebuilds from disk anyway); a genuine
+                // refusal or store failure surfaces like the
+                // end-of-pass commit.
+                commit_admissible(engine, &facts)?;
                 return Ok(report);
             }
             // Backoff: a repeatedly invalid child representation is
@@ -295,6 +355,14 @@ fn execute_inner(
         for (content, candidates) in &plan.pending_objects {
             if spent(deadline) {
                 report.unfulfilled = remaining;
+                // Checkpoint the fulfilled prefix before the normal
+                // return: the vault imports already happened, and
+                // dropping the batch would re-request it every tight
+                // slice. A torn checkpoint leaves nothing durable (the
+                // next run rebuilds from disk anyway); a genuine
+                // refusal or store failure surfaces like the
+                // end-of-pass commit.
+                commit_admissible(engine, &facts)?;
                 return Ok(report);
             }
             // Backoff: cooled representations are not attempted. A
@@ -390,20 +458,18 @@ fn execute_inner(
             report.unfulfilled = remaining;
             return Ok(report);
         }
-        match engine.commit_facts_landing(&facts) {
-            Ok(true) => {}
-            // Torn (crash-hooked) commit: the in-memory projection
-            // now claims facts that are not durable, so the next pass
-            // replays from disk instead of building on them — the same
-            // recovery the per-pass rebuild used to provide.
-            Ok(false) => {
-                rebuilt = engine.store.rebuild(engine.device)?;
-            }
-            Err(error) => {
-                let _ = engine.resync();
-                return Err(error.into());
-            }
+        // An over-ceiling batch splits into admissible commits (each
+        // lands before the next is attempted) instead of refusing
+        // identically every pass. A torn commit rebuilds from disk —
+        // the landed prefix stays durable and the loop re-derives the
+        // remainder — preserving the torn-commit rebuild semantics.
+        if !commit_admissible(engine, &facts)? {
+            rebuilt = engine.store.rebuild(engine.device)?;
         }
+        // The pass's batch is durable (or the projection was rebuilt
+        // around a tear), so the per-pass accumulation starts over and
+        // the deadline exit below cannot recommit it.
+        facts.clear();
         // The convergence pass the commits unlocked starts only if the
         // budget allows: stopping here leaves the rest planned and
         // pending for the next run.

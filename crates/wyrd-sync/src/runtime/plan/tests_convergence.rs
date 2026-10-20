@@ -993,3 +993,118 @@ fn torn_pass_converges(nth: usize, stage: CrashStage) {
         "{stage:?} nth={nth}: recovery rerun is a no-op"
     );
 }
+
+/// Individually-admissible manifests whose combined encoding exceeds
+/// the per-commit byte ceiling converge in several admissible commits
+/// instead of refusing identically every pass: 300 child manifests of
+/// ~230KiB each (~68MiB combined) under one root, all mapping the
+/// same 2000 pinned chunks.
+#[test]
+fn over_ceiling_manifest_batch_converges_in_split_commits() {
+    const CHUNKS: usize = 2000;
+    const CHILDREN: usize = 300;
+
+    let mut fixture = fixture();
+    let device = fixture.recipient;
+    let (mut builder, genesis) = Builder::genesis(10);
+    let admission = admit_engine(&mut builder, device);
+    let epoch_secret = EpochSecret::from_bytes([0x09; 32]);
+    let drive = member_drive();
+    // One shared entry set, sealed once: every child maps nearly
+    // the same 2000 chunks (child i omits entry i, so all 300 stay
+    // distinct identities), keeping each child small while the batch
+    // is huge.
+    let mut entries = Vec::with_capacity(CHUNKS);
+    let mut pinned = Vec::with_capacity(CHUNKS);
+    for i in 0..CHUNKS {
+        let plaintext = format!("over-ceiling payload {i:06}").into_bytes();
+        let content = ContentId::derive(ObjectKind::Chunk, &plaintext);
+        let object_key =
+            epoch_secret.object_key(&drive, 2, &content, ObjectKind::Chunk, SEAL_VERSION);
+        let sealed_object =
+            crate::seal::seal(&object_key, ObjectKind::Chunk, &content, &plaintext).unwrap();
+        entries
+            .push(entry_for(ObjectKind::Chunk, 2, &sealed_object, &content, &plaintext).unwrap());
+        pinned.push((content, sealed_object));
+    }
+    let body = intake_body(&builder, &admission);
+    let snapshot = body.snapshot_id();
+    let manifest_key = epoch_secret.manifest_key(&drive, 2, &snapshot);
+    let mut inner = MemoryBulkSource::default();
+    let mut links = Vec::with_capacity(CHILDREN);
+    for i in 0..CHILDREN {
+        // Omit a rotating entry: 300 distinct manifest identities
+        // over (almost) one shared entry set, so the batch encoding
+        // is ~300 small manifests instead of one repeated one the
+        // plan would deduplicate.
+        let mut child_entries = entries.clone();
+        child_entries.remove(i % CHUNKS);
+        let child = Manifest::new(snapshot, child_entries, Vec::new()).unwrap();
+        let (child_id, sealed_child) = seal_manifest(&manifest_key, &child).unwrap();
+        inner.publish_sealed(sealed_child.storage_id(), sealed_child.encode());
+        // Distinct subtree identities: children key by tree id.
+        let mut tree = [0u8; 32];
+        tree[0] = (i & 0xFF) as u8;
+        tree[1] = ((i >> 8) & 0xFF) as u8;
+        links.push(wyrd_format::ChildManifest {
+            tree: ContentId::from_bytes(tree),
+            manifest: child_id,
+            storage: sealed_child.storage_id(),
+            transport: crate::seal::transport_root(&sealed_child),
+        });
+    }
+    let root = Manifest::new(snapshot, Vec::new(), links).unwrap();
+    let (root_id, sealed_root) = seal_manifest(&manifest_key, &root).unwrap();
+    inner.publish_root(
+        snapshot,
+        SealedManifest {
+            content_id: root_id,
+            sealed: sealed_root.encode(),
+        },
+    );
+    for (_, sealed_object) in &pinned {
+        inner.publish_sealed(sealed_object.storage_id(), sealed_object.encode());
+    }
+    intake_published(
+        &mut fixture,
+        &mut inner,
+        &builder,
+        &genesis,
+        &admission,
+        vec![EpochSecret::from_bytes([0x08; 32]), epoch_secret],
+        AnnouncedRoots {
+            manifest: root_id,
+            transport: crate::seal::transport_root(&sealed_root),
+        },
+    );
+    fixture
+        .engine
+        .set_materializations(
+            &pinned
+                .iter()
+                .map(|(content, _)| (*content, MaterializationState::Pinned))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let rev_start = fixture.engine.current();
+    let mut objects = MemoryObjectStore::default();
+    let report = fixture
+        .engine
+        .execute_plan(&mut inner, &mut objects)
+        .unwrap();
+    assert_eq!(report.snapshot_bodies, 1, "the body lands");
+    assert_eq!(
+        report.manifests,
+        CHILDREN + 1,
+        "the root plus every child lands"
+    );
+    assert_eq!(report.objects, CHUNKS, "every mapped chunk lands");
+    assert_eq!(
+        report.unfulfilled, 0,
+        "the over-ceiling batch converges instead of refusing every pass"
+    );
+    assert!(
+        fixture.engine.current() - rev_start > 1,
+        "the batch lands in several admissible commits, not one refused batch"
+    );
+}
